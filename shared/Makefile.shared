@@ -513,6 +513,9 @@ _SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
 _VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
 _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)"
 
+# 1 when the env is deterministic and configures no agent: governance only.
+_GOVERNANCE_ONLY = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id")))'
+
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
 	if [ "$$mode" = deterministic ]; then \
@@ -812,6 +815,10 @@ _prepare-classification:
 _plan-layer:
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
+	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
+		exit 0; \
+	fi; \
 	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK) --warn; fi; \
 	if [ ! -f "$$env_dir/abac.auto.tfvars" ]; then \
 		echo "=== Skipping terraform plan ($$layer:$$target_env): no $$env_dir/abac.auto.tfvars ==="; \
@@ -853,6 +860,10 @@ wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to 
 _apply-layer: _guard-not-ci-apply
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
+	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
+		exit 0; \
+	fi; \
 	apply_flags="$(if $(filter data_access workspace,$(LAYER)),$(APPLY_FLAGS),)"; \
 	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK); fi; \
 	if [ "$$layer" = "data_access" ]; then \
