@@ -149,7 +149,6 @@ def derive_treatment_model(
     config: TreatmentConfig,
     *,
     capture_source_less_explicit: bool = False,
-    deterministic_settings: dict | None = None,
 ) -> tuple[dict, int]:
     """Collapse mapped column findings and rebuild masks on ``gr_treatment``.
 
@@ -294,22 +293,7 @@ def derive_treatment_model(
         catalogs_by_treatment.setdefault(treatment_value, set()).add(catalog)
 
     new_masks: list[dict] = []
-    if deterministic_settings is not None:
-        from governance_policies import build_deterministic_policies
-        catalogs_by_treatment = {
-            value: sorted(catalogs)
-            for value, catalogs in catalogs_by_treatment.items()
-        }
-        function_schema = deterministic_settings.get("function_schema") or "default"
-        new_masks = build_deterministic_policies(
-            catalogs_by_treatment=catalogs_by_treatment,
-            access_tier_groups=deterministic_settings.get("access_tier_groups") or [],
-            raw_exempt_principals=deterministic_settings.get("raw_exempt_principals") or [],
-            deployer_principal=deterministic_settings.get("deployer_principal") or "",
-            function_schema=function_schema,
-        )
-
-    for treatment in (() if deterministic_settings is not None else config.treatments):
+    for treatment in config.treatments:
         for catalog in sorted(catalogs_by_treatment.get(treatment.value, set())):
             tag_sets = source_tags_by_catalog_treatment[(catalog, treatment.value)]
             replaced_masks = []

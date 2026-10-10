@@ -21,22 +21,22 @@ from generate_abac import (  # noqa: E402
     _fetch_live_classification_source,
     _find_bracket_section,
     _render_tag_assignment_block,
-    _render_fgac_policy_block,
     _replace_bracket_section,
+    deterministic_model_for,
     discover_agent_footprint,
     fetch_tables_from_databricks,
     footprint_contains_column,
     footprint_table_refs,
     load_auth_config,
-    ensure_deterministic_mask_functions,
     scope_ddl_to_footprint,
+    write_deterministic_model,
 )
+from governance_policies import TAG_KEY, DeterministicGovernanceError  # noqa: E402
 from treatment_derivation import (  # noqa: E402
     collapse_sensitivity_assignments,
     derive_treatment_model,
     load_treatment_config,
 )
-from governance_policies import FAILSAFE_TREATMENT  # noqa: E402
 from scripts.coverage_gate import write_refresh_record  # noqa: E402
 from scripts.footprint import FootprintError, resolve_footprint  # noqa: E402
 from scripts.sticky_governance import load_governed_tables, record  # noqa: E402
@@ -84,12 +84,8 @@ def _assert_promoted_masks_cover(assignments: list[dict], promoted: dict, tag_ke
         )
 
 
-def refresh_fetched_ddl(table_refs: list[str], runtime: dict, footprint: list[dict], ddl_out: Path) -> None:
-    """Write the footprint's live DDL, as make generate does, for the coverage check.
-
-    Promoted envs never ran generate, so this is the only DDL the first-exposure
-    check has there. Any read failure raises: the gate must not judge stale DDL.
-    """
+def fetched_ddl_text(table_refs: list[str], runtime: dict, footprint: list[dict]) -> str:
+    """The footprint's live DDL; any read failure raises."""
     captured = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured):
@@ -100,7 +96,16 @@ def refresh_fetched_ddl(table_refs: list[str], runtime: dict, footprint: list[di
         ) from exc
     except Exception as exc:
         raise RuntimeError(f"Could not fetch DDL for the governed footprint: {exc}") from exc
-    text = scope_ddl_to_footprint(ddl_text, footprint) + "\n"
+    return scope_ddl_to_footprint(ddl_text, footprint) + "\n"
+
+
+def refresh_fetched_ddl(table_refs: list[str], runtime: dict, footprint: list[dict], ddl_out: Path) -> None:
+    """Write the footprint's live DDL, as make generate does, for the coverage check.
+
+    Promoted envs never ran generate, so this is the only DDL the first-exposure
+    check has there. Any read failure raises: the gate must not judge stale DDL.
+    """
+    text = fetched_ddl_text(table_refs, runtime, footprint)
     if not ddl_out.is_file() or ddl_out.read_text() != text:
         ddl_out.parent.mkdir(parents=True, exist_ok=True)
         ddl_out.write_text(text)
@@ -170,17 +175,18 @@ def derive_assignments(
         )
     if ddl_out is not None:
         refresh_fetched_ddl(table_refs, runtime, footprint, ddl_out)
+    if runtime.get("governance_mode", "legacy") == "deterministic":
+        ddl_text = (ddl_out.read_text() if ddl_out is not None
+                    else fetched_ddl_text(table_refs, runtime, footprint))
+        return _derive_deterministic(config_path, env_path, runtime, native, ddl_text)
 
     config = load_treatment_config()
     unmapped = native.unmapped_columns(sorted(native.classified_columns()))
     if unmapped:
         details = ", ".join(f"{column}=class.{semantic}" for column, semantic in unmapped)
-        if runtime.get("governance_mode", "legacy") != "deterministic":
-            raise NativeClassificationRequiredError(
-                f"Native classification contains unmapped class.* findings: {details}"
-            )
-        print("WARNING: Unmapped class.* findings are fail-closed with the never-raw "
-              f"redacted treatment: {details}", file=sys.stderr)
+        raise NativeClassificationRequiredError(
+            f"Native classification contains unmapped class.* findings: {details}"
+        )
     native_assignments = [
         finding.as_assignment()
         for finding in native.findings_for(sorted(native.classified_columns()))
@@ -209,24 +215,13 @@ def derive_assignments(
             "tag_key": config.tag_key,
             "tag_value": treatment,
         })
-    override_assignments.extend({
-        "entity_type": "columns", "entity_name": column,
-        "tag_key": config.tag_key, "tag_value": FAILSAFE_TREATMENT,
-    } for column, _semantic in unmapped if runtime.get("governance_mode") == "deterministic")
     retained = _retained_promoted_assignments(
         list(promoted.get("tag_assignments") or []), config
     )
     # Use the exact treatment transform used by generate. Only its assignments
     # are consumed; its rebuilt policy model is intentionally discarded.
     derived, _changes = derive_treatment_model(
-        {"tag_assignments": retained + native_assignments + override_assignments}, config,
-        deterministic_settings={
-            "access_tier_groups": runtime.get("access_tier_groups") or [],
-            "raw_exempt_principals": runtime.get("raw_exempt_principals") or [],
-            "deployer_principal": runtime.get("databricks_client_id") or "",
-            "function_schema": next((p.get("function_schema") for p in promoted.get("fgac_policies") or []
-                                     if p.get("function_schema")), "default"),
-        } if runtime.get("governance_mode", "legacy") == "deterministic" else None,
+        {"tag_assignments": retained + native_assignments + override_assignments}, config
     )
     sensitivity_keys = {
         key for treatment in config.treatments for key, _value in treatment.sources
@@ -243,30 +238,36 @@ def derive_assignments(
             and item.get("tag_key") in sensitivity_keys
         )
     ]
-    effective_rules = promoted
-    if runtime.get("governance_mode", "legacy") == "deterministic":
-        effective_rules = dict(promoted)
-        effective_rules["fgac_policies"] = derived.get("fgac_policies") or []
-    _assert_promoted_masks_cover(refreshed, effective_rules, config.tag_key)
+    _assert_promoted_masks_cover(refreshed, promoted, config.tag_key)
     record(env_path.parent, refreshed, config.tag_key)
     updated = _replace_bracket_section(
         original,
         "tag_assignments",
         [_render_tag_assignment_block(item) for item in refreshed],
     )
-    if runtime.get("governance_mode", "legacy") == "deterministic":
-        updated = _replace_bracket_section(
-            updated, "fgac_policies",
-            [_render_fgac_policy_block(item) for item in effective_rules["fgac_policies"]],
-        )
     if updated == original:
         return 0
     config_path.write_text(updated)
-    if runtime.get("governance_mode", "legacy") == "deterministic":
-        ensure_deterministic_mask_functions(
-            config_path, config_path.with_name("masking_functions.sql"),
-        )
     return sum(1 for item in refreshed if item.get("tag_key") == config.tag_key)
+
+
+def _derive_deterministic(config_path: Path, env_path: Path, runtime: dict, native, ddl_text: str) -> int:
+    """Rebuild the whole deterministic model from live class.* tags and column types.
+
+    Unmapped classes don't stop the refresh: their columns get the never-raw
+    fail-safe redaction, and the coverage check keeps blocking new access.
+    """
+    try:
+        model = deterministic_model_for(runtime, native, ddl_text)
+    except DeterministicGovernanceError as exc:
+        raise RuntimeError(str(exc)) from exc
+    for column, semantic in model.unmapped:
+        print(f"WARNING: {column} has unmapped class.{semantic}; redacted for every tier "
+              "and new access is blocked until it is mapped (make scaffold-treatments)",
+              file=sys.stderr)
+    record(env_path.parent, model.tag_assignments, TAG_KEY)
+    write_deterministic_model(config_path, config_path.with_name("masking_functions.sql"), model)
+    return len(model.tag_assignments)
 
 
 def main(argv: list[str] | None = None) -> int:

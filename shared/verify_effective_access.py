@@ -2793,6 +2793,7 @@ def load_spec_from_tfvars(
     governance = {**data, **env_data}
     if _as_str(governance.get("governance_mode")) == "deterministic":
         from deterministic_governance import resolve_precedence
+        from governance_policies import base_treatment
 
         tiers = _as_list(governance.get("access_tier_groups"))
         raw_exempt = _as_list(governance.get("raw_exempt_principals"))
@@ -2847,7 +2848,7 @@ def load_spec_from_tfvars(
                          if ALL_USERS_GROUP in _as_list(p.get("to_principals"))), "")
             partial = next((_mask_function(p) for p in policies
                             if ALL_USERS_GROUP not in _as_list(p.get("to_principals"))), "")
-            treatment = config_tags.get(f"{check.table}.{check.column}".lower(), "")
+            treatment = base_treatment(config_tags.get(f"{check.table}.{check.column}".lower(), ""))
             expectations = [
                 (principal, access_for(f"{check.table}.{check.column}", treatment,
                                        principal, principal_memberships))

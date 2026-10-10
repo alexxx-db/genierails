@@ -133,31 +133,86 @@ def test_refresh_fails_closed_on_unmapped_native_class(tmp_path, monkeypatch):
     assert config.read_bytes() == before
 
 
-def test_deterministic_refresh_fail_safe_redacts_unmapped_native_class(tmp_path, monkeypatch):
-    config, auth, env = _files(tmp_path)
-    env.write_text('''
+DETERMINISTIC_ENV = '''
 governance_mode = "deterministic"
 uc_catalog = "prod"
 uc_tables = ["sales.customers"]
 access_tier_groups = ["raw", "partial", "full"]
 raw_exempt_principals = ["etl"]
-''')
+'''
+DETERMINISTIC_DDL = """CREATE TABLE prod.sales.customers (
+  email STRING,
+  secret STRING,
+  cvv STRING,
+  dob DATE,
+  score DECIMAL(5,0)
+) USING delta;
+"""
+
+
+def _deterministic(tmp_path, monkeypatch, tag_rows):
+    config, auth, env = _files(tmp_path)
+    env.write_text(DETERMINISTIC_ENV)
     (tmp_path / "generated" / "governed_tables.json").write_text(
         '{"tables":["prod.sales.customers"]}\n'
     )
-    native = ClassificationSource(tag_rows=[
-        ("prod", "sales", "customers", "secret", "class.future_secret", ""),
-    ])
-    monkeypatch.setattr(MODULE, "_fetch_live_classification_source", lambda *a, **k: native)
+    monkeypatch.setattr(MODULE, "_fetch_live_classification_source",
+                        lambda *a, **k: ClassificationSource(tag_rows=tag_rows))
+    monkeypatch.setattr(MODULE, "fetched_ddl_text", lambda *a, **k: DETERMINISTIC_DDL)
+    _forbid_model_calls(monkeypatch)
+    return config, auth, env
 
-    assert MODULE.derive_assignments(config, auth, env) == 1
-    parsed = hcl2.loads(config.read_text())
-    assignment = next(a for a in parsed["tag_assignments"] if a.get("entity_name", "").endswith(".secret"))
-    assert assignment["tag_value"] == "unmapped_redact"
-    fallback = [p for p in parsed["fgac_policies"] if "unmapped_redact" in p.get("name", "")]
+
+def test_deterministic_refresh_fail_safe_redacts_unmapped_native_class(tmp_path, monkeypatch):
+    config, auth, env = _deterministic(tmp_path, monkeypatch, [
+        ("prod", "sales", "customers", "secret", "class.future_secret", ""),
+        ("prod", "sales", "customers", "email", "class.email_address", ""),
+    ])
+
+    assert MODULE.derive_assignments(config, auth, env) == 2
+    text = config.read_text()
+    parsed = hcl2.loads(text)
+    values = {a["entity_name"]: a["tag_value"] for a in parsed["tag_assignments"]
+              if a["tag_key"] == "gr_treatment"}
+    assert values["prod.sales.customers.secret"].startswith("unmapped_redact__string__")
+    assert values["prod.sales.customers.email"].startswith("email_partial__string__")
+    fallback = [p for p in parsed["fgac_policies"] if "unmapped_redact" in p["name"]]
     assert len(fallback) == 1
     assert fallback[0]["to_principals"] == ["account users"]
     assert fallback[0].get("except_principals", []) == []
+    # The coverage check still reports it, which blocks new access.
+    assert "# gr.classification_unmapped: prod.sales.customers.secret|class.future_secret" in text
+    # Legacy masks and their reviewed functions are replaced, row filters kept.
+    names = {p["name"] for p in parsed["fgac_policies"]}
+    assert "reviewed_email" not in names and "reviewed_row_filter" in names
+    sql = config.with_name("masking_functions.sql").read_text()
+    assert f"FUNCTION gr_mask_{values['prod.sales.customers.email']}_partial(value STRING) RETURNS STRING" in sql
+
+
+def test_deterministic_refresh_types_functions_and_never_raw_wins(tmp_path, monkeypatch):
+    config, auth, env = _deterministic(tmp_path, monkeypatch, [
+        ("prod", "sales", "customers", "cvv", "class.card_security_code", ""),
+        ("prod", "sales", "customers", "cvv", "class.name", ""),
+        ("prod", "sales", "customers", "dob", "class.date_of_birth", ""),
+        ("prod", "sales", "customers", "score", "class.credit_score", ""),
+    ])
+
+    MODULE.derive_assignments(config, auth, env)
+    parsed = hcl2.loads(config.read_text())
+    values = {a["entity_name"].rsplit(".", 1)[1]: a["tag_value"] for a in parsed["tag_assignments"]
+              if a["tag_key"] == "gr_treatment"}
+    assert values["cvv"].startswith("card_security_code__string__")
+    assert values["dob"].startswith("date_year__date__")
+    assert values["score"].startswith("credit_score__decimal_5_0__")
+    cvv = [p for p in parsed["fgac_policies"] if values["cvv"] in p["name"]]
+    assert [p["to_principals"] for p in cvv] == [["account users"]]
+    sql = config.with_name("masking_functions.sql").read_text()
+    assert "(value DATE) RETURNS DATE" in sql
+    assert "(value DECIMAL(5,0)) RETURNS DECIMAL(5,0)" in sql
+    # The same inputs give the same output.
+    before = config.read_text()
+    MODULE.derive_assignments(config, auth, env)
+    assert config.read_text() == before
 
 
 def test_refresh_fails_closed_when_promoted_mask_does_not_cover_treatment(tmp_path, monkeypatch):
@@ -555,3 +610,18 @@ def test_live_refresh_refuses_ambient_credentials(tmp_path, monkeypatch):
     for extra in ([], ["--ddl-only"]):
         assert MODULE.main([*extra, "--config", str(config), "--auth-file", str(auth),
                             "--env-file", str(env), "--write-ddl", str(tmp_path / "ddl.sql")]) == 1
+
+
+def test_legacy_refresh_never_builds_a_deterministic_model(tmp_path, monkeypatch):
+    config, auth, env = _files(tmp_path)
+    native = ClassificationSource(tag_rows=[
+        ("prod", "sales", "customers", "email", "class.email_address", ""),
+    ])
+    monkeypatch.setattr(MODULE, "_fetch_live_classification_source", lambda *a, **k: native)
+    monkeypatch.setattr(MODULE, "deterministic_model_for",
+                        lambda *a, **k: pytest.fail("legacy envs must keep the legacy derivation"))
+    _forbid_model_calls(monkeypatch)
+    MODULE.derive_assignments(config, auth, env)
+    text = config.read_text()
+    assert "__string__" not in text and "gr.classification_unmapped" not in text
+    assert not config.with_name("masking_functions.sql").exists()

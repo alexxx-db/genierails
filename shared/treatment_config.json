@@ -3,12 +3,6 @@
   "description": "GenieRails-owned enforcement treatment derived from sensitivity findings. Entries are ordered strictest-first.",
   "treatments": [
     {
-      "value": "unmapped_redact",
-      "masking_function": "gr_mask_unmapped_redact_full",
-      "sources": [],
-      "review": "Fail-safe never-raw treatment for an unmapped class.* finding."
-    },
-    {
       "value": "redact",
       "masking_function": "mask_redact",
       "udf_signature": "mask_redact(input STRING) RETURNS STRING",
