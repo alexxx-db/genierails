@@ -16,6 +16,16 @@ from pathlib import Path
 WORK_DIR = Path.cwd()
 
 
+def retained_deterministic_values(key: str, current_values: set[str]) -> set[str]:
+    """Live deterministic gr_treatment values (``<treatment>__<type>__<gen>``)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from governance_policies import TAG_KEY, parse_treatment_value
+
+    if key != TAG_KEY and not key.startswith(TAG_KEY + "_"):
+        return set()
+    return {value for value in current_values if parse_treatment_value(value)}
+
+
 def _load_auth():
     """Read auth.auto.tfvars and return config dict + set SDK env vars."""
     auth_path = WORK_DIR / "auth.auto.tfvars"
@@ -127,6 +137,10 @@ def main():
         if current_values is None:
             continue
 
+        # A deterministic treatment value stays allowed while a retained policy
+        # generation or a not-yet-retagged column may still use it; only the
+        # staged retirement removes generations, so this sync never does.
+        desired_values |= retained_deterministic_values(key, current_values)
         missing = desired_values - current_values
         removed = current_values - desired_values
         desired_list = sorted(desired_values)
