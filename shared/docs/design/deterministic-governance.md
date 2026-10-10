@@ -162,18 +162,44 @@ row_filters = [
 | Tags | One treatment tag key for everything. Each column has one treatment-tag resource keyed by `entity_type|entity_name|tag_key` (never by value) with no `ignore_changes`, so value changes update in place (verified in the provider). Classifier-owned `class.*` tags are never managed by Terraform. Order for a column moving to a new treatment: add the value to the tag policy, create the new treatment's policies, then retag. A column is never tagged with a value no policy matches. |
 | CI | Every applying target refuses in CI. The only exception is the optional post-merge `rehearse ENV=dev` job, and only with remote locked state (section 10). |
 
-**One acknowledgement variable, with typed and fully scoped entries:**
+**Acknowledgements are committed and environment-scoped.** Each
+`envs/<env>/ack.txt` line includes the environment again so copying a file to a
+different environment fails closed:
 
-```bash
-ACK="prod:weaken:cat.sch.t.col:etl-sp,prod:unclassified:cat.sch.t.col,prod:reader:cat.sch.t:bi-sp"
+```text
+prod:weaken:cat.sch.t.col:etl-sp
+prod:unclassified:cat.sch.t.col
+prod:reader:cat.sch.t:bi-sp
 ```
 
-Each entry names the env, the kind and the exact object. GenieRails prints the before/after consequence of each and refuses entries that match nothing.
+Each entry names the env, kind and exact object. GenieRails prints the
+before/after consequence of each and refuses entries that match nothing after
+all checks (weakening, reader and unclassified) are reconciled together, once.
+Entries for another env are refused. The weakening keys are
+`<env>:weaken:<column|table|treatment>:<principal>` (`*` for readers outside a
+removed row filter, `partial` for `partial = "raw"`); reader keys are
+`<env>:reader:<table>:<principal>`.
+Repositories must add `envs/*/ack.txt` to `CODEOWNERS` using the existing
+governance-owner team or users; the project deliberately does not prescribe an
+organization-specific owner name.
 
 **Residual risks (stated, not solved):**
 - Owners, metastore admins and `MANAGE` holders can grant `SELECT` outside GenieRails at any time; `ACK` can't catch that. Keep ownership and `MANAGE` off human principals; `maintain` reports new readers on its next run.
 - Readers with schema- or catalog-level `SELECT` can read a new table raw until it is classified and `maintain` runs. Run `maintain` on a schedule.
 - In dev, tables added to an agent in the UI but not yet captured are not governed.
+- Reader inventory is bounded by the deployer's Unity Catalog visibility.
+  `information_schema` returns only the grants the caller may see, so the
+  check fails unless the deployer is the metastore admin (the metastore owner,
+  read from the API) or an owner or `MANAGE` holder of each inventoried
+  securable or a parent, including the schemas and catalogs of dependent
+  views. It also fails if a table, view, schema or catalog is missing or has
+  no visible owner, or if any query fails or times out. An incomplete
+  inventory is never treated as empty. Group membership comes from the
+  workspace SCIM API (users by user name/email, service principals by
+  application id, nested groups by name).
+- Delta Sharing recipients and file-level paths such as `READ FILES` are not
+  covered by the v1 table-reader inventory. Govern those paths separately and
+  do not treat this report as proof that they are absent.
 
 ## 7. Verification
 
@@ -253,7 +279,7 @@ The README shows one golden-path config (three tiers, one agent, `catalog_map`);
 
 
 - **Settings:** `access_tier_groups`, `table_readers`, `uc_tables`, `catalog_map`, per-agent `genie_space_id` / `acl_groups` / `delete`, and optionally `raw_exempt_principals`, `treatment_versions`, `column_overrides`, `tag_treatments`, `row_filters`. `governance_mode` exists only during migration.
-- **One variable:** `ACK`.
+- **One acknowledgement file:** `envs/<env>/ack.txt` (env-scoped entries, code-owned).
 - **Commands:** `setup`, `generate`, `capture`, `rehearse`, `promote-to`, `release`, `maintain`; occasionally `ungovern`, `detach-agent`, `scaffold-treatments`.
 
 ## 14. Platform checks (before step 4)
