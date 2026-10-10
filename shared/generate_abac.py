@@ -3244,6 +3244,7 @@ def ensure_deterministic_mask_functions(tfvars_path: Path, sql_path: Path | None
     """Append exactly the library functions referenced by deterministic policies."""
     if not sql_path or not sql_path.exists():
         return 0
+    import hcl2
     from governance_policies import render_mask_functions
     cfg = hcl2.loads(tfvars_path.read_text())
     targets: dict[tuple[str, str], set[str]] = {}

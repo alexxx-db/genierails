@@ -262,9 +262,10 @@ def derive_assignments(
     if updated == original:
         return 0
     config_path.write_text(updated)
-    ensure_deterministic_mask_functions(
-        config_path, config_path.with_name("masking_functions.sql"),
-    )
+    if runtime.get("governance_mode", "legacy") == "deterministic":
+        ensure_deterministic_mask_functions(
+            config_path, config_path.with_name("masking_functions.sql"),
+        )
     return sum(1 for item in refreshed if item.get("tag_key") == config.tag_key)
 
 
