@@ -214,7 +214,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 - New functions are created under new names; policies change in tighten-before-loosen phases; old functions are kept until no policy uses them. Tag state moves with generated `terraform state mv`.
 - Existing AI-drafted row filters are frozen as they are until declared ones replace them.
 - Cutover is reported done only after a fresh classification read and a passing tier-aware verification.
-- Rollback: one PR reverts **both** the source change and its promotion (or reverts the source change and re-runs `promote-to`), adds `rollback:<commit>` to `envs/prod/ack.txt`, and goes through the normal stages. The previous version's functions and policies are kept until a later release has succeeded, so masks switch back in place.
+- Rollback: one PR reverts **both** the source change and its promotion (or reverts the source change and re-runs `promote-to`), adds `prod:rollback:<commit>` to `envs/prod/ack.txt`, and goes through the normal stages. The previous version's functions and policies are kept until a later release has succeeded, so masks switch back in place.
 
 ## 9. Files and version control
 
@@ -238,7 +238,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 | Release | after the promotion PR is merged and rehearse has passed on that merge commit: the prod pipeline (section 17), or in v1 the operator on the deployment machine | prod |
 
 - **Rehearse writes a receipt per commit** (append-only, keyed by commit) next to dev's state: commit, clean-tree flag, fingerprint of code and inputs, result, target env mapping, and the digest of what `promote-to` produces for each target. If the dev fingerprint matches a passing receipt, rehearse writes a receipt for the new commit without re-applying, and still recomputes the `promote-to` digests.
-- **`release` recomputes everything and refuses unless** `HEAD` equals the receipt's commit, the tree is clean, `HEAD` is on freshly fetched `origin/main`, the fingerprints match, and the digest of `envs/prod/generated` matches the receipt. It also refuses a commit that is an ancestor of the last release (an out-of-order or stale approval) unless `rollback:<commit>` is acknowledged. The promotion PR's merge commit is the one that must pass rehearse, so code merged after it can't reach prod untested.
+- **`release` recomputes everything and refuses unless** `HEAD` equals the receipt's commit, the tree is clean, `HEAD` is on freshly fetched `origin/main`, the fingerprints match, and the digest of `envs/prod/generated` matches the receipt. It also refuses a commit that is an ancestor of the last release (an out-of-order or stale approval) unless `<env>:rollback:<commit>` is acknowledged. The promotion PR's merge commit is the one that must pass rehearse, so code merged after it can't reach prod untested.
 - **Unfinished agents** never reach git, because capture is explicit. Promoting A carries B's last captured version unchanged.
 - **Removing an agent revokes `CAN_RUN` only. Removing a `table_readers` entry revokes the `SELECT` it granted.** Masks stay until `make ungovern`.
 - A failed rehearse blocks release until a fix merges and rehearse passes. CI also regenerates each open promotion PR and fails it if it differs.
@@ -272,7 +272,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 | Remove agent A | A PR sets `acl_groups = []` and `detached = true` and is released (`CAN_RUN` revoked); then `make detach-agent`; then a PR removes it from config with a no-destroy plan. Table access and masks unchanged. |
 | Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, release. Additions are checked as widening. |
 | Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR, rehearse and release apply the removal. |
-| Roll back | One revert PR covering the source change and its promotion, with `rollback:<commit>` acknowledged; normal stages; masks switch back in place. |
+| Roll back | One revert PR covering the source change and its promotion, with `prod:rollback:<commit>` acknowledged; normal stages; masks switch back in place. |
 | Upgrade GenieRails | A governance change: upgrade, rehearse, promote, release. |
 | Several teams | Per-agent files with code owners; a central team owns governance files. |
 
@@ -341,7 +341,7 @@ A change that needs an intermediate replan (staged policy changes, tier moves, m
 **Provenance for operations.** Every applying command enforces its own provenance, independent of pipeline settings:
 - `detach-agent`: HEAD is the last released commit, and that release had the agent with `detached = true`.
 - `apply-account`: clean `origin/main` HEAD; a saved account plan and manifest; approval; the account lock; it writes an account receipt.
-- Migration and policy phases: a clean checkout whose `HEAD` is on freshly fetched `origin/main`, with a matching passing dev receipt, and not older than the last release unless `rollback:<commit>` is acknowledged; one manifest and approval per phase, each recording the commit and this provenance result.
+- Migration and policy phases: a clean checkout whose `HEAD` is on freshly fetched `origin/main`, with a matching passing dev receipt, and not older than the last release unless `<env>:rollback:<commit>` is acknowledged; one manifest and approval per phase, each recording the commit and this provenance result.
 
 **`make check ENV=<env>`** is read-only. It runs `validate`, a regeneration that fails if any committed generated file differs, `validate-generated`, the offline coverage check, the mask-library unit tests and `plan`. With `ENV=prod` it also runs `make promote-to ENV=prod CHECK=1`, which regenerates into a scratch directory and fails if the committed output differs. Before an env has remote state, `plan` is a structural plan against empty state; state-aware plans start with remote state.
 
