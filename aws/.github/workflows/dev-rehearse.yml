@@ -18,9 +18,11 @@ name: GenieRails dev (aws)
 # deployment machine, at each merged commit in order,
 # in that machine's one persistent checkout: v1 keeps Terraform state, the
 # env lock and the Genie ID files under its gitignored envs/, so a re-clone
-# loses them. Move the checkout with `git fetch && git checkout --detach
-# <sha>`, confirm `git status --porcelain` prints nothing, and never run
-# `git clean -x` or re-clone. (State outside the checkout, in
+# loses them. Move the checkout with
+# `git fetch && git checkout --force --detach <sha>` (--force drops earlier
+# runs' edits to tracked generated/ and layer files and leaves the ignored
+# state alone), confirm `git status --porcelain` prints nothing, and never
+# run `git clean -x` or re-clone. (State outside the checkout, in
 # GENIERAILS_STATE_DIR, is the target.)
 # The CI guard refuses every applying target here. Do not set
 # GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway

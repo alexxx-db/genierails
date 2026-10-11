@@ -9,8 +9,8 @@ name: GenieRails prod maintain (aws)
 # receipt (rollout step 9), which names the last released commit. Until both
 # exist the operator runs make maintain ENV=prod on the deployment machine,
 # on its own schedule, at the last released commit, in the same persistent
-# checkout as releases (`git fetch && git checkout --detach <sha>`, an empty
-# `git status --porcelain`, never `git clean -x` or a re-clone; see
+# checkout as releases (`git fetch && git checkout --force --detach <sha>`,
+# an empty `git status --porcelain`, never `git clean -x` or a re-clone; see
 # prod-release.yml). The CI guard refuses every applying target here.
 # Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 this job runs the read-only
 # drift audit, which exits non-zero when sensitive columns are untagged or
