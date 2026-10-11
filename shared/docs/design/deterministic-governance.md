@@ -10,7 +10,7 @@ GenieRails has two layers with separate lifecycles:
 |---|---|---|
 | Owns | treatment tags, mask functions, ABAC policies, row filters, coverage check, **who can read each table** (`table_readers`) | Genie config, `acl_groups`, `CAN_RUN` |
 | Input | the governed set of tables (section 1) and reviewed config | the configured agents |
-| Needs the other? | no | yes: its tables are governed first |
+| Needs the other? | no | yes: before GenieRails grants `CAN_RUN`, the tables are either governed by GenieRails (`governance = "genierails"`) or validated as externally governed (`governance = "external"`). |
 
 Governance is computed only from classification tags and reviewed config. It is the same for every agent and uses no AI. The champion flow uses both layers; governance can also run on its own (section 11).
 
@@ -31,7 +31,7 @@ Governance is computed only from classification tags and reviewed config. It is 
 
 ## 1. The governed set
 
-Governed set = top-level `uc_tables` ∪ tables of configured agents ∪ tables already governed (the governed-table list, so a table stays governed until `make ungovern`). In an env with `governance = "external"` the governed set is empty: the agents' tables are an external-access set, for which GenieRails may grant `CAN_RUN` after live checks but creates no masks, row filters, treatment tags, policies, table grants or governed-table entries.
+With `governance = "genierails"`, governed set = top-level `uc_tables` ∪ tables of configured agents ∪ tables already governed (the governed-table list, so a table stays governed until `make ungovern`). With `governance = "external"`, the governed set is empty: the env is agent-only, and agents' tables are an external-access set for which GenieRails may grant `CAN_RUN` after live checks but creates no masks, row filters, treatment tags, policies, table grants or governed-table entries.
 
 - `uc_tables` keeps its existing syntax: `schema.table` (relative to `uc_catalog`), `catalog.schema.table`, or `catalog.schema.*`.
 - `uc_tables` **governs and never grants**, with or without agents.
@@ -144,9 +144,9 @@ row_filters = [
 - **Capture is explicit:** `make capture ENV=dev SPACE="<agent>"` writes that agent's exported `serialized_space` to `envs/dev/agents/<agent>.space.json`. Only the outer fields (`space_id`, `etag`, ACLs) are removed; the item IDs inside the payload (instructions, sample questions, joins, snippets, benchmarks) are kept, because the format needs them for a faithful round-trip. A plain `generate` only imports agents not yet in git (it writes files; no Terraform state changes).
 - **Per-agent files:** `envs/<env>/agents/<agent>.auto.tfvars` holds `genie_space_id`, `acl_groups` and `delete`. The prod agent ID is kept in prod's Terraform state and in the release receipt, never committed by a pipeline; if state is lost it is recovered from the receipt, or by title adoption (#79). A loader merges these files before plan.
 - **Access:** `acl_groups` get `CAN_RUN` on the agent, nothing else. With `governance = "genierails"`, `generate`, `rehearse` and `release` stop if any `acl_groups` group can't read one of the agent's tables through resolved `table_readers`. With `governance = "external"`, no `table_readers` grant is needed; `rehearse` and `release` check live privileges instead. Either way they name the table and the missing group.
-- **Champion convenience:** when `generate` first imports an agent, it writes a `table_readers` entry for each of the agent's tables that no entry (exact or wildcard) already covers, filled with the agent's `acl_groups`, for review and commit. It never edits an existing entry.
+- **Champion convenience:** with `governance = "genierails"`, when `generate` first imports an agent, it writes a `table_readers` entry for each of the agent's tables that no entry (exact or wildcard) already covers, filled with the agent's `acl_groups`, for review and commit. It never edits an existing entry. With `governance = "external"`, `generate` writes no `table_readers` entries.
 - **`acl_groups` is env-owned:** the first `promote-to` seeds prod from dev; later promotions keep prod's value and print the differences.
-- **Dev:** agent config is never overwritten; GenieRails applies governance and access for captured tables only, and creates an agent only if missing.
+- **Dev:** agent config is never overwritten. With `governance = "genierails"`, GenieRails applies governance and access for captured tables only; with `governance = "external"`, it applies only agent access after the live external-governance checks. It creates an agent only if missing.
 - **Prod:** every `release` overwrites the agent's config from git (full replacement). Any field the API rejects fails the release; nothing is skipped silently. It prints a field-level report of what it overwrote, never recreates the agent and never changes its ID, so conversations stay.
 - **Promotion remap** is JSON-aware: catalog names and the warehouse are replaced on identifier boundaries inside string values, never in keys or prose.
 - **Removing an agent** takes two steps:
@@ -278,7 +278,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 | A and B share a table | Masks are shared and unchanged; only A changes. |
 | Mask change while B is mid-curation | Governance change; rehearse, promote, release. B's config is untouched in dev and prod. |
 | New sensitive column in prod | `maintain` applies the library mask, or the fail-safe redaction if unmapped. |
-| Grant another group access to A in prod | Add the group to A's `acl_groups` in `envs/prod/agents/A.auto.tfvars` and, if it can't already read A's tables, to `table_readers`; PR, release. |
+| Grant another group access to A in prod | Add the group to A's `acl_groups` in `envs/prod/agents/A.auto.tfvars`. With `governance = "genierails"`, also add it to `table_readers` if it can't already read A's tables. With `governance = "external"`, grant table access outside GenieRails before release; GenieRails checks it live. PR, release. |
 | Remove agent A | A PR sets `acl_groups = []` and `detached = true` and is released (`CAN_RUN` revoked); then `make detach-agent`; then a PR removes it from config with a no-destroy plan. Table access and masks unchanged. |
 | Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, release. Additions are checked as widening. |
 | Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR, rehearse and release apply the removal. |
