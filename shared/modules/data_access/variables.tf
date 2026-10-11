@@ -170,6 +170,30 @@ variable "governance_mode" {
   default = "legacy"
 }
 
+variable "table_readers" {
+  type        = map(list(string))
+  default     = null
+  description = "Deterministic envs: fully qualified table (or catalog.schema.*) => groups granted SELECT; a table's readers are the union of every matching entry. null (unset) grants nothing and refuses to revoke grants already applied; {} grants nothing."
+}
+
+variable "access_tier_groups" {
+  type        = list(string)
+  default     = []
+  description = "Deterministic tiers; every table_readers group must be one, or in raw_exempt_principals."
+}
+
+variable "raw_exempt_principals" {
+  type        = list(string)
+  default     = []
+  description = "Deterministic raw-exempt principals; also allowed as table_readers groups."
+}
+
+variable "governed_tables" {
+  type        = list(string)
+  default     = []
+  description = "Other tables known to be governed (generated/governed_tables.json), so catalog.schema.* readers reach them."
+}
+
 variable "fgac_policies" {
   type = list(object({
     name              = string

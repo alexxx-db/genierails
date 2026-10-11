@@ -19,11 +19,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import threading
 from pathlib import Path
 from typing import Callable
+
+SHARED_ROOT = Path(__file__).resolve().parent.parent
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
 
 
 def _top_level_list_span(text: str, key: str) -> tuple[int, int, int] | None:
@@ -322,7 +327,75 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Destination auth.auto.tfvars, for a read-only listing of live policies.",
     )
+    parser.add_argument(
+        "--group-map-env",
+        metavar="PATH",
+        type=Path,
+        help="Destination env.auto.tfvars: in a deterministic destination its group_map renames "
+             "the policies' principals (the source's raw_exempt_principals are never mapped).",
+    )
+    parser.add_argument("--source-env", metavar="PATH", type=Path,
+                        help="Source env.auto.tfvars (its raw_exempt_principals).")
     return parser.parse_args()
+
+
+_PRINCIPALS_LINE = re.compile(r'^(?P<lead>\s*(?:to|except)_principals\s*=\s*)(?P<list>\[[^\]\n]*\])(?P<tail>\s*)$',
+                              re.MULTILINE)
+
+
+class PromotionError(ValueError):
+    """The promoted config can't be written safely; nothing is written."""
+
+
+def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str],
+                   dest_exempt: list[str] | None = None) -> str:
+    """Rename policy principals through group_map (decision 8).
+
+    raw_exempt_principals are env-owned and never mapped: where a policy
+    names one of the source's, the destination's whole exempt set takes its
+    place (in that list only), so a promoted policy never names a dev-only
+    exempt principal. A destination exempt that is an everyone-principal
+    (account users, users) would exempt everyone from the mask, so that
+    refuses the promotion instead (PromotionError) whether or not a policy
+    names a source exempt.
+    """
+    dest_exempt = list(dest_exempt or [])
+    from table_readers import is_everyone
+
+    everyone = [name for name in dest_exempt if is_everyone(name)]
+    if everyone:
+        raise PromotionError(
+            f"destination raw_exempt_principals names {', '.join(repr(n) for n in everyone)}, which is "
+            "everyone: substituting it into the promoted policies' except_principals would let everyone "
+            "see raw values")
+    if not group_map and not exempt:
+        return hcl_text
+
+    def rename(match: re.Match) -> str:
+        names = json.loads(match["list"])
+        mapped = []
+        for name in names:
+            targets = dest_exempt if name in exempt else [group_map.get(name, name)]
+            for target in targets:
+                if target not in mapped:
+                    mapped.append(target)
+        return f"{match['lead']}[{', '.join(json.dumps(n) for n in mapped)}]{match['tail']}"
+
+    return _PRINCIPALS_LINE.sub(rename, hcl_text)
+
+
+def _group_map_inputs(args) -> tuple[dict[str, str], set[str], list[str] | None]:
+    import hcl2
+
+    if not args.group_map_env or not args.group_map_env.is_file():
+        return {}, set(), None
+    dest = hcl2.loads(args.group_map_env.read_text())
+    if dest.get("governance_mode", "legacy") != "deterministic":
+        return {}, set(), None
+    source = hcl2.loads(args.source_env.read_text()) if args.source_env and args.source_env.is_file() else {}
+    return ({str(k): str(v) for k, v in (dest.get("group_map") or {}).items()},
+            {str(p) for p in source.get("raw_exempt_principals") or []},
+            [str(p) for p in dest.get("raw_exempt_principals") or []])
 
 
 def parse_catalog_pairs(raw_pairs: list[str]) -> list[tuple[str, str]]:
@@ -445,6 +518,12 @@ def main() -> None:
         )
     except (RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}")
+        sys.exit(1)
+    group_map, exempt, dest_exempt = _group_map_inputs(args)
+    try:
+        remapped_hcl = map_principals(remapped_hcl, group_map, exempt, dest_exempt)
+    except PromotionError as exc:
+        print(f"ERROR: {exc}; nothing was written.")
         sys.exit(1)
     for note in name_notes:
         print(note)

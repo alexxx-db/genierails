@@ -46,11 +46,13 @@ anyone outside the tiers gets the full version.
 
 ## Governance only
 
-Deterministic envs create no business grant: `uc_tables` governs and never
-grants (no `USE_CATALOG`, `USE_SCHEMA` or `SELECT`, so nothing targets
-`account users`). With no agents, the workspace layer is skipped, so
-GenieRails creates nothing there (no group assignment, entitlement, warehouse
-or Genie resource). `table_readers` grants arrive in step 8.
+`uc_tables` governs and never grants. `SELECT` (with its `USE_CATALOG` and
+`USE_SCHEMA`) comes only from `table_readers`, and nothing targets `account
+users`; without `table_readers` GenieRails grants nothing. With no agents, the
+workspace layer is skipped, so GenieRails creates nothing there (no group
+assignment, entitlement, warehouse or Genie resource). See
+[access.md](access.md) for `table_readers`, `acl_groups`, the live agent
+coverage check that gates `CAN_RUN`, and `group_map`.
 
 ## External masks
 
@@ -59,7 +61,8 @@ exposure preflight), `scripts/external_mask_inventory.py` stops the run when a
 governed table carries a column-mask policy GenieRails didn't create
 (catalog, schema or table level, from the policies API) or a governed column
 carries a table-attached mask (`information_schema.column_masks`). Policies of
-any retained generation are recognised by name and function.
+any retained generation are recognised by name and function. GenieRails
+supports only governance it generates (design decision 9).
 
 ## Staged-apply hooks (the interface for step 6)
 

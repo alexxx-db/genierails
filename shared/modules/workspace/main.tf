@@ -31,8 +31,10 @@ locals {
   )
 
   # ACL resolution is fail-closed before this module. Explicit [] means nobody.
-  # When var.groups is empty (genie-only mode), ACLs are skipped entirely.
-  genie_space_groups = length(var.groups) > 0 ? {
+  # When var.groups is empty (genie-only mode), ACLs are skipped entirely,
+  # unless the root says it manages them (deterministic envs: CAN_RUN comes
+  # from acl_groups alone, whatever groups the config lists).
+  genie_space_groups = (var.manage_acls == null ? length(var.groups) > 0 : var.manage_acls) ? {
     for key, space in var.genie_spaces : key => join(",", space.config.acl_groups)
   } : {}
 

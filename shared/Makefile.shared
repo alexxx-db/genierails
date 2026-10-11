@@ -282,7 +282,15 @@ _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
 setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@echo "=== Setup ($(ENV)) ==="
-	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
+	@gov_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+	det="$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+	access_note="     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)"; \
+	if [ "$$gov_only" = 1 ]; then \
+		access_note="     (governance only: applies masks; grants SELECT only from table_readers, after its coverage check passes)"; \
+	elif [ "$$det" = 1 ]; then \
+		access_note="     (grants SELECT only from table_readers after its coverage check passes, and Genie CAN_RUN only from acl_groups after the live agent coverage check)"; \
+	fi; \
+	if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		echo "Shared account environment ready:     $(ACCOUNT_ENV_DIR)"; \
 		echo ""; \
 		echo "Next steps:"; \
@@ -305,7 +313,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
 		echo "  5. Run: make release ENV=$(ENV)"; \
-		echo "     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)"; \
+		echo "$$access_note"; \
 		echo "     It proves a row-pairing key for every masked table before applying (no key to set)."; \
 		echo "  6. Steady state (scheduled): make maintain ENV=$(ENV)"; \
 		echo ""; \
@@ -322,16 +330,26 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 			echo "       cp ../shared/examples/dev_to_prod/env.auto.tfvars.example $(_SETUP_ENV_REL)/env.auto.tfvars"; step=$$((step+1)); \
 		fi; \
 		echo "  $$step. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deploying SP client_id / client_secret + workspace host & id"; step=$$((step+1)); \
-		echo "  $$step. Edit $(_SETUP_ENV_REL)/env.auto.tfvars — set genie_space_id to your Genie agent ID and"; \
-		echo "     access_tier_groups to your IdP groups, most to least privileged"; \
-		echo "     (No agent yet? See ../shared/examples/dev_to_prod/SAMPLE_ENV.md)"; step=$$((step+1)); \
+		if [ "$$gov_only" = 1 ]; then \
+			echo "  $$step. Edit $(_SETUP_ENV_REL)/env.auto.tfvars — governance only (no agent): set uc_tables to the tables to govern"; \
+			echo "     and access_tier_groups to your IdP groups, most to least privileged; optionally table_readers"; \
+			echo "     (who gets SELECT; without it GenieRails grants none and masks apply to existing readers)"; step=$$((step+1)); \
+		else \
+			echo "  $$step. Edit $(_SETUP_ENV_REL)/env.auto.tfvars — set genie_space_id to your Genie agent ID and"; \
+			echo "     access_tier_groups to your IdP groups, most to least privileged"; \
+			echo "     (No agent yet? See ../shared/examples/dev_to_prod/SAMPLE_ENV.md)"; step=$$((step+1)); \
+		fi; \
 		echo "  $$step. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
-		step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
+		if [ "$$gov_only" = 1 ]; then \
+			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (derives the masks for the governed tables from their class.* tags)"; \
+		else \
+			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
+		fi; \
 		step=$$((step+1)); echo "  $$step. Run: make rehearse ENV=$(ENV)"; \
-		echo "     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)"; \
+		echo "$$access_note"; \
 		echo "     verify-access picks a row-pairing key per masked table; the proven keys are saved and promoted."; \
 		echo ""; \
 		echo "Walkthrough: $(_SETUP_WALKTHROUGH) (the walkthrough's Dev section)"; \
@@ -387,6 +405,9 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	fi
 	@if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ] && grep -Eq '^[[:space:]]*governance_mode[[:space:]]*=[[:space:]]*"deterministic"' "$(ENV_DIR)/env.auto.tfvars"; then \
 		$(_STICKY) record --env-dir "$(ENV_DIR)" --config "$(ENV_DIR)/generated/abac.auto.tfvars"; \
+	fi
+	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars")" = 1 ]; then \
+		$(_TABLE_READERS) propose --env-dir "$(ENV_DIR)" && $(_ACCESS_CHECK) "make generate"; \
 	fi
 
 # Takes one table out of a deterministic env's governed set, removes its
@@ -545,7 +566,26 @@ _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto
 _ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$(CLOUD_ROOT)/envs" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)"
 
 # 1 when the env is deterministic and configures no agent: governance only.
-_GOVERNANCE_ONLY = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id")))'
+# A genie_space_title alone also creates an agent (the legacy single-space path).
+_GOVERNANCE_ONLY = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id") and not c.get("genie_space_title")))'
+# 1 when the env is deterministic: CAN_RUN rests on the live agent coverage check.
+_IS_DETERMINISTIC = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic"))'
+# 1 when the env configures an agent or its workspace state still holds one
+# (envs/<env>/terraform.tfstate next to env.auto.tfvars; unreadable counts).
+_HAS_AGENTS = { python3 -c 'import hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); st=os.path.join(os.path.dirname(sys.argv[1]),"terraform.tfstate"); r=json.load(open(st)).get("resources",[]) if os.path.exists(st) else []; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or any(str(x.get("name","")).startswith("genie_space") for x in r))))' "$(1)" 2>/dev/null || echo 1; }
+# Live "agent tables covered" check (scripts/agent_coverage.py): run before
+# every deterministic workspace plan/apply; the workspace root reads its result.
+_AGENT_COVERAGE = python3 "$(SHARED_ROOT)/scripts/agent_coverage.py"
+# table_readers (shared/table_readers.py): show resolved readers, propose
+# entries for newly imported agents, and refuse acl_groups that can't read.
+_TABLE_READERS = python3 "$(SHARED_ROOT)/table_readers.py"
+_ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --command-name
+# group_map (shared/group_map.py, decision 8): before rehearse and release,
+# every group the env names (after mapping) must exist live, and a changed
+# group_map needs its <env>:weaken:group_map:<dev>=<target> ack. After a
+# successful run, the applied group_map is recorded (ignored runtime file).
+_GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
+_GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
@@ -581,12 +621,15 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		echo "rehearse: ENV=prod is not allowed; use make release ENV=prod" >&2; \
 		exit 1; \
 	fi; \
-	$(_DRY_RUN_GUARD); $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
+	$(_DRY_RUN_GUARD); $(_ACCESS_CHECK) "make rehearse" || exit 1; \
+	$(_GROUP_CHECK) "make rehearse" || exit 1; \
+	$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
 		$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 && \
 		$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
-		$(_SAVE_VERIFY_KEY)
+		$(_SAVE_VERIFY_KEY) && \
+		$(_GROUP_MAP_RECORD)
 
 # A failed $(MAKE) exits 2 whatever its recipe returned, so release and
 # maintain have audit-rulebook write its script's own exit code (1 = drift,
@@ -640,6 +683,8 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	export GENIERAILS_RERUN_TARGET=release; \
+	$(_ACCESS_CHECK) "make release" || exit 1; \
+	$(_GROUP_CHECK) "make release" || exit 1; \
 	mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
 	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)" --mode "$$mode" --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
@@ -680,9 +725,14 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		exit 1; \
 	fi; \
 	$(_SAVE_VERIFY_KEY); \
+	$(_GROUP_MAP_RECORD); \
 	echo ""; \
 	echo "=== Release complete ($(ENV)) ==="; \
-	echo "  Business access: applied (granted only after the coverage check passed)"; \
+	if [ "$$mode" = deterministic ]; then \
+		$(_RELEASE_HELPER) access-summary "$(ENV_DIR)"; \
+	else \
+		echo "  Business access: applied (granted only after the coverage check passed)"; \
+	fi; \
 	echo "  Verification:  make verify-access ENV=$(ENV) passed"; \
 	echo "  Steady state:  make maintain ENV=$(ENV)"
 
@@ -692,7 +742,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; $(call _ENV_LOCK,maintain); \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) --no-print-directory _guarded-bootstrap _guard-workspace-target ENV="$(ENV)" || exit 1; \
-	python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --id-files --warn; \
+	if [ "$$($(call _HAS_AGENTS,$(ENV_DIR)/env.auto.tfvars))" = 1 ]; then python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --id-files --warn; fi; \
 	echo "=== Schema Drift Audit ($(ENV)) ==="; \
 	(cd "$(ENV_DIR)" && python3 "$(AUDIT_SCHEMA_SCRIPT)"); audit_rc=$$?; \
 	if [ $$audit_rc -ne 0 ]; then \
@@ -769,6 +819,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 			"$$dest_env_dir/generated/masking_functions.sql" \
 			--state "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/terraform.tfstate" \
 			--auth "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/auth.auto.tfvars" \
+			--group-map-env "$$dest_env_dir/env.auto.tfvars" --source-env "$(SOURCE_ENV_DIR)/env.auto.tfvars" \
 			$$map_flags $(if $(filter 1,$(VERBOSE)),,--quiet-remaps); \
 		python3 "$(SHARED_ROOT)/scripts/derive_genie_acls.py" \
 			"$$dest_env_dir/generated/abac.auto.tfvars" \
@@ -846,7 +897,8 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 		--destination "$$dest_dir/generated/expected_classification.json" --catalog-map "$$map" || exit 1; \
 	if [ -f "$$src_dir/generated/abac.auto.tfvars" ]; then \
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
-	fi
+	fi; \
+	$(_TABLE_READERS) show --env-dir "$$dest_dir"
 
 # Read-only PR check (scripts/check_env.py): every step runs in a scratch copy
 # of the cloud dir, so nothing under envs/ is written and no applying target
@@ -888,6 +940,9 @@ _plan-layer:
 		$(_COVERAGE_GATE) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" $(if $(filter 1,$(VERBOSE)),--verbose,); \
 	fi; \
 	if [ "$$layer" = "workspace" ]; then \
+		if [ "$$($(_IS_DETERMINISTIC) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+			$(_AGENT_COVERAGE) run --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" || true; \
+		fi; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)"; \
 	fi; \
 	echo "=== Terraform Plan ($$layer:$$target_env) ==="; \
@@ -901,6 +956,7 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
 		if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" PROMOTE_AFTER=1 TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 		$(MAKE) --no-print-directory ENV="$(ENV)" TARGET_ENV="$(ENV)" _guard-data-access-config; \
+		$(_TABLE_READERS) show --env-dir "$(ENV_DIR)"; \
 		$(MAKE) --no-print-directory _plan-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
 		$(MAKE) --no-print-directory _plan-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
 	fi
@@ -933,6 +989,9 @@ _apply-layer: _guard-not-ci-apply
 	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
 		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
 		exit 0; \
+	fi; \
+	if [ "$$layer" = "workspace" ] && [ "$$($(_IS_DETERMINISTIC) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		$(_AGENT_COVERAGE) run --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags" || true; \
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(_STICKY) check-layout --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env"; \
