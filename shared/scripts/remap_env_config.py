@@ -30,7 +30,7 @@ from scripts.footprint import (
 )
 from scripts.remap_generated_config import remap_hcl
 from group_map import map_groups as _map_groups, mapping as _group_mapping, validation_errors as _group_map_errors
-from table_readers import normalize as _normalize_readers
+from table_readers import is_everyone as _is_everyone, normalize as _normalize_readers
 from verify_effective_access import normalize_key_map
 from walkthrough_marker import PROMOTED_HEADER, follows_walkthrough
 
@@ -447,6 +447,11 @@ def main():
     # mapped: the source's stay out of the mapping, the destination keeps its own.
     dest_deterministic = preserved_mode == "deterministic"
     map_errors = _group_map_errors(dest_cfg)
+    everyone_exempt = [p for p in dest_cfg.get("raw_exempt_principals") or [] if _is_everyone(p)]
+    if dest_deterministic and everyone_exempt:
+        map_errors.append(
+            f"raw_exempt_principals names {', '.join(repr(p) for p in everyone_exempt)}, which is everyone "
+            "(everyone would see raw values)")
     if map_errors:
         for error in map_errors:
             print(f"ERROR: destination {error}; nothing was written.")

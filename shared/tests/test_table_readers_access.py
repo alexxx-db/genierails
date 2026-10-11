@@ -494,6 +494,58 @@ def test_legacy_destinations_keep_their_own_tiers(tmp_path):
     assert "group_map" not in cfg
 
 
+@pytest.mark.parametrize("everyone", ["account users", "users", "Account Users", " USERS ", "account  users"])
+def test_raw_exempt_principals_never_include_everyone(everyone):
+    errors = validate_config(_cfg(raw_exempt_principals=["etl", everyone]))
+    assert any("raw_exempt_principals may not name" in e and "everyone would see raw values" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("everyone", ["account users", "Users"])
+def test_promotion_refuses_to_substitute_an_everyone_exempt(everyone):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from remap_generated_config import PromotionError, map_principals
+
+    hcl = '    except_principals = ["dev_raw", "dev_etl"]\n'
+    with pytest.raises(PromotionError, match="everyone"):
+        map_principals(hcl, {}, {"dev_etl"}, ["prod_etl", everyone])
+
+
+def test_promote_to_refuses_an_everyone_exempt_before_writing_the_env_file(tmp_path):
+    dest_text = PROD + 'raw_exempt_principals = ["Account Users"]\n'
+    source = tmp_path / "envs" / "dev"
+    dest = tmp_path / "envs" / "prod"
+    source.mkdir(parents=True)
+    dest.mkdir(parents=True)
+    (source / "env.auto.tfvars").write_text(SOURCE)
+    (dest / "env.auto.tfvars").write_text(dest_text)
+    result = subprocess.run([sys.executable, str(REMAP), str(source), str(dest), "dev_cat=prod_cat"],
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1 and "which is everyone" in result.stdout and "nothing was written" in result.stdout
+    assert (dest / "env.auto.tfvars").read_text() == dest_text
+
+
+def test_promotion_with_an_everyone_exempt_writes_nothing(tmp_path):
+    source = tmp_path / "dev"
+    dest = tmp_path / "prod"
+    (source / "generated").mkdir(parents=True)
+    (dest / "generated").mkdir(parents=True)
+    (source / "env.auto.tfvars").write_text('governance_mode = "deterministic"\nraw_exempt_principals = ["dev_etl"]\n')
+    (dest / "env.auto.tfvars").write_text('governance_mode = "deterministic"\nraw_exempt_principals = ["account users"]\n')
+    (source / "generated" / "abac.auto.tfvars").write_text(
+        'fgac_policies = [\n  {\n    name = "dev_cat_p"\n    to_principals    = ["dev_partial"]\n'
+        '    except_principals = ["dev_raw", "dev_etl"]\n  },\n]\n')
+    out = dest / "generated" / "abac.auto.tfvars"
+    result = subprocess.run(
+        [sys.executable, str(SHARED / "scripts" / "remap_generated_config.py"),
+         str(source / "generated" / "abac.auto.tfvars"), str(source / "generated" / "masking_functions.sql"),
+         str(out), str(dest / "generated" / "masking_functions.sql"), "--map", "dev_cat=prod_cat",
+         "--group-map-env", str(dest / "env.auto.tfvars"), "--source-env", str(source / "env.auto.tfvars")],
+        text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "everyone" in result.stdout and "nothing was written" in result.stdout
+    assert not out.exists()
+
+
 def test_promoted_policy_principals_go_through_group_map(tmp_path):
     sys.path.insert(0, str(SHARED / "scripts"))
     from remap_generated_config import map_principals
@@ -587,6 +639,21 @@ POLICY_ONLY = '''fgac_policies = [
 ]
 '''
 LIVE = ["prod_raw", "prod_partial", "full", "prod_rf", "deployer-sp-id"]
+
+
+def test_the_deployer_sp_is_accepted_only_as_the_envs_own_auth(tmp_path, capsys):
+    # The live listing (the mock) never contains the deployer SP's
+    # application ID; only the env's own auth.auto.tfvars makes it acceptable.
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    (env / "data_access" / "abac.auto.tfvars").write_text(POLICY_ONLY)
+    live = [name for name in LIVE if name != "deployer-sp-id"] + ["prod_policy_only"]
+    assert "deployer-sp-id" not in live
+    assert _check(env, live) == 1
+    assert "deployer-sp-id" in capsys.readouterr().err
+    (env / "auth.auto.tfvars").write_text('databricks_client_id = "other-sp-id"\n')
+    assert _check(env, live) == 1  # another SP's credentials accept nothing
+    (env / "auth.auto.tfvars").write_text('databricks_client_id = "deployer-sp-id"\n')
+    assert _check(env, live) == 0
 
 
 def test_a_principal_named_only_in_a_promoted_policy_must_exist_live(tmp_path, capsys):

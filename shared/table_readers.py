@@ -29,8 +29,13 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 SETTING = "table_readers"
-# Built-in principals that would reach everyone. Never a reader.
+# Built-in principals that would reach everyone. Never a reader, never raw-exempt.
 EVERYONE = frozenset({"account users", "users"})
+
+
+def is_everyone(name: object) -> bool:
+    """Whether ``name`` is a built-in everyone-principal (any case or spacing)."""
+    return isinstance(name, str) and " ".join(name.split()).lower() in EVERYONE
 # Agents whose first-import proposal was already written (committed record).
 PROPOSED_RECORD = Path("generated") / "table_readers_proposed.json"
 

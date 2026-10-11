@@ -26,6 +26,10 @@ import threading
 from pathlib import Path
 from typing import Callable
 
+SHARED_ROOT = Path(__file__).resolve().parent.parent
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
+
 
 def _top_level_list_span(text: str, key: str) -> tuple[int, int, int] | None:
     """Return (key_start, open_bracket, end_after_close) for a top-level list."""
@@ -339,16 +343,32 @@ _PRINCIPALS_LINE = re.compile(r'^(?P<lead>\s*(?:to|except)_principals\s*=\s*)(?P
                               re.MULTILINE)
 
 
+class PromotionError(ValueError):
+    """The promoted config can't be written safely; nothing is written."""
+
+
 def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str],
                    dest_exempt: list[str] | None = None) -> str:
     """Rename policy principals through group_map (decision 8).
 
     raw_exempt_principals are env-owned and never mapped: where a policy
-    names the source's, the destination's own take their place (in that
-    list only), so a promoted policy never names a dev-only exempt principal.
+    names one of the source's, the destination's whole exempt set takes its
+    place (in that list only), so a promoted policy never names a dev-only
+    exempt principal. A destination exempt that is an everyone-principal
+    (account users, users) would exempt everyone from the mask, so that
+    refuses the promotion instead (PromotionError) whether or not a policy
+    names a source exempt.
     """
     dest_exempt = list(dest_exempt or [])
-    if not group_map and not (exempt and dest_exempt is not None):
+    from table_readers import is_everyone
+
+    everyone = [name for name in dest_exempt if is_everyone(name)]
+    if everyone:
+        raise PromotionError(
+            f"destination raw_exempt_principals names {', '.join(repr(n) for n in everyone)}, which is "
+            "everyone: substituting it into the promoted policies' except_principals would let everyone "
+            "see raw values")
+    if not group_map and not exempt:
         return hcl_text
 
     def rename(match: re.Match) -> str:
@@ -499,6 +519,12 @@ def main() -> None:
     except (RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
+    group_map, exempt, dest_exempt = _group_map_inputs(args)
+    try:
+        remapped_hcl = map_principals(remapped_hcl, group_map, exempt, dest_exempt)
+    except PromotionError as exc:
+        print(f"ERROR: {exc}; nothing was written.")
+        sys.exit(1)
     for note in name_notes:
         print(note)
     remapped_sql = remap_sql(args.source_sql.read_text(), pairs) if has_sql else None
@@ -520,8 +546,7 @@ def main() -> None:
         elif not args.quiet_remaps:
             print(f"  Catalog remap: {src} -> {dest}")
 
-    group_map, exempt, dest_exempt = _group_map_inputs(args)
-    args.out_abac.write_text(map_principals(remapped_hcl, group_map, exempt, dest_exempt))
+    args.out_abac.write_text(remapped_hcl)
     print(f"  Wrote remapped generated config: {args.out_abac}")
 
     if remapped_sql is not None:
