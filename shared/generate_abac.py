@@ -3234,6 +3234,59 @@ def ensure_derived_treatment_functions(tfvars_path: Path, sql_path: Path | None)
     return len(missing)
 
 
+def write_deterministic_model(tfvars_path: Path, sql_path: Path | None, model) -> bool:
+    """Write a deterministic governance model over the generated config.
+
+    Every column mask and treatment fact is replaced; unmapped classes are
+    recorded as ``gr.classification_unmapped`` markers, which the coverage
+    check reports so they block new access while their column is redacted
+    for every tier by the fail-safe treatment.
+    """
+    import hcl2
+    from governance_policies import UNMAPPED_MARKER, apply_model, replace_sql_library
+
+    original = tfvars_path.read_text()
+    updated_cfg = apply_model(hcl2.loads(original), model)
+    text = re.sub(rf"^\s*{re.escape(UNMAPPED_MARKER)}[^\n]*\n?", "", original, flags=re.MULTILINE)
+    for section, render in (
+        ("tag_policies", _render_tag_policy_block),
+        ("tag_assignments", _render_tag_assignment_block),
+        ("fgac_policies", _render_fgac_policy_block),
+    ):
+        items = [render(item) for item in updated_cfg.get(section) or []]
+        if _find_bracket_section(text, section) is None:
+            text = text.rstrip() + f"\n\n{section} = [\n]\n"
+        text = _replace_bracket_section(text, section, items)
+    markers = [f"{UNMAPPED_MARKER} {column}|class.{semantic}" for column, semantic in model.unmapped]
+    if markers:
+        text = "\n".join(markers) + "\n" + text
+    changed = text != original
+    if changed:
+        tfvars_path.write_text(text)
+    if sql_path is not None:
+        sql_text = sql_path.read_text() if sql_path.exists() else ""
+        sql_updated = replace_sql_library(sql_text, model.functions_sql)
+        if sql_updated != sql_text:
+            sql_path.write_text(sql_updated)
+            changed = True
+    return changed
+
+
+def deterministic_model_for(
+    env_cfg: dict, classification_source, ddl_text: str, *,
+    columns: list[str] | None = None,
+):
+    """The deterministic model for the classified columns of the governed set."""
+    from governance_policies import build_model, column_types_from_ddl
+
+    return build_model(
+        classification_source.classes_by_column(columns) if classification_source else {},
+        column_types_from_ddl(ddl_text),
+        env_cfg,
+        deployer_principal=str(env_cfg.get("databricks_client_id") or ""),
+    )
+
+
 def _parse_sql_function_names(sql_path: Path | None) -> set[str]:
     if not sql_path or not sql_path.exists():
         return set()
@@ -9040,6 +9093,36 @@ Before you apply, tune for your business roles, security requirements, and Genie
         if pruned:
             print(f"  [AUTOFIX] Removed {len(pruned)} new masking function(s) no policy uses: "
                   f"{', '.join(pruned)}")
+
+    # Deterministic governance is computed only from class.* tags, column types
+    # and reviewed config, last, so no model output or autofix above can shape
+    # a mask: every column mask and treatment fact is replaced.
+    if (hcl_block and args.mode != "genie"
+            and auth_cfg.get("governance_mode", "legacy") == "deterministic"):
+        from governance_policies import DeterministicGovernanceError
+        if args.space or args.tables:
+            print("ERROR: deterministic governance derives the whole governed set at once; run "
+                  "make generate without SPACE or tables, or make derive-assignments")
+            sys.exit(1)
+        if classification_source is None:
+            print("ERROR: deterministic governance is computed from native class.* tags, and none "
+                  "were read; set enable_classification = true and wait for the tags")
+            sys.exit(1)
+        try:
+            model = deterministic_model_for(auth_cfg, classification_source, ddl_text)
+        except DeterministicGovernanceError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+        write_deterministic_model(
+            validation_dir / "abac.auto.tfvars",
+            validation_dir / "masking_functions.sql",
+            model,
+        )
+        print(f"  Deterministic governance: {len(model.columns)} column(s), "
+              f"{len(model.fgac_policies)} polic(y/ies)")
+        for column, semantic in model.unmapped:
+            print(f"  WARNING: {column} has unmapped class.{semantic}; redacted for every tier "
+                  "and new access is blocked until it is mapped (make scaffold-treatments)")
 
     # Genie mode: skip validation — the output intentionally has no groups/ABAC sections
     # and validate_abac.py would incorrectly report "groups is missing".

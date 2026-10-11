@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to check
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -479,7 +479,9 @@ _COVERAGE_GATE = python3 "$(SHARED_ROOT)/scripts/coverage_gate.py"
 # the gate then fails closed, and Terraform only lets through changes that
 # keep or revoke SELECT / CAN_RUN, so revocation never waits on Unity Catalog.
 _derive-before-exposure:
-	@mode="$$($(_COVERAGE_GATE) needs-derive --env-dir "$(ENV_DIR)" --apply-flags="$(APPLY_FLAGS)")" || exit 1; \
+	@governance_mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
+	if [ "$$governance_mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; \
+	mode="$$($(_COVERAGE_GATE) needs-derive --env-dir "$(ENV_DIR)" --apply-flags="$(APPLY_FLAGS)")" || exit 1; \
 	refreshed=1; \
 	case "$$mode" in \
 		full) $(MAKE) --no-print-directory derive-assignments ENV="$(ENV)" || refreshed=0 ;; \
@@ -510,6 +512,43 @@ _refresh-live-ddl: _guarded-bootstrap _guard-workspace-target
 _SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
 _VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
 _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)"
+
+# 1 when any workspace env of this checkout ($(CLOUD_ROOT)/envs/*, not account
+# or data_access) is deterministic. The account layer is shared, so its
+# tag-policy values may only be removed under the account lock then.
+_ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$(CLOUD_ROOT)/envs" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)"
+
+# 1 when the env is deterministic and configures no agent: governance only.
+_GOVERNANCE_ONLY = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id")))'
+
+_external-mask-inventory: _guarded-bootstrap _guard-workspace-target
+	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
+	if [ "$$mode" = deterministic ]; then \
+		python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"; \
+	fi
+
+_guard-account-plan-empty:
+	@set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
+	if [ $$status -eq 2 ]; then \
+		echo "ERROR: account plan is non-empty; rehearse/release may only add allowed treatment-tag values." >&2; \
+		echo "Run 'make apply-account' in the approved operations stage." >&2; exit 1; \
+	fi; \
+	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
+
+_apply-account-for-workspace:
+	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
+	if [ "$$mode" = deterministic ]; then \
+		$(MAKE) --no-print-directory _guard-account-plan-empty ENV="$(ENV)" && $(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only; \
+	else \
+		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace; \
+	fi
+
+apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account resources in the approved operations stage
+	@$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)"
+
+_apply-account-locked:
+	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,apply-account); \
+	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace
 
 rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (verify-access picks and proves a row-pairing key per masked table; VERIFY_KEY_COLUMN optionally overrides)
 	@if [ "$(ENV)" = "prod" ]; then \
@@ -566,6 +605,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
+	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)" --mode "$$mode" --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
@@ -612,7 +652,8 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 
 maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): audit-schema -> derive-assignments -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
 	@$(_GUARD_WORKSPACE_ENV); \
-	$(_DRY_RUN_GUARD); $(call _ENV_LOCK,maintain); \
+	$(_DRY_RUN_GUARD); mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
+	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; $(call _ENV_LOCK,maintain); \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) --no-print-directory _guarded-bootstrap _guard-workspace-target ENV="$(ENV)" || exit 1; \
 	python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --id-files --warn; \
@@ -797,6 +838,10 @@ _plan-layer:
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
 	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK) --warn; fi; \
+	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
+		exit 0; \
+	fi; \
 	if [ ! -f "$$env_dir/abac.auto.tfvars" ]; then \
 		echo "=== Skipping terraform plan ($$layer:$$target_env): no $$env_dir/abac.auto.tfvars ==="; \
 		exit 0; \
@@ -824,10 +869,20 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		$(MAKE) --no-print-directory _plan-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
 	fi
 
-sync-tags: _bootstrap ## Sync tag policy values in the shared account layer
+# add-only never removes a live tag-policy value (it refuses instead, pointing
+# at make apply-account); replace removes values no longer desired. A
+# deterministic ENV, or ENV=account while any env is deterministic, defaults
+# to add-only; anything else keeps replace.
+sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG_SYNC_MODE=add-only|replace)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
-	@cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py"
+	@mode="$(TAG_SYNC_MODE)"; \
+	if [ -z "$$mode" ]; then \
+		mode=replace; \
+		if [ -f "$(ENV_DIR)/env.auto.tfvars" ] && [ "$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" = deterministic ]; then mode=add-only; fi; \
+		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then mode=add-only; fi; \
+	fi; \
+	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
 
 wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to downstream FGAC APIs
 	@$(MAKE) --no-print-directory _guard-account-config
@@ -839,6 +894,10 @@ _apply-layer: _guard-not-ci-apply
 	env_dir="$(LAYER_ENV_DIR)"; \
 	apply_flags="$(if $(filter data_access workspace,$(LAYER)),$(APPLY_FLAGS),)"; \
 	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK); fi; \
+	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
+		exit 0; \
+	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(_STICKY) check-layout --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env"; \
 		$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$$target_env" CLASSIFICATION_ENV_DIR="$$(dirname "$$env_dir")" IMPORT_CLASSIFICATION=1; \
@@ -851,7 +910,7 @@ _apply-layer: _guard-not-ci-apply
 		$(_COVERAGE_GATE) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags" $(if $(filter 1,$(VERBOSE)),--verbose,); \
 	fi; \
 	if [ "$$layer" = "account" ]; then \
-		$(MAKE) --no-print-directory sync-tags; \
+		$(MAKE) --no-print-directory sync-tags $(if $(TAG_SYNC_MODE),TAG_SYNC_MODE=$(TAG_SYNC_MODE),); \
 	fi; \
 	files="$$env_dir/auth.auto.tfvars $$env_dir/env.auto.tfvars $$env_dir/abac.auto.tfvars $$env_dir/classification.auto.tfvars $$env_dir/discovered_uc_tables.auto.tfvars"; \
 	if [ -f "$$env_dir/masking_functions.sql" ]; then files="$$files $$env_dir/masking_functions.sql"; fi; \
@@ -902,7 +961,7 @@ _apply-layer: _guard-not-ci-apply
 		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" "$$layer" "$$target_env" apply -parallelism=1 -auto-approve $$apply_flags; \
 	fi; \
 	if [ "$$layer" = "account" ]; then \
-		$(MAKE) --no-print-directory sync-tags; \
+		$(MAKE) --no-print-directory sync-tags $(if $(TAG_SYNC_MODE),TAG_SYNC_MODE=$(TAG_SYNC_MODE),); \
 	fi; \
 	printf "%s\n" "$$current_fingerprint" > "$$fingerprint_file"; \
 	if [ -z "$(DEFER_WITHHELD)" ] && { [ "$$layer" = "data_access" ] || [ "$$layer" = "workspace" ]; }; then \
@@ -912,7 +971,12 @@ _apply-layer: _guard-not-ci-apply
 apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or account -> data_access -> workspace for ENV=<workspace>
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
-		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+			echo "=== A deterministic env uses this account layer: applying it through make apply-account (account lock) ==="; \
+			$(MAKE) --no-print-directory apply-account; \
+		else \
+			$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+		fi; \
 		$(MAKE) --no-print-directory wait-tag-policies; \
 	else \
 		$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
@@ -925,7 +989,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		fi; \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
 		$(MAKE) --no-print-directory TARGET_ENV="$(ENV)" _guard-data-access-config; \
-		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+		$(MAKE) --no-print-directory _apply-account-for-workspace ENV="$(ENV)"; \
 		$(MAKE) --no-print-directory wait-tag-policies REQUIRED_VALUES_TFVARS="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars"; \
 		echo "=== Waiting 30s for account-level groups to propagate before data_access apply ==="; \
 		sleep 30; \
@@ -950,7 +1014,7 @@ apply-governance: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target
 	fi; \
 	$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
 	$(MAKE) --no-print-directory TARGET_ENV="$(ENV)" _guard-data-access-config; \
-	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+	$(MAKE) --no-print-directory _apply-account-for-workspace ENV="$(ENV)"; \
 	$(MAKE) --no-print-directory wait-tag-policies REQUIRED_VALUES_TFVARS="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars"; \
 	echo "=== Waiting 30s for account-level groups to propagate before data_access apply ==="; \
 	sleep 30; \

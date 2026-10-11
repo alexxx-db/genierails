@@ -51,7 +51,7 @@ locals {
   # Built-in principals such as "account users" are intentionally absent from
   # the managed groups map, but still need catalog/schema/table grants. Derive
   # the access set from both managed groups and policy targets.
-  access_principals = distinct(concat(
+  access_principals = var.governance_mode == "deterministic" ? [] : distinct(concat(
     keys(var.groups),
     flatten([
       for p in var.fgac_policies : p.to_principals
@@ -81,7 +81,7 @@ locals {
     )
   }
 
-  table_access_pairs = flatten([
+  table_access_pairs = var.governance_mode == "deterministic" ? [] : flatten([
     for table, principals in local.table_access_principals : [
       for principal in principals : { table = table, principal = principal }
     ]

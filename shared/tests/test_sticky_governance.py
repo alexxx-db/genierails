@@ -13,6 +13,7 @@ import hcl2
 import pytest
 
 import generate_abac
+from governance_policies import base_treatment
 from sensitivity_source import ClassificationSource
 from scripts import sticky_governance as sticky
 from scripts.sticky_governance import GovernedTablesError, check_layout, load_governed_tables, main, ungovern
@@ -63,14 +64,25 @@ def _live(monkeypatch, columns):
                 if ".".join(column.split(".")[:3]).lower() in refs]
         return ClassificationSource(tag_rows=rows)
 
+    def ddl(table_refs, runtime, footprint):
+        refs = {ref.lower() for ref in table_refs}
+        tables: dict[str, list[str]] = {}
+        for column in columns:
+            table, name = column.rsplit(".", 1)
+            if table.lower() in refs:
+                tables.setdefault(table, []).append(f"  {name} STRING")
+        return "".join(f"CREATE TABLE {t} (\n" + ",\n".join(c) + "\n) USING delta;\n" for t, c in tables.items())
+
     monkeypatch.setattr(DERIVE, "_fetch_live_classification_source", fetch)
+    monkeypatch.setattr(DERIVE, "fetched_ddl_text", ddl)
     return scanned
 
 
 def _derive(env):
     DERIVE.derive_assignments(env / "generated/abac.auto.tfvars", env / "auth.auto.tfvars", env / "env.auto.tfvars")
     items = hcl2.loads((env / "generated/abac.auto.tfvars").read_text())["tag_assignments"]
-    return {i["entity_name"]: i["tag_value"] for i in items if i["tag_key"] == "gr_treatment"}
+    # The library treatment behind each versioned deterministic value.
+    return {i["entity_name"]: base_treatment(i["tag_value"]) for i in items if i["tag_key"] == "gr_treatment"}
 
 
 def _state(env, tags, name="treatment"):
@@ -94,18 +106,18 @@ def _manifest(env):
 def test_dropping_a_table_from_every_agent_keeps_its_tags(tmp_path, monkeypatch):
     env = _env(tmp_path)
     scanned = _live(monkeypatch, {f"{CUSTOMERS}.email": "email", f"{ORDERS}.ssn": "ssn"})
-    assert _derive(env) == {f"{CUSTOMERS}.email": "email_partial", f"{ORDERS}.ssn": "ssn_last4"}
+    assert _derive(env) == {f"{CUSTOMERS}.email": "email_partial", f"{ORDERS}.ssn": "ssn"}
     assert _manifest(env) == {"tables": [CUSTOMERS, ORDERS]}
 
     _env(env, tables=("sales.customers",))
-    assert _derive(env) == {f"{CUSTOMERS}.email": "email_partial", f"{ORDERS}.ssn": "ssn_last4"}
+    assert _derive(env) == {f"{CUSTOMERS}.email": "email_partial", f"{ORDERS}.ssn": "ssn"}
     assert ORDERS in scanned[-1]
 
 
 def test_treatment_change_replaces_the_value_and_keeps_one_tag_per_column(tmp_path, monkeypatch):
     env = _env(tmp_path)
     _live(monkeypatch, {f"{ORDERS}.ssn": "ssn"})
-    assert _derive(env) == {f"{ORDERS}.ssn": "ssn_last4"}
+    assert _derive(env) == {f"{ORDERS}.ssn": "ssn"}
     _env(env, tables=("sales.customers",))
     _live(monkeypatch, {f"{ORDERS}.ssn": "email"})
     assert _derive(env) == {f"{ORDERS}.ssn": "email_partial"}
@@ -146,7 +158,7 @@ def test_manifest_deleted_before_any_apply_is_refused(tmp_path, monkeypatch):
     assert f"make rebuild-governed-tables ENV={env.resolve().name}" in str(refused.value)
     assert main(["rebuild", "--env-dir", str(env)]) == 0
     assert _manifest(env) == {"tables": [ORDERS]}
-    assert _derive(env) == {f"{ORDERS}.ssn": "ssn_last4"}
+    assert _derive(env) == {f"{ORDERS}.ssn": "ssn"}
 
 
 def test_manifest_deleted_after_apply_is_refused_then_rebuilt_from_state(tmp_path, monkeypatch):
@@ -190,7 +202,7 @@ def test_hand_removed_table_stays_governed_while_deployed(tmp_path, monkeypatch)
     _state(env, {f"{ORDERS}.ssn": "ssn_last4"})
     (env / "generated/governed_tables.json").write_text('{"tables": []}\n')
     _live(monkeypatch, {f"{ORDERS}.ssn": "ssn"})
-    assert _derive(env) == {f"{ORDERS}.ssn": "ssn_last4"}
+    assert _derive(env) == {f"{ORDERS}.ssn": "ssn"}
 
 
 def test_hand_edited_treatment_is_replaced_by_current_tags(tmp_path, monkeypatch):
@@ -200,7 +212,7 @@ def test_hand_edited_treatment_is_replaced_by_current_tags(tmp_path, monkeypatch
     (env / "generated/abac.auto.tfvars").write_text(PROMOTED.replace("tag_assignments = [\n", (
         'tag_assignments = [\n  { entity_type = "columns", entity_name = "prod.sales.orders.ssn", '
         'tag_key = "gr_treatment", tag_value = "email_partial" },\n')))
-    assert _derive(env) == {f"{ORDERS}.ssn": "ssn_last4"}
+    assert _derive(env) == {f"{ORDERS}.ssn": "ssn"}
 
 
 @pytest.mark.parametrize("content", [

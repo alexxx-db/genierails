@@ -1,0 +1,3 @@
+#!/bin/sh
+# Staged-apply hook for scripts/staged_policy_apply.py; see scripts/policy_generations.py.
+exec python3 "$(dirname "$0")/../policy_generations.py" hook create

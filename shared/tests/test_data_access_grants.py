@@ -12,6 +12,7 @@ from tests.terraform_helpers import shared_copy, tf, tf_env, tf_init
 
 MAIN_TF = Path(__file__).parents[1] / "modules" / "data_access" / "main.tf"
 WORKSPACE_MAIN_TF = Path(__file__).parents[1] / "modules" / "workspace" / "main.tf"
+SHARED = Path(__file__).parents[1]
 
 
 def _resource_body(source: str, name: str) -> str:
@@ -174,6 +175,20 @@ def test_select_is_not_granted_at_namespace_level():
     assert '"SELECT"' not in _resource_body(source, "schema_access")
     assert '"USE_CATALOG"' not in _resource_body(source, "table_access")
     assert '"USE_SCHEMA"' not in _resource_body(source, "table_access")
+
+
+def test_no_terraform_grant_anywhere_targets_account_users():
+    for path in SHARED.rglob("*.tf"):
+        source = path.read_text()
+        for match in re.finditer(r'resource\s+"databricks_grants?"\s+"[^"]+"\s*\{', source):
+            body = source[match.end():]
+            assert 'account users' not in body[:body.find("\n}")], path
+
+
+def test_deterministic_mode_has_no_business_grant_pairs():
+    source = MAIN_TF.read_text()
+    assert 'access_principals = var.governance_mode == "deterministic" ? []' in source
+    assert 'table_access_pairs = var.governance_mode == "deterministic" ? []' in source
 
 
 def test_deployment_sp_self_grant_includes_apply_tag():
@@ -414,7 +429,7 @@ def test_builtin_policy_targets_are_included_in_access_principals():
     source = MAIN_TF.read_text()
     normalized = " ".join(source.split())
     assert (
-        "access_principals = distinct(concat( keys(var.groups), "
+        "access_principals = var.governance_mode == \"deterministic\" ? [] : distinct(concat( keys(var.groups), "
         "flatten([ for p in var.fgac_policies : p.to_principals "
         "if !startswith(p.comment, \"GenieRails treatment fallback; "
         "principals are masking-only\") ]), "
