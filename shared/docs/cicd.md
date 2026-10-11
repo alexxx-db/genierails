@@ -19,9 +19,10 @@ Use this split of responsibilities:
   - after the reviewed change is approved, enable/wait for prod native classification and run `make release ENV=prod`
   - keep the deployment checkout, credentials, and Terraform state persistent between releases
 
-The full PR→rehearse / approved-merge→release pipeline, including remote state
-and promotion automation, arrives in a later deterministic-governance rollout
-step. Do not bypass the v1 CI guard on a deployment job.
+Pipeline samples for every stage, for GitHub Actions and Azure DevOps, are in
+[Pipeline samples](#pipeline-samples-where-each-command-runs). Their applying
+stages stay on the deployment machine until remote state exists. Do not
+bypass the v1 CI guard on a deployment job.
 
 This keeps LLM-driven generation and human review out of the automated deployment path, keeps the LLM out of prod entirely (prod re-derives deterministically), and makes coverage an explicit, enforced check rather than something you hope happened.
 
@@ -57,31 +58,29 @@ For each target environment, create `envs/<env>/auth.auto.tfvars` during the job
 - `databricks_workspace_id`
 - `databricks_workspace_host`
 
+The [pipeline samples](#pipeline-samples-where-each-command-runs) use OIDC workload identity federation instead: they write only the IDs and leave `databricks_client_secret` empty.
+
 If the account layer or `data_access` layer needs different credentials, write those layer-specific auth files separately instead of relying on the default symlinks.
 
 ## Recommended Pipeline Stages
 
 ## 1. Validate on pull requests
 
-Use PR validation to make sure the committed config is internally consistent.
-
-Typical steps:
+Run one read-only command per env:
 
 ```bash
-make validate ENV=dev
-make validate ENV=prod
+make check ENV=dev
+make check ENV=prod     # when the PR touches envs/prod/**; includes make promote-to ENV=prod CHECK=1
 ```
 
-If the change includes fresh generated drafts that have not yet been split, also run the blocking coverage check and generated-config validation — the coverage check fails the PR if any classified sensitive column has no covering mask:
-
-```bash
-make coverage-gate ENV=dev
-make validate-generated ENV=dev
-```
+`make check` runs `validate`, checks the committed generated files are current,
+then `validate-generated`, the blocking offline coverage check (it fails the PR
+if any classified sensitive column has no covering mask), the mask-library unit
+tests and a structural `plan`. See the [command reference](../examples/dev_to_prod/REFERENCE.md#command-reference).
 
 ## 2. Plan before deploy
 
-For a target environment, create the auth file from CI secrets, then run:
+On the deployment machine, where the Terraform state lives, review the change before applying it:
 
 ```bash
 make plan ENV=dev
@@ -127,7 +126,7 @@ Recommended for most teams.
    ```
 
 2. The promoted config is reviewed and committed
-3. CI runs `make plan ENV=prod` against the reviewed configuration
+3. CI runs `make check ENV=prod` against the reviewed configuration; it includes `make promote-to ENV=prod CHECK=1`, which fails if the committed promotion differs from what `promote-to` writes
 4. After approval, the operator enables/waits for prod native classification and runs `make release ENV=prod` from the persistent deployment workspace; if its coverage check fails, fix the rules in dev and re-promote
 
 This is the best model when you want promotion to stay explicit and reviewable in Git.
@@ -145,37 +144,60 @@ Use this for separate business units or environments that should not inherit `de
 2. The generated config is reviewed and committed
 3. CI validates and plans `ENV=bu2`; the persistent deployment workspace applies the approved change
 
-## Ready-to-Use GitHub Actions Workflows
+## Pipeline samples: where each command runs
 
-Template workflows are included at `.github/workflows/` inside each cloud wrapper (`aws/` and `azure/`):
+Each cloud wrapper ships one sample per stage of design section 17, for GitHub
+Actions (`<cloud>/.github/workflows/`) and Azure DevOps
+(`<cloud>/azure-pipelines/`). GitHub only runs workflows from `.github/workflows/`
+at the repository root, so copy the ones you use there; in Azure DevOps, create
+a pipeline from each file. The samples assume the repository is a GenieRails
+checkout and run from `aws/` or `azure/`.
 
-- `validate.yml` — runs `make validate` on every pull request; no Databricks credentials needed.
-- `deploy.yml` — despite its historical filename, validates and runs `make plan` on merge to `main`; it never applies, releases, imports, migrates, or destroys.
+| Stage | Sample | Trigger | Runs in CI in v1 |
+|---|---|---|---|
+| 2. PR check | `pr-check.yml` | every pull request (a required check; re-runs when `main` moves) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` |
+| 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev` on the merged commit |
+| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval | `make check ENV=prod` on that commit, then the approval gate |
+| 5. Keep protected | `prod-maintain.yml` | a schedule | `make audit-schema ENV=prod` (read-only drift audit) |
 
-### AWS (`aws/.github/workflows/`)
-- Uses `aws-actions/configure-aws-credentials@v4` for S3 state backend
-- State stored at `s3://<TF_STATE_BUCKET>/genie-aws/envs/...`
+**Auth.** Every Databricks credential is a service principal through OIDC
+workload identity federation (`github-oidc` or `azure-devops-oidc`); no PATs
+and no client secrets. The samples write `auth.auto.tfvars` with IDs only (an
+empty `databricks_client_secret`) and set `DATABRICKS_AUTH_TYPE`. Your
+Databricks Terraform provider and SDK must support that auth type.
 
-### Azure (`azure/.github/workflows/`)
-- Uses `azure/login@v2` with OIDC federated credentials for Azure Blob Storage state backend
-- State stored at `https://<TF_STATE_STORAGE_ACCOUNT>.blob.core.windows.net/<TF_STATE_CONTAINER>/genie-azure/envs/...`
+**`make check` is read-only.** Each step runs in a scratch copy of the cloud
+dir that holds the env files without credentials, Terraform state or runtime
+records; the plan step alone gets the env's `auth.auto.tfvars`. Nothing under
+`envs/` is written and no applying target runs, so it is safe under `CI=true`.
+The only file it can leave outside the copy is Terraform's own
+`shared/roots/*/.terraform.lock.hcl` on a first plan, which is gitignored.
 
-Because GitHub Actions workflows must live at `.github/workflows/` **at the repository root**, you need to copy them there to activate them:
+**v1 limits.**
 
-```bash
-# From the repository root (AWS):
-cp -r uc-quickstart/utils/genie/aws/.github/workflows/validate.yml .github/workflows/genie-aws-validate.yml
-cp -r uc-quickstart/utils/genie/aws/.github/workflows/deploy.yml   .github/workflows/genie-aws-deploy.yml
-
-# Azure:
-cp -r uc-quickstart/utils/genie/azure/.github/workflows/validate.yml .github/workflows/genie-azure-validate.yml
-cp -r uc-quickstart/utils/genie/azure/.github/workflows/deploy.yml   .github/workflows/genie-azure-deploy.yml
-```
-
-If this folder is later promoted to its own top-level repository, the workflows
-are ready as plan-only checks — place `.github/workflows/` at the new repo root
-and they will activate without modification. Run releases separately from the
-persistent deployment workspace.
+- **Applying stages run on the deployment machine** until the env has remote
+  state with locking: `make rehearse ENV=dev` (dev remote state is rollout
+  step 12), `make release ENV=prod` and `make maintain ENV=prod` (prod remote
+  state is deferred, design section 15). The operator runs them there, from a
+  clean checkout of the commit the pipeline names, in order. Every applying
+  target keeps refusing in CI, and the samples never set
+  `GENIERAILS_ALLOW_CI_APPLY`, which exists only for GenieRails' own throwaway
+  integration-test workspace. The dev and prod samples already carry the
+  triggers, ordering, locks and approvals; their applying steps are marked
+  `REQUIRES ... REMOTE STATE` and only report the commit to apply.
+- **The plan in `make check` is structural**: the committed config against
+  empty state, without re-reading live tags. It proves the config plans, not
+  what a release would change. State-aware plans start with remote state.
+- **Generated files are checked by re-running the deterministic steps**: the
+  same-env split of `generated/` into layer files, the governed-table record,
+  and, for an env with `promote_from` or `ENV=prod`, `promote-to`. Legacy envs
+  skip this with a note. `generated/abac.auto.tfvars` itself is a reviewed
+  draft and is not regenerated, so a hand edit there shows up only through the
+  committed layer files it feeds.
+- **`promote-to CHECK=1` never reads prod state**, so the policy names it
+  expects are the ones a first promote picks. The deployed-name overlay moves
+  to `release-plan` with the two-phase release (rollout step 9), as do the
+  release manifest and per-commit receipts.
 
 ---
 
