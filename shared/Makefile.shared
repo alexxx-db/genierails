@@ -815,11 +815,11 @@ _prepare-classification:
 _plan-layer:
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
+	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK) --warn; fi; \
 	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
 		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
 		exit 0; \
 	fi; \
-	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK) --warn; fi; \
 	if [ ! -f "$$env_dir/abac.auto.tfvars" ]; then \
 		echo "=== Skipping terraform plan ($$layer:$$target_env): no $$env_dir/abac.auto.tfvars ==="; \
 		exit 0; \
@@ -860,12 +860,12 @@ wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to 
 _apply-layer: _guard-not-ci-apply
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
+	apply_flags="$(if $(filter data_access workspace,$(LAYER)),$(APPLY_FLAGS),)"; \
+	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK); fi; \
 	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
 		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
 		exit 0; \
 	fi; \
-	apply_flags="$(if $(filter data_access workspace,$(LAYER)),$(APPLY_FLAGS),)"; \
-	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK); fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(_STICKY) check-layout --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env"; \
 		$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$$target_env" CLASSIFICATION_ENV_DIR="$$(dirname "$$env_dir")" IMPORT_CLASSIFICATION=1; \
