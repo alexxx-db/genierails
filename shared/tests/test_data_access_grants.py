@@ -185,10 +185,21 @@ def test_no_terraform_grant_anywhere_targets_account_users():
             assert 'account users' not in body[:body.find("\n}")], path
 
 
-def test_deterministic_mode_has_no_business_grant_pairs():
+def test_deterministic_select_comes_only_from_table_readers():
+    # Rollout step 8: deterministic SELECT pairs are built from table_readers
+    # alone (never agents' acl_groups, policy targets or groups), and nothing
+    # is granted with governance = "external".
     source = MAIN_TF.read_text()
+    normalized = " ".join(source.split())
     assert 'access_principals = var.governance_mode == "deterministic" ? []' in source
-    assert 'table_access_pairs = var.governance_mode == "deterministic" ? []' in source
+    assert 'table_access_pairs = var.governance_mode == "deterministic" ? local.reader_access_pairs' in source
+    pairs = normalized.split("reader_access_pairs = ", 1)[1].split("reader_catalog_pairs", 1)[0]
+    assert pairs.startswith("local.grants_from_readers ? flatten([ for table, readers in local.table_readers_resolved")
+    assert 'grants_from_readers = var.governance_mode == "deterministic" && var.governance == "genierails"' in normalized
+    resolved = normalized.split("table_readers_resolved = {", 1)[1].split("reader_access_pairs", 1)[0]
+    assert "local.reader_entries" in resolved
+    for forbidden in ("genie_space_acl_groups", "table_agents", "var.groups", "fgac_policies", "access_principals"):
+        assert forbidden not in pairs + resolved, forbidden
 
 
 def test_deployment_sp_self_grant_includes_apply_tag():

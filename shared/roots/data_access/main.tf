@@ -77,6 +77,18 @@ locals {
     ))
   }
   full_effective_uc_tables = distinct(concat(local.full_uc_tables, local.full_discovered_uc_tables))
+  # table_readers keys use the uc_tables syntax; schema-relative ones take uc_catalog.
+  _full_table_readers = var.table_readers == null ? null : {
+    for key, readers in var.table_readers :
+    length(split(".", key)) == 2 && var.uc_catalog != "" ? "${var.uc_catalog}.${key}" : key => readers...
+  }
+  full_table_readers = local._full_table_readers == null ? null : {
+    for key, readers in local._full_table_readers : key => distinct(flatten(readers))
+  }
+  # The committed governed-table list (deterministic envs), so a catalog.schema.*
+  # reader entry reaches tables that are governed but in no other input.
+  _governed_tables_file = "${var.env_dir}/../generated/governed_tables.json"
+  governed_tables       = fileexists(local._governed_tables_file) ? try([for t in jsondecode(file(local._governed_tables_file)).tables : tostring(t)], []) : []
 
   # What the last apply of this layer left in place, read from its own state
   # (the layer runner's local backend), so keeping or revoking SELECT never
@@ -277,6 +289,22 @@ variable "governance_mode" {
     error_message = "governance_mode must be legacy or deterministic."
   }
 }
+variable "governance" {
+  type        = string
+  default     = "genierails"
+  description = "Deterministic envs only: genierails (GenieRails derives masks and grants SELECT from table_readers) or external (another tool governs the tables; GenieRails only gates CAN_RUN on a live coverage check)."
+  validation {
+    condition     = contains(["genierails", "external"], var.governance)
+    error_message = "governance must be \"genierails\" or \"external\"."
+  }
+}
+
+variable "table_readers" {
+  type        = map(list(string))
+  default     = null
+  description = "Deterministic envs: table (catalog.schema.table, catalog.schema.*, or schema-relative with uc_catalog) => tier groups or raw_exempt_principals granted SELECT; the only source of SELECT. Env-owned."
+}
+
 variable "raw_exempt_principals" {
   type        = list(string)
   default     = []
@@ -488,6 +516,11 @@ module "data_access" {
   classification_existing_auto_tag_configs = var.classification_existing_auto_tag_configs
   tag_assignments                          = var.tag_assignments
   governance_mode                          = var.governance_mode
+  governance                               = var.governance
+  table_readers                            = local.full_table_readers
+  access_tier_groups                       = var.access_tier_groups
+  raw_exempt_principals                    = var.raw_exempt_principals
+  governed_tables                          = local.governed_tables
   fgac_policies                            = var.fgac_policies
   sql_warehouse_id                         = var.sql_warehouse_id
   warehouse_name                           = var.warehouse_name
@@ -552,4 +585,9 @@ output "coverage_gate" {
 output "legacy_unattributed_discovered_tables" {
   description = "Legacy discovered tables falling back to all access principals until make generate re-derives agent attribution."
   value       = module.data_access.legacy_unattributed_discovered_tables
+}
+
+output "access_config" {
+  description = "Deterministic access: resolved table_readers per governed table and the SELECT grants they plan; null in legacy envs."
+  value       = module.data_access.access_config
 }

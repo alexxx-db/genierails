@@ -76,3 +76,30 @@ output "withheld_table_grants" {
     problem = local.coverage_gate_problem
   }
 }
+
+output "access_config" {
+  description = "Deterministic access: resolved table_readers per governed table and the SELECT grants they plan (null in legacy envs, so their plans don't change). Its preconditions refuse an unsafe table_readers in any plan, make or raw terraform."
+  value = var.governance_mode == "deterministic" ? {
+    grants_from_readers = local.grants_from_readers
+    table_readers_set   = var.table_readers != null
+    readers             = local.table_readers_resolved
+    grant_keys          = sort([for pair in local.reader_access_pairs : "${pair.table}|${pair.principal}"])
+  } : null
+
+  precondition {
+    condition     = !(var.governance_mode == "deterministic" && var.governance == "external")
+    error_message = "governance = \"external\": another tool governs these tables, so GenieRails manages nothing in the data_access layer (make skips it). Remove governance = \"external\" to have GenieRails govern them."
+  }
+  precondition {
+    condition     = length(local.table_readers_bad_keys) == 0
+    error_message = "table_readers keys must be catalog.schema.table or catalog.schema.* (schema.table with uc_catalog set); invalid: ${join(", ", local.table_readers_bad_keys)}."
+  }
+  precondition {
+    condition     = length(local.table_readers_refused) == 0
+    error_message = "table_readers may name only access_tier_groups and raw_exempt_principals, never account users; refused: ${join(", ", local.table_readers_refused)}."
+  }
+  precondition {
+    condition     = !(local.grants_from_readers && var.table_readers == null && length(var.applied_table_grants) > 0)
+    error_message = "table_readers is not set, but this layer's state holds ${length(var.applied_table_grants)} SELECT grant(s) (${join(", ", var.applied_table_grants)}). Deterministic governance grants SELECT only from table_readers, so this plan would revoke them all. Set table_readers to the readers to keep (make generate proposes entries for agents' tables), or set table_readers = {} to revoke them deliberately."
+  }
+}

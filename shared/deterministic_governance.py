@@ -335,6 +335,8 @@ def validate_config(
                     errors.append(f"agent {name} acl_groups must not contain duplicates")
             if "delete" in space and not isinstance(space["delete"], bool):
                 errors.append(f"agent {name} delete must be a boolean")
+    from table_readers import validation_errors as table_readers_errors
+    errors.extend(table_readers_errors(cfg))
     errors.extend(_validate_ack_list("ACK_UNCLASSIFIED", ack_unclassified, principal=False))
     errors.extend(_validate_ack_list("ACK_WEAKEN", ack_weaken, principal=True))
     return errors

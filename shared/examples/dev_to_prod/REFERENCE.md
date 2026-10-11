@@ -80,7 +80,9 @@ unused until the rollout step shown, so adding them cannot change current behavi
 | `tier_access_overrides` | `{ treatment = { group = "raw" \| "partial" \| "full" } }`; groups must occur in `access_tier_groups`, and the named tier must exist. | 5 |
 | `column_overrides` | Per-column `{ partial = "version" }`, `{ treatment = "stricter_treatment" }`, or `{ keep_current = true }`. Setting `full` is refused. | 3 (`keep_current`: 6) |
 | `row_filters` | List of `{ table, column, values_by_group = map(group -> list(string)) }`; `table` is mandatory, literals are strings, tier-1 groups are refused, rules on one table are ANDed, and a multi-group caller receives the union of its named values. | 8 |
-| `genie_spaces[*].acl_groups` | Explicit `[]` means nobody. Set `require_acl_groups = true` to refuse a missing value now; step 5 makes that rule the default. | 5 |
+| `genie_spaces[*].acl_groups` | Explicit `[]` means nobody. Deterministic envs: the only source of `CAN_RUN`, a missing value stops the run, and every group must be able to read the agent's tables through `table_readers`. Legacy: set `require_acl_groups = true` to refuse a missing value. | 5 (deterministic: 8) |
+| `table_readers` | Deterministic envs: `{ "cat.sch.tbl" or "cat.sch.*" = [tier groups or raw_exempt_principals] }`, the only source of `SELECT`; a table's readers are the union of matching entries. Env-owned (seeded by the first promote). See [access.md](../../docs/access.md). | 8 |
+| `governance` | Deterministic envs: `"genierails"` (default) or `"external"` (another tool governs the tables; GenieRails only gates `CAN_RUN` on the live agent coverage check). Env-owned. | 8 |
 | `genie_spaces[*].delete` | `true` requests deletion instead of the default detach when an agent is removed. | 9 |
 | `ACK_UNCLASSIFIED` | Environment variable formatted as comma-separated `cat.sch.tbl.col` entries. Validation is format-only until the completeness check lands. | 2 |
 | `ACK_WEAKEN` | Environment variable formatted as comma-separated `cat.sch.tbl.col:principal` entries. Validation is format-only until refuse-weakening lands. | 7 |

@@ -51,6 +51,7 @@ locals {
   # Built-in principals such as "account users" are intentionally absent from
   # the managed groups map, but still need catalog/schema/table grants. Derive
   # the access set from both managed groups and policy targets.
+  # Legacy only. Deterministic access comes from table_readers alone (below).
   access_principals = var.governance_mode == "deterministic" ? [] : distinct(concat(
     keys(var.groups),
     flatten([
@@ -81,11 +82,59 @@ locals {
     )
   }
 
-  table_access_pairs = var.governance_mode == "deterministic" ? [] : flatten([
+  table_access_pairs = var.governance_mode == "deterministic" ? local.reader_access_pairs : flatten([
     for table, principals in local.table_access_principals : [
       for principal in principals : { table = table, principal = principal }
     ]
   ])
+
+  # Deterministic envs: SELECT only from table_readers (design decision 7).
+  # A table's readers are the union of every entry matching it: the exact
+  # table and its catalog.schema.*. Wildcards resolve over the tables this
+  # layer knows are governed (uc_tables, agent tables, treatment-tagged
+  # tables, table_readers keys and var.governed_tables). Agents' acl_groups
+  # never grant SELECT here, and governance = "external" grants nothing.
+  grants_from_readers = var.governance_mode == "deterministic" && var.governance == "genierails"
+  _reader_map         = var.table_readers == null ? {} : var.table_readers
+  _reader_groups      = { for key, readers in local._reader_map : lower(trimspace(key)) => readers... }
+  reader_entries      = { for key, readers in local._reader_groups : key => distinct(flatten(readers)) }
+  _known_tables = distinct([
+    for table in concat(
+      local.effective_uc_tables,
+      [for ta in var.tag_assignments : join(".", slice(split(".", ta.entity_name), 0, 3)) if ta.entity_type == "columns" && length(split(".", ta.entity_name)) == 4],
+      keys(local._reader_map),
+      var.governed_tables,
+    ) : lower(trimspace(table)) if length(split(".", table)) == 3 && !strcontains(table, "*")
+  ])
+  table_readers_resolved = {
+    for table in local._known_tables : table => sort(distinct(flatten([
+      for key, readers in local.reader_entries : readers
+      if key == table || (endswith(key, ".*") && trimsuffix(key, ".*") == join(".", slice(split(".", table), 0, 2)))
+    ])))
+  }
+  reader_access_pairs = local.grants_from_readers ? flatten([
+    for table, readers in local.table_readers_resolved : [
+      for principal in readers : { table = table, principal = principal }
+    ]
+  ]) : []
+  # USE_CATALOG / USE_SCHEMA only where a reader is granted SELECT.
+  reader_catalog_pairs = distinct([for pair in local.reader_access_pairs : { catalog = split(".", pair.table)[0], group = pair.principal }])
+  reader_schema_pairs  = distinct([for pair in local.reader_access_pairs : { schema = join(".", slice(split(".", pair.table), 0, 2)), group = pair.principal }])
+
+  # Refusals (output.access_config preconditions), so a raw terraform run
+  # fails the same way make does.
+  _allowed_readers = toset(concat(var.access_tier_groups, var.raw_exempt_principals))
+  table_readers_refused = local.grants_from_readers ? flatten([
+    for key, readers in local.reader_entries : [
+      for reader in readers : "${key} = ${reader}"
+      if !contains(local._allowed_readers, reader) || contains(["account users", "users"], lower(trimspace(reader)))
+    ]
+  ]) : []
+  table_readers_bad_keys = [
+    for key in keys(local.reader_entries) : key
+    if length(split(".", key)) != 3 || strcontains(join(".", slice(split(".", key), 0, min(2, length(split(".", key))))), "*")
+    || (strcontains(element(split(".", key), length(split(".", key)) - 1), "*") && element(split(".", key), length(split(".", key)) - 1) != "*")
+  ]
 
   _ta_catalogs = [
     for ta in var.tag_assignments :
@@ -341,10 +390,12 @@ resource "databricks_grant" "terraform_sp_manage_catalog" {
 }
 
 resource "databricks_grant" "catalog_access" {
-  for_each = {
+  for_each = var.governance_mode == "deterministic" ? tomap({
+    for pair in local.reader_catalog_pairs : "${pair.catalog}|${pair.group}" => pair
+    }) : tomap({
     for pair in setproduct(local.all_catalogs, local.access_principals) :
     "${pair[0]}|${pair[1]}" => { catalog = pair[0], group = pair[1] }
-  }
+  })
 
   provider   = databricks.workspace
   catalog    = each.value.catalog
@@ -357,10 +408,12 @@ resource "databricks_grant" "catalog_access" {
 }
 
 resource "databricks_grant" "schema_access" {
-  for_each = {
+  for_each = var.governance_mode == "deterministic" ? tomap({
+    for pair in local.reader_schema_pairs : "${pair.schema}|${pair.group}" => pair
+    }) : tomap({
     for pair in setproduct(local.uc_schemas, local.access_principals) :
     "${pair[0]}|${pair[1]}" => { schema = pair[0], group = pair[1] }
-  }
+  })
 
   provider   = databricks.workspace
   schema     = each.value.schema

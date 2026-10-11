@@ -29,6 +29,7 @@ from scripts.footprint import (
     resolve_footprint,
 )
 from scripts.remap_generated_config import remap_hcl
+from table_readers import normalize as _normalize_readers
 from verify_effective_access import normalize_key_map
 from walkthrough_marker import PROMOTED_HEADER, follows_walkthrough
 
@@ -428,6 +429,24 @@ def main():
     # Each env migrates to deterministic governance on its own, so the mode is
     # the destination's: kept as it is, never copied from the source.
     preserved_mode = _str(dest_cfg.get("governance_mode", "")) if "governance_mode" in dest_cfg else None
+    # governance (genierails or external) and table_readers are env-owned: the
+    # first promotion seeds them from the source (table_readers keys remapped
+    # to the destination catalogs); later promotions keep the destination's and
+    # print how they differ. raw_exempt_principals is the destination's alone.
+    governance_seeded = "governance" not in dest_cfg and "governance" in cfg
+    promoted_governance = (_str(dest_cfg["governance"]) if "governance" in dest_cfg
+                           else _str(cfg["governance"]) if "governance" in cfg else None)
+    source_readers = None
+    if cfg.get("table_readers") is not None:
+        source_uc_catalog = _str(cfg.get("uc_catalog", ""))
+        source_readers = {
+            remap_table(table): readers for table, readers in
+            _normalize_readers(cfg.get("table_readers"), source_uc_catalog).items()
+        }
+    readers_seeded = "table_readers" not in dest_cfg and source_readers is not None
+    promoted_readers = (_normalize_readers(dest_cfg.get("table_readers")) if "table_readers" in dest_cfg
+                        else source_readers)
+    preserved_exempt = [_str(p) for p in dest_cfg.get("raw_exempt_principals") or []]
     # make promote-to's saved source env + catalog map belong to the destination.
     preserved_promote = {
         name: dest_cfg[name]
@@ -471,6 +490,22 @@ def main():
         print("  Dropped the retired business_access_enabled setting from the destination")
     if preserved_mode is not None:
         print(f"  Preserved destination governance_mode={preserved_mode!r}")
+    if promoted_governance is not None:
+        print(f"  {'Seeded' if governance_seeded else 'Preserved destination'} governance={promoted_governance!r}")
+    if readers_seeded:
+        print(f"  Seeded table_readers from {source_env} ({len(source_readers)} entr(y/ies), catalogs remapped); "
+              "from now on the destination keeps its own")
+    elif "table_readers" in dest_cfg:
+        print(f"  Preserved destination table_readers ({len(promoted_readers)} entr(y/ies))")
+        for table in sorted(set(promoted_readers) | set(source_readers or {})):
+            dev = sorted((source_readers or {}).get(table, []))
+            dest = sorted(promoted_readers.get(table, []))
+            if source_readers is not None and dev != dest:
+                print(f"  table_readers diff for {table} ({source_env} vs destination): "
+                      f"{source_env}={dev!r}; destination={dest!r}. To change the destination, "
+                      "edit its env.auto.tfvars in a PR.")
+    if preserved_exempt:
+        print(f"  Preserved destination raw_exempt_principals ({len(preserved_exempt)})")
     if preserved_acknowledged:
         print(
             "  Preserved destination coverage_acknowledged_columns "
@@ -617,6 +652,18 @@ def main():
     lines.append("enable_classification = true")
     if preserved_mode is not None:
         lines.append(f"governance_mode = {json.dumps(preserved_mode)}")
+    if promoted_governance is not None:
+        lines.append(f"governance = {json.dumps(promoted_governance)}")
+    if preserved_exempt:
+        lines.append("raw_exempt_principals = [" + ", ".join(json.dumps(p) for p in preserved_exempt) + "]")
+    if promoted_readers is not None:
+        lines.append("")
+        lines.append("# Who can read each governed table (SELECT). Env-owned: seeded by the first")
+        lines.append("# promotion, then kept; change it here in a PR.")
+        lines.append("table_readers = {")
+        lines.extend(f"  {json.dumps(table)} = [{', '.join(json.dumps(r) for r in readers)}]"
+                     for table, readers in sorted(promoted_readers.items()))
+        lines.append("}")
     if preserved_auto_tagging is not None:
         lines.append(f"enable_auto_tagging = {str(preserved_auto_tagging).lower()}")
     if preserved_acknowledged:

@@ -281,7 +281,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 The README shows one golden-path config (three tiers, one agent, `catalog_map`); every optional setting lives in an advanced doc.
 
 
-- **Settings:** `access_tier_groups`, `table_readers`, `uc_tables`, `catalog_map`, per-agent `genie_space_id` / `acl_groups` / `delete`, and optionally `raw_exempt_principals`, `treatment_versions`, `column_overrides`, `tag_treatments`, `row_filters`. `governance_mode` exists only during migration.
+- **Settings:** `access_tier_groups`, `table_readers`, `uc_tables`, `catalog_map`, per-agent `genie_space_id` / `acl_groups` / `delete`, and optionally `raw_exempt_principals`, `treatment_versions`, `column_overrides`, `tag_treatments`, `row_filters`, and `governance = "external"` for agents on tables another tool governs (GenieRails then derives and grants nothing, and gates `CAN_RUN` only on the live agent coverage check). `governance_mode` exists only during migration.
 - **One acknowledgement file:** `envs/<env>/ack.txt` (env-scoped entries, code-owned).
 - **Commands:** `setup`, `generate`, `capture`, `rehearse`, `promote-to`, `release-plan`, `release`, `maintain`; occasionally `ungovern`, `detach-agent`, `apply-account`, `scaffold-treatments`.
 
@@ -309,7 +309,7 @@ Every step keeps `main` working and ships its own live test on AWS and Azure whe
 5. **Governance-only policies, no grants:** per-tier policies, `raw_exempt_principals`, fail-safe redaction for unmapped classes, the external-mask inventory, and a test that no grant targets `account users`.
 6. **Policy changes and tier moves:** the staged-apply protocol and its verification.
 7. **Reader and weakening checks** with committed, scoped acknowledgements (`ack.txt`).
-8. **Access:** `SELECT` only from `table_readers`, `CAN_RUN` only from `acl_groups`; per-agent files; the agent-readability check and the proposed `table_readers` in `generate`.
+8. **Access:** `SELECT` only from `table_readers`, `CAN_RUN` only from `acl_groups`; per-agent files; the agent-readability check and the proposed `table_readers` in `generate`. Built (except per-agent files, which move to step 11 with capture), extended with the live agent coverage check that replaces the `CAN_RUN` gate's dependence on data_access state, and `governance = "external"` ([access.md](../access.md)).
 9. **Release gating, then migration:** the rehearse receipt and `release` attestation first; then the migration dry run, revocation list, frozen AI row filters, tag state moves and staged cutover.
 10. **Declared row filters.**
 11. **Capture and prod ownership:** `make capture`, JSON-aware remap, prod IDs in state and the release receipt, overwrite report, two-step detach.
