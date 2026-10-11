@@ -89,7 +89,7 @@ def test_release_runs_unified_pipeline_in_order_and_writes_no_receipt(tmp_path):
         _same_env_promote(env_dir),
         ["verify-access-keys", "ENV=prod", "VERIFY_KEY_COLUMN=customer_id"],
         ["audit-rulebook", "ENV=prod"],
-        ["apply", "ENV=prod", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1"],
+        ["apply", "ENV=prod", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
         ["verify-access", "ENV=prod", "VERIFY_REQUIRE_MASKS=1", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate to open or persist: release neither passes nor writes it. The
@@ -524,7 +524,9 @@ def test_retired_flag_in_caller_apply_flags_warns_once_though_nested_apply_clear
     assert "(APPLY_FLAGS)" in warnings[0]
     # What reaches Terraform is unchanged: the nested apply still gets empty flags.
     nested_calls = [call for call in calls if call[0] == nested]
-    assert nested_calls == [[nested, f"ENV={env_name}", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1"]]
+    # rehearse and release confirm the staged policy journal themselves, after their verification.
+    confirm = ["_STAGED_CONFIRM=0"] if nested == "apply" else []
+    assert nested_calls == [[nested, f"ENV={env_name}", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", *confirm]]
     assert not any(f"APPLY_FLAGS={flags}" in call for call in calls)
 
 
