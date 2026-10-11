@@ -22,16 +22,16 @@ Governance is computed only from classification tags and reviewed config. It is 
 | 2 | Identifiers (national, tax, document and device IDs) are **redacted** for both masked tiers. The keyed hash is deferred (section 15). |
 | 3 | Row filters only when declared. GenieRails never invents one. |
 | 4 | An agent is run only by its `acl_groups`. A missing `acl_groups` stops the run; `[]` means nobody. |
-| 5 | No AI in governance: `generate`, `rehearse`, `release` and `maintain` never call a model, and no model endpoint is required. AI is only an optional, explicit helper (draft Genie content for a new agent, suggest a treatment for an unmapped class, draft SQL for a custom mask), never run in CI or prod, and its output is reviewed and committed like any change. |
+| 5 | No AI in governance. `generate`, `rehearse`, `release` and `maintain` never call a model or require a model endpoint. AI may be used only as an explicit helper to draft Genie content, suggest an unmapped treatment, or draft custom-mask SQL; its output is reviewed and committed like any change, and never runs in CI or prod. |
 | 6 | Governance works without any agent, using the existing `uc_tables`. |
 | 7 | GenieRails creates `SELECT` **only** from `table_readers` (governance) and `CAN_RUN` **only** from agents' `acl_groups`. It doesn't revoke unrelated existing access except in the explicit migration (section 8). |
 | 8 | `access_tier_groups` is promoted from dev, so prod uses exactly the rehearsed tiers. Where prod's group names differ, an optional env-owned `group_map` (like `catalog_map`) maps them; changing it counts as weakening. |
-| 9 | One tool, three entry points: **govern tables** (`uc_tables`, no agents), **promote an agent** onto tables the customer governs itself (`governance = "external"`: GenieRails creates no masks or policies, but `CAN_RUN` still needs the live check that every classified column of the agent's tables has some mask and every `acl_groups` group can read them), and **both** (the champion flow, `governance = "genierails"`). |
+| 9 | One tool, three entry points, chosen per env with `governance`: **govern tables** (`uc_tables`, no agents), **promote an agent onto externally governed tables** (`governance = "external"`: GenieRails creates no masks, row filters, treatment tags, policies or table grants; it creates only `CAN_RUN`, after live checks prove each `acl_groups` group can read the agent's tables and each classified column has an effective, non-conflicting mask or policy), and **both** (the champion flow, `governance = "genierails"`, the default). External mode checks presence and readability; it does not certify the strength of customer-owned governance. |
 | 10 | The legacy AI-drafted mode exists only as a migration source. It is not documented as a path. |
 
 ## 1. The governed set
 
-Governed set = top-level `uc_tables` ∪ tables of configured agents ∪ tables already governed (the governed-table list, so a table stays governed until `make ungovern`).
+Governed set = top-level `uc_tables` ∪ tables of configured agents ∪ tables already governed (the governed-table list, so a table stays governed until `make ungovern`). In an env with `governance = "external"` the governed set is empty: the agents' tables are an external-access set, for which GenieRails may grant `CAN_RUN` after live checks but creates no masks, row filters, treatment tags, policies, table grants or governed-table entries.
 
 - `uc_tables` keeps its existing syntax: `schema.table` (relative to `uc_catalog`), `catalog.schema.table`, or `catalog.schema.*`.
 - `uc_tables` **governs and never grants**, with or without agents.
@@ -124,7 +124,7 @@ raw_exempt_principals = ["etl-sp", "bi-service-account"]                  # opti
   group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
   ```
 
-  `promote-to` maps every group reference it writes (`access_tier_groups`, and the first seed of `acl_groups` and `table_readers`) through `group_map`. A dev group with no mapping is used as is; a mapped name that doesn't exist in prod, or two dev groups mapped to one prod group, is refused. Adding, removing or changing a mapping is a weakening (section 6) and needs an `ack`.
+  `promote-to` maps every committed group reference it writes: `access_tier_groups`, `row_filters` `values_by_group`, and the first seed of `acl_groups` and `table_readers`. A dev group with no mapping is used as is, but every resulting group must exist in the target account. A mapped name that doesn't exist, or a many-to-one mapping, is refused. Nested membership is expanded only after mapping, for reader checks and `verify-access`. Env-owned `raw_exempt_principals` are never mapped. Adding, removing or changing a mapping is a weakening (section 6) and needs an `ack`.
 
 ## 4. Row filters (declared only)
 
@@ -143,7 +143,7 @@ row_filters = [
 
 - **Capture is explicit:** `make capture ENV=dev SPACE="<agent>"` writes that agent's exported `serialized_space` to `envs/dev/agents/<agent>.space.json`. Only the outer fields (`space_id`, `etag`, ACLs) are removed; the item IDs inside the payload (instructions, sample questions, joins, snippets, benchmarks) are kept, because the format needs them for a faithful round-trip. A plain `generate` only imports agents not yet in git (it writes files; no Terraform state changes).
 - **Per-agent files:** `envs/<env>/agents/<agent>.auto.tfvars` holds `genie_space_id`, `acl_groups` and `delete`. The prod agent ID is kept in prod's Terraform state and in the release receipt, never committed by a pipeline; if state is lost it is recovered from the receipt, or by title adoption (#79). A loader merges these files before plan.
-- **Access:** `acl_groups` get `CAN_RUN` on the agent, nothing else. `generate`, `rehearse` and `release` stop if any `acl_groups` group can't read one of the agent's tables through `table_readers`, and name the table and the missing group.
+- **Access:** `acl_groups` get `CAN_RUN` on the agent, nothing else. With `governance = "genierails"`, `generate`, `rehearse` and `release` stop if any `acl_groups` group can't read one of the agent's tables through resolved `table_readers`. With `governance = "external"`, no `table_readers` grant is needed; `rehearse` and `release` check live privileges instead. Either way they name the table and the missing group.
 - **Champion convenience:** when `generate` first imports an agent, it writes a `table_readers` entry for each of the agent's tables that no entry (exact or wildcard) already covers, filled with the agent's `acl_groups`, for review and commit. It never edits an existing entry.
 - **`acl_groups` is env-owned:** the first `promote-to` seeds prod from dev; later promotions keep prod's value and print the differences.
 - **Dev:** agent config is never overwritten; GenieRails applies governance and access for captured tables only, and creates an agent only if missing.
@@ -167,7 +167,7 @@ row_filters = [
 | Reader check | Before the first deterministic apply of an env, and whenever governance newly covers a table, GenieRails computes the table's **current readers** that GenieRails didn't grant: `SELECT` and `ALL PRIVILEGES` at table, schema and catalog level (from `information_schema` privileges), owners of the table and its parents, readers of every view that depends on it (view-level and inherited `SELECT`/`ALL PRIVILEGES`, following views of views), and metastore admins, with group membership expanded transitively. ABAC masks still apply to view readers, because they're evaluated as the querying user. Every reader must be in a tier, in `raw_exempt_principals`, or in `ack.txt`; otherwise the run stops. Principals that can **grant** access (`MANAGE`, owners, including view owners) are reported separately as a risk. Groups a row filter would leave with zero rows are listed the same way. |
 | Account layer | The account layer (groups, group members, tag policies) is shared by every env. `rehearse` and `release` never change it, except to **add** allowed values to the treatment tag policy that a new treatment needs. Any other account change runs only through `make apply-account` in the operations stage, with an approval. If the account plan isn't otherwise empty, `rehearse` and `release` refuse and print that command. Every tag-value addition takes the global **account lock**, in local and pipeline runs alike. |
 | Policy changes | Any change that replaces or removes a policy or function runs as separate applies under the env lock: (1) create new functions and policies, removing nothing; (2) verify with `SHOW EFFECTIVE POLICIES` and queries as every affected tier; (3) retag or move principals; (4) verify; (5) remove the old policies and functions. Outside phase 5, policies and functions are protected from destroy. A brief `MULTIPLE_MASKS` error is acceptable only for the principals being moved; any raw value fails the run. Run tier moves as maintenance windows. |
-| External masks | Before every `rehearse`, `release` and `maintain`, GenieRails inventories effective policies and table-attached masks on governed tables. One it didn't create on a governed column stops the run, because it would break queries with `MULTIPLE_MASKS`. |
+| External masks | With `governance = "genierails"`, before every `rehearse`, `release` and `maintain`, GenieRails inventories effective policies and table-attached masks on governed tables. One it didn't create on a governed column stops the run, because it would break queries with `MULTIPLE_MASKS`. With `governance = "external"`, the same inventory runs on the agent's tables: every classified column must have an effective, non-conflicting customer-owned mask or policy, and GenieRails reports that it did not verify treatment strength. |
 | Tags | One treatment tag key for everything. Each column has one treatment-tag resource keyed by `entity_type|entity_name|tag_key` (never by value) with no `ignore_changes`, so value changes update in place (verified in the provider). Classifier-owned `class.*` tags are never managed by Terraform. Order for a column moving to a new treatment: add the value to the tag policy, create the new treatment's policies, then retag. A column is never tagged with a value no policy matches. |
 | CI | Every applying target refuses in CI, except the dev and prod pipelines of section 17, and only once that env has remote locked state. |
 | Coverage freshness | A pass counts only for the same commit (`check`) and the same live snapshot (`rehearse`, `release`, `maintain`). |
@@ -185,8 +185,9 @@ Each entry names the env, kind and exact object. GenieRails prints the
 before/after consequence of each and refuses entries that match nothing after
 all checks (weakening, reader and unclassified) are reconciled together, once.
 Entries for another env are refused. The weakening keys are
-`<env>:weaken:<column|table|treatment>:<principal>` (`*` for readers outside a
-removed row filter, `partial` for `partial = "raw"`); reader keys are
+`<env>:weaken:<column|table|treatment|group_map>:<principal-or-mapping>` (`*` for
+readers outside a removed row filter, `partial` for `partial = "raw"`, and
+`<dev_group>=<target_group>` for `group_map`); reader keys are
 `<env>:reader:<table>:<principal>`.
 Repositories must add `envs/*/ack.txt` to `CODEOWNERS` using the existing
 governance-owner team or users; the project deliberately does not prescribe an
@@ -290,7 +291,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 The README shows one golden-path config (three tiers, one agent, `catalog_map`); every optional setting lives in an advanced doc.
 
 
-- **Settings:** `access_tier_groups`, `table_readers`, `uc_tables`, `catalog_map`, optional `group_map`, per-agent `genie_space_id` / `acl_groups` / `delete`, and optionally `raw_exempt_principals`, `treatment_versions`, `column_overrides`, `tag_treatments`, `row_filters`. `governance_mode` exists only during migration.
+- **Settings:** `access_tier_groups`, `table_readers`, `uc_tables`, `catalog_map`, optional `group_map`, `governance` (`genierails`, the default, or `external` for agent-only), per-agent `genie_space_id` / `acl_groups` / `delete`, and optionally `raw_exempt_principals`, `treatment_versions`, `column_overrides`, `tag_treatments`, `row_filters`. Legacy `governance_mode` exists only as migration input.
 - **One acknowledgement file:** `envs/<env>/ack.txt` (env-scoped entries, code-owned).
 - **Commands:** `setup`, `generate`, `capture`, `rehearse`, `promote-to`, `release-plan`, `release`, `maintain`; occasionally `ungovern`, `detach-agent`, `apply-account`, `scaffold-treatments`.
 
