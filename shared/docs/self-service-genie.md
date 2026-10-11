@@ -199,7 +199,7 @@ make apply-governance ENV=prod
 make apply-genie ENV=bu_finance
 ```
 
-Each command only touches its own Terraform state files. The governance pipeline never writes to `envs/bu_*/terraform.tfstate`. The BU pipeline never writes to `envs/*/data_access/terraform.tfstate`.
+Each command only touches its own Terraform state files. `apply-governance` never writes to `envs/bu_*/terraform.tfstate`. `apply-genie` never writes to `envs/*/data_access/terraform.tfstate`.
 
 ---
 

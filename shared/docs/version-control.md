@@ -34,7 +34,7 @@ envs/
 | Genie agent configuration | Workspace | `envs/<env>/abac.auto.tfvars` |
 | Environment input (tables, warehouse) | Workspace | `envs/<env>/env.auto.tfvars` |
 
-The `generated/` folder is ephemeral — it holds the raw LLM draft for review and tuning. After `make promote` splits it into the three layers, the split configs become the source of truth.
+`generated/` holds the reviewed rules. Commit it: `make promote` splits it into the three layers, and `make check` re-derives the layer files from it to prove they're current.
 
 ## What to version control
 
@@ -70,7 +70,10 @@ auth.auto.tfvars
 *.tfstate
 *.tfstate.backup
 .terraform/
-.genie_space_*
+.genie_*
+**/envs/**/data_access/.policy_generations/
+**/envs/**/data_access/classification.auto.tfvars
+**/envs/**/data_access/discovered_uc_tables.auto.tfvars
 **/envs/**/.*.apply.sha
 **/envs/**/.coverage_gate.json
 **/envs/**/.can_run_check.json
@@ -83,7 +86,8 @@ git add -f envs/dev/env.auto.tfvars
 git add -f envs/dev/abac.auto.tfvars
 git add -f envs/dev/data_access/abac.auto.tfvars
 git add -f envs/dev/data_access/masking_functions.sql
-git add -f envs/dev/generated/
+git add -f envs/dev/generated/abac.auto.tfvars envs/dev/generated/masking_functions.sql envs/dev/generated/governed_tables.json
+# promoted envs also: envs/prod/generated/expected_classification.json
 ```
 
 ## Pinning to a GenieRails version

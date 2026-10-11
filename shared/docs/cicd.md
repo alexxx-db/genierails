@@ -32,9 +32,10 @@ files (`envs/<env>/abac.auto.tfvars`, `envs/<env>/data_access/abac.auto.tfvars`,
 `envs/<env>/data_access/masking_functions.sql`) and `envs/account/abac.auto.tfvars`.
 Without `generated/`, `make check` skips the regeneration and coverage checks.
 
-Never commit `auth.auto.tfvars`, Terraform state, `.terraform/`, Genie ID files,
+Never commit `auth.auto.tfvars`, Terraform state, `.terraform/`, Genie ID and adoption marker files (`.genie_*`),
 or the runtime records GenieRails writes (`.*.apply.sha`, `.coverage_gate.json`,
-`.can_run_check.json`, `generated/.*`).
+`.can_run_check.json`, `generated/.*`, `data_access/.policy_generations/`,
+`classification.auto.tfvars`, `discovered_uc_tables.auto.tfvars`).
 
 ## CI guard
 
@@ -100,9 +101,11 @@ The only file it can leave outside the copy is Terraform's own
   state is deferred, design section 15). The operator runs them there, in
   order, in the machine's one persistent checkout: Terraform state, the env
   lock and Genie ID files live under its gitignored `envs/` today. Move it to
-  the commit the pipeline names with `git fetch && git checkout --detach <sha>`
-  and confirm `git status --porcelain` is empty; never `git clean -x` or
-  re-clone. (State outside the checkout, `GENIERAILS_STATE_DIR`, is target.) Every applying
+  the commit the pipeline names with `git fetch && git checkout --force --detach <sha>`:
+  `--force` discards the edits earlier runs made to tracked `generated/` and
+  layer files (applying commands re-derive and rewrite them today) and leaves
+  the ignored state, lock and Genie files alone. Then confirm
+  `git status --porcelain` is empty. Never `git clean -x` or re-clone. (State outside the checkout, `GENIERAILS_STATE_DIR`, is target.) Every applying
   target keeps refusing in CI, and the samples never set
   `GENIERAILS_ALLOW_CI_APPLY`, which exists only for GenieRails' own throwaway
   integration-test workspace. The dev and prod samples already carry the
