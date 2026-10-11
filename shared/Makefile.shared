@@ -647,7 +647,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 
 validate: _guarded-bootstrap ## Validate split config in the selected environment
 	@echo "=== Validate ($(ENV)) ==="
-	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
+	@set -e; if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		cd "$(ACCOUNT_ENV_DIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,validate-account) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); fi; \
 	else \
 		cd "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars masking_functions.sql $(call _VALIDATION_FLAGS,validate-data-access) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); fi; \
