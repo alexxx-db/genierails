@@ -1,0 +1,86 @@
+name: GenieRails prod maintain (azure)
+
+# Stage 5, "Keep protected", of shared/docs/cicd.md: on a schedule. Copy to
+# .github/workflows/ at the repository root.
+#
+#   make maintain ENV=prod     at the last released commit
+#
+# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the release
+# receipt (rollout step 9), which names the last released commit. Until both
+# exist the operator runs make maintain ENV=prod on the deployment machine,
+# on its own schedule, at the last released commit, in the same persistent
+# checkout as releases (`git fetch && git checkout --force --detach <sha>`,
+# an empty `git status --porcelain`, never `git clean -x` or a re-clone; see
+# prod-release.yml). The CI guard refuses every applying target here.
+# Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 this job runs the read-only
+# drift audit, which exits non-zero when sensitive columns are untagged or
+# tag assignments are stale; GitHub's failed-run notification alerts the
+# owning team.
+#
+# Auth: OIDC workload identity federation, no PATs or secrets. The
+# "production-maintain" environment (deploys only from main, no reviewer, so
+# the schedule isn't held for approval) holds the prod read-only service
+# principal's IDs as variables; that SP also needs CAN_USE on a SQL warehouse:
+#   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
+#   PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+# Its own group, never shared with the release workflow: GitHub keeps only
+# one pending run per group, so a shared group let a scheduled maintain
+# cancel a pending release and a release waiting days for approval hold
+# maintain back. A newer pending maintain may replace an older pending one
+# (the audit is read-only and repeats in full); a running one is never
+# cancelled. Release and maintain must never apply to prod at the same
+# time; on the deployment machine the GenieRails env lock serialises them.
+concurrency:
+  group: genierails-prod-maintain-azure
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    working-directory: azure
+
+jobs:
+  maintain:
+    name: Drift audit (v1; maintain REQUIRES PROD REMOTE STATE)
+    runs-on: ubuntu-latest
+    environment: production-maintain
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+    steps:
+      # TODO(rollout step 9): check out the last released commit, read from
+      # the release receipt, instead of main.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install python-hcl2 databricks-sdk
+
+      - name: Write OIDC auth file (IDs only, no secrets)
+        env:
+          ACCOUNT_ID: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+          CLIENT_ID: ${{ vars.PROD_READONLY_CLIENT_ID }}
+          WORKSPACE_ID: ${{ vars.PROD_DATABRICKS_WORKSPACE_ID }}
+          HOST: ${{ vars.PROD_DATABRICKS_WORKSPACE_HOST }}
+        run: |
+          mkdir -p envs/prod
+          printf '%s\n' \
+            "databricks_account_id     = \"$ACCOUNT_ID\"" \
+            "databricks_client_id      = \"$CLIENT_ID\"" \
+            'databricks_client_secret  = ""' \
+            "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
+            "databricks_workspace_host = \"$HOST\"" > envs/prod/auth.auto.tfvars
+
+      - name: Read-only drift audit
+        run: make audit-schema ENV=prod

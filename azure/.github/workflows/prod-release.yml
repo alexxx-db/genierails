@@ -1,0 +1,138 @@
+name: GenieRails prod release (azure)
+
+# Stage 4, "Prod release", of shared/docs/cicd.md. Copy to .github/workflows/
+# at the repository root. It starts only when the dev pipeline ("GenieRails
+# dev (azure)") succeeds on main, and only for a commit that touches envs/prod/**.
+#
+#   make release-plan ENV=prod                     publishes the approval manifest
+#   (required approval on the "production" environment)
+#   make release ENV=prod MANIFEST=<manifest>      applies exactly that manifest
+#
+# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the two-phase
+# release (rollout step 9). Until both exist the operator releases on the
+# deployment machine with make release ENV=prod, at the commit this run names,
+# in that machine's one persistent checkout: v1 keeps Terraform state, the
+# env lock and the Genie ID files under its gitignored envs/, so a re-clone
+# loses them. Move the checkout with
+# `git fetch && git checkout --force --detach <sha>` (--force drops earlier
+# runs' edits to tracked generated/ and layer files and leaves the ignored
+# state alone), confirm `git status --porcelain` prints nothing, and never
+# run `git clean -x` or re-clone. (State outside the checkout, in
+# GENIERAILS_STATE_DIR, is the target.)
+# The CI guard refuses every applying target here. Do not set
+# GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
+# integration-test workspace. In v1 the plan job re-runs the
+# read-only check of that exact commit, and the release job only records the
+# approval gate and the commit to release.
+#
+# Settings: the "production" environment requires a reviewer from the
+# governance code owners, prevents self-review and deploys only from main.
+# Auth: OIDC workload identity federation, no PATs or secrets. Repository
+# variables (IDs, not credentials) for the read-only plan job:
+#   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
+#   PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
+# Once release applies in CI, the "production" environment holds the prod
+# deployer SP's PROD_DEPLOYER_CLIENT_ID, so only an approved job can use it.
+
+on:
+  workflow_run:
+    workflows: ["GenieRails dev (azure)"]
+    types: [completed]
+    branches: [main]
+
+# Deliberately no concurrency group, as in the dev workflow: GitHub keeps
+# only one pending run per group and cancels the older one, so a newer run
+# (even one that does not touch envs/prod) or a scheduled maintain could
+# cancel a release still waiting for approval. Every release run waits for
+# its own approval and none is cancelled. Release and maintain must never
+# apply to prod at the same time: in v1 neither applies here, and on the
+# deployment machine the GenieRails env lock (envs/prod/generated/
+# .governance.lock in the persistent checkout) serialises them.
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: azure
+
+jobs:
+  scope:
+    name: Did the commit touch envs/prod?
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      prod: ${{ steps.diff.outputs.prod }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 2
+
+      - id: diff
+        run: |
+          if git diff --name-only HEAD^ HEAD -- envs/prod | grep -q .; then
+            echo "prod=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-plan:
+    name: Release plan (v1, check only; REQUIRES PROD REMOTE STATE)
+    needs: scope
+    if: needs.scope.outputs.prod == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install python-hcl2 databricks-sdk pytest
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Write OIDC auth file (IDs only, no secrets)
+        env:
+          ACCOUNT_ID: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+          CLIENT_ID: ${{ vars.PROD_READONLY_CLIENT_ID }}
+          WORKSPACE_ID: ${{ vars.PROD_DATABRICKS_WORKSPACE_ID }}
+          HOST: ${{ vars.PROD_DATABRICKS_WORKSPACE_HOST }}
+        run: |
+          mkdir -p envs/prod
+          printf '%s\n' \
+            "databricks_account_id     = \"$ACCOUNT_ID\"" \
+            "databricks_client_id      = \"$CLIENT_ID\"" \
+            'databricks_client_secret  = ""' \
+            "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
+            "databricks_workspace_host = \"$HOST\"" > envs/prod/auth.auto.tfvars
+
+      # TODO(rollout step 9): run the release plan here and upload its
+      # manifest as an artifact; the release job applies that manifest.
+      - name: Read-only check of the commit to release
+        run: make check ENV=prod
+
+  release:
+    name: Release (v1, runs on the deployment machine; REQUIRES PROD REMOTE STATE)
+    needs: release-plan
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      # TODO(deferred, section 15): apply the approved manifest here once prod
+      # has remote state with locking.
+      - name: Release runs on the deployment machine (v1)
+        run: |
+          {
+            echo "### Prod release not run in CI (v1)"
+            echo "Approved commit: ${{ github.event.workflow_run.head_sha }}"
+            echo "Release it on the deployment machine (see this workflow's header); prod remote state is not built yet."
+          } >> "$GITHUB_STEP_SUMMARY"

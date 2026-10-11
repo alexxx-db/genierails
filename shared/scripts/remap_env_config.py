@@ -425,6 +425,9 @@ def main():
     preserved_acknowledged = [
         _str(column) for column in dest_cfg.get("coverage_acknowledged_columns") or []
     ]
+    # Each env migrates to deterministic governance on its own, so the mode is
+    # the destination's: kept as it is, never copied from the source.
+    preserved_mode = _str(dest_cfg.get("governance_mode", "")) if "governance_mode" in dest_cfg else None
     # make promote-to's saved source env + catalog map belong to the destination.
     preserved_promote = {
         name: dest_cfg[name]
@@ -466,6 +469,8 @@ def main():
         # Retired: access follows the coverage check, so the rewrite drops the
         # line instead of resetting it (a reset used to close live prod).
         print("  Dropped the retired business_access_enabled setting from the destination")
+    if preserved_mode is not None:
+        print(f"  Preserved destination governance_mode={preserved_mode!r}")
     if preserved_acknowledged:
         print(
             "  Preserved destination coverage_acknowledged_columns "
@@ -610,6 +615,8 @@ def main():
     lines.append("# Safe production defaults. Business access is granted only through the")
     lines.append("# coverage check that make release runs; there is no access flag to set.")
     lines.append("enable_classification = true")
+    if preserved_mode is not None:
+        lines.append(f"governance_mode = {json.dumps(preserved_mode)}")
     if preserved_auto_tagging is not None:
         lines.append(f"enable_auto_tagging = {str(preserved_auto_tagging).lower()}")
     if preserved_acknowledged:

@@ -184,19 +184,22 @@ Governance team maintains a separate repo containing `envs/account/` and `envs/*
 
 ## CI/CD integration
 
-See [cicd.md](cicd.md) for general CI/CD setup. For self-service Genie mode:
+See [cicd.md](cicd.md) for general CI/CD setup. In v1, applying targets refuse
+to run in CI, so both of these run on the deployment machine after the PR is
+approved; CI runs only `make check ENV=<env>` on the PR.
 
-**Governance pipeline** (triggered by changes to `envs/account/` or `envs/*/data_access/`):
-```yaml
-- run: make apply-governance ENV=prod
+**Governance change** (touches `envs/account/` or `envs/*/data_access/`; legacy
+self-service mode. A deterministic prod uses `make release ENV=prod` instead):
+```bash
+make apply-governance ENV=prod
 ```
 
-**BU pipeline** (triggered by changes to `envs/bu_finance/`):
-```yaml
-- run: make apply-genie ENV=bu_finance
+**BU change** (touches `envs/bu_finance/`):
+```bash
+make apply-genie ENV=bu_finance
 ```
 
-Each pipeline only touches its own Terraform state files. The governance pipeline never writes to `envs/bu_*/terraform.tfstate`. The BU pipeline never writes to `envs/*/data_access/terraform.tfstate`.
+Each command only touches its own Terraform state files. `apply-governance` never writes to `envs/bu_*/terraform.tfstate`. `apply-genie` never writes to `envs/*/data_access/terraform.tfstate`.
 
 ---
 
