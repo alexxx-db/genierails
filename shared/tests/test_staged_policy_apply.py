@@ -274,6 +274,10 @@ class Harness:
         # (Unity Catalog diverging from what Terraform says it applied).
         self.diverge_after: dict = {}
         self.inventory_problems: list[list[str]] = []
+        # "strict": the live check must find the state exactly as rendered, so no
+        # failure-path test can pass on an unexpected divergence. "real": the
+        # controller gets the real check's result (a test of the check itself).
+        self.live_check = "strict"
         self.simulate_access = True
         monkeypatch.delenv("FAKE_TF_FAIL_APPLY", raising=False)
         monkeypatch.delenv("FAKE_TF_FAIL_PLAN", raising=False)
@@ -315,6 +319,8 @@ class Harness:
             # The real live check, reading "Unity Catalog" from the fake state.
             problems = spv.verify(self.env_dir, stages, reader=fake_reader)
             self.inventory_problems.append(problems)
+            if self.live_check == "strict":
+                assert not problems, problems
             return SimpleNamespace(returncode=1 if problems else 0)
         if argv[:2] == ["/bin/sh", "-c"]:
             record = pg.load_stage_record(self.env_dir)
@@ -560,6 +566,7 @@ def test_live_state_diverging_after_switch_is_caught_by_the_real_live_check_and_
     new = write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
     # Only the real staged_policy_verify can notice: verify-access is not simulated here.
     harness.simulate_access = False
+    harness.live_check = "real"
     harness.diverge_after = {"switch": _retag_first_column(next(iter(old["tags"].values())))}
     assert harness.apply() == 1
     assert "verify-access:switch" not in harness.calls  # stopped by the live check, before verify-access
