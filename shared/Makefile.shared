@@ -513,6 +513,11 @@ _SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
 _VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
 _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)"
 
+# 1 when any workspace env of this checkout ($(CLOUD_ROOT)/envs/*, not account
+# or data_access) is deterministic. The account layer is shared, so its
+# tag-policy values may only be removed under the account lock then.
+_ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$(CLOUD_ROOT)/envs" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)"
+
 # 1 when the env is deterministic and configures no agent: governance only.
 _GOVERNANCE_ONLY = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id")))'
 
@@ -849,7 +854,8 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 
 # add-only never removes a live tag-policy value (it refuses instead, pointing
 # at make apply-account); replace removes values no longer desired. A
-# deterministic ENV defaults to add-only; anything else keeps replace.
+# deterministic ENV, or ENV=account while any env is deterministic, defaults
+# to add-only; anything else keeps replace.
 sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG_SYNC_MODE=add-only|replace)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
@@ -857,6 +863,7 @@ sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG
 	if [ -z "$$mode" ]; then \
 		mode=replace; \
 		if [ -f "$(ENV_DIR)/env.auto.tfvars" ] && [ "$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" = deterministic ]; then mode=add-only; fi; \
+		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then mode=add-only; fi; \
 	fi; \
 	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
 
@@ -947,7 +954,12 @@ _apply-layer: _guard-not-ci-apply
 apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or account -> data_access -> workspace for ENV=<workspace>
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
-		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+			echo "=== A deterministic env uses this account layer: applying it through make apply-account (account lock) ==="; \
+			$(MAKE) --no-print-directory apply-account; \
+		else \
+			$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+		fi; \
 		$(MAKE) --no-print-directory wait-tag-policies; \
 	else \
 		$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \

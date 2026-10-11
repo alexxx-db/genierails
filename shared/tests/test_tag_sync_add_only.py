@@ -8,6 +8,7 @@ reports an empty plan.
 
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -56,7 +57,14 @@ class WorkspaceClient:
         self.tag_policies = _Tags()
 ''',
 }
-RUNNER = "#!/bin/sh\n# Terraform stand-in: every plan is empty, every apply succeeds.\nexit 0\n"
+# Terraform stand-in: every plan is empty and every apply succeeds; an apply
+# records whether the account lock was held at that moment.
+RUNNER = """#!/bin/sh
+if [ "$3" = apply ]; then
+  if [ -f "$FAKE_LOCK_PATH" ]; then echo "apply locked" >> "$FAKE_RUNNER_LOG"; else echo "apply unlocked" >> "$FAKE_RUNNER_LOG"; fi
+fi
+exit 0
+"""
 DESIRED = '''tag_policies = [
   { key = "gr_treatment", description = "d", values = ["email_partial__string__0a1b2c3d", "new_value"] },
 ]
@@ -90,7 +98,22 @@ class Repo:
             **{k: v for k, v in os.environ.items() if k not in {"CI", "MAKEFLAGS", "MAKELEVEL", "TAG_SYNC_MODE"}},
             "PYTHONPATH": str(sdk), "PIP_NO_INDEX": "1",
             "FAKE_TAGS_STATE": str(self.state), "FAKE_TAGS_WRITES": str(self.writes),
+            "FAKE_LOCK_PATH": str(self.lock), "FAKE_RUNNER_LOG": str(tmp_path / "runner.log"),
         }
+
+    @property
+    def lock(self):
+        return self.account / "generated" / ".governance.lock"
+
+    def hold_lock(self):
+        """The account lock, held by another live run (this test process)."""
+        self.lock.parent.mkdir(parents=True, exist_ok=True)
+        self.lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(),
+                                         "owner": "release", "started_at": "2026-10-11T00:00:00+00:00"}))
+
+    def applies(self):
+        log = self.tmp / "runner.log"
+        return log.read_text().splitlines() if log.exists() else []
 
     def make(self, target, env="dev", *extra):
         return subprocess.run(
@@ -196,3 +219,59 @@ def test_the_script_defaults_to_add_only(tmp_path):
     assert repo.wrote() == []
     assert repo.script("--mode", "replace").returncode == 0
     assert "retired_by_hand" not in repo.live()["gr_treatment"]
+
+
+# apply-account holds the account lock for the whole account apply.
+def test_apply_account_refuses_while_the_account_lock_is_held_and_writes_nothing(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    repo.hold_lock()
+    result = repo.make("apply-account")
+    assert result.returncode != 0
+    assert "is locked" in result.stderr and "held by make release" in result.stderr
+    assert repo.applies() == [] and repo.wrote() == []
+    assert repo.live() == {k: sorted(v) for k, v in LIVE.items()}
+
+
+def test_apply_account_applies_under_the_lock_and_releases_it(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    result = repo.make("apply-account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert repo.applies() == ["apply locked"]
+    assert not repo.lock.exists()
+
+
+# make apply ENV=account, while any env of this checkout is deterministic,
+# goes through apply-account: same CI guard, account lock and removals.
+def test_apply_env_account_with_a_deterministic_env_refuses_while_the_lock_is_held(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    repo.hold_lock()
+    result = repo.make("apply", "account")
+    assert result.returncode != 0 and "is locked" in result.stderr
+    assert repo.applies() == [] and repo.wrote() == []
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+def test_apply_env_account_with_a_deterministic_env_removes_only_under_the_lock(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    result = repo.make("apply", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "through make apply-account" in result.stdout
+    assert repo.applies() == ["apply locked"]
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+    assert not repo.lock.exists()
+
+
+def test_legacy_apply_env_account_is_unchanged(tmp_path):
+    repo = Repo(tmp_path, LIVE, mode="legacy")
+    result = repo.make("apply", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "through make apply-account" not in result.stdout
+    assert repo.applies() == ["apply unlocked"]
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+
+
+def test_standalone_sync_tags_env_account_with_a_deterministic_env_is_add_only(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    result = repo.make("sync-tags", "account")
+    assert result.returncode != 0 and "make apply-account" in result.stdout
+    assert repo.wrote() == []
