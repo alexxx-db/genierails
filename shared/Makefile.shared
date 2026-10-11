@@ -533,9 +533,9 @@ _guard-account-plan-empty:
 _apply-account-for-workspace:
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
 	if [ "$$mode" = deterministic ]; then \
-		$(MAKE) --no-print-directory _guard-account-plan-empty ENV="$(ENV)" && $(MAKE) --no-print-directory sync-tags; \
+		$(MAKE) --no-print-directory _guard-account-plan-empty ENV="$(ENV)" && $(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only; \
 	else \
-		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
+		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace; \
 	fi
 
 apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account resources in the approved operations stage
@@ -543,7 +543,7 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 
 _apply-account-locked:
 	@$(call _ENV_LOCK,apply-account); \
-	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"
+	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace
 
 rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (verify-access picks and proves a row-pairing key per masked table; VERIFY_KEY_COLUMN optionally overrides)
 	@if [ "$(ENV)" = "prod" ]; then \
@@ -847,10 +847,18 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		$(MAKE) --no-print-directory _plan-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
 	fi
 
-sync-tags: _bootstrap ## Sync tag policy values in the shared account layer
+# add-only never removes a live tag-policy value (it refuses instead, pointing
+# at make apply-account); replace removes values no longer desired. A
+# deterministic ENV defaults to add-only; anything else keeps replace.
+sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG_SYNC_MODE=add-only|replace)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
-	@cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py"
+	@mode="$(TAG_SYNC_MODE)"; \
+	if [ -z "$$mode" ]; then \
+		mode=replace; \
+		if [ -f "$(ENV_DIR)/env.auto.tfvars" ] && [ "$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" = deterministic ]; then mode=add-only; fi; \
+	fi; \
+	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
 
 wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to downstream FGAC APIs
 	@$(MAKE) --no-print-directory _guard-account-config
@@ -878,7 +886,7 @@ _apply-layer: _guard-not-ci-apply
 		$(_COVERAGE_GATE) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags" $(if $(filter 1,$(VERBOSE)),--verbose,); \
 	fi; \
 	if [ "$$layer" = "account" ]; then \
-		$(MAKE) --no-print-directory sync-tags; \
+		$(MAKE) --no-print-directory sync-tags $(if $(TAG_SYNC_MODE),TAG_SYNC_MODE=$(TAG_SYNC_MODE),); \
 	fi; \
 	files="$$env_dir/auth.auto.tfvars $$env_dir/env.auto.tfvars $$env_dir/abac.auto.tfvars $$env_dir/classification.auto.tfvars $$env_dir/discovered_uc_tables.auto.tfvars"; \
 	if [ -f "$$env_dir/masking_functions.sql" ]; then files="$$files $$env_dir/masking_functions.sql"; fi; \
@@ -929,7 +937,7 @@ _apply-layer: _guard-not-ci-apply
 		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" "$$layer" "$$target_env" apply -parallelism=1 -auto-approve $$apply_flags; \
 	fi; \
 	if [ "$$layer" = "account" ]; then \
-		$(MAKE) --no-print-directory sync-tags; \
+		$(MAKE) --no-print-directory sync-tags $(if $(TAG_SYNC_MODE),TAG_SYNC_MODE=$(TAG_SYNC_MODE),); \
 	fi; \
 	printf "%s\n" "$$current_fingerprint" > "$$fingerprint_file"; \
 	if [ -z "$(DEFER_WITHHELD)" ] && { [ "$$layer" = "data_access" ] || [ "$$layer" = "workspace" ]; }; then \

@@ -6,9 +6,23 @@ values after apply, causing "Provider produced inconsistent result" errors.
 This script bypasses Terraform by updating tag policy values directly via
 the Databricks REST API, so Terraform can use ignore_changes = [values] safely.
 
+Modes:
+    add-only  (default) only adds values. If a live value is no longer
+              desired, nothing is written and the run fails, pointing at
+              ``make apply-account``. Deterministic rehearse, release and
+              apply use this: Terraform ignores tag-policy values, so an
+              empty account plan doesn't prove a REST update is safe.
+    replace   makes the live values equal the desired ones, removing the
+              rest. Only account-layer applies use it: ``make apply-account``
+              and the legacy account apply (unchanged behaviour).
+
+In both modes a live deterministic gr_treatment value is kept: only the
+staged retirement removes a generation.
+
 Usage:
-    python3 scripts/sync_tag_policies.py [path/to/abac.auto.tfvars]
+    python3 scripts/sync_tag_policies.py [--mode add-only|replace] [path/to/abac.auto.tfvars]
 """
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -63,10 +77,55 @@ def _str(v):
     return (v[0] if isinstance(v, list) else v or "").strip()
 
 
-def main():
-    tfvars_path = (
-        Path(sys.argv[1]) if len(sys.argv) > 1 else WORK_DIR / "abac.auto.tfvars"
-    )
+APPLY_ACCOUNT_HINT = "Run 'make apply-account' in the approved operations stage to remove them."
+
+
+def plan_updates(desired_policies, existing, mode):
+    """``(updates, refused)``: per-key values to write, and removals add-only refuses.
+
+    ``updates`` is ``[(actual_key, values, added, removed)]``; ``refused`` is
+    ``[(actual_key, values that would be removed)]``.
+    """
+    updates, refused = [], []
+    for tp in desired_policies:
+        key = tp["key"]
+        desired_values = set(tp["values"])
+        # Exact match first, then suffix match (Terraform appends _<hex> suffix
+        # to tag keys for account-level isolation in parallel test environments).
+        current_values = existing.get(key)
+        actual_key = key
+        if current_values is None:
+            for db_key, db_vals in existing.items():
+                if db_key == key or db_key.startswith(key + "_"):
+                    current_values = db_vals
+                    actual_key = db_key
+                    break
+
+        if current_values is None:
+            continue
+
+        # A deterministic treatment value stays allowed while a retained policy
+        # generation or a not-yet-retagged column may still use it; only the
+        # staged retirement removes generations, so this sync never does.
+        desired_values |= retained_deterministic_values(key, current_values)
+        missing = desired_values - current_values
+        removed = current_values - desired_values
+        if mode == "add-only":
+            if removed:
+                refused.append((actual_key, sorted(removed)))
+                continue
+            if not missing:
+                continue
+        updates.append((actual_key, sorted(desired_values), sorted(missing), sorted(removed)))
+    return updates, refused
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Sync tag policy values to Databricks.")
+    parser.add_argument("--mode", choices=("add-only", "replace"), default="add-only")
+    parser.add_argument("tfvars", nargs="?", default=str(WORK_DIR / "abac.auto.tfvars"))
+    args = parser.parse_args(argv)
+    tfvars_path = Path(args.tfvars)
     if not tfvars_path.exists():
         print(f"  [SKIP] {tfvars_path} not found")
         return
@@ -119,52 +178,37 @@ def main():
         print(f"  [ERROR] Could not list tag policies ({list_err})")
         raise SystemExit(1)
 
+    updates, refused = plan_updates(desired_policies, existing, args.mode)
+    if refused:
+        # Nothing is written: a partial sync would leave the account half-updated.
+        print("  [ERROR] Tag policy values are live but no longer desired; this sync only adds values:")
+        for actual_key, values in refused:
+            print(f"    - {actual_key}: would remove {values}")
+        print(f"  {APPLY_ACCOUNT_HINT}")
+        raise SystemExit(1)
+
     updated = 0
-    for tp in desired_policies:
-        key = tp["key"]
-        desired_values = set(tp["values"])
-        # Exact match first, then suffix match (Terraform appends _<hex> suffix
-        # to tag keys for account-level isolation in parallel test environments).
-        current_values = existing.get(key)
-        actual_key = key
-        if current_values is None:
-            for db_key, db_vals in existing.items():
-                if db_key == key or db_key.startswith(key + "_"):
-                    current_values = db_vals
-                    actual_key = db_key
-                    break
-
-        if current_values is None:
-            continue
-
-        # A deterministic treatment value stays allowed while a retained policy
-        # generation or a not-yet-retagged column may still use it; only the
-        # staged retirement removes generations, so this sync never does.
-        desired_values |= retained_deterministic_values(key, current_values)
-        missing = desired_values - current_values
-        removed = current_values - desired_values
-        desired_list = sorted(desired_values)
-
+    for actual_key, values, missing, removed in updates:
         try:
             w.tag_policies.update_tag_policy(
                 tag_key=actual_key,
                 tag_policy=TagPolicy(
                     tag_key=actual_key,
-                    values=[Value(name=v) for v in desired_list],
+                    values=[Value(name=v) for v in values],
                 ),
                 update_mask="values",
             )
             changes = []
             if missing:
-                changes.append(f"added {sorted(missing)}")
+                changes.append(f"added {missing}")
             if removed:
-                changes.append(f"removed {sorted(removed)}")
+                changes.append(f"removed {removed}")
             if not changes:
                 changes.append("reasserted desired values")
             print(f"  [SYNC] {actual_key}: {', '.join(changes)}")
             updated += 1
         except Exception as e:
-            print(f"  [ERROR] {key}: {e}")
+            print(f"  [ERROR] {actual_key}: {e}")
             raise SystemExit(1)
 
     if updated:

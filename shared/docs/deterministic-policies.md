@@ -91,3 +91,13 @@ Each applied generation is snapshotted in
 layer's state. A hook refuses to run when a live generation has no snapshot.
 The account tag sync never removes a live deterministic value; the caller runs
 `sync-tags` and `wait-tag-policies` before `create`.
+
+## Tag-policy values
+
+Rehearse, release and apply in a deterministic env only **add** tag-policy
+values (`sync_tag_policies.py --mode add-only`). Terraform ignores the values,
+so an empty account plan doesn't prove the REST update is safe: when a live
+value is no longer desired, the sync writes nothing, lists the values it would
+remove and fails, pointing at `make apply-account`. Only `make apply-account`
+(CI guard, account lock) runs `--mode replace`, which removes them. Legacy envs
+keep `replace`, as before.
