@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -688,7 +688,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 
 validate: _guarded-bootstrap ## Validate split config in the selected environment
 	@echo "=== Validate ($(ENV)) ==="
-	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
+	@set -e; if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		cd "$(ACCOUNT_ENV_DIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,validate-account) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); fi; \
 	else \
 		cd "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars masking_functions.sql $(call _VALIDATION_FLAGS,validate-data-access) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); fi; \
@@ -792,9 +792,15 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 _PROMOTE_TO_FROM = $(if $(filter command line,$(origin FROM)),$(FROM))
 _PROMOTE_TO_MAP = $(if $(filter command line,$(origin CATALOG_MAP)),$(CATALOG_MAP))
 
-promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod
+# CHECK=1 writes nothing: it reruns promote-to in a scratch copy of envs/ (no
+# credentials or state) and fails if the committed output differs.
+promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
+	if [ "$(CHECK)" = 1 ]; then \
+		$(_CHECK_ENV) promote-check --from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)"; \
+		exit $$?; \
+	fi; \
 	resolved="$$($(_SAVED_SETTINGS) promote-resolve --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" \
 		--from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)")" || exit 1; \
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
@@ -805,6 +811,17 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	if [ -f "$$src_dir/generated/abac.auto.tfvars" ]; then \
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
 	fi
+
+# Read-only PR check (scripts/check_env.py): every step runs in a scratch copy
+# of the cloud dir, so nothing under envs/ is written and no applying target
+# runs; safe under CI=true. ENV_DIR overrides are refused: it checks envs/$(ENV).
+_CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter command line,$(origin ENV_DIR)), --env-dir-override "$(ENV_DIR)",) \
+	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
+
+check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
+	@$(_GUARD_WORKSPACE_ENV); \
+	$(_DRY_RUN_GUARD); \
+	$(_CHECK_ENV) check
 
 _prepare-classification:
 	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)")" || exit 1; \

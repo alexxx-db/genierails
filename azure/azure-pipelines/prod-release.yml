@@ -1,0 +1,133 @@
+# GenieRails prod release (azure), Azure DevOps.
+#
+# Stage 4, "Prod release", of shared/docs/cicd.md. It starts only when the
+# Rehearse stage of the dev pipeline ("genierails-dev-azure") succeeds on main,
+# and releases only a commit that touches envs/prod/**.
+#
+#   make release-plan ENV=prod                     publishes the approval manifest
+#   (Approvals check on the "genierails-prod" environment)
+#   make release ENV=prod MANIFEST=<manifest>      applies exactly that manifest
+#
+# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the two-phase
+# release (rollout step 9). Until both exist the operator releases on the
+# deployment machine with make release ENV=prod, from a clean checkout of
+# the commit this run names, and the CI guard refuses every applying target
+# here (TF_BUILD is set). Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 the
+# plan stage re-runs the read-only check of that exact commit, and the
+# release stage only records the approval gate and the commit to release.
+#
+# Settings: on "genierails-prod" add an Approvals check (a reviewer from the
+# governance code owners; approvers may not approve their own runs), a
+# Branch control check (main only) and an Exclusive Lock check.
+# lockBehavior: runLatest runs one release at a time and lets a newer
+# release supersede pending ones.
+# Auth: OIDC workload identity federation (azure-devops-oidc), no PATs or
+# secrets. Variable group "genierails-ids" holds the IDs:
+#   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
+#   PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: dev
+      source: genierails-dev-azure
+      trigger:
+        branches:
+          include: [main]
+        stages: [Rehearse]
+
+lockBehavior: runLatest
+
+variables:
+  - group: genierails-ids
+  - name: TERRAFORM_VERSION
+    value: '1.11.4'
+
+stages:
+  - stage: Scope
+    displayName: Did the commit touch envs/prod?
+    jobs:
+      - job: scope
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 2
+
+          - script: |
+              if [ "$(Build.SourceVersion)" != "$(resources.pipeline.dev.sourceCommit)" ]; then
+                echo "##[error]checked out $(Build.SourceVersion), but dev rehearsed $(resources.pipeline.dev.sourceCommit)"
+                exit 1
+              fi
+              if git diff --name-only HEAD^ HEAD -- envs/prod | grep -q .; then
+                echo "##vso[task.setvariable variable=prod;isOutput=true]true"
+              fi
+            name: diff
+            workingDirectory: azure
+
+  - stage: ReleasePlan
+    displayName: Release plan (v1, check only; REQUIRES PROD REMOTE STATE)
+    dependsOn: Scope
+    condition: and(succeeded(), eq(dependencies.Scope.outputs['scope.diff.prod'], 'true'))
+    jobs:
+      - job: plan
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.11'
+
+          - script: |
+              pip install python-hcl2 databricks-sdk pytest
+              curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
+              sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
+            displayName: Install dependencies and Terraform
+
+          - script: |
+              mkdir -p envs/prod
+              printf '%s\n' \
+                "databricks_account_id     = \"$ACCOUNT_ID\"" \
+                "databricks_client_id      = \"$CLIENT_ID\"" \
+                'databricks_client_secret  = ""' \
+                "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
+                "databricks_workspace_host = \"$HOST\"" > envs/prod/auth.auto.tfvars
+            displayName: Write OIDC auth file (IDs only, no secrets)
+            workingDirectory: azure
+            env:
+              ACCOUNT_ID: $(DATABRICKS_ACCOUNT_ID)
+              CLIENT_ID: $(PROD_READONLY_CLIENT_ID)
+              WORKSPACE_ID: $(PROD_DATABRICKS_WORKSPACE_ID)
+              HOST: $(PROD_DATABRICKS_WORKSPACE_HOST)
+
+          # TODO(rollout step 9): run the release plan here and publish its
+          # manifest as a pipeline artifact; the release stage applies it.
+          - script: make check ENV=prod
+            displayName: Read-only check of the commit to release
+            workingDirectory: azure
+            env:
+              DATABRICKS_AUTH_TYPE: azure-devops-oidc
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+  - stage: Release
+    displayName: Release (v1, runs on the deployment machine; REQUIRES PROD REMOTE STATE)
+    dependsOn: ReleasePlan
+    jobs:
+      - deployment: release
+        pool:
+          vmImage: ubuntu-latest
+        environment: genierails-prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # TODO(deferred, section 15): apply the approved manifest here
+                # once prod has remote state with locking.
+                - script: |
+                    echo "##[warning]Prod release not run in CI (v1); prod remote state is not built yet."
+                    echo "Release approved commit $(resources.pipeline.dev.sourceCommit) on the deployment machine (see this pipeline's header)."
+                  displayName: Release runs on the deployment machine (v1)

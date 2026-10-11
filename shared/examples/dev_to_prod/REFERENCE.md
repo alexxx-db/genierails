@@ -50,6 +50,8 @@ So "expose last" isn't a policy you hope holds — there is simply no new or wid
 | `make release ENV=prod` | 4 | (prod) Placeholder guard → read-only row-pairing key check (admin only; refuses before the lock) → lock → live derive → validate → coverage → promote → `verify-access-keys` (admin-only proof of every masked table's row-pairing key; refuses before any apply) → read-only rulebook audit → all-layer apply → `verify-access` |
 | `make maintain ENV=prod` | 5 | (prod, scheduled) audit-schema → derive-assignments → coverage-gate → validate-generated → audit-rulebook → apply-governance; reconciles governance including SELECT for already-covered tables, never widens access past a passing coverage check, and never changes Genie. Skips unchanged inputs, so it does not repair grants revoked outside Terraform |
 | `make promote-to ENV=prod` | 2 | Promote **rules only** using `promote_from` and `catalog_map` from prod `env.auto.tfvars` (leaves tag assignments behind). `FROM=`/`CATALOG_MAP=` are optional overrides. Policy names take the prod catalog (`gr_mask_<prod_catalog>_<treatment>`) only when a read-only policy listing of the prod catalog (prod `auth.auto.tfvars`) shows neither the old nor the new name and prod's state doesn't hold the old key; otherwise it keeps its name, since renaming a live policy would drop and recreate it |
+| `make promote-to ENV=prod CHECK=1` | PR check | Read-only. Re-runs `promote-to` in a scratch copy of `envs/` with no credentials or Terraform state, from the committed files only, and fails if any committed file it writes differs (diff shown). Writes nothing. Policy names come out as a first promote names them, since the copy has no prod state |
+| `make check ENV=<e>` | PR check | Read-only; safe in CI. In a scratch copy of the cloud dir: `validate` → generated files current (deterministic envs: re-split `generated/` and re-record the governed tables, then compare; with `promote_from` set or `ENV=prod`, also `promote-to CHECK=1`; legacy envs skip this with a note) → `validate-generated` → offline coverage check → mask-library unit tests → a **structural** `plan` (committed config against empty state, live tags not re-read; no env has remote state yet). Stops at the first failure and exits non-zero. Never writes `envs/` or calls a Databricks write API |
 | `make promote SOURCE_ENV=dev DEST_ENV=prod DEST_CATALOG_MAP="dev_cat=prod_cat"` | — | The same promotion with explicit arguments every time (nothing saved); `make promote ENV=<e>` alone splits `generated/` into layers |
 | `make verify-access ENV=<e>` | 1/4 | Prove masking by querying as per-tier test principals (**needs the business grants applied**); the row-pairing key is picked per table (optional overrides: `verify_key_columns`, `VERIFY_KEY_COLUMN=<col>`) |
 | `make verify-access-keys ENV=<e>` | 4 | Admin only, no grants: pick and prove a row-pairing key for every masked table (`make release` runs a read-only form before its lock, and this before applying) |
@@ -110,6 +112,9 @@ validation, unit tests, coverage checks, and audits. The
 `GENIERAILS_ALLOW_CI_APPLY=1` escape hatch is an internal switch used only by
 GenieRails' own throwaway integration-test jobs; never set it on a deployment
 job. Run `make release ENV=prod` from the persistent deployment workspace.
+`make check` and `make promote-to CHECK=1` are read-only and run in CI; see
+[CI/CD](../../docs/cicd.md#pipeline-samples-where-each-command-runs) for the
+pipeline samples.
 
 ---
 

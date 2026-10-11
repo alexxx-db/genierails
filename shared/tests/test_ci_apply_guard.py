@@ -54,10 +54,13 @@ def test_every_applying_target_refuses_in_ci(cloud, target):
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
-@pytest.mark.parametrize("target", ["plan", "validate", "test-unit", "coverage-gate", "audit-schema"])
+@pytest.mark.parametrize("target", [
+    ["plan"], ["validate"], ["test-unit"], ["coverage-gate"], ["audit-schema"], ["check"],
+    ["promote-to", "CHECK=1"],
+])
 def test_read_only_targets_have_no_ci_refusal(cloud, target):
     proc = subprocess.run(
-        ["make", "-n", "-f", str(ROOT / cloud / "Makefile"), target, "ENV=dev", "CI=true"],
+        ["make", "-n", "-f", str(ROOT / cloud / "Makefile"), *target, "ENV=dev", "CI=true"],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -94,17 +97,31 @@ def test_ci_workflow_scopes_apply_opt_out_to_integration_steps():
     assert "GENIERAILS_ALLOW_CI_APPLY" not in unit_job
 
 
-def test_shipped_workflows_do_not_run_guarded_targets_without_opt_out():
-    workflow_paths = sorted(
-        path
+SAMPLE_DIRS = (".github", "azure-pipelines")
+# GitHub Actions steps sit at six spaces; Azure DevOps steps start with a step keyword.
+STEP_SPLIT = {
+    ".github": r"(?m)^      - ",
+    "azure-pipelines": r"(?m)^\s*- (?:script|bash|pwsh|powershell|task|checkout|template|download|publish):",
+}
+
+
+def _sample_workflows():
+    return sorted(
+        (sample_dir, path)
         for cloud in ("aws", "azure")
+        for sample_dir in SAMPLE_DIRS
         for suffix in ("*.yml", "*.yaml")
-        for path in (ROOT / cloud / ".github").rglob(suffix)
+        for path in (ROOT / cloud / sample_dir).rglob(suffix)
     )
-    assert workflow_paths
-    for path in workflow_paths:
+
+
+def test_shipped_workflows_do_not_run_guarded_targets_without_opt_out():
+    workflow_paths = _sample_workflows()
+    assert {sample_dir for sample_dir, _ in workflow_paths} == set(SAMPLE_DIRS)
+    for sample_dir, path in workflow_paths:
         text = path.read_text()
-        steps = re.split(r"(?m)^      - ", text)[1:]
+        steps = re.split(STEP_SPLIT[sample_dir], text)[1:]
+        assert steps, f"{path}: no steps found"
         executed_targets = set()
         for step in steps:
             targets = re.findall(r"\bmake\s+(?:--no-print-directory\s+)?([A-Za-z_][\w-]*)", step)
@@ -112,9 +129,38 @@ def test_shipped_workflows_do_not_run_guarded_targets_without_opt_out():
             opted_out = bool(re.search(r"GENIERAILS_ALLOW_CI_APPLY:\s*['\"]?1['\"]?", step))
             guarded = set(targets) & set(APPLYING_TARGETS)
             assert not guarded or opted_out, f"{path} runs guarded targets without opt-out: {sorted(guarded)}"
-        if path.name == "deploy.yml":
-            assert "GENIERAILS_ALLOW_CI_APPLY" not in text
-            assert not (executed_targets & set(APPLYING_TARGETS))
+        # Samples are for customer pipelines, never the throwaway integration
+        # workspace: none opts out of the guard or runs an applying target.
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        assert "GENIERAILS_ALLOW_CI_APPLY" not in code, path
+        assert not (executed_targets & set(APPLYING_TARGETS)), f"{path}: {sorted(executed_targets)}"
+
+
+@pytest.mark.parametrize("stage", ["dev-rehearse", "prod-release", "prod-maintain"])
+def test_applying_stage_samples_are_marked_as_needing_remote_state(stage):
+    for cloud in ("aws", "azure"):
+        for sample_dir in SAMPLE_DIRS:
+            text = (ROOT / cloud / sample_dir / ("workflows" if sample_dir == ".github" else "") / f"{stage}.yml").read_text()
+            assert "REQUIRES DEV REMOTE STATE" in text or "REQUIRES PROD REMOTE STATE" in text
+            assert "deployment machine" in text
+            assert "make check" in text or "make audit-schema" in text
+
+
+def test_dev_samples_queue_every_commit_and_never_cancel():
+    for cloud in ("aws", "azure"):
+        github = (ROOT / cloud / ".github" / "workflows" / "dev-rehearse.yml").read_text()
+        assert "concurrency:" not in github and "cancel-in-progress: true" not in github
+        assert "needs: queue" in github
+        devops = (ROOT / cloud / "azure-pipelines" / "dev-rehearse.yml").read_text()
+        assert "lockBehavior: sequential" in devops and "batch: false" in devops
+
+
+def test_samples_use_oidc_not_secrets():
+    for _, path in _sample_workflows():
+        text = path.read_text()
+        assert "${{ secrets." not in text and "$(secrets" not in text and "CLIENT_SECRET:" not in text, path
+        if "make check" in text or "make audit-schema" in text:
+            assert "github-oidc" in text or "azure-devops-oidc" in text, path
 
 
 def test_workspace_guard_runs_env_validator_and_rejects_bad_tfvars(tmp_path):
