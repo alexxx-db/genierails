@@ -170,12 +170,6 @@ variable "governance_mode" {
   default = "legacy"
 }
 
-variable "governance" {
-  type        = string
-  default     = "genierails"
-  description = "Deterministic envs: genierails (this layer derives masks and grants SELECT from table_readers) or external (another tool governs the tables; this layer is not used)."
-}
-
 variable "table_readers" {
   type        = map(list(string))
   default     = null

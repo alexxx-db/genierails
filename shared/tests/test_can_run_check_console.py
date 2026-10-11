@@ -123,9 +123,12 @@ class _Live:
 
     def read(self, tables):
         import agent_coverage as ac
+        value = "email_partial__string__0a1b2c3d"
+        own = {"name": f"cat_gr_mask_cat_{value}_partial", "function_name": f"cat.sch.gr_mask_{value}_partial",
+               "policy_type": "POLICY_TYPE_COLUMN_MASK", "conditions": [f"hasTagValue('gr_treatment', '{value}')"]}
         return ac.Snapshot(
-            column_tags={"cat.sch.customers": {"email": {("class.email_address", "")}}},
-            table_masks={"cat.sch.customers.email"} if self.masked else set(),
+            column_tags={"cat.sch.customers": {"email": {("class.email_address", ""), ("gr_treatment", value)}}},
+            policies={"cat.sch.customers": [own]} if self.masked else {},
             grants={("CATALOG", "cat"): {("partial", "USE_CATALOG")}, ("SCHEMA", "cat.sch"): {("partial", "USE_SCHEMA")},
                     ("TABLE", "cat.sch.customers"): {("partial", "SELECT")}})
 

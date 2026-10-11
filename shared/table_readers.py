@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 SETTING = "table_readers"
-GOVERNANCE_VALUES = ("genierails", "external")
 # Built-in principals that would reach everyone. Never a reader.
 EVERYONE = frozenset({"account users", "users"})
 # Agents whose first-import proposal was already written (committed record).
@@ -50,11 +49,6 @@ def _load_hcl(path: Path) -> dict:
     except Exception as exc:
         raise TableReadersError(f"cannot parse {path}: {exc}") from exc
     return value if isinstance(value, dict) else {}
-
-
-def governance(cfg: Mapping) -> str:
-    """genierails (default) or external; meaningful only in deterministic envs."""
-    return str(cfg.get("governance") or "genierails")
 
 
 def deterministic(cfg: Mapping) -> bool:
@@ -114,27 +108,15 @@ def covered(table: str, table_readers: Mapping[str, Iterable[str]]) -> bool:
 
 
 def validation_errors(cfg: Mapping) -> list[str]:
-    """Schema errors for ``governance`` and ``table_readers`` (validate_config adds them)."""
+    """Schema errors for ``table_readers`` (validate_config adds them)."""
     errors: list[str] = []
     mode = cfg.get("governance_mode", "legacy")
-    value = cfg.get("governance")
-    if value is not None:
-        if value not in GOVERNANCE_VALUES:
-            errors.append('governance must be "genierails" or "external"')
-        elif mode != "deterministic":
-            errors.append('governance applies only with governance_mode = "deterministic"; '
-                          "remove it from this legacy env")
     readers = cfg.get(SETTING)
     if readers is None:
         return errors
     if mode != "deterministic":
         errors.append(f'{SETTING} applies only with governance_mode = "deterministic"; '
                       "legacy envs keep their own grants")
-        return errors
-    if governance(cfg) == "external":
-        if readers:
-            errors.append(f'{SETTING} must be empty with governance = "external": GenieRails grants no '
-                          "SELECT there; grant it in the tool that governs these tables")
         return errors
     if not isinstance(readers, dict):
         return errors + [f"{SETTING} must be a map of table to reader groups"]
@@ -208,11 +190,10 @@ def agents(env_dir: Path, cfg: Mapping | None = None) -> list[dict]:
 
 
 def access_problems(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
-    """Every acl_groups group that can't read one of its agent's tables (genierails mode).
+    """Every acl_groups group that can't read one of its agent's tables through table_readers.
 
     Decision 4: a deterministic agent without acl_groups stops the run
-    ([] means nobody). External governance is checked live instead
-    (scripts/agent_coverage.py), since GenieRails grants nothing there.
+    ([] means nobody).
     """
     env_dir = Path(env_dir)
     cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
@@ -226,7 +207,7 @@ def access_problems(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
             problems.append(f"agent {agent['name']} has no acl_groups: list the groups that may run it "
                             "([] means nobody)")
             continue
-        if not groups or governance(cfg) == "external":
+        if not groups:
             continue
         if not agent["tables"]:
             problems.append(f"agent {agent['name']}: no tables are known for it; run make generate first")
@@ -269,7 +250,7 @@ def proposals(env_dir: Path, cfg: Mapping | None = None) -> tuple[dict[str, list
     """
     env_dir = Path(env_dir)
     cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
-    if not deterministic(cfg) or governance(cfg) != "genierails":
+    if not deterministic(cfg):
         return {}, []
     existing = normalize(cfg.get(SETTING), str(cfg.get("uc_catalog") or ""))
     allowed = set(cfg.get("access_tier_groups") or []) | set(cfg.get("raw_exempt_principals") or [])
@@ -341,8 +322,6 @@ def describe(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
     cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
     if not deterministic(cfg):
         return []
-    if governance(cfg) == "external":
-        return ['Table readers: governance = "external": GenieRails grants no SELECT in this env.']
     if cfg.get(SETTING) is None:
         return ["Table readers: table_readers is not set, so GenieRails grants no SELECT "
                 "(masks apply to whoever already has access)."]

@@ -199,7 +199,6 @@ locals {
   agent_coverage_inputs = {
     version    = 1
     deployment = local.deployment_binding
-    governance = var.governance
     max_age    = var.coverage_gate_max_age
     # Tables of agents known only by ID come from make generate's discovery.
     discovered = fileexists(local._discovered_file) ? filesha256(local._discovered_file) : ""
@@ -576,16 +575,6 @@ variable "governance_mode" {
   validation {
     condition     = contains(["legacy", "deterministic"], var.governance_mode)
     error_message = "governance_mode must be legacy or deterministic."
-  }
-}
-
-variable "governance" {
-  type        = string
-  default     = "genierails"
-  description = "Deterministic envs only: genierails or external (another tool governs the tables). Either way CAN_RUN opens only after the live agent coverage check."
-  validation {
-    condition     = contains(["genierails", "external"], var.governance)
-    error_message = "governance must be \"genierails\" or \"external\"."
   }
 }
 

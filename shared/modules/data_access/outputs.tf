@@ -87,10 +87,6 @@ output "access_config" {
   } : null
 
   precondition {
-    condition     = !(var.governance_mode == "deterministic" && var.governance == "external")
-    error_message = "governance = \"external\": another tool governs these tables, so GenieRails manages nothing in the data_access layer (make skips it). Remove governance = \"external\" to have GenieRails govern them."
-  }
-  precondition {
     condition     = length(local.table_readers_bad_keys) == 0
     error_message = "table_readers keys must be catalog.schema.table or catalog.schema.* (schema.table with uc_catalog set); invalid: ${join(", ", local.table_readers_bad_keys)}."
   }

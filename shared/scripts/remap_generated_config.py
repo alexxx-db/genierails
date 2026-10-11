@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import threading
@@ -322,7 +323,50 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Destination auth.auto.tfvars, for a read-only listing of live policies.",
     )
+    parser.add_argument(
+        "--group-map-env",
+        metavar="PATH",
+        type=Path,
+        help="Destination env.auto.tfvars: in a deterministic destination its group_map renames "
+             "the policies' principals (the source's raw_exempt_principals are never mapped).",
+    )
+    parser.add_argument("--source-env", metavar="PATH", type=Path,
+                        help="Source env.auto.tfvars (its raw_exempt_principals).")
     return parser.parse_args()
+
+
+_PRINCIPALS_LINE = re.compile(r'^(?P<lead>\s*(?:to|except)_principals\s*=\s*)(?P<list>\[[^\]\n]*\])(?P<tail>\s*)$',
+                              re.MULTILINE)
+
+
+def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str]) -> str:
+    """Rename policy principals through group_map (decision 8); nothing else changes."""
+    if not group_map:
+        return hcl_text
+
+    def rename(match: re.Match) -> str:
+        names = json.loads(match["list"])
+        mapped = []
+        for name in names:
+            target = name if name in exempt else group_map.get(name, name)
+            if target not in mapped:
+                mapped.append(target)
+        return f"{match['lead']}[{', '.join(json.dumps(n) for n in mapped)}]{match['tail']}"
+
+    return _PRINCIPALS_LINE.sub(rename, hcl_text)
+
+
+def _group_map_inputs(args) -> tuple[dict[str, str], set[str]]:
+    import hcl2
+
+    if not args.group_map_env or not args.group_map_env.is_file():
+        return {}, set()
+    dest = hcl2.loads(args.group_map_env.read_text())
+    if dest.get("governance_mode", "legacy") != "deterministic":
+        return {}, set()
+    source = hcl2.loads(args.source_env.read_text()) if args.source_env and args.source_env.is_file() else {}
+    return ({str(k): str(v) for k, v in (dest.get("group_map") or {}).items()},
+            {str(p) for p in source.get("raw_exempt_principals") or []})
 
 
 def parse_catalog_pairs(raw_pairs: list[str]) -> list[tuple[str, str]]:
@@ -467,7 +511,8 @@ def main() -> None:
         elif not args.quiet_remaps:
             print(f"  Catalog remap: {src} -> {dest}")
 
-    args.out_abac.write_text(remapped_hcl)
+    group_map, exempt = _group_map_inputs(args)
+    args.out_abac.write_text(map_principals(remapped_hcl, group_map, exempt))
     print(f"  Wrote remapped generated config: {args.out_abac}")
 
     if remapped_sql is not None:

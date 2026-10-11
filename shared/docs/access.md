@@ -31,7 +31,7 @@ table_readers = {
 - New `SELECT` waits for a passing coverage check, as before. Removing an
   entry revokes the `SELECT` it granted, with no check needed.
 - `table_readers` is env-owned: the first `make promote-to` seeds prod from
-  dev (catalogs remapped); later promotions keep prod's value and print how
+  dev (catalogs remapped, groups through `group_map`); later promotions keep prod's value and print how
   it differs from dev.
 - No `table_readers` means GenieRails grants no `SELECT`.
 
@@ -54,12 +54,15 @@ removed. Review the proposal before committing.
 
 `CAN_RUN` no longer depends on the data_access layer's Terraform state.
 Before every workspace plan and apply, `make` runs
-`scripts/agent_coverage.py`, which checks Unity Catalog live, whoever made
-the masks:
+`scripts/agent_coverage.py`, which checks Unity Catalog live against
+GenieRails' own governance:
 
-1. every classified column (`class.*` tag) of each agent's tables has an
-   effective column mask (a table-attached mask, or a column-mask policy in
-   effect on the table whose condition names one of the column's tags);
+1. every classified column (`class.*` tag) of each agent's tables has a
+   GenieRails mask in effect (a GenieRails column-mask policy whose condition
+   names one of the column's tags). GenieRails supports only governance it
+   generates: a table-attached mask or a policy made in the UI or by another
+   tool doesn't count, and the external-mask inventory refuses rehearse,
+   release and maintain while one is on a governed table;
 2. every `acl_groups` group can `SELECT` each table (directly, through a
    group it is nested in, or `account users`, with `USE CATALOG` and
    `USE SCHEMA`), or owns it.
@@ -72,28 +75,39 @@ in a result for exactly the current inputs and no older than
 hand-edited result withholds new groups; removing or keeping `CAN_RUN`
 always applies, and `make` exits non-zero naming what it withheld.
 
-The check proves a mask exists on every classified column and that the
-groups can read. It can't prove a mask another tool made is the right one
-for each tier.
+The check catches masks or grants changed outside GenieRails since the last
+apply; it doesn't re-verify each tier's output (that is `verify-access`).
 
-## `governance = "external"`
+## Group names in prod: `group_map`
+
+`access_tier_groups` is governance: `make promote-to` copies dev's tiers to
+prod on every promotion, so prod uses exactly the rehearsed tiers. Where
+prod's group names differ, set an env-owned map in `envs/prod/env.auto.tfvars`:
 
 ```hcl
-governance_mode = "deterministic"
-governance      = "external"   # default "genierails"
+group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
 ```
 
-For agents on tables another tool governs:
-
-- GenieRails derives no treatments, masks or policies, grants no `SELECT`
-  (`table_readers` must be empty), skips the account and data_access layers
-  and the external-mask refusal, and `make generate` only imports agents.
-- `CAN_RUN` still opens only after the live agent coverage check passed.
-- `make release` applies the agents under the env lock; `make maintain`
-  re-runs the live check and fails when an agent no longer passes.
-
-`governance` is env-owned: the first promotion seeds it, later promotions
-keep the destination's.
+- `promote-to` maps every group it writes: `access_tier_groups`, the groups
+  in `row_filters`, the principals of the promoted policies, and the first
+  seeding of `acl_groups` and `table_readers`. A dev group with no mapping
+  keeps its name. Later promotions keep prod's own `acl_groups` and
+  `table_readers`, and print how dev's (mapped) values differ.
+- `raw_exempt_principals` are env-owned and never mapped; a `group_map` key
+  that is one is refused. Many-to-one mappings are refused (they would merge
+  tiers or readers), and so is mapping `account users`.
+- `promote-to` reads only committed files. `rehearse` and `release` check
+  live, before the lock: every group the env names (tiers, readers,
+  `acl_groups`, row-filter groups, mapped or not) must exist in the
+  workspace.
+- Nested groups are expanded only after mapping: the reader and agent
+  checks read the destination's own (mapped) config.
+- Adding, removing or retargeting a mapping is a weakening. Compared with
+  the `group_map` the last successful rehearse or release used, each change
+  stops the run until `envs/<env>/ack.txt` has
+  `<env>:weaken:group_map:<dev>=<target>` (for a removed mapping the target
+  is the dev group itself).
+- Legacy destinations keep their own tiers on re-promotion, as before.
 
 ## Upgrading an existing deterministic env
 

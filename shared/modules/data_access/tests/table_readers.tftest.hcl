@@ -6,8 +6,7 @@
 #     raw_exempt_principals is refused;
 #   - new SELECT still waits for a coverage check pass; removing an entry
 #     revokes what it granted without one;
-#   - an unset table_readers never silently revokes grants already applied,
-#     and governance = "external" manages nothing here.
+#   - an unset table_readers never silently revokes grants already applied.
 
 mock_provider "databricks" {
   alias = "account"
@@ -242,19 +241,6 @@ run "unset_table_readers_grants_nothing_on_a_fresh_env" {
     condition     = length(databricks_grant.table_access) == 0 && length(output.withheld_table_grants.grants) == 0
     error_message = "no table_readers means GenieRails grants no SELECT"
   }
-}
-
-run "external_governance_manages_nothing_here" {
-  command = plan
-  providers = {
-    databricks.account   = databricks.account
-    databricks.workspace = databricks.workspace
-    time                 = time
-  }
-  variables {
-    governance = "external"
-  }
-  expect_failures = [output.access_config]
 }
 
 # Legacy envs ignore table_readers entirely.

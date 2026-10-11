@@ -29,6 +29,7 @@ from scripts.footprint import (
     resolve_footprint,
 )
 from scripts.remap_generated_config import remap_hcl
+from group_map import map_groups as _map_groups, mapping as _group_mapping, validation_errors as _group_map_errors
 from table_readers import normalize as _normalize_readers
 from verify_effective_access import normalize_key_map
 from walkthrough_marker import PROMOTED_HEADER, follows_walkthrough
@@ -123,14 +124,25 @@ def _deployed_space_keys(dest_env_dir: str) -> dict[str, list[str]]:
     return keys
 
 
-def _promoted_access_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict) -> list[str]:
-    """Preserve destination tiers on re-promote; seed them from source initially."""
+def _promoted_access_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict,
+                                 deterministic: bool = False, map_groups=None) -> list[str]:
+    """Deterministic destinations get the source's tiers through group_map on
+    every promotion (decision 8: tiers are promoted governance). Legacy ones
+    keep their own tiers on re-promote and are seeded from the source initially."""
     shared_root = str(Path(__file__).resolve().parent.parent)
     if shared_root not in sys.path:
         sys.path.insert(0, shared_root)
-    from access_tier_groups import promoted_lines
+    from access_tier_groups import persisted_access_tier_groups, promoted_lines, render
 
     try:
+        if deterministic:
+            tiers = map_groups(persisted_access_tier_groups(cfg, Path(source_env_dir) / "env.auto.tfvars"))
+            if "access_tier_groups" in dest_cfg and dest_cfg["access_tier_groups"] != tiers:
+                print(f"  access_tier_groups promoted: {dest_cfg['access_tier_groups']!r} -> {tiers!r}")
+            if not tiers:
+                return []
+            return ["", "# Same access tiers as the promoted rules (most to least privileged), through group_map.",
+                    render(tiers)]
         if "access_tier_groups" in dest_cfg:
             return ["", "access_tier_groups = " + json.dumps(dest_cfg["access_tier_groups"])]
         return promoted_lines(cfg, Path(source_env_dir) / "env.auto.tfvars")
@@ -429,18 +441,30 @@ def main():
     # Each env migrates to deterministic governance on its own, so the mode is
     # the destination's: kept as it is, never copied from the source.
     preserved_mode = _str(dest_cfg.get("governance_mode", "")) if "governance_mode" in dest_cfg else None
-    # governance (genierails or external) and table_readers are env-owned: the
-    # first promotion seeds them from the source (table_readers keys remapped
-    # to the destination catalogs); later promotions keep the destination's and
-    # print how they differ. raw_exempt_principals is the destination's alone.
-    governance_seeded = "governance" not in dest_cfg and "governance" in cfg
-    promoted_governance = (_str(dest_cfg["governance"]) if "governance" in dest_cfg
-                           else _str(cfg["governance"]) if "governance" in cfg else None)
+    # Deterministic destinations (decision 8): group names in everything this
+    # promotion writes go through the destination's env-owned group_map (a dev
+    # group with no mapping keeps its name). raw_exempt_principals are never
+    # mapped: the source's stay out of the mapping, the destination keeps its own.
+    dest_deterministic = preserved_mode == "deterministic"
+    map_errors = _group_map_errors(dest_cfg)
+    if map_errors:
+        for error in map_errors:
+            print(f"ERROR: destination {error}; nothing was written.")
+        sys.exit(1)
+    group_map = _group_mapping(dest_cfg) if dest_deterministic else {}
+    source_exempt = [_str(p) for p in cfg.get("raw_exempt_principals") or []]
+
+    def map_groups(groups):
+        return _map_groups(groups or [], group_map, source_exempt)
+
+    # table_readers is env-owned: the first promotion seeds it from the source
+    # (keys remapped to the destination catalogs, groups through group_map);
+    # later promotions keep the destination's and print how they differ.
     source_readers = None
     if cfg.get("table_readers") is not None:
         source_uc_catalog = _str(cfg.get("uc_catalog", ""))
         source_readers = {
-            remap_table(table): readers for table, readers in
+            remap_table(table): map_groups(readers) for table, readers in
             _normalize_readers(cfg.get("table_readers"), source_uc_catalog).items()
         }
     readers_seeded = "table_readers" not in dest_cfg and source_readers is not None
@@ -490,8 +514,8 @@ def main():
         print("  Dropped the retired business_access_enabled setting from the destination")
     if preserved_mode is not None:
         print(f"  Preserved destination governance_mode={preserved_mode!r}")
-    if promoted_governance is not None:
-        print(f"  {'Seeded' if governance_seeded else 'Preserved destination'} governance={promoted_governance!r}")
+    if group_map:
+        print("  group_map: " + ", ".join(f"{dev} -> {target}" for dev, target in sorted(group_map.items())))
     if readers_seeded:
         print(f"  Seeded table_readers from {source_env} ({len(source_readers)} entr(y/ies), catalogs remapped); "
               "from now on the destination keeps its own")
@@ -596,6 +620,8 @@ def main():
                 )
                 sys.exit(1)
             if acl_groups is not None:
+                if not is_repromote:
+                    acl_groups = map_groups(acl_groups)
                 rendered_acl = ", ".join(json.dumps(group) for group in acl_groups)
                 lines.append(f"    acl_groups       = [{rendered_acl}]")
         if is_repromote:
@@ -610,6 +636,8 @@ def main():
                     "(destination policy derivation remains authoritative)"
                 )
             source_acl = space.get("acl_groups")
+            if isinstance(source_acl, list):
+                source_acl = map_groups(source_acl)
             dest_acl = dest_space.get("acl_groups")
             if isinstance(source_acl, list) and isinstance(dest_acl, list):
                 added = sorted(set(source_acl) - set(dest_acl))
@@ -652,8 +680,23 @@ def main():
     lines.append("enable_classification = true")
     if preserved_mode is not None:
         lines.append(f"governance_mode = {json.dumps(preserved_mode)}")
-    if promoted_governance is not None:
-        lines.append(f"governance = {json.dumps(promoted_governance)}")
+    if "group_map" in dest_cfg:
+        lines.append("")
+        lines.append("# Dev group names to this env's (env-owned; changing it needs an ack).")
+        lines.append("group_map = {")
+        lines.extend(f"  {json.dumps(dev)} = {json.dumps(target)}" for dev, target in sorted(_group_mapping(dest_cfg).items()))
+        lines.append("}")
+    source_filters = cfg.get("row_filters") or []
+    if dest_deterministic and source_filters:
+        lines.append("")
+        lines.append("# Declared row filters, promoted (tables remapped, groups through group_map).")
+        lines.append("row_filters = [")
+        for rule in source_filters:
+            values = {map_groups([group])[0]: literals for group, literals in (rule.get("values_by_group") or {}).items()}
+            lines.append(f"  {{ table = {json.dumps(remap_table(_str(rule.get('table'))))}, "
+                         f"column = {json.dumps(_str(rule.get('column')))}, values_by_group = {{ "
+                         + ", ".join(f"{json.dumps(g)} = {json.dumps(v)}" for g, v in values.items()) + " } },")
+        lines.append("]")
     if preserved_exempt:
         lines.append("raw_exempt_principals = [" + ", ".join(json.dumps(p) for p in preserved_exempt) + "]")
     if promoted_readers is not None:
@@ -672,7 +715,7 @@ def main():
         lines.append("coverage_acknowledged_columns = [")
         lines.extend(f"  {json.dumps(column)}," for column in preserved_acknowledged)
         lines.append("]")
-    lines.extend(_promoted_access_tier_groups(cfg, source_env_dir, dest_cfg))
+    lines.extend(_promoted_access_tier_groups(cfg, source_env_dir, dest_cfg, dest_deterministic, map_groups))
     if preserved_promote:
         lines.append("")
         lines.append("# Saved by make promote-to (source env + catalog map for the next promote).")

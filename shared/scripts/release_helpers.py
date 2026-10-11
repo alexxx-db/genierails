@@ -110,13 +110,11 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
 def access_summary(env_dir: Path) -> list[str]:
     """What a deterministic release granted, by mode; never claims access nothing grants."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from table_readers import _load_hcl, agents, governance, normalize
+    from table_readers import _load_hcl, agents, normalize
 
     cfg = _load_hcl(env_dir / "env.auto.tfvars")
     lines = []
-    if governance(cfg) == "external":
-        lines.append('  Table access:  not granted by GenieRails (governance = "external"; another tool governs it)')
-    elif normalize(cfg.get("table_readers")):
+    if normalize(cfg.get("table_readers")):
         lines.append("  Table access:  SELECT from table_readers (new grants only after the coverage check passed)")
     else:
         lines.append("  Table access:  none granted (no table_readers); masks apply to whoever already has access")

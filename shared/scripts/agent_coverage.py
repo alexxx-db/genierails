@@ -8,14 +8,17 @@ state. Before every workspace plan/apply of a deterministic env, make runs
 
 which asks Terraform (terraform console on the workspace root, same var
 files and -var flags as the apply) for each agent's acl_groups and tables and
-the fingerprint of those inputs, then checks Unity Catalog live, whoever made
-the masks (GenieRails or, with governance = "external", another tool):
+the fingerprint of those inputs, then checks Unity Catalog live against
+GenieRails' own governance (design decision 9: GenieRails supports only
+governance it generates):
 
-  1. every classified column (any ``class.*`` tag) of each agent table has an
-     effective column mask: a table-attached mask, or a column-mask ABAC
-     policy in effect on the table whose match condition names one of the
-     column's tags (the policy listing external_mask_inventory.py uses, read
-     with the rulebook's condition parser);
+  1. every classified column (any ``class.*`` tag) of each agent table has a
+     GenieRails mask in effect: a column-mask ABAC policy on the table (or
+     its schema or catalog) that is GenieRails' own by name and function
+     (external_mask_inventory.is_own_policy) and whose match condition names
+     one of the column's tags (read with the rulebook's condition parser). A
+     table-attached mask or any other policy doesn't count; the external-mask
+     inventory refuses those before rehearse, release and maintain;
   2. every acl_groups group can SELECT each table: SELECT (or ALL
      PRIVILEGES) at table, schema or catalog level plus USE CATALOG and USE
      SCHEMA, held by the group, a group it is nested in, or account users
@@ -30,9 +33,9 @@ expired file withholds every new CAN_RUN group, and a failed agent gets none.
 Keeping, shrinking or clearing CAN_RUN never waits on it. The file is first
 marked failed, so an interrupted or failed check leaves no usable pass.
 
-Residual risk: the check proves a mask exists on every classified column and
-that the groups can read; it can't prove a mask another tool made is the
-right one for each tier.
+It proves the live state matches what GenieRails applied (a GenieRails mask on
+every classified column, readable by every acl_groups group): masks or
+grants changed outside GenieRails after the last apply are caught here.
 
 Exit codes: 0 the check completed (``--strict``: and every agent passed),
 1 ``--strict`` and an agent failed, 2 the check couldn't run (recorded failed).
@@ -56,6 +59,7 @@ for path in (SHARED, SHARED / "scripts"):
         sys.path.insert(0, str(path))
 
 from scripts.audit_schema_drift import _parse_condition_tag_refs  # noqa: E402
+from scripts.external_mask_inventory import is_own_policy  # noqa: E402
 from scripts.coverage_gate import (  # noqa: E402
     GateError, RUNNER, _run_bounded, console_flags, write_result,
 )
@@ -82,9 +86,9 @@ class Snapshot:
     """What Unity Catalog says about the agents' tables (live, or fake in tests)."""
     # table -> column -> {(tag key, tag value)}
     column_tags: dict[str, dict[str, set[tuple[str, str]]]] = field(default_factory=dict)
-    # catalog.schema.table.column with a table-attached mask
+    # catalog.schema.table.column with a table-attached mask (never GenieRails')
     table_masks: set[str] = field(default_factory=set)
-    # table -> effective policies: {policy_type, conditions: [str]}
+    # table -> effective policies: {name, function_name, policy_type, conditions: [str]}
     policies: dict[str, list[dict]] = field(default_factory=dict)
     # (securable type, name) -> {(principal, privilege)}
     grants: dict[tuple[str, str], set[tuple[str, str]]] = field(default_factory=dict)
@@ -139,6 +143,8 @@ def read_problem(group: str, table: str, snapshot: Snapshot) -> str | None:
 def _policy_covers(policy: Mapping, tags: set[tuple[str, str]]) -> bool:
     if str(policy.get("policy_type") or "").upper() not in COLUMN_MASK:
         return False
+    if not is_own_policy(str(policy.get("name") or ""), str(policy.get("function_name") or "")):
+        return False
     keys = {key for key, _ in tags}
     for condition in policy.get("conditions") or []:
         value_refs, key_refs = _parse_condition_tag_refs(condition)
@@ -148,18 +154,18 @@ def _policy_covers(policy: Mapping, tags: set[tuple[str, str]]) -> bool:
 
 
 def mask_problems(table: str, snapshot: Snapshot) -> list[str]:
-    """Classified columns of ``table`` that no column mask covers."""
+    """Classified columns of ``table`` that no GenieRails mask covers."""
     problems = []
     for column, tags in sorted(snapshot.column_tags.get(table, {}).items()):
         classes = sorted(key for key, _ in tags if key.startswith("class."))
         if not classes:
             continue
         name = f"{table}.{column}"
-        if name.lower() in {masked.lower() for masked in snapshot.table_masks}:
-            continue
         if any(_policy_covers(policy, tags) for policy in snapshot.policies.get(table, [])):
             continue
-        problems.append(f"{name} is classified ({', '.join(classes)}) but no column mask applies to it")
+        attached = " (only a table-attached mask, which GenieRails doesn't support)" if name.lower() in {
+            masked.lower() for masked in snapshot.table_masks} else ""
+        problems.append(f"{name} is classified ({', '.join(classes)}) but no GenieRails mask applies to it{attached}")
     return problems
 
 
@@ -270,6 +276,7 @@ class LiveSnapshot:
             chosen = [m for m in matches if on_column and getattr(m, "alias", None) == on_column] or matches
             rows.append({
                 "name": policy.name,
+                "function_name": getattr(mask, "function_name", "") if mask else "",
                 "policy_type": getattr(policy_type, "value", policy_type),
                 "conditions": [str(getattr(m, "condition", "") or "") for m in chosen],
             })
@@ -331,7 +338,7 @@ def invalidate(env_dir: Path, reason: str) -> None:
 
 def run(env_dir: Path, env_name: str, runner: Path, apply_flags: str, *, strict: bool = False,
         snapshot_factory: Callable[[Path], object] = LiveSnapshot) -> int:
-    from table_readers import deterministic, governance
+    from table_readers import deterministic
 
     env_dir = env_dir.resolve()
     cfg = _load_hcl(env_dir / "env.auto.tfvars")
@@ -359,7 +366,7 @@ def run(env_dir: Path, env_name: str, runner: Path, apply_flags: str, *, strict:
               "CAN_RUN still applies.", file=sys.stderr)
         return 2
     write_result(path, {
-        "version": RESULT_VERSION, "env": env_name, "governance": governance(cfg),
+        "version": RESULT_VERSION, "env": env_name,
         # "pass" = the check completed; each agent carries its own verdict.
         "status": "pass", "fingerprint": value["fingerprint"],
         "refreshed_at": _now(), "agents": results,

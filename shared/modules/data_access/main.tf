@@ -93,8 +93,8 @@ locals {
   # table and its catalog.schema.*. Wildcards resolve over the tables this
   # layer knows are governed (uc_tables, agent tables, treatment-tagged
   # tables, table_readers keys and var.governed_tables). Agents' acl_groups
-  # never grant SELECT here, and governance = "external" grants nothing.
-  grants_from_readers = var.governance_mode == "deterministic" && var.governance == "genierails"
+  # never grant SELECT here.
+  grants_from_readers = var.governance_mode == "deterministic"
   _reader_map         = var.table_readers == null ? {} : var.table_readers
   _reader_groups      = { for key, readers in local._reader_map : lower(trimspace(key)) => readers... }
   reader_entries      = { for key, readers in local._reader_groups : key => distinct(flatten(readers)) }

@@ -289,16 +289,6 @@ variable "governance_mode" {
     error_message = "governance_mode must be legacy or deterministic."
   }
 }
-variable "governance" {
-  type        = string
-  default     = "genierails"
-  description = "Deterministic envs only: genierails (GenieRails derives masks and grants SELECT from table_readers) or external (another tool governs the tables; GenieRails only gates CAN_RUN on a live coverage check)."
-  validation {
-    condition     = contains(["genierails", "external"], var.governance)
-    error_message = "governance must be \"genierails\" or \"external\"."
-  }
-}
-
 variable "table_readers" {
   type        = map(list(string))
   default     = null
@@ -516,7 +506,6 @@ module "data_access" {
   classification_existing_auto_tag_configs = var.classification_existing_auto_tag_configs
   tag_assignments                          = var.tag_assignments
   governance_mode                          = var.governance_mode
-  governance                               = var.governance
   table_readers                            = local.full_table_readers
   access_tier_groups                       = var.access_tier_groups
   raw_exempt_principals                    = var.raw_exempt_principals

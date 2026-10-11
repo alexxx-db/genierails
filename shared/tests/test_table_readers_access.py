@@ -1,5 +1,5 @@
 """Rollout step 8: SELECT only from table_readers, CAN_RUN only from acl_groups,
-the live agent coverage check, and governance = "external".
+the live agent coverage check, and group_map (decision 8).
 
 Terraform-level proofs live in modules/data_access/tests/table_readers.tftest.hcl
 and roots/workspace/tests/agent_coverage_gate.tftest.hcl (run by
@@ -87,20 +87,6 @@ def test_schema_relative_keys_take_uc_catalog_and_may_not_collide():
     assert any("lists \"cat.sch.t\" twice" in e for e in errors)
 
 
-def test_governance_setting_values_and_scope():
-    assert validate_config(_cfg(governance="genierails")) == []
-    assert validate_config(_cfg(governance="external")) == []
-    assert validate_config(_cfg(governance="other")) == ['governance must be "genierails" or "external"']
-    assert any("only with governance_mode" in e for e in validate_config({"governance": "external"}))
-    assert any("only with governance_mode" in e for e in validate_config({"table_readers": {"c.s.t": ["x"]}}))
-
-
-def test_external_governance_grants_no_select():
-    errors = validate_config(_cfg(governance="external", table_readers={"cat.sch.t": ["raw"]}))
-    assert any("GenieRails grants no SELECT there" in e for e in errors)
-    assert validate_config(_cfg(governance="external", table_readers={})) == []
-
-
 # ── resolution ───────────────────────────────────────────────────────────────
 
 def test_readers_are_the_union_of_every_matching_entry():
@@ -144,12 +130,9 @@ def test_a_deterministic_agent_without_acl_groups_stops_the_run(tmp_path):
     assert tr.access_problems(env) == []
 
 
-def test_legacy_and_external_envs_are_not_refused_on_table_readers(tmp_path):
+def test_legacy_envs_are_not_refused_on_table_readers(tmp_path):
     legacy = _env(tmp_path, 'genie_spaces = [{ name = "Sales", uc_tables = ["cat.sch.t"], acl_groups = ["x"] }]\n')
     assert tr.access_problems(legacy) == []
-    external = _env(tmp_path, AGENT_ENV + 'governance = "external"\n', {"Sales": ["cat.sch.t"]}, name="ext")
-    # GenieRails grants nothing there; the live agent coverage check gates CAN_RUN.
-    assert tr.access_problems(external) == []
 
 
 # ── proposals written by make generate ───────────────────────────────────────
@@ -191,11 +174,9 @@ def test_proposals_leave_out_groups_that_cannot_be_readers(tmp_path):
     assert any("'analysts' cannot read cat.sch.orders" in p for p in tr.access_problems(env))
 
 
-def test_no_proposals_for_external_or_legacy(tmp_path):
-    for name, text in (("ext", AGENT_ENV + 'governance = "external"\n'),
-                       ("legacy", AGENT_ENV.replace('governance_mode = "deterministic"\n', ""))):
-        env = _env(tmp_path, text, {"Sales": ["cat.sch.orders"]}, name=name)
-        assert tr.proposals(env) == ({}, [])
+def test_no_proposals_for_legacy(tmp_path):
+    env = _env(tmp_path, AGENT_ENV.replace('governance_mode = "deterministic"\n', ""), {"Sales": ["cat.sch.orders"]})
+    assert tr.proposals(env) == ({}, [])
 
 
 def test_show_lists_resolved_readers_and_revocations(tmp_path):
@@ -232,12 +213,17 @@ def test_upgrade_existing_env_is_refused_until_table_readers_cover_its_agents(tm
 
 # ── live agent coverage check ────────────────────────────────────────────────
 
+VALUE = "email_partial__string__0a1b2c3d"
+# A GenieRails policy, by its deterministic name and function.
+OWN = {"name": f"cat_gr_mask_cat_{VALUE}_partial", "function_name": f"cat.sch.gr_mask_{VALUE}_partial",
+       "policy_type": "POLICY_TYPE_COLUMN_MASK", "conditions": [f"hasTagValue('gr_treatment', '{VALUE}')"]}
+
+
 def _snapshot(**overrides):
     base = dict(
-        column_tags={"cat.sch.t": {"email": {("class.email_address", ""), ("gr_treatment", "email__x")},
+        column_tags={"cat.sch.t": {"email": {("class.email_address", ""), ("gr_treatment", VALUE)},
                                    "id": {("other", "x")}}},
-        policies={"cat.sch.t": [{"policy_type": "POLICY_TYPE_COLUMN_MASK",
-                                 "conditions": ["hasTagValue('gr_treatment', 'email__x')"]}]},
+        policies={"cat.sch.t": [OWN]},
         grants={("CATALOG", "cat"): {("partial", "USE_CATALOG")},
                 ("SCHEMA", "cat.sch"): {("partial", "USE SCHEMA")},
                 ("TABLE", "cat.sch.t"): {("partial", "SELECT")}},
@@ -256,23 +242,30 @@ def test_live_check_passes_when_every_classified_column_is_masked_and_groups_can
 def test_live_check_fails_an_unmasked_classified_column():
     result = ac.evaluate(AGENT, _snapshot(policies={}))["a"]
     assert result["status"] == "fail"
-    assert result["problems"] == ["cat.sch.t.email is classified (class.email_address) but no column mask applies to it"]
+    assert result["problems"] == ["cat.sch.t.email is classified (class.email_address) but no GenieRails mask applies to it"]
 
 
-@pytest.mark.parametrize("snapshot", [
-    # A table-attached mask (another tool's) counts.
-    {"policies": {}, "table_masks": {"cat.sch.t.email"}},
-    # So does any column-mask policy whose condition names one of the column's tags.
-    {"policies": {"cat.sch.t": [{"policy_type": "COLUMN_MASK", "conditions": ["hasTag('class.email_address')"]}]}},
+@pytest.mark.parametrize("snapshot,note", [
+    # A table-attached mask (made in the UI or by another tool) doesn't count.
+    ({"policies": {}, "table_masks": {"cat.sch.t.email"}}, " (only a table-attached mask, which GenieRails doesn't support)"),
+    # Nor does a policy GenieRails didn't create, whatever it matches.
+    ({"policies": {"cat.sch.t": [{**OWN, "name": "customer_email_mask"}]}}, ""),
+    ({"policies": {"cat.sch.t": [{**OWN, "function_name": "cat.sch.my_mask"}]}}, ""),
+    # A GenieRails policy that doesn't match one of the column's tags doesn't either.
+    ({"policies": {"cat.sch.t": [{**OWN, "conditions": ["hasTagValue('gr_treatment', 'other')"]}]}}, ""),
+    # And a row filter is never a mask.
+    ({"policies": {"cat.sch.t": [{**OWN, "policy_type": "POLICY_TYPE_ROW_FILTER"}]}}, ""),
 ])
-def test_live_check_accepts_masks_whoever_made_them(snapshot):
-    assert ac.evaluate(AGENT, _snapshot(**snapshot))["a"]["status"] == "pass"
+def test_live_check_accepts_only_genierails_masks(snapshot, note):
+    result = ac.evaluate(AGENT, _snapshot(**snapshot))["a"]
+    assert result["status"] == "fail"
+    assert result["problems"] == [
+        f"cat.sch.t.email is classified (class.email_address) but no GenieRails mask applies to it{note}"]
 
 
-def test_a_row_filter_is_not_a_mask():
-    snapshot = _snapshot(policies={"cat.sch.t": [{"policy_type": "POLICY_TYPE_ROW_FILTER",
-                                                  "conditions": ["hasTag('class.email_address')"]}]})
-    assert ac.evaluate(AGENT, snapshot)["a"]["status"] == "fail"
+def test_an_inherited_genierails_policy_matching_by_key_counts():
+    snapshot = _snapshot(policies={"cat.sch.t": [{**OWN, "conditions": ["hasTag('gr_treatment')"]}]})
+    assert ac.evaluate(AGENT, snapshot)["a"]["status"] == "pass"
 
 
 def test_live_check_fails_a_group_that_cannot_read():
@@ -392,8 +385,6 @@ def test_release_summary_never_claims_access_nothing_grants(tmp_path):
     readers = _env(tmp_path, AGENT_ENV + 'table_readers = { "cat.sch.*" = ["raw"] }\n', name="b")
     assert release_helpers.access_summary(readers)[0].startswith("  Table access:  SELECT from table_readers")
     assert "CAN_RUN from acl_groups" in release_helpers.access_summary(readers)[1]
-    external = _env(tmp_path, AGENT_ENV + 'governance = "external"\n', name="c")
-    assert "not granted by GenieRails" in release_helpers.access_summary(external)[0]
 
 
 # ── promotion: env-owned table_readers and governance ────────────────────────
@@ -416,35 +407,203 @@ def _promote(tmp_path, source_text, dest_text):
 
 
 SOURCE = '''governance_mode = "deterministic"
-governance = "genierails"
 uc_catalog = "dev_cat"
-genie_spaces = []
+access_tier_groups = ["dev_raw", "dev_partial", "full"]
+genie_spaces = [{ name = "Sales", uc_tables = ["dev_cat.sch.t"], acl_groups = ["dev_partial", "dev_etl"] }]
 uc_tables = ["dev_cat.sch.t"]
-table_readers = { "sch.t" = ["raw"], "dev_cat.sch.*" = ["partial"] }
-raw_exempt_principals = ["dev-etl"]
+table_readers = { "sch.t" = ["dev_raw", "dev_etl"], "dev_cat.sch.*" = ["dev_partial"] }
+raw_exempt_principals = ["dev_etl"]
+row_filters = [{ table = "dev_cat.sch.t", column = "region", values_by_group = { dev_partial = ["APAC"] } }]
 '''
+PROD = 'governance_mode = "deterministic"\n'
+GROUP_MAP = 'group_map = { dev_raw = "prod_raw", dev_partial = "prod_partial", dev_etl = "prod_etl" }\n'
 
 
 def test_first_promote_seeds_table_readers_with_remapped_catalogs(tmp_path):
-    cfg, out = _promote(tmp_path, SOURCE, 'governance_mode = "deterministic"\n')
-    assert cfg["table_readers"] == {"prod_cat.sch.*": ["partial"], "prod_cat.sch.t": ["raw"]}
-    assert cfg["governance"] == "genierails"
+    cfg, out = _promote(tmp_path, SOURCE, PROD)
+    assert cfg["table_readers"] == {"prod_cat.sch.*": ["dev_partial"], "prod_cat.sch.t": ["dev_raw", "dev_etl"]}
     assert "raw_exempt_principals" not in cfg  # env-owned, never copied from dev
     assert "Seeded table_readers from dev" in out
 
 
 def test_later_promotes_keep_the_destination_table_readers_and_print_differences(tmp_path):
-    dest = ('governance_mode = "deterministic"\ngovernance = "external"\nraw_exempt_principals = ["prod-etl"]\n'
-            'table_readers = { "prod_cat.sch.t" = ["full"] }\n')
+    dest = PROD + 'raw_exempt_principals = ["prod-etl"]\ntable_readers = { "prod_cat.sch.t" = ["full"] }\n'
     cfg, out = _promote(tmp_path, SOURCE, dest)
     assert cfg["table_readers"] == {"prod_cat.sch.t": ["full"]}
-    assert cfg["governance"] == "external"
     assert cfg["raw_exempt_principals"] == ["prod-etl"]
-    assert "table_readers diff for prod_cat.sch.t (dev vs destination): dev=['raw']; destination=['full']" in out
-    assert "Preserved destination governance='external'" in out
+    assert ("table_readers diff for prod_cat.sch.t (dev vs destination): dev=['dev_etl', 'dev_raw']; "
+            "destination=['full']") in out
 
 
-# ── Makefile: refusals, external mode, governance-only messages ─────────────
+# ── group_map (decision 8) ───────────────────────────────────────────────────
+
+def test_promote_maps_every_group_it_writes_and_never_raw_exempt_principals(tmp_path):
+    cfg, out = _promote(tmp_path, SOURCE, PROD + GROUP_MAP.replace(', dev_etl = "prod_etl"', ""))
+    # Tiers are promoted governance, through group_map (unmapped groups keep their names).
+    assert cfg["access_tier_groups"] == ["prod_raw", "prod_partial", "full"]
+    # First seeding of table_readers and acl_groups is mapped; dev's
+    # raw_exempt principal (dev_etl) is never mapped.
+    assert cfg["table_readers"] == {"prod_cat.sch.*": ["prod_partial"], "prod_cat.sch.t": ["prod_raw", "dev_etl"]}
+    assert cfg["genie_spaces"][0]["acl_groups"] == ["prod_partial", "dev_etl"]
+    # Row-filter groups, with the table remapped.
+    assert cfg["row_filters"] == [{"table": "prod_cat.sch.t", "column": "region",
+                                   "values_by_group": {"prod_partial": ["APAC"]}}]
+    # group_map itself is the destination's and stays.
+    assert cfg["group_map"] == {"dev_raw": "prod_raw", "dev_partial": "prod_partial"}
+    assert "group_map: dev_partial -> prod_partial, dev_raw -> prod_raw" in out
+    # prod lists its own raw_exempt_principals: until it does, the unmapped dev one is refused as a reader.
+    assert [e for e in validate_config(cfg)] == [
+        'table_readers["prod_cat.sch.t"] names \'dev_etl\', which is neither in access_tier_groups nor in '
+        "raw_exempt_principals; a reader outside the tiers would get an unplanned mask"]
+
+
+def test_tiers_are_promoted_on_every_promote_but_seeded_access_is_kept(tmp_path):
+    _promote(tmp_path, SOURCE, PROD + GROUP_MAP)
+    dest = tmp_path / "envs" / "prod" / "env.auto.tfvars"
+    text = dest.read_text().replace('"prod_partial", "dev_etl"]', '"prod_partial"]')  # a prod-only ACL edit
+    assert text != dest.read_text()
+    dest.write_text(text)
+    source = (tmp_path / "envs" / "dev" / "env.auto.tfvars")
+    source.write_text(SOURCE.replace('"dev_partial", "full"]', '"dev_partial", "viewers"]'))
+    cfg, out = _promote(tmp_path, source.read_text(), None)
+    assert cfg["access_tier_groups"] == ["prod_raw", "prod_partial", "viewers"]
+    assert "access_tier_groups promoted" in out
+    assert cfg["genie_spaces"][0]["acl_groups"] == ["prod_partial"]
+
+
+def test_legacy_destinations_keep_their_own_tiers(tmp_path):
+    cfg, _ = _promote(tmp_path, SOURCE.replace('governance_mode = "deterministic"\n', ""),
+                      'access_tier_groups = ["stale"]\n' + GROUP_MAP.replace("group_map", "# group_map"))
+    assert cfg["access_tier_groups"] == ["stale"]
+    assert "group_map" not in cfg
+
+
+def test_promoted_policy_principals_go_through_group_map(tmp_path):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from remap_generated_config import map_principals
+
+    hcl = ('  {\n    to_principals    = ["dev_partial"]\n    except_principals = ["dev_raw", "dev_etl", "sp-1"]\n  }\n')
+    mapped = map_principals(hcl, {"dev_partial": "prod_partial", "dev_raw": "prod_raw", "dev_etl": "x"}, {"dev_etl"})
+    assert '    to_principals    = ["prod_partial"]\n' in mapped
+    assert '    except_principals = ["prod_raw", "dev_etl", "sp-1"]\n' in mapped
+
+
+@pytest.mark.parametrize("group_map,error", [
+    ({"a": "p", "b": "p"}, "maps a, b all to 'p': many-to-one mappings"),
+    ({"etl": "prod_etl"}, "maps 'etl', which is in raw_exempt_principals"),
+    ({"account users": "x"}, "account users is never mapped"),
+    ({"a": ""}, "must map dev group names"),
+])
+def test_group_map_validation(group_map, error):
+    errors = validate_config(_cfg(group_map=group_map, raw_exempt_principals=["etl"]))
+    assert any(error in e for e in errors), errors
+
+
+def test_group_map_is_deterministic_only():
+    assert validate_config({"group_map": {"a": "b"}}) == ['group_map applies only with governance_mode = "deterministic"']
+
+
+def test_a_many_to_one_destination_map_stops_promote(tmp_path):
+    source = tmp_path / "envs" / "dev"
+    dest = tmp_path / "envs" / "prod"
+    source.mkdir(parents=True)
+    dest.mkdir(parents=True)
+    (source / "env.auto.tfvars").write_text(SOURCE)
+    (dest / "env.auto.tfvars").write_text(PROD + 'group_map = { dev_raw = "p", dev_partial = "p" }\n')
+    result = subprocess.run([sys.executable, str(REMAP), str(source), str(dest), "dev_cat=prod_cat"],
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1 and "many-to-one" in result.stdout and "nothing was written" in result.stdout
+
+
+import group_map as gm  # noqa: E402
+
+MAPPED_PROD = '''governance_mode = "deterministic"
+access_tier_groups = ["prod_raw", "prod_partial", "full"]
+group_map = { dev_raw = "prod_raw", dev_partial = "prod_partial" }
+genie_spaces = [{ name = "Sales", uc_tables = ["c.s.t"], acl_groups = ["prod_partial"] }]
+table_readers = { "c.s.t" = ["prod_partial"] }
+row_filters = [{ table = "c.s.t", column = "r", values_by_group = { prod_rf = ["x"] } }]
+'''
+
+
+def _check(env, existing):
+    return gm.main(["check", "--env-dir", str(env), "--env", "prod", "--command-name", "make release"],
+                   lister=lambda _d: existing)
+
+
+def test_every_resulting_group_must_exist_live_mapped_or_not(tmp_path, capsys):
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    assert _check(env, ["prod_raw", "prod_partial", "full", "prod_rf"]) == 0
+    assert _check(env, ["prod_raw", "prod_partial", "prod_rf"]) == 1  # unmapped "full" is missing
+    assert "don't exist in prod (after group_map): full" in capsys.readouterr().err
+
+
+def test_the_group_check_fails_closed_when_groups_cannot_be_listed(tmp_path, capsys):
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+
+    def broken(_d):
+        raise RuntimeError("SCIM unavailable")
+
+    assert gm.main(["check", "--env-dir", str(env), "--env", "prod"], lister=broken) == 2
+    assert "could not run: SCIM unavailable" in capsys.readouterr().err
+
+
+def test_a_changed_group_map_needs_its_ack(tmp_path, capsys):
+    existing = ["prod_raw", "prod_partial", "full", "prod_rf", "prod_viewers"]
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    (env / "data_access" / "terraform.tfstate").write_text("{}")  # applied before
+    # First release: the applied map is recorded.
+    gm.record_applied(env, gm._load_hcl(env / "env.auto.tfvars"))
+    assert _check(env, existing) == 0
+    # Retarget one mapping, add one, remove one.
+    (env / "env.auto.tfvars").write_text(MAPPED_PROD.replace(
+        'group_map = { dev_raw = "prod_raw", dev_partial = "prod_partial" }',
+        'group_map = { dev_raw = "prod_viewers", dev_viewers = "prod_viewers2" }'))
+    existing.append("prod_viewers2")
+    capsys.readouterr()
+    assert _check(env, existing) == 1
+    err = capsys.readouterr().err
+    for key in ("prod:weaken:group_map:dev_raw=prod_viewers", "prod:weaken:group_map:dev_viewers=prod_viewers2",
+                "prod:weaken:group_map:dev_partial=dev_partial"):
+        assert key in err
+    (env / "ack.txt").write_text("prod:weaken:group_map:dev_raw=prod_viewers\n"
+                                 "prod:weaken:group_map:dev_viewers=prod_viewers2\n")
+    assert _check(env, existing) == 1
+    assert "dev_partial=dev_partial" in capsys.readouterr().err
+    (env / "ack.txt").write_text((env / "ack.txt").read_text() + "prod:weaken:group_map:dev_partial=dev_partial\n")
+    assert _check(env, existing) == 0
+    # An ack for another env is refused by the step-7 parser.
+    (env / "ack.txt").write_text("dev:weaken:group_map:dev_raw=prod_viewers\n")
+    assert _check(env, existing) == 2
+
+
+def test_an_already_applied_env_without_a_record_counts_a_new_group_map_as_a_change(tmp_path, capsys):
+    existing = ["prod_raw", "prod_partial", "full", "prod_rf"]
+    fresh = _env(tmp_path, MAPPED_PROD, name="prod")
+    assert _check(fresh, existing) == 0  # first release of a fresh env
+    applied = _env(tmp_path, MAPPED_PROD, name="other")
+    (applied / "terraform.tfstate").write_text("{}")
+    assert gm.main(["check", "--env-dir", str(applied), "--env", "other"], lister=lambda _d: existing) == 1
+    assert "other:weaken:group_map:dev_raw=prod_raw" in capsys.readouterr().err
+
+
+def test_nested_groups_are_expanded_after_mapping(tmp_path):
+    # The live check reads the destination's own, mapped config: prod_partial
+    # reads through its prod parent; dev_partial's membership is irrelevant.
+    snapshot = _snapshot(grants={("CATALOG", "cat"): {("prod_parent", "USE_CATALOG"), ("prod_parent", "USE_SCHEMA"),
+                                                      ("prod_parent", "SELECT")}},
+                         groups={"prod_parent": {"prod_partial"}, "dev_parent": {"dev_partial"}})
+    mapped = {"a": {"name": "A", "groups": gm.map_groups(["dev_partial"], {"dev_partial": "prod_partial"}),
+                    "tables": ["cat.sch.t"]}}
+    assert ac.evaluate(mapped, snapshot)["a"]["status"] == "pass"
+
+
+def test_legacy_envs_skip_the_group_check(tmp_path):
+    env = _env(tmp_path, 'uc_tables = ["c.s.t"]\n', name="prod")
+    assert gm.main(["check", "--env-dir", str(env), "--env", "prod"], lister=lambda _d: []) == 0
+
+
+# ── Makefile: refusals, group check, governance-only messages ─────────────
 
 def _clean_env():
     return {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "ENV", "CI")}
@@ -473,51 +632,18 @@ def test_rehearse_and_release_refuse_acl_groups_that_cannot_read_before_anything
 
 
 @needs_make
-def test_external_rehearse_applies_agents_only(tmp_path):
-    env = _env(tmp_path, AGENT_ENV + 'governance = "external"\n', {"Sales": ["cat.sch.t"]})
-    result, calls = _make(tmp_path, env, "rehearse", "ENV=dev")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert [c.split()[2] for c in calls] == ["_rehearse-external"]
-    result, calls = _make(tmp_path, env, "_rehearse-external", "ENV=dev")
-    assert result.returncode == 0, result.stdout + result.stderr
-    calls = calls[1:]  # the stub's log also holds the rehearse call above
-    assert len(calls) == 1 and " apply " in f" {calls[0]} " and "_EXPOSURE_DERIVED=1" in calls[0]
-    for skipped in ("_derive-before-exposure", "validate-generated", "coverage-gate", "verify-access"):
-        assert skipped not in calls[0]
-
-
-@needs_make
-def test_external_release_takes_the_external_path(tmp_path):
-    env = _env(tmp_path, AGENT_ENV + 'governance = "external"\n', {"Sales": ["cat.sch.t"]}, name="prod")
-    result, calls = _make(tmp_path, env, "release", "ENV=prod")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert [c.split()[2] for c in calls] == ["_release-external"]
-
-
-@needs_make
-def test_external_release_applies_under_the_lock_and_reports_agents_only(tmp_path):
-    env = _env(tmp_path, AGENT_ENV + 'governance = "external"\n', {"Sales": ["cat.sch.t"]}, name="prod")
-    result, calls = _make(tmp_path, env, "_release-external", "ENV=prod")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert len(calls) == 1 and "apply ENV=prod" in calls[0]
-    assert "Business access: applied" not in result.stdout
-    assert 'Table access:  not granted by GenieRails (governance = "external"' in result.stdout
-
-
-@needs_make
-@pytest.mark.parametrize("target", ["_plan-layer", "_apply-layer"])
-def test_external_skips_the_data_access_layer(tmp_path, target):
-    env = _env(tmp_path, AGENT_ENV + 'governance = "external"\n')
-    (env / "data_access" / "abac.auto.tfvars").write_text("fgac_policies = []\n")
-    runner = tmp_path / "runner.sh"
-    runner.write_text("#!/bin/sh\necho RUNNER-CALLED; exit 7\n")
-    runner.chmod(0o755)
-    result = subprocess.run(["make", "-f", str(ROOT / "aws" / "Makefile"), target, "LAYER=data_access", "TARGET_ENV=dev",
-                             f"LAYER_ENV_DIR={env / 'data_access'}", f"ROOT_RUNNER={runner}"],
-                            cwd=ROOT, env=_clean_env(), text=True, capture_output=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'governance = "external"; another tool governs these tables' in result.stdout
-    assert "RUNNER-CALLED" not in result.stdout
+@pytest.mark.parametrize("target,env_name", [("rehearse", "dev"), ("release", "prod")])
+def test_rehearse_and_release_stop_on_the_group_check_before_anything_runs(tmp_path, target, env_name):
+    env = _env(tmp_path, AGENT_ENV + 'table_readers = { "cat.sch.*" = ["raw", "partial"] }\n',
+               {"Sales": ["cat.sch.t"]}, name=env_name)
+    check = tmp_path / "group-check"
+    check.write_text(f"#!/bin/sh\necho \"$*\" > '{tmp_path / 'group-args'}'\nexit 1\n")
+    check.chmod(0o755)
+    result, calls = _make(tmp_path, env, target, f"ENV={env_name}", f"_GROUP_CHECK={check}")
+    assert result.returncode != 0
+    assert (tmp_path / "group-args").read_text().strip() == f"make {target}"
+    assert calls == []
+    assert not (env / "generated" / ".governance.lock").exists()
 
 
 @needs_make
@@ -540,18 +666,6 @@ def test_deterministic_workspace_plan_runs_the_live_check_before_the_can_run_che
     calls = log.read_text().splitlines()
     first = [c.split()[0] + " " + c.split()[1] for c in calls]
     assert first.index("agent run") < first.index("gate can-run-check") < first.index("runner workspace")
-
-
-@needs_make
-def test_external_maintain_only_rechecks_agents_live(tmp_path):
-    env = _env(tmp_path, AGENT_ENV + 'governance = "external"\n', name="prod")
-    agent = tmp_path / "agent"
-    agent.write_text(f"#!/bin/sh\nprintf 'agent %s\\n' \"$*\" >> '{tmp_path / 'agent-calls'}'\nexit 1\n")
-    agent.chmod(0o755)
-    result, calls = _make(tmp_path, env, "maintain", "ENV=prod", f"_AGENT_COVERAGE={agent}")
-    assert result.returncode != 0  # a failing agent alerts the scheduled run
-    assert "--strict" in (tmp_path / "agent-calls").read_text()
-    assert calls == []
 
 
 @needs_make

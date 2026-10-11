@@ -337,6 +337,8 @@ def validate_config(
                 errors.append(f"agent {name} delete must be a boolean")
     from table_readers import validation_errors as table_readers_errors
     errors.extend(table_readers_errors(cfg))
+    from group_map import validation_errors as group_map_errors
+    errors.extend(group_map_errors(cfg))
     errors.extend(_validate_ack_list("ACK_UNCLASSIFIED", ack_unclassified, principal=False))
     errors.extend(_validate_ack_list("ACK_WEAKEN", ack_weaken, principal=True))
     return errors
