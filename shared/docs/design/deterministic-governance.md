@@ -411,7 +411,7 @@ Explicit, opt-in commands, never called by `generate`, `rehearse`, `release` or 
 
 - `make suggest-treatment CLASS=<class>`: proposes a treatment and mask for an unmapped class, for review.
 - `make draft-genie-content SPACE=<agent>`: drafts instructions, sample questions and benchmarks for an agent that has none.
-- Custom-mask SQL drafting, gated by the mask library's exact-output tests before it can be used.
+- `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>`: writes a draft to `envs/dev/drafts/custom_masks/<name>.sql` and an exact-output test fixture to `envs/dev/drafts/custom_masks/<name>.json`, for review. `tag_treatments` can't reference the draft until `make test-custom-mask ENV=dev TREATMENT=<name>` passes the mask library's exact-output tests.
 
 Output is written to files for review and committed like any change. A missing model endpoint only disables these helpers.
 
