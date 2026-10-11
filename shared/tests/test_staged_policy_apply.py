@@ -270,6 +270,11 @@ class Harness:
         self.crash_after: str = ""
         self.invariant_problems: list[str] = []
         self.dropped: list[str] = []
+        # stage -> edit of the fake live state right after that stage's apply "succeeded"
+        # (Unity Catalog diverging from what Terraform says it applied).
+        self.diverge_after: dict = {}
+        self.inventory_problems: list[list[str]] = []
+        self.simulate_access = True
         monkeypatch.delenv("FAKE_TF_FAIL_APPLY", raising=False)
         monkeypatch.delenv("FAKE_TF_FAIL_PLAN", raising=False)
 
@@ -295,6 +300,11 @@ class Harness:
                     print(exc, file=sys.stderr)
                     rc = 2
             self._check_invariants(stage, before, env)
+            if stage in self.diverge_after:
+                path = self.env_dir / "data_access" / "terraform.tfstate"
+                state = live_state(self.env_dir)
+                self.diverge_after.pop(stage)(state)
+                path.write_text(json.dumps(state))
             if self.crash_after == stage:
                 self.crash_after = ""
                 raise KeyboardInterrupt(f"crash after {stage}")
@@ -302,13 +312,16 @@ class Harness:
         if argv[0] == "inventory":
             stages = set(argv[argv.index("--stage") + 1].split(","))
             self.calls.append("inventory:" + "/".join(sorted(stages)))
+            # The real live check, reading "Unity Catalog" from the fake state.
             problems = spv.verify(self.env_dir, stages, reader=fake_reader)
-            assert not problems, problems  # the live check passes whenever its stage applied cleanly
-            return SimpleNamespace(returncode=0)
+            self.inventory_problems.append(problems)
+            return SimpleNamespace(returncode=1 if problems else 0)
         if argv[:2] == ["/bin/sh", "-c"]:
             record = pg.load_stage_record(self.env_dir)
             self.calls.append(f"verify-access:{record['stage']}")
             self.verify_envs.append(hcl2.loads(Path(env["GENIERAILS_VERIFY_ENV_FILE"]).read_text()))
+            if not self.simulate_access:
+                return SimpleNamespace(returncode=0)
             problems = simulated_verify_access(self.env_dir, Path(env["GENIERAILS_VERIFY_TFVARS"]),
                                                Path(env["GENIERAILS_VERIFY_ENV_FILE"]))
             if record["stage"] in self.fail_verify:
@@ -531,6 +544,40 @@ def test_failed_verification_after_switch_restores_and_the_retry_switches_again(
     assert harness.apply() == 0
     assert live_tags(live_state(harness.env_dir)) == new["tags"]
     assert harness.journal()["pending"][0]["fingerprint"] == old["fingerprint"]
+
+
+def _retag_first_column(value):
+    """Edit a state: the first column's treatment tag is ``value``, whatever the apply reported."""
+    def edit(state):
+        for resource in state["resources"]:
+            if resource["name"] == "treatment":
+                resource["instances"][0]["attributes"]["tag_value"] = value
+    return edit
+
+
+def test_live_state_diverging_after_switch_is_caught_by_the_real_live_check_and_restored(harness):
+    old = released(harness)
+    new = write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    # Only the real staged_policy_verify can notice: verify-access is not simulated here.
+    harness.simulate_access = False
+    harness.diverge_after = {"switch": _retag_first_column(next(iter(old["tags"].values())))}
+    assert harness.apply() == 1
+    assert "verify-access:switch" not in harness.calls  # stopped by the live check, before verify-access
+    assert any("live treatment" in p for p in harness.inventory_problems[-2]), harness.inventory_problems
+    assert harness.calls[-2:] == ["restore", "inventory:restore"]
+    t = harness.journal()["transition"]
+    assert t["status"] == "failed" and t["failed_phase"] == "verify-switched" and t["completed"] == ["create"]
+    assert harness.journal()["active"] == old["fingerprint"]
+    # The previous protection is back: the old generation's values and policies.
+    state = live_state(harness.env_dir)
+    assert live_tags(state) == old["tags"]
+    assert {p["name"] for p in old["fgac_policies"]} <= {p["name"] for p in live_policies(state)}
+    # Fixed (UC applies what it is told): the retry resumes after create and finishes.
+    harness.calls.clear()
+    assert harness.apply() == 0
+    assert harness.calls[0] == "inventory:create/restore" and "switch" in harness.calls
+    assert live_tags(live_state(harness.env_dir)) == new["tags"]
+    assert harness.journal()["transition"] is None and harness.journal()["active"] == new["fingerprint"]
 
 
 def test_failed_create_leaves_everything_live_and_resumes_at_create(harness):
