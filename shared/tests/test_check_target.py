@@ -337,3 +337,74 @@ def test_check_prod_runs_promote_check(promoted, tmp_path):
     assert "FAILED (promote-to ENV=prod CHECK=1)" in result.stderr
     _assert_read_only(promoted, before)
 
+
+
+# ── symlinks: a scratch copy must never write through one ───────────────────
+
+def _link_out(repo, tmp_path, env, rel):
+    """Move envs/<env>/<rel> outside the repo and leave a symlink in its place."""
+    inside = _envs(repo) / env / rel if rel else _envs(repo) / env
+    outside = tmp_path / "external" / env / (rel or "env")
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(inside), str(outside))
+    inside.symlink_to(outside, target_is_directory=outside.is_dir())
+    _commit(repo, f"symlink {env}/{rel}")
+    return outside
+
+
+def _external(outside):
+    if outside.is_dir():
+        return _snapshot(outside)
+    return outside.read_bytes()
+
+
+@pytest.mark.parametrize("rel, shown", [
+    ("", "envs/dev is a symlink"),
+    ("generated", "envs/dev/generated is a symlink"),
+    ("generated/governed_tables.json", "envs/dev/generated/governed_tables.json is a symlink"),
+])
+def test_check_refuses_a_symlink_in_the_env_and_leaves_its_target_alone(repo, tmp_path, rel, shown):
+    outside = _link_out(repo, tmp_path, "dev", rel)
+    external = _external(outside)
+    before = _baseline(repo)
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", CI="true")
+
+    assert result.returncode != 0
+    assert shown in result.stderr
+    assert "Replace the symlink with the file or directory it points to." in result.stderr
+    assert "--- check 1/6" not in result.stdout
+    assert _external(outside) == external
+    _assert_read_only(repo, before)
+
+
+@pytest.mark.parametrize("rel, shown", [
+    ("", "envs/prod is a symlink"),
+    ("generated", "envs/prod/generated is a symlink"),
+    ("generated/abac.auto.tfvars", "envs/prod/generated/abac.auto.tfvars is a symlink"),
+])
+def test_promote_check_refuses_a_symlink_in_any_env(promoted, tmp_path, rel, shown):
+    outside = _link_out(promoted, tmp_path, "prod", rel)
+    external = _external(outside)
+    before = _baseline(promoted)
+
+    result = _make(promoted, tmp_path, "promote-to", "ENV=prod", "CHECK=1", CI="true")
+
+    assert result.returncode != 0
+    assert shown in result.stderr
+    assert "Running promote-to" not in result.stdout
+    assert _external(outside) == external
+    _assert_read_only(promoted, before)
+
+
+def test_check_allows_only_the_scaffolded_env_link(repo, tmp_path):
+    link = _envs(repo) / "dev" / "data_access" / "env.auto.tfvars"
+    assert link.is_symlink() and os.readlink(link) == "../env.auto.tfvars"
+    link.unlink()
+    link.symlink_to(_envs(repo) / "dev" / "env.auto.tfvars")  # same file, but an absolute link
+    _commit(repo, "absolute link")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+
+    assert result.returncode != 0
+    assert "envs/dev/data_access/env.auto.tfvars is a symlink" in result.stderr

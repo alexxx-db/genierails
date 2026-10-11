@@ -78,23 +78,67 @@ def _is_runtime(rel: Path) -> bool:
     return False
 
 
+# The one link make itself scaffolds in a copied env (_prepare-env); it is not
+# copied, and the scratch make recreates it inside the copy.
+SCAFFOLD_LINKS = {("data_access", "env.auto.tfvars"): "../env.auto.tfvars"}
+
+
+def _is_scaffold_link(envs: Path, rel: Path) -> bool:
+    return (len(rel.parts) == 3 and (envs / rel).is_symlink()
+            and SCAFFOLD_LINKS.get(rel.parts[1:]) == os.readlink(envs / rel))
+
+
+def _refuse_symlinks(cloud_dir: Path, envs: Path) -> None:
+    """Refuse an envs/ tree a scratch copy could write out of through a symlink.
+
+    Same rule as promote-to (#88): envs/ and every env dir must be real
+    directories whose physical path is exactly <cloud>/envs/<name>, and no
+    copied path inside an env may be a symlink, except the scaffold link
+    above. Runtime files are never copied, so they are not checked.
+    """
+    if not envs.exists() and not envs.is_symlink():
+        return
+    if envs.is_symlink() or os.path.realpath(envs) != os.path.join(os.path.realpath(cloud_dir), "envs"):
+        raise CheckFailed(f"{envs} is a symlink or not this cloud's envs/; the check copies only a real envs/")
+    for directory, dirnames, filenames in os.walk(envs):
+        for name in dirnames + filenames:
+            path = Path(directory) / name
+            rel = path.relative_to(envs)
+            if _is_runtime(rel) or not path.is_symlink():
+                continue
+            if _is_scaffold_link(envs, rel):
+                continue
+            raise CheckFailed(
+                f"envs/{rel} is a symlink (to {os.readlink(path)}); the check copies only real files and "
+                "directories under envs/, so it can't write outside its scratch copy. Replace the symlink "
+                "with the file or directory it points to.")
+
+
+def _assert_contained(root: Path) -> None:
+    """Before any make step: no path in the copy is a link or leaves it."""
+    real_root = root.resolve()
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.resolve().is_relative_to(real_root):
+            raise CheckFailed(f"scratch copy path {path} is a symlink or resolves outside {real_root}")
+
+
 def _ignore_runtime(envs: Path):
     def ignore(directory: str, names: list[str]) -> set[str]:
         base = Path(directory).relative_to(envs)
-        return {name for name in names if _is_runtime(base / name)}
+        return {name for name in names if _is_runtime(base / name) or _is_scaffold_link(envs, base / name)}
     return ignore
 
 
 def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
-    """Relative path -> (kind, content) for every non-runtime file under envs/."""
+    """Relative path -> (kind, content) for every non-runtime file in the copy.
+
+    The copy starts with no links (_assert_contained), so any link in it is
+    one the scratch make scaffolded, not a regenerated file.
+    """
     found = {}
     for path in sorted(envs.rglob("*")):
         rel = path.relative_to(envs)
-        if _is_runtime(rel):
-            continue
-        if path.is_symlink():
-            found[str(rel)] = ("link", os.readlink(path).encode())
-        elif path.is_file():
+        if not _is_runtime(rel) and not path.is_symlink() and path.is_file():
             found[str(rel)] = ("file", path.read_bytes())
     return found
 
@@ -105,16 +149,22 @@ class Scratch:
     def __init__(self, cloud_dir: Path, makefile: Path, make_bin: str):
         self.real_envs = cloud_dir / "envs"
         self.make_bin = make_bin
+        _refuse_symlinks(cloud_dir, self.real_envs)
         self.root = Path(tempfile.mkdtemp(prefix="genierails-check-"))
-        self.cloud = self.root / cloud_dir.name
-        self.cloud.mkdir()
-        shutil.copy2(makefile, self.cloud / "Makefile")
-        self.envs = self.cloud / "envs"
-        if self.real_envs.is_dir():
-            shutil.copytree(self.real_envs, self.envs, symlinks=True,
-                            ignore=_ignore_runtime(self.real_envs))
-        else:
-            self.envs.mkdir()
+        try:
+            self.cloud = self.root / cloud_dir.name
+            self.cloud.mkdir()
+            shutil.copyfile(makefile, self.cloud / "Makefile")
+            self.envs = self.cloud / "envs"
+            if self.real_envs.is_dir():
+                shutil.copytree(self.real_envs, self.envs, symlinks=False,
+                                ignore=_ignore_runtime(self.real_envs))
+            else:
+                self.envs.mkdir()
+            _assert_contained(self.root)
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -138,7 +188,10 @@ class Scratch:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.is_symlink() or dest.exists():
                 dest.unlink()
-            shutil.copy2(source, dest, follow_symlinks=False)
+            # A real file in the copy (contents read through any link), so
+            # nothing the plan step touches points outside it.
+            shutil.copyfile(source, dest)
+            os.chmod(dest, 0o600)
 
 
 def _display(rel: str) -> str:
