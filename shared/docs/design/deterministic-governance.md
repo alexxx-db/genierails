@@ -375,3 +375,80 @@ A change that needs an intermediate replan (staged policy changes, tier moves, m
 - Acknowledgements are committed and reviewed (section 6), never pipeline parameters.
 
 **v1 vs later.** Until an env has remote state with locking, its applying stages run on the **deployment machine** with the same commands and the same checks, and every applying target refuses in CI. The deployment machine keeps Terraform state, receipts and locks **outside the checkout**, in `GENIERAILS_STATE_DIR` (one folder per env plus one for the account layer), takes a machine-wide lock per env and one for the account layer, and runs each command from a fresh, clean checkout of the commit being applied. Dev remote state is rollout step 12; prod remote state is deferred (section 15). Stages 1 and 2 work in CI from v1. GenieRails ships a sample per stage for GitHub Actions and Azure DevOps.
+
+## 18. Next iteration (agreed, not yet scheduled)
+
+Agreed in design discussion after the rollout above was set. It starts once rollout steps 1–13 are built and pass end to end. Nothing here changes sections 1–17; where it refines them, this section wins.
+
+### 18.1 Personas and the files each owns
+
+| Persona | Changes | Owns (CODEOWNERS) |
+|---|---|---|
+| **Champion** (first deployment) | one agent, end to end | everything, once |
+| **Data citizen** | curates an agent in the dev UI, captures it, promotes it | `envs/<env>/agents/<agent>.*` |
+| **Governance engineer** | treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, `uc_tables`, `ungovern` | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/`, `ack.txt` |
+| **One team doing both** (small or medium company) | both kinds of change, often in one PR | both sets |
+
+- `env.auto.tfvars` holds only governance and env-owned settings. Agent settings live only in `agents/` files (section 5), so an agent-only PR never touches a governance-owned file.
+- **Customer class mappings never live in `shared/`.** `shared/` is GenieRails product code and is replaced on upgrade. `scaffold-treatments ENV=<env> TREATMENT=<name>` writes the mapping to the env's `tag_treatments` (and the promotion carries it), not to `shared/treatment_config.json`.
+- **`promote-to` keeps the split.** It writes agent output under `envs/<target>/agents/` and governance output under `envs/<target>/generated/`, so CODEOWNERS can require only the owners of what changed. An agent-only promotion needs no governance approval; a promotion that changes governance needs it.
+- **`generate` proposes, it doesn't decide, for governance-owned files.** The `table_readers` entries it seeds for a new agent (section 5) are a proposal the governance owner approves in the same PR.
+
+### 18.2 Pipeline setup
+
+- **`make bootstrap-pipelines ENV=<env> CI=github|azure-devops`**: creates the read-only service principal per env and the OIDC federation for each pipeline identity, grants exactly the privileges section 17 lists, and prints the repo variables, environments (with required reviewers), branch-protection settings and a `CODEOWNERS` matching 18.1. It is idempotent, has a `PLAN=1` dry run like `bootstrap-sp`, and never writes to the repo.
+- **The prod stage triggers on `shared/**` changes too,** not only `envs/prod/**`, because a product or mapping change can change prod's generated output.
+- **The scheduled governance job is deployed from the data_access root,** so governance-only envs (no agents) get it.
+
+### 18.3 First deployment in git
+
+- `make setup` writes the section 9 `.gitignore` (today it doesn't).
+- The champion walkthrough ends with a commit step: what to `git add`, and opening the first PR.
+
+### 18.4 Optional AI helpers (decision 5)
+
+Explicit, opt-in commands, never called by `generate`, `rehearse`, `release` or `maintain`, never run in CI:
+
+- `make suggest-treatment CLASS=<class>`: proposes a treatment and mask for an unmapped class, for review.
+- `make draft-genie-content SPACE=<agent>`: drafts instructions, sample questions and benchmarks for an agent that has none.
+- Custom-mask SQL drafting, gated by the mask library's exact-output tests before it can be used.
+
+Output is written to files for review and committed like any change. A missing model endpoint only disables these helpers.
+
+### 18.5 Docs, organised by persona
+
+```
+README.md (root)                     start here; pick: govern tables, or govern and promote agents
+shared/examples/dev_to_prod/README   champion flow
+shared/docs/agents.md                data citizen playbook
+shared/docs/governance.md            governance engineer playbook
+shared/docs/operations.md            day-2 changes, including the one-team path (from #111)
+shared/docs/pipelines.md             DevOps setup for GitHub Actions and Azure DevOps (replaces cicd.md)
+shared/docs/deployment-machine.md    the v1 deployment machine
+shared/docs/legacy.md                legacy mode, as a migration source only
+REFERENCE.md                         every command and setting
+```
+
+Each playbook follows the champion README's style: the flow in one code block, short numbered steps, a "pass looks like" line, and what to do when it stops. `playbook.md`, `version-control.md`, `from-ui-to-production.md` and `self-service-genie.md` are merged into these and retired.
+
+### 18.6 Proving it
+
+- **Live runs per persona** on AWS and Azure: champion; data citizen (promote agent A while B is unfinished); governance engineer (mask change while an agent is mid-curation; tier move; new class); one team (both in one PR); governance only (no agents).
+- **Real pipelines:** the section 17 stages running in GitHub Actions and Azure DevOps against a test repo with OIDC and `bootstrap-pipelines`, including the refusals (unrehearsed commit, older commit, stale promotion PR, `maintain` from a non-released commit).
+- **Migrating the existing live AWS and Azure deployments** from legacy mode with step 9's migration, with the revocation report reviewed before cutover.
+
+### 18.7 Code health
+
+- Split `generate_abac.py` along the governance and agent layers, with no behaviour change, after step 11.
+
+### 18.8 Rollout (continues section 16)
+
+14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample.
+15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2).
+16. `make bootstrap-pipelines` (18.2).
+17. Optional AI helpers (18.4).
+18. Persona docs (18.5).
+19. Live persona runs, real pipeline runs, and migration of the existing deployments (18.6).
+20. `generate_abac.py` split (18.7).
+
+Still deferred: the items in section 15. Accepted residual risks are unchanged: a new table can be read raw until it is classified if readers already have schema-level access, and owners and admins can grant access outside GenieRails.
