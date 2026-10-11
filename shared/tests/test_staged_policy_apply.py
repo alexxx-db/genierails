@@ -784,3 +784,12 @@ def test_status_and_describe_print_the_journal(harness, capsys):
     assert spa.main(["status", "--env-dir", str(harness.env_dir), "--commit", "x"]) == 0
     out = capsys.readouterr().out
     assert "Unfinished policy change" in out and "failed at tighten" in out
+
+
+def test_describe_never_fails_a_plan(harness, capsys):
+    gen = write_env(harness.env_dir)
+    spa.journal_path(harness.env_dir).parent.mkdir(parents=True, exist_ok=True)
+    spa.journal_path(harness.env_dir).write_text("{not json")
+    assert harness.controller().describe() == 0
+    assert "no phase preview" in capsys.readouterr().out
+    assert gen and harness.calls == []

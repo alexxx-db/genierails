@@ -503,10 +503,17 @@ class Controller:
         return 0
 
     def describe(self) -> int:
-        """What the next apply would stage (read-only)."""
+        """What the next apply would stage (read-only, never fails: make plan and make check call it)."""
         if governance_mode(self.env_dir) != "deterministic":
             print("Staged policy apply: legacy governance mode; applies are not staged.")
             return 0
+        try:
+            return self._describe()
+        except (Refused, pg.StageError, OSError, ValueError) as exc:
+            print(f"Staged policy apply: no phase preview ({exc}); an apply would stop on this first.")
+            return 0
+
+    def _describe(self) -> int:
         desired = pg.desired_generation(self.env_dir)
         journal = load_journal(self.env_dir)
         t = (journal or {}).get("transition")

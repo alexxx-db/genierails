@@ -141,3 +141,4 @@ def test_terraform_refuses_a_one_shot_policy_change_outside_the_staged_phases(tm
     for run in ("one_shot_retag_is_refused", "one_shot_tier_move_is_refused", "create_may_not_remove_a_live_policy",
                 "tighten_may_not_remove_coverage", "legacy_mode_is_never_guarded", "switch_retags_under_the_controller"):
         assert f'run "{run}"... pass' in result.stdout, result.stdout
+

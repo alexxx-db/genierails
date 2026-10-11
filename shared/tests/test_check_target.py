@@ -408,3 +408,23 @@ def test_check_allows_only_the_scaffolded_env_link(repo, tmp_path):
 
     assert result.returncode != 0
     assert "envs/dev/data_access/env.auto.tfvars is a symlink" in result.stderr
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_never_runs_the_staged_policy_controller_or_any_apply(repo, tmp_path, ci):
+    """In a deterministic env, check's plan only previews the staged phases (step 6); nothing applies."""
+    log = tmp_path / "tf_all.log"
+    (tmp_path / "bin" / "terraform").write_text(
+        FAKE_TERRAFORM.replace("#!/bin/sh\n", f'#!/bin/sh\necho "$(basename "$PWD") $*" >> "{log}"\n', 1))
+    before = _baseline(repo)
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    # This fixture's values aren't versioned generations, so the preview says it can't plan the phases.
+    assert "Staged policy apply: no phase preview" in out
+    # The controller's run prints these (and takes the env lock); check never reaches it.
+    assert "=== Policy staged apply" not in out and "=== Policy phase" not in out
+    commands = log.read_text().splitlines()
+    assert not [c for c in commands if c.split()[1:2] in (["apply"], ["import"], ["destroy"])], commands
+    assert any(c.startswith("data_access plan") and "-var=policy_stage=preview" in c for c in commands), commands
+    _assert_read_only(repo, before)
