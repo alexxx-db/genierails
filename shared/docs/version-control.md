@@ -16,7 +16,7 @@ envs/
 │   ├── abac.auto.tfvars           ← Genie agent configs (title, instructions,
 │   │                                 benchmarks, SQL measures, sample questions)
 │   ├── auth.auto.tfvars           ← credentials (NEVER commit)
-│   ├── generated/                 ← ephemeral LLM draft (gitignored)
+│   ├── generated/                 ← reviewed rules (commit)
 │   └── data_access/
 │       ├── abac.auto.tfvars       ← tag_assignments, fgac_policies
 │       └── masking_functions.sql  ← SQL UDFs for column masking
@@ -34,7 +34,7 @@ envs/
 | Genie agent configuration | Workspace | `envs/<env>/abac.auto.tfvars` |
 | Environment input (tables, warehouse) | Workspace | `envs/<env>/env.auto.tfvars` |
 
-The `generated/` folder is ephemeral — it holds the raw LLM draft for review and tuning. After `make promote` splits it into the three layers, the split configs become the source of truth.
+`generated/` holds the reviewed rules. Commit it: `make promote` splits it into the three layers, and `make check` re-derives the layer files from it to prove they're current.
 
 ## What to version control
 
@@ -47,13 +47,14 @@ The `generated/` folder is ephemeral — it holds the raw LLM draft for review a
 | `envs/<env>/abac.auto.tfvars` | Genie agent configuration (tuned instructions, benchmarks) |
 | `envs/<env>/data_access/abac.auto.tfvars` | Tag assignments and FGAC policies |
 | `envs/<env>/data_access/masking_functions.sql` | Masking SQL UDFs deployed to the warehouse |
+| `envs/<env>/generated/` | Reviewed rules; `make check` re-derives and verifies the layer files from it |
 
 ### Never commit
 
 | File | Why |
 |------|-----|
 | `auth.auto.tfvars` | Contains service principal credentials |
-| `generated/` | Ephemeral LLM drafts — regenerated on every `make generate` |
+| Runtime records | `.*.apply.sha`, `.coverage_gate.json`, `.can_run_check.json`, `generated/.*` |
 | `*.tfstate`, `*.tfstate.backup` | Terraform state may contain secrets |
 | `.terraform/` | Provider binaries and cache |
 | `.genie_space_id` | Auto-managed by Terraform lifecycle |
@@ -63,13 +64,21 @@ The `generated/` folder is ephemeral — it holds the raw LLM draft for review a
 The default `.gitignore` excludes `envs/` entirely. To track your configs:
 
 ```bash
-# Option 1: Remove the blanket exclusion, add specific ignores
-# Edit .gitignore: remove the "envs/" line, then add:
-envs/*/auth.auto.tfvars
-envs/**/generated/
-envs/**/.terraform/
-envs/**/*.tfstate*
-envs/**/.genie_space_id
+# Option 1 (recommended): in .gitignore, replace the three lines
+# "envs/", "generated/" and "masking_functions.sql" with:
+auth.auto.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+.genie_*
+**/envs/**/data_access/.policy_generations/
+**/envs/**/data_access/classification.auto.tfvars
+**/envs/**/data_access/discovered_uc_tables.auto.tfvars
+**/envs/**/.*.apply.sha
+**/envs/**/.coverage_gate.json
+**/envs/**/.can_run_check.json
+**/envs/**/generated/.*
+**/envs/**/ddl/_fetched.sql
 
 # Option 2: Force-track specific files (leave .gitignore as-is)
 git add -f envs/account/abac.auto.tfvars
@@ -77,6 +86,8 @@ git add -f envs/dev/env.auto.tfvars
 git add -f envs/dev/abac.auto.tfvars
 git add -f envs/dev/data_access/abac.auto.tfvars
 git add -f envs/dev/data_access/masking_functions.sql
+git add -f envs/dev/generated/abac.auto.tfvars envs/dev/generated/masking_functions.sql envs/dev/generated/governed_tables.json
+# promoted envs also: envs/prod/generated/expected_classification.json
 ```
 
 ## Pinning to a GenieRails version
