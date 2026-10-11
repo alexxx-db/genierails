@@ -8,7 +8,10 @@ name: GenieRails prod maintain (azure)
 # REQUIRES PROD REMOTE STATE (deferred; design section 15) and the release
 # receipt (rollout step 9), which names the last released commit. Until both
 # exist the operator runs make maintain ENV=prod on the deployment machine,
-# on its own schedule, and the CI guard refuses every applying target here.
+# on its own schedule, at the last released commit, in the same persistent
+# checkout as releases (`git fetch && git checkout --detach <sha>`, an empty
+# `git status --porcelain`, never `git clean -x` or a re-clone; see
+# prod-release.yml). The CI guard refuses every applying target here.
 # Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 this job runs the read-only
 # drift audit, which exits non-zero when sensitive columns are untagged or
 # tag assignments are stale; GitHub's failed-run notification alerts the
@@ -26,9 +29,15 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
 
-# Shares the prod group with the release workflow: one prod run at a time.
+# Its own group, never shared with the release workflow: GitHub keeps only
+# one pending run per group, so a shared group let a scheduled maintain
+# cancel a pending release and a release waiting days for approval hold
+# maintain back. A newer pending maintain may replace an older pending one
+# (the audit is read-only and repeats in full); a running one is never
+# cancelled. Release and maintain must never apply to prod at the same
+# time; on the deployment machine the GenieRails env lock serialises them.
 concurrency:
-  group: genierails-prod-azure
+  group: genierails-prod-maintain-azure
   cancel-in-progress: false
 
 permissions:

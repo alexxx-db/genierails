@@ -155,6 +155,27 @@ def test_dev_samples_queue_every_commit_and_never_cancel():
         assert "lockBehavior: sequential" in devops and "batch: false" in devops
 
 
+def _concurrency_group(text):
+    block = re.search(r"(?m)^concurrency:\n((?:[ \t]+.*\n)+)", text)
+    return block and re.search(r"(?m)^\s+group:\s*(\S+)", block.group(1)).group(1)
+
+
+def test_prod_release_and_maintain_do_not_share_a_concurrency_group():
+    # GitHub keeps one pending run per group and cancels the older one, so a
+    # shared group (or any group on release) can cancel a pending release.
+    for cloud in ("aws", "azure"):
+        github = ROOT / cloud / ".github" / "workflows"
+        release = (github / "prod-release.yml").read_text()
+        maintain = (github / "prod-maintain.yml").read_text()
+        assert _concurrency_group(release) is None, cloud
+        assert _concurrency_group(maintain) == f"genierails-prod-maintain-{cloud}"
+        assert "cancel-in-progress: true" not in release + maintain
+        devops = ROOT / cloud / "azure-pipelines"
+        release = (devops / "prod-release.yml").read_text()
+        assert "lockBehavior: sequential" in release and "lockBehavior: runLatest" not in release
+        assert "environment:" not in (devops / "prod-maintain.yml").read_text()
+
+
 def test_samples_use_oidc_not_secrets():
     for _, path in _sample_workflows():
         text = path.read_text()

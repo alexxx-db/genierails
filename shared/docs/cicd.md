@@ -65,8 +65,8 @@ checkout and run from `aws/` or `azure/`.
 |---|---|---|---|
 | 2. PR check | `pr-check.yml` | every pull request (a required check; re-runs when `main` moves) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` |
 | 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev` on the merged commit |
-| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval | `make check ENV=prod` on that commit, then the approval gate |
-| 5. Keep protected | `prod-maintain.yml` | a schedule | `make audit-schema ENV=prod` (read-only drift audit) |
+| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; every run waits for its own approval and none is cancelled (GitHub: no concurrency group; Azure DevOps: `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=prod` on that commit, then the approval gate |
+| 5. Keep protected | `prod-maintain.yml` | a schedule (GitHub: its own concurrency group, never the release's) | `make audit-schema ENV=prod` (read-only drift audit) |
 
 **Auth.** Every Databricks credential is a service principal through OIDC
 workload identity federation (`github-oidc` or `azure-devops-oidc`); no PATs
@@ -86,8 +86,13 @@ The only file it can leave outside the copy is Terraform's own
 - **Applying stages run on the deployment machine** until the env has remote
   state with locking: `make rehearse ENV=dev` (dev remote state is rollout
   step 12), `make release ENV=prod` and `make maintain ENV=prod` (prod remote
-  state is deferred, design section 15). The operator runs them there, from a
-  clean checkout of the commit the pipeline names, in order. Every applying
+  state is deferred, design section 15). The operator runs them there, in order,
+  in the deployment machine's one persistent checkout, moved to the commit the
+  pipeline names with `git fetch && git checkout --detach <sha>`; confirm
+  `git status --porcelain` prints nothing. v1 keeps Terraform state, the env
+  lock and the Genie ID files under that checkout's gitignored `envs/`, so
+  never run `git clean -x` or re-clone; keeping them outside the checkout, in
+  `GENIERAILS_STATE_DIR`, is the target. Every applying
   target keeps refusing in CI, and the samples never set
   `GENIERAILS_ALLOW_CI_APPLY`, which exists only for GenieRails' own throwaway
   integration-test workspace. The dev and prod samples already carry the

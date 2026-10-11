@@ -10,17 +10,27 @@
 #
 # REQUIRES PROD REMOTE STATE (deferred; design section 15) and the two-phase
 # release (rollout step 9). Until both exist the operator releases on the
-# deployment machine with make release ENV=prod, from a clean checkout of
-# the commit this run names, and the CI guard refuses every applying target
-# here (TF_BUILD is set). Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 the
-# plan stage re-runs the read-only check of that exact commit, and the
-# release stage only records the approval gate and the commit to release.
+# deployment machine with make release ENV=prod, at the commit this run names,
+# in that machine's one persistent checkout: v1 keeps Terraform state, the
+# env lock and the Genie ID files under its gitignored envs/, so a re-clone
+# loses them. Move the checkout with `git fetch && git checkout --detach
+# <sha>`, confirm `git status --porcelain` prints nothing, and never run
+# `git clean -x` or re-clone. (State outside the checkout, in
+# GENIERAILS_STATE_DIR, is the target.)
+# The CI guard refuses every applying target here (TF_BUILD is set). Do
+# not set GENIERAILS_ALLOW_CI_APPLY. In v1 the plan stage re-runs the
+# read-only check of that exact commit, and the release stage only records
+# the approval gate and the commit to release.
 #
 # Settings: on "genierails-prod" add an Approvals check (a reviewer from the
 # governance code owners; approvers may not approve their own runs), a
 # Branch control check (main only) and an Exclusive Lock check.
-# lockBehavior: runLatest runs one release at a time and lets a newer
-# release supersede pending ones.
+# lockBehavior: sequential runs one release at a time, in order, and never
+# cancels a pending one (runLatest would let a newer run, even one that
+# does not touch envs/prod, cancel a release waiting for the lock). The
+# maintain pipeline uses no environment, so the two never wait on each
+# other's lock. Release and maintain must never apply to prod at the same
+# time; on the deployment machine the GenieRails env lock serialises them.
 # Auth: OIDC workload identity federation (azure-devops-oidc), no PATs or
 # secrets. Variable group "genierails-ids" holds the IDs:
 #   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
@@ -38,7 +48,7 @@ resources:
           include: [main]
         stages: [Rehearse]
 
-lockBehavior: runLatest
+lockBehavior: sequential
 
 variables:
   - group: genierails-ids
