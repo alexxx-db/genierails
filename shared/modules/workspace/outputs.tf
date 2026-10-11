@@ -34,6 +34,11 @@ output "genie_space_acls_applied" {
   value       = length(null_resource.genie_space_acls) > 0 || length(null_resource.genie_space_acls_created) > 0
 }
 
+output "genie_space_acl_groups_planned" {
+  description = "Per-space groups this plan grants CAN_RUN (the desired groups minus any withheld) when the root manages ACLs (deterministic); null otherwise."
+  value       = var.manage_acls == true ? local.genie_space_acl_groups : null
+}
+
 output "genie_space_acls_groups" {
   description = "Per-space groups the config grants CAN_RUN on each Genie agent (before any are withheld)."
   value       = local.genie_space_groups

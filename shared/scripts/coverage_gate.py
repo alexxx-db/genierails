@@ -60,6 +60,7 @@ VALIDATOR = SHARED_ROOT / "validate_abac.py"
 DATA_ACCESS_SUBDIR = "data_access"
 GATE_FILENAME = ".coverage_gate.json"
 CAN_RUN_FILENAME = ".can_run_check.json"
+AGENT_COVERAGE_FILENAME = ".agent_coverage.json"  # scripts/agent_coverage.py
 ACL_RESOURCES = ("genie_space_acls", "genie_space_acls_created")
 REFRESH_RELPATH = Path("generated") / ".live_refresh.json"
 REFRESH_VERSION = 1
@@ -380,16 +381,20 @@ def _failed(gate_path: Path, record: dict, inputs: dict, env_name: str, reason: 
 # local.genie_exposure_blocker itself is unknown under terraform console (its
 # refresh-time checks need plantimestamp()), so read the rest of it and apply
 # those two checks here (refresh_problem), as modules/coverage_gate_check does.
+# local.exposure_gate is the gate CAN_RUN rests on: the data_access coverage
+# check (legacy) or the live agent coverage check (deterministic,
+# scripts/agent_coverage.py).
 CAN_RUN_EXPRESSION = (
     "base64encode(jsonencode({"
     "groups = module.workspace.genie_space_acls_groups, "
     "blocker = local.genie_exposure_static_blocker, "
-    "refreshed_at = module.coverage_gate_check.refreshed_at, "
-    "fresh_until = module.coverage_gate_check.fresh_until, "
-    "problems = module.coverage_gate_check.problems, "
+    "refreshed_at = local.exposure_gate.refreshed_at, "
+    "fresh_until = local.exposure_gate.fresh_until, "
+    "problems = local.exposure_gate.problems, "
     "widening = local.genie_space_can_run_widening, "
     "applied = local.applied_can_run_groups, "
-    "missing = local.genie_space_missing_grants}))"
+    "missing = local.genie_space_missing_grants, "
+    "deterministic = local.deterministic}))"
 )
 # modules/coverage_gate_check future_skew.
 FUTURE_SKEW = timedelta(minutes=5)
@@ -452,7 +457,9 @@ def can_run_check(env_dir: Path, env_name: str, runner: Path, apply_flags: str) 
         if csv and widening.get(key, ["unknown"]) and (blocker or missing.get(key, ["unknown"]))
     }
     if withheld:
-        reason = blocker or "the data_access state lacks the SELECT grants those groups need"
+        reason = blocker or ("the live agent coverage check failed for those agents"
+                             if state.get("deterministic") else
+                             "the data_access state lacks the SELECT grants those groups need")
         details = "; ".join(f"{key}: +{', '.join(added)}" for key, added in sorted(withheld.items()))
         print(f"WARNING: Genie CAN_RUN withheld for workspace:{env_name}: these groups wait ({details}) "
               f"while {reason}.\n  Everything else in this change (keeping, shrinking or clearing "
@@ -639,9 +646,21 @@ def skip_key(layer: str, layer_dir: Path) -> str:
     if withheld_access(layer, layer_dir):
         return "noskip"
     outputs = (_state(layer_dir / DATA_ACCESS_SUBDIR / "terraform.tfstate") or {}).get("outputs", {})
-    return "data_access " + hashlib.sha256(json.dumps(
+    key = "data_access " + hashlib.sha256(json.dumps(
         [outputs.get("coverage_gate"), outputs.get("table_grant_resource_keys")], sort_keys=True,
     ).encode()).hexdigest()
+    # Deterministic envs gate CAN_RUN on the live agent coverage check; a new
+    # verdict (not just a newer time) must reach Terraform.
+    agent_gate = layer_dir / AGENT_COVERAGE_FILENAME
+    if agent_gate.exists():
+        try:
+            record = json.loads(agent_gate.read_text())
+            verdict = [record.get("status"), record.get("fingerprint"),
+                       {k: (v or {}).get("status") for k, v in (record.get("agents") or {}).items()}]
+        except (OSError, ValueError, AttributeError):
+            return "noskip"
+        key += " agents " + hashlib.sha256(json.dumps(verdict, sort_keys=True).encode()).hexdigest()
+    return key
 
 
 def invalidate(env_dir: Path, reason: str) -> None:

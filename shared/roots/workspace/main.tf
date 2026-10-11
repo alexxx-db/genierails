@@ -31,6 +31,10 @@ provider "databricks" {
 
 locals {
   project_root = abspath("${path.root}/../..")
+  # Deterministic envs: CAN_RUN comes only from genie_spaces[].acl_groups and
+  # opens only after the live agent coverage check (below) passed.
+  deterministic = var.governance_mode == "deterministic"
+  acl_managed   = local.deterministic || length(var.groups) > 0
 
   # ── Backward-compat shim ──────────────────────────────────────────────────
   # If genie_spaces is not set (old single-space config), synthesize a single
@@ -135,7 +139,11 @@ locals {
       sql_warehouse_id            = s.sql_warehouse_id != "" ? s.sql_warehouse_id : var.sql_warehouse_id
       configured_sql_warehouse_id = s.sql_warehouse_id
       uc_tables                   = s.uc_tables
-      config                      = try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
+      # Deterministic: the agent's own acl_groups, never a derived or drafted list.
+      config = (local.deterministic
+        ? merge(try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
+        : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
+      )
     }
   }
 
@@ -153,7 +161,7 @@ locals {
   _applied_coverage_gate = try(local._data_access_state.outputs.coverage_gate.value, null)
   # The blocker minus the gate's refresh-time checks, which need the plan time
   # (unknown under terraform console); can-run-check applies those itself.
-  genie_exposure_static_blocker = (
+  genie_exposure_static_blocker = local.deterministic ? local.agent_gate_static_blocker : (
     local._data_access_state == null ? "the data_access layer has no readable state (${local.data_access_dir}/terraform.tfstate)" :
     local._applied_coverage_gate == null ? "the data_access state predates the coverage check; re-apply the data_access layer" :
     # Legacy state from before business_access_enabled was retired: an apply
@@ -165,7 +173,57 @@ locals {
     module.coverage_gate_check.static_status == "stale" ? "the data_access config changed after its last checked apply" :
     module.coverage_gate_check.static_problem
   )
-  genie_exposure_blocker = local.genie_exposure_static_blocker != "" ? local.genie_exposure_static_blocker : module.coverage_gate_check.problem
+  genie_exposure_blocker = local.genie_exposure_static_blocker != "" ? local.genie_exposure_static_blocker : local.exposure_gate.problem
+  # The gate CAN_RUN rests on: the live agent coverage check (deterministic)
+  # or the data_access coverage check its last apply used (legacy).
+  exposure_gate = local.deterministic ? module.agent_coverage_check : module.coverage_gate_check
+
+  # ── Live agent coverage check (deterministic envs) ─────────────────────────
+  # CAN_RUN no longer depends on the data_access layer's state. Before every
+  # workspace plan/apply, make runs scripts/agent_coverage.py, which checks
+  # Unity Catalog live, whoever made the masks: every classified (class.*)
+  # column of each agent's tables has an effective column mask, and every
+  # acl_groups group can SELECT each table. It records one result per agent
+  # in .agent_coverage.json for exactly these inputs (fingerprint below),
+  # judged by modules/coverage_gate_check like the data_access gate: a
+  # missing, unreadable, stale (inputs changed, or a hand-edited
+  # fingerprint) or expired result withholds every new CAN_RUN group, and an
+  # agent the check failed gets none. Keeping, shrinking or clearing CAN_RUN
+  # never needs it.
+  agent_coverage_file = "${var.env_dir}/.agent_coverage.json"
+  _discovered_file    = "${var.env_dir}/data_access/discovered_uc_tables.auto.tfvars"
+  deployment_binding = sha256(jsonencode({
+    workspace_host = lower(trimsuffix(trimspace(var.databricks_workspace_host), "/"))
+    workspace_id   = trimspace(var.databricks_workspace_id)
+  }))
+  agent_coverage_inputs = {
+    version    = 1
+    deployment = local.deployment_binding
+    max_age    = var.coverage_gate_max_age
+    # Tables of agents known only by ID come from make generate's discovery.
+    discovered = fileexists(local._discovered_file) ? filesha256(local._discovered_file) : ""
+    agents = {
+      for key, space in local.merged_spaces : key => {
+        name   = space.name
+        groups = sort(distinct(space.config.acl_groups))
+        tables = sort(distinct(local._space_tables[key]))
+      }
+    }
+  }
+  agent_coverage_fingerprint = sha256(jsonencode(local.agent_coverage_inputs))
+  _agent_gate_result         = fileexists(local.agent_coverage_file) ? try(jsondecode(file(local.agent_coverage_file)), null) : null
+  agent_gate_static_blocker = (
+    module.agent_coverage_check.static_status == "pass" ? "" :
+    "the live agent coverage check has no current pass: ${module.agent_coverage_check.static_problem}"
+  )
+  agent_gate_missing = {
+    for key, space in local.merged_spaces : key => (
+      try(local._agent_gate_result.agents[key].status, "") == "pass" ? [] : [coalesce(
+        try(join("; ", [for problem in local._agent_gate_result.agents[key].problems : tostring(problem)]), ""),
+        "no live agent coverage result for this agent",
+      )]
+    )
+  }
 
   # What CAN_RUN the last apply left in place, per space, from this layer's
   # own state (the layer runner's local backend): the groups recorded in the
@@ -241,7 +299,7 @@ locals {
   # Groups each space's desired CAN_RUN adds beyond what is applied.
   genie_space_can_run_widening = {
     for key, space in local.merged_spaces : key => (
-      length(var.groups) > 0
+      local.acl_managed
       ? sort(tolist(setsubtract(toset(space.config.acl_groups), toset(local.applied_can_run_groups[key]))))
       : []
     )
@@ -259,7 +317,7 @@ locals {
       length(split(".", t)) >= 3 ? t : (var.uc_catalog != "" ? "${var.uc_catalog}.${t}" : t)
     ]
   }
-  genie_space_missing_grants = {
+  genie_space_missing_grants = local.deterministic ? local.agent_gate_missing : {
     for key, space in local.merged_spaces : key => (
       length(local._space_tables[key]) > 0
       ? [
@@ -520,6 +578,14 @@ variable "governance_mode" {
   }
 }
 
+# Shared env.auto.tfvars is consumed by both workspace and data-access roots.
+# SELECT is granted only in data_access; declared here to avoid an
+# undeclared-variable warning.
+variable "table_readers" {
+  type    = map(list(string))
+  default = null
+}
+
 variable "raw_exempt_principals" {
   type        = list(string)
   default     = []
@@ -697,6 +763,16 @@ module "coverage_gate_check" {
   max_age              = try(local._applied_coverage_gate.max_age, "")
 }
 
+# The live agent coverage check's result must be for exactly these agents,
+# groups and tables, and recent (deterministic envs; see agent_coverage_inputs).
+module "agent_coverage_check" {
+  source = "../../modules/coverage_gate_check"
+
+  gate_file            = local.agent_coverage_file
+  expected_fingerprint = local.agent_coverage_fingerprint
+  max_age              = var.coverage_gate_max_age
+}
+
 module "workspace" {
   source = "../../modules/workspace"
 
@@ -713,6 +789,7 @@ module "workspace" {
   genie_only                       = var.genie_only
   manage_groups                    = var.manage_groups
   groups                           = var.groups
+  manage_acls                      = local.deterministic ? true : null
   genie_exposure_blocker           = local.genie_exposure_blocker
   genie_space_missing_grants       = local.genie_space_missing_grants
   genie_space_can_run_widening     = local.genie_space_can_run_widening
@@ -772,7 +849,7 @@ output "genie_space_can_run_withheld" {
 check "genie_can_run_withheld" {
   assert {
     condition     = length(module.workspace.genie_space_can_run_withheld) == 0
-    error_message = "Genie CAN_RUN withheld (${join("; ", [for key, groups in module.workspace.genie_space_can_run_withheld : "${key}: ${join(", ", groups)}"])}): ${local.genie_exposure_blocker != "" ? local.genie_exposure_blocker : "the data_access state lacks the SELECT grants those groups need"}. Removing or keeping CAN_RUN still applies. Apply governance first through make (make apply, make release or make apply-governance), which runs the coverage check and applies data_access before Genie ACLs."
+    error_message = "Genie CAN_RUN withheld (${join("; ", [for key, groups in module.workspace.genie_space_can_run_withheld : "${key}: ${join(", ", groups)}"])}): ${local.genie_exposure_blocker != "" ? local.genie_exposure_blocker : (local.deterministic ? "the live agent coverage check failed for those agents" : "the data_access state lacks the SELECT grants those groups need")}. Removing or keeping CAN_RUN still applies. ${local.deterministic ? "Run the workspace layer through make (make apply, make rehearse or make release), which runs the live agent coverage check first." : "Apply governance first through make (make apply, make release or make apply-governance), which runs the coverage check and applies data_access before Genie ACLs."}"
   }
 }
 
@@ -789,6 +866,14 @@ output "genie_space_can_run_widening" {
 output "genie_existing_space_warehouse_intent" {
   description = "Per attached agent, the raw per-space warehouse update intent."
   value       = module.workspace.genie_existing_space_warehouse_intent
+}
+
+output "agent_coverage_inputs" {
+  description = "Deterministic envs: what the live agent coverage check (scripts/agent_coverage.py) must check, and the fingerprint its result must record; null in legacy envs, so their plans don't change."
+  value = local.deterministic ? {
+    fingerprint = local.agent_coverage_fingerprint
+    inputs      = local.agent_coverage_inputs
+  } : null
 }
 
 output "genie_exposure_blocker" {

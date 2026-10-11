@@ -319,7 +319,7 @@ Every step keeps `main` working and ships its own live test on AWS and Azure whe
 5. **Governance-only policies, no grants:** per-tier policies, `raw_exempt_principals`, fail-safe redaction for unmapped classes, the external-mask inventory, and a test that no grant targets `account users`.
 6. **Policy changes and tier moves:** the staged-apply protocol and its verification.
 7. **Reader and weakening checks** with committed, scoped acknowledgements (`ack.txt`).
-8. **Access:** `SELECT` only from `table_readers`, `CAN_RUN` only from `acl_groups`; per-agent files; the agent-readability check and the proposed `table_readers` in `generate`.
+8. **Access:** `SELECT` only from `table_readers`, `CAN_RUN` only from `acl_groups`; per-agent files; the agent-readability check and the proposed `table_readers` in `generate`. Built (except per-agent files, which move to step 11 with capture), extended with the live agent coverage check that replaces the `CAN_RUN` gate's dependence on data_access state, and `group_map` (decision 8) ([access.md](../access.md)).
 9. **Release gating, then migration:** the rehearse receipt and `release` attestation first; then the migration dry run, revocation list, frozen AI row filters, tag state moves and staged cutover.
 10. **Declared row filters.**
 11. **Capture and prod ownership:** `make capture`, JSON-aware remap, prod IDs in state and the release receipt, overwrite report, two-step detach.
