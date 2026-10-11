@@ -344,3 +344,27 @@ def test_drop_functions_drops_only_functions_no_kept_generation_defines(tmp_path
     calls.clear()
     assert pg.drop_functions(env_dir, environ, live_users=lambda *a: {next(iter(dropped))}, run=run) == 1
     assert calls == []
+
+
+def test_grant_plan_may_change_access_only():
+    plan = {"resource_changes": [
+        dict(_change("databricks_grant", "c.s.t|g", "create"), name="table_access"),
+        dict(_change("databricks_grant", "c.s.t|h", "delete"), name="table_access"),
+        _change("databricks_policy_info", "p", "no-op"),
+    ]}
+    assert pg.plan_violations(plan, "grant") == []
+    for rtype, key in (("databricks_policy_info", "p"), ("databricks_entity_tag_assignment", "columns|c.s.t.x|gr_treatment")):
+        for action in ("update", "create", "delete"):
+            assert pg.plan_violations({"resource_changes": [_change(rtype, key, action)]}, "grant"), (rtype, action)
+
+
+def test_grant_hook_reapplies_the_last_render_with_new_access_allowed(tmp_path, monkeypatch):
+    env_dir = tmp_path / "dev"
+    gen = _generation(env_dir)
+    monkeypatch.setattr(pg, "RUNNER", _stub_runner(tmp_path, {"resource_changes": []}))
+    with pytest.raises(pg.StageError, match="last applied stage"):
+        pg.run_hook("grant", _environ(env_dir, gen["fingerprint"]))
+    assert pg.run_hook("switch", _environ(env_dir, gen["fingerprint"])) == 0
+    assert pg.run_hook("grant", _environ(env_dir, gen["fingerprint"])) == 0
+    plans = [line for line in (tmp_path / "runner.log").read_text().splitlines() if " plan " in f" {line} "]
+    assert "-var=policy_stage=grant" in plans[-1]

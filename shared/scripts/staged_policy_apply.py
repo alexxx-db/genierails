@@ -18,6 +18,9 @@ verification, in this order:
 6. ``retire``, ``verify-retired``, ``drop-functions``: only for a generation an
    **earlier** run made obsolete and a later successful run confirmed
    (``confirm``); never the generation this run switched away from.
+7. ``grant``: new SELECT (table_readers). Every phase above withholds new
+   grants (``policy_stage``), so access opens only once its protection is
+   applied and verified.
 
 The journal (``<env>/data_access/.policy_generations/journal.json``, next to
 the layer's state) records the active generation, the obsolete one waiting
@@ -57,7 +60,7 @@ JOURNAL_NAME = "journal.json"
 HOOK_DIR = SHARED / "scripts" / "policy_hooks"
 INVENTORY = SHARED / "scripts" / "staged_policy_verify.py"
 APPLY_PHASES = {"create": "create", "tighten": "tighten", "switch": "switch", "retire": "retire",
-                "drop-functions": "drop-functions"}
+                "drop-functions": "drop-functions", "grant": "grant"}
 # verify phase -> (stages the last applied hook may be, run verify-access too)
 VERIFY_PHASES = {
     "verify-created": (("create", "restore"), True),
@@ -284,6 +287,8 @@ class Controller:
             phases += ["switch", "verify-switched"]
         if eligible:
             phases += ["retire", "verify-retired", "drop-functions"]
+        # New SELECT opens last, after everything above is applied and verified.
+        phases.append("grant")
         return {
             "run_id": uuid.uuid4().hex[:12], "commit": self.commit, "from": active,
             "to": desired["fingerprint"], "retain": held["fingerprint"] if held else "",

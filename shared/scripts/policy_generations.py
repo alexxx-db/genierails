@@ -50,6 +50,11 @@ Stages (every one keeps all retained generations' functions):
   active generation, without the replacement's policies.
 * ``drop-functions``: after ``retire``, drop the functions only the retired
   generation used, once no live policy calls them.
+* ``grant``: last, once every phase above is applied and verified: re-apply
+  the last stage's render with new SELECT allowed. Every earlier phase plans
+  ``policy_stage`` values that withhold new grants (grants already applied
+  stay), so access never opens before its protection is verified. Its plan
+  may change no policy or treatment tag.
 
 Snapshots of every generation a hook applies are kept next to the layer's
 state, in ``<env>/data_access/.policy_generations/<fingerprint>.json``; the
@@ -78,7 +83,7 @@ from governance_policies import (  # noqa: E402
 )
 
 APPLY_STAGES = ("create", "tighten", "switch", "restore", "retire", "abandon")
-STAGES = APPLY_STAGES + ("drop-functions",)
+STAGES = APPLY_STAGES + ("drop-functions", "grant")
 RUNNER = SHARED / "scripts" / "terraform_layer.sh"
 COVERAGE_GATE = SHARED / "scripts" / "coverage_gate.py"
 DEPLOY_FUNCTIONS = SHARED / "deploy_masking_functions.py"
@@ -405,6 +410,10 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
         if ("create" in actions and rtype == "databricks_grant" and change.get("name") in BUSINESS_GRANTS
                 and stage in ("create", "tighten", "restore", "abandon")):
             problems.append(f"{address}: business access is only granted after the switch")
+        if stage == "grant" and rtype in ("databricks_policy_info", "databricks_entity_tag_assignment") \
+                and set(actions) - {"no-op", "read"}:
+            problems.append(f"{address}: {'/'.join(actions)} (the grant phase changes access only)")
+            continue
         if "delete" not in actions:
             continue
         protected = rtype in PROTECTED_TYPES or any(address.endswith(t) for t in PROTECTED_TYPES if "." in t)
@@ -456,6 +465,8 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
         raise StageError("GENIERAILS_ENV_DIR must name the env directory")
     if stage == "drop-functions":
         return drop_functions(env_dir, environ)
+    if stage == "grant":
+        return grant(env_dir, environ)
     env_name = environ.get("GENIERAILS_ENV_NAME") or env_dir.name
     layer_dir = env_dir / "data_access"
     expected = environ.get("GENIERAILS_POLICY_FINGERPRINT", "")
@@ -509,6 +520,33 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
     })
     print(f"Policy stage {stage}: applied generation {desired['fingerprint']}"
           + (f" (retained {old['fingerprint']})" if old else ""))
+    return 0
+
+
+def grant(env_dir: Path, environ: dict) -> int:
+    """Re-apply the last verified render with new SELECT allowed; nothing else may change."""
+    env_name = environ.get("GENIERAILS_ENV_NAME") or env_dir.name
+    layer_dir = env_dir / "data_access"
+    expected = environ.get("GENIERAILS_POLICY_FINGERPRINT", "")
+    record = load_stage_record(env_dir)
+    if not record or record.get("desired") != expected or desired_generation(env_dir)["fingerprint"] != expected:
+        raise StageError("grant: the last applied stage is not of the generation the controller is applying")
+    write_stage(layer_dir, record["rendered"])
+    if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
+        _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"])
+    with tempfile.TemporaryDirectory() as tmp:
+        plan_file = Path(tmp) / "grant.tfplan"
+        _runner(env_name, layer_dir, "plan", "-input=false", "-var=policy_stage=grant", f"-out={plan_file}")
+        shown = _runner(env_name, layer_dir, "show", "-json", str(plan_file), capture=True)
+        plan = json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
+        problems = plan_violations(plan, "grant")
+        if problems:
+            print("ERROR: the grant plan changes protection; nothing was applied:", file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+            return 1
+        _runner(env_name, layer_dir, "apply-plan", str(plan_file))
+    print(f"Policy stage grant: access applied on generation {expected}")
     return 0
 
 

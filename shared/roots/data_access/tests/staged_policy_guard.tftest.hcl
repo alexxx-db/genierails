@@ -253,3 +253,137 @@ run "legacy_mode_is_never_guarded" {
   }
 }
 
+# Step 8 SELECT (table_readers) with a passing coverage check: every staged
+# phase but grant withholds new SELECT, so access opens only after the new
+# protection is applied and verified; grant (and a plain plan) opens it.
+run "readers_gate_inputs" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+}
+
+run "readers_gate_passes" {
+  module {
+    source = "./tests/file_writer"
+  }
+  variables {
+    files = {
+      "tests/.tmp/staged/data_access/masking_functions.sql" = "SELECT 1;\n"
+      "tests/.tmp/staged/data_access/.coverage_gate.json"   = jsonencode({ status = "pass", fingerprint = run.readers_gate_inputs.coverage_gate_inputs.fingerprint, refreshed_at = "@NOW@" })
+      "tests/.tmp/staged/data_access/terraform.tfstate"     = jsonencode({ version = 4, outputs = { coverage_gate = { value = { status = "pass", fingerprint = "applied", deployment_binding = run.readers_gate_inputs.coverage_gate_inputs.deployment_binding } } }, resources = [{ module = "module.data_access", mode = "managed", type = "databricks_policy_info", name = "policies", provider = "provider[\"registry.terraform.io/databricks/databricks\"].workspace", instances = [{ index_key = "gr_mask_cat_email_partial__string__0a1b2c3d_partial", schema_version = 0, attributes = { to_principals = ["partial"], except_principals = ["raw"], column_mask = { function_name = "cat.sch.gr_mask_email_partial__string__0a1b2c3d_partial" } } }, { index_key = "gr_mask_cat_email_partial__string__0a1b2c3d_full", schema_version = 0, attributes = { to_principals = ["account users"], except_principals = ["raw", "partial"], column_mask = { function_name = "cat.sch.gr_mask_email_partial__string__0a1b2c3d_full" } } }] }, { module = "module.data_access", mode = "managed", type = "databricks_entity_tag_assignment", name = "treatment", provider = "provider[\"registry.terraform.io/databricks/databricks\"].workspace", instances = [{ index_key = "columns|cat.sch.orders.email|gr_treatment", schema_version = 0, attributes = { entity_name = "cat.sch.orders.email", tag_value = "email_partial__string__0a1b2c3d" } }] }] })
+    }
+  }
+}
+
+# create plans no new SELECT.
+run "create_withholds_new_select" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "create"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "a staged phase before grant must withhold new SELECT"
+  }
+}
+
+# tighten plans no new SELECT.
+run "tighten_withholds_new_select" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "tighten"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "a staged phase before grant must withhold new SELECT"
+  }
+}
+
+# switch plans no new SELECT.
+run "switch_withholds_new_select" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "switch"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "a staged phase before grant must withhold new SELECT"
+  }
+}
+
+# restore plans no new SELECT.
+run "restore_withholds_new_select" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "restore"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "a staged phase before grant must withhold new SELECT"
+  }
+}
+
+# retire plans no new SELECT.
+run "retire_withholds_new_select" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "retire"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "a staged phase before grant must withhold new SELECT"
+  }
+}
+
+# abandon plans no new SELECT.
+run "abandon_withholds_new_select" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "abandon"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "a staged phase before grant must withhold new SELECT"
+  }
+}
+
+# grant, the last phase, plans it.
+run "grant_opens_new_select" {
+  command = plan
+  variables {
+    policy_stage  = "grant"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = length(module.data_access.withheld_table_grants.grants) == 0 && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "the grant phase opens new SELECT"
+  }
+}
+
+# Outside the controller (make plan's preview) the gate alone decides, as before.
+run "plain_plan_still_grants" {
+  command = plan
+  variables {
+    policy_stage  = "preview"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = length(module.data_access.withheld_table_grants.grants) == 0 && module.data_access.withheld_table_grants.status == "pass"
+    error_message = "the grant phase opens new SELECT"
+  }
+}
+

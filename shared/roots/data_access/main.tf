@@ -161,7 +161,10 @@ locals {
     for ta in var.tag_assignments : "${ta.entity_type}|${ta.entity_name}|${ta.tag_key}" => ta.tag_value
     if ta.entity_type == "columns" && ta.tag_key == "gr_treatment"
   }
-  _policy_stage_guarded = var.governance_mode == "deterministic" && contains(["", "create", "tighten"], var.policy_stage)
+  _policy_stage_guarded = var.governance_mode == "deterministic" && contains(["", "create", "tighten", "grant"], var.policy_stage)
+  # New SELECT opens only in the grant phase, after every staged phase is
+  # applied and verified (scripts/staged_policy_apply.py).
+  withhold_new_table_grants = var.governance_mode == "deterministic" && contains(["create", "tighten", "switch", "restore", "retire", "abandon"], var.policy_stage)
   staged_policy_violations = local._policy_stage_guarded ? concat(
     [for name, live in local._applied_mask_policies : "${name} removed" if !contains(keys(local._config_mask_policies), name)],
     [for name, live in local._applied_mask_policies : "${name} changes its function" if contains(keys(local._config_mask_policies), name) && try(local._config_mask_policies[name].function, "") != live.function],
@@ -176,8 +179,8 @@ variable "policy_stage" {
   default     = ""
   description = "Set only by scripts/policy_generations.py (one value per staged phase), preview by make plan and destroy by make destroy."
   validation {
-    condition     = contains(["", "preview", "destroy", "create", "tighten", "switch", "restore", "retire", "abandon"], var.policy_stage)
-    error_message = "policy_stage must be empty or one of preview, destroy, create, tighten, switch, restore, retire, abandon."
+    condition     = contains(["", "preview", "destroy", "create", "tighten", "switch", "restore", "retire", "abandon", "grant"], var.policy_stage)
+    error_message = "policy_stage must be empty or one of preview, destroy, create, tighten, switch, restore, retire, abandon, grant."
   }
 }
 
@@ -565,6 +568,7 @@ module "data_access" {
   tag_assignments                          = var.tag_assignments
   governance_mode                          = var.governance_mode
   table_readers                            = local.full_table_readers
+  withhold_new_table_grants                = local.withhold_new_table_grants
   access_tier_groups                       = var.access_tier_groups
   raw_exempt_principals                    = var.raw_exempt_principals
   governed_tables                          = local.governed_tables

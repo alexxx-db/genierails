@@ -443,7 +443,7 @@ def test_first_release_creates_policies_before_tagging_any_column(harness):
     gen = write_env(harness.env_dir)
     assert harness.apply() == 0
     assert harness.calls == ["create", "inventory:create/restore", "switch", "inventory:switch",
-                             "verify-access:switch"]
+                             "verify-access:switch", "grant"]
     journal = harness.journal()
     assert journal["active"] == gen["fingerprint"] and journal["pending"] == [] and journal["transition"] is None
     assert live_tags(live_state(harness.env_dir)) == gen["tags"]
@@ -452,7 +452,7 @@ def test_first_release_creates_policies_before_tagging_any_column(harness):
 def test_unchanged_generation_is_one_apply_with_nothing_to_verify_or_retire(harness):
     released(harness)
     assert harness.apply() == 0
-    assert harness.calls == ["create"]
+    assert harness.calls == ["create", "grant"]
 
 
 def test_treatment_change_creates_verifies_switches_verifies_and_keeps_the_old_generation(harness):
@@ -461,7 +461,7 @@ def test_treatment_change_creates_verifies_switches_verifies_and_keeps_the_old_g
     assert new_value(old, new)
     assert harness.apply() == 0
     assert harness.calls == ["create", "inventory:create/restore", "verify-access:create",
-                             "switch", "inventory:switch", "verify-access:switch"]
+                             "switch", "inventory:switch", "verify-access:switch", "grant"]
     state = live_state(harness.env_dir)
     names = {p["name"] for p in live_policies(state)}
     # Both generations are live; columns carry the new one; nothing was retired.
@@ -487,7 +487,7 @@ def test_old_generation_retires_only_after_a_later_confirmed_release(harness):
     # A later release: verify the live generation first, then retire the old one.
     assert harness.apply() == 0
     assert harness.calls == ["create", "inventory:create/restore", "verify-access:create",
-                             "retire", "inventory:retire", "drop-functions"]
+                             "retire", "inventory:retire", "drop-functions", "grant"]
     state = live_state(harness.env_dir)
     assert {p["name"] for p in live_policies(state)} == {p["name"] for p in new["fgac_policies"]}
     assert harness.journal()["pending"] == []
@@ -704,7 +704,7 @@ def test_failed_function_drop_resumes_without_retiring_twice(harness, monkeypatc
     harness._drop = real
     harness.calls.clear()
     assert harness.apply() == 0
-    assert harness.calls == ["drop-functions"]
+    assert harness.calls == ["drop-functions", "grant"]
 
 
 # -- tier moves -------------------------------------------------------------------------------
@@ -720,7 +720,7 @@ def test_tier_move_tightens_before_it_loosens(harness, before, after):
     assert old["tags"] == new["tags"]  # a tier move needs no new value
     assert harness.apply() == 0
     assert harness.calls[:4] == ["create", "inventory:create/restore", "verify-access:create", "tighten"]
-    assert harness.calls[4:] == ["inventory:tighten", "switch", "inventory:switch", "verify-access:switch"]
+    assert harness.calls[4:] == ["inventory:tighten", "switch", "inventory:switch", "verify-access:switch", "grant"]
     # verify-created checks the old tiers (what columns still give), verify-switched the new ones.
     assert harness.verify_envs[0]["access_tier_groups"] == before
     assert harness.verify_envs[1]["access_tier_groups"] == after
@@ -847,3 +847,34 @@ def test_describe_never_fails_a_plan(harness, capsys):
     assert harness.controller().describe() == 0
     assert "no phase preview" in capsys.readouterr().out
     assert gen and harness.calls == []
+
+
+def test_new_access_opens_only_in_the_last_phase_after_every_verification(harness, tmp_path):
+    """table_readers SELECT (step 8): every staged plan withholds new grants; only grant allows them."""
+    released(harness)
+    write_env(harness.env_dir, tiers=["raw", "analysts", "masked"], versions={"email_partial": {"partial": "redacted"}})
+    assert harness.apply() == 0 and harness.controller().confirm() == 0
+    write_env(harness.env_dir, tiers=["raw", "analysts", "masked"], versions={"email_partial": {"partial": "initials"}})
+    log = tmp_path / "envs" / "dev" / "runner.log"
+    log.write_text("")
+    assert harness.apply() == 0
+    phases = harness.journal()["history"][-1]["phases"]
+    assert phases[-1] == "grant" and "retire" in phases and "verify-switched" in phases
+    stages = [line.split("-var=policy_stage=")[1].split()[0] for line in log.read_text().splitlines()
+              if line.startswith("plan ")]
+    # One plan per applying phase, grant strictly last; each other stage withholds new SELECT in Terraform.
+    assert stages[-1] == "grant" and "grant" not in stages[:-1]
+    assert set(stages[:-1]) <= {"create", "tighten", "switch", "retire"}
+
+
+def test_failed_grant_keeps_the_verified_protection_and_resumes_at_grant(harness):
+    old = released(harness)
+    new = write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    assert harness.apply(FAKE_TF_FAIL_PLAN="grant") == 1
+    t = harness.journal()["transition"]
+    assert t["failed_phase"] == "grant" and "restore" not in harness.calls
+    assert live_tags(live_state(harness.env_dir)) == new["tags"]  # switched and verified; not undone
+    harness.calls.clear()
+    assert harness.apply() == 0
+    assert harness.calls == ["grant"]
+    assert harness.journal()["pending"][0]["fingerprint"] == old["fingerprint"]
