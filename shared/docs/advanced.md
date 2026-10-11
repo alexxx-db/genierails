@@ -126,9 +126,9 @@ generate it on its own instead of promoting:
 make generate ENV=bu2
 ```
 
-Review and commit the result. CI runs `make check ENV=bu2`; the deployment
-machine runs `make rehearse ENV=bu2` / `make release ENV=bu2` after approval,
-as for any env. See [CI/CD](cicd.md).
+Review and commit the result. CI runs `make check ENV=bu2`; after approval the
+deployment machine runs `make rehearse ENV=bu2`, which applies and verifies it.
+`make release` is only for envs filled by `make promote-to`. See [CI/CD](cicd.md).
 
 ## Migrating an Existing Root-Based Workspace
 
