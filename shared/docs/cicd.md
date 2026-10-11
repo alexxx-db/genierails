@@ -1,148 +1,56 @@
-# CI/CD Integration
+# CI/CD
 
-This document explains how to integrate the quickstart into a CI/CD process.
+How to run GenieRails from a pipeline. The full design is
+[section 17 of the design doc](design/deterministic-governance.md#17-where-each-command-runs);
+this page is what works **today (v1)**, with target-only items marked.
 
-## Recommended Model
+## Who runs what
 
-Use this split of responsibilities:
+| Stage | Where | Command | Writes Databricks? |
+|---|---|---|---|
+| 1. Author | your machine | `make generate ENV=dev` (and `make promote-to ENV=prod` for a promotion); review, commit, open a PR | no |
+| 2. PR check | CI, every PR | `make check ENV=dev`; plus `make check ENV=prod` when the PR touches `envs/prod/**` | no |
+| 3. Dev rehearsal | after each merge to `main`, in order | `make rehearse ENV=dev` | dev |
+| 4. Prod release | after the promotion PR is merged, rehearsed and approved | `make release ENV=prod` (target: `release-plan` → approve → `release MANIFEST=…`, rollout step 9) | prod |
+| 5. Keep protected | schedule | `make maintain ENV=prod` | prod, governance only |
 
-- Local or developer workflow:
-  - run `make generate`
-  - review and tune `generated/abac.auto.tfvars`
-  - review and tune `generated/masking_functions.sql`
-  - run `make validate-generated`
-  - commit the reviewed config changes
-- CI workflow:
-  - validate committed config **and run `make coverage-gate`** (block the build if any classified sensitive column has no covering mask)
-  - run `make plan`; applying from CI is not supported in v1
-- Persistent deployment workspace:
-  - after the reviewed change is approved, enable/wait for prod native classification and run `make release ENV=prod`
-  - keep the deployment checkout, credentials, and Terraform state persistent between releases
+- **In v1, stages 3–5 run on the deployment machine**, not in CI: every applying
+  target refuses under CI (see [CI guard](#ci-guard)). The samples below carry
+  the triggers and approvals and report the commit to apply.
+- **Promotion is a person, not a pipeline.** `make promote-to ENV=prod` reads
+  `promote_from` and `catalog_map` from `envs/prod/env.auto.tfvars`; commit its
+  output in a PR. No pipeline writes to git.
+- **Never run `make generate` in CI or prod.** Prod re-derives from its own tags.
 
-Pipeline samples for every stage, for GitHub Actions and Azure DevOps, are in
-[Pipeline samples](#pipeline-samples-where-each-command-runs). Their applying
-stages stay on the deployment machine until remote state exists. Do not
-bypass the v1 CI guard on a deployment job.
+## What to commit
 
-This keeps LLM-driven generation and human review out of the automated deployment path, keeps the LLM out of prod entirely (prod re-derives deterministically), and makes coverage an explicit, enforced check rather than something you hope happened.
+GenieRails' own `.gitignore` excludes `envs/`; un-ignore it (see
+[Version control](version-control.md)) and commit:
 
-> **Prerequisite:** Your configs should be version-controlled before setting up CI/CD. See [Version Control & Standalone Terraform](version-control.md) for what to commit and how to set up git tracking.
+- `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/`, the layer files
+  `envs/<env>/abac.auto.tfvars`, `envs/<env>/data_access/abac.auto.tfvars`,
+  `envs/<env>/data_access/masking_functions.sql`, and `envs/account/abac.auto.tfvars`.
 
-## What Should Be Committed
+Never commit `auth.auto.tfvars`, Terraform state, `.terraform/`, or lock and
+fingerprint files.
 
-Commit the reviewed environment and layer config:
+## CI guard
 
-- `envs/account/abac.auto.tfvars`
-- `envs/<env>/abac.auto.tfvars`
-- `envs/<env>/data_access/abac.auto.tfvars`
-- `envs/<env>/data_access/masking_functions.sql`
-- `envs/<env>/env.auto.tfvars`
+Applying targets (`apply`, `apply-governance`, `apply-genie`, `apply-account`,
+`rehearse`, `release`, `maintain`, `enable-classification`, `ungovern`,
+`destroy*`, `import`, `migrate-state`) refuse when they detect CI:
+`CI=true|1|yes`, or `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`, `BUILDKITE` or
+`CIRCLECI` set. `make check`, `plan`, `validate` and `audit-schema` are allowed.
+`GENIERAILS_ALLOW_CI_APPLY=1` exists only for GenieRails' own throwaway
+integration tests; never set it on a deployment job.
 
-Do not commit secrets or local state:
+## Branch protection and approvals
 
-- `envs/<env>/auth.auto.tfvars`
-- `envs/account/auth.auto.tfvars`
-- Terraform state files
-- local apply fingerprint files
-- fetched local DDL snapshots unless you intentionally want them in version control
-
-## Secrets in CI
-
-Your pipeline should inject credentials at runtime rather than committing `auth.auto.tfvars`.
-
-For each target environment, create `envs/<env>/auth.auto.tfvars` during the job from secret values such as:
-
-- `databricks_account_id`
-- `databricks_client_id`
-- `databricks_client_secret`
-- `databricks_workspace_id`
-- `databricks_workspace_host`
-
-The [pipeline samples](#pipeline-samples-where-each-command-runs) use OIDC workload identity federation instead: they write only the IDs and leave `databricks_client_secret` empty.
-
-If the account layer or `data_access` layer needs different credentials, write those layer-specific auth files separately instead of relying on the default symlinks.
-
-## Recommended Pipeline Stages
-
-## 1. Validate on pull requests
-
-Run one read-only command per env:
-
-```bash
-make check ENV=dev
-make check ENV=prod     # when the PR touches envs/prod/**; includes make promote-to ENV=prod CHECK=1
-```
-
-`make check` runs `validate`, checks the committed generated files are current,
-then `validate-generated`, the blocking offline coverage check (it fails the PR
-if any classified sensitive column has no covering mask), the mask-library unit
-tests and a structural `plan`. See the [command reference](../examples/dev_to_prod/REFERENCE.md#command-reference).
-
-## 2. Plan before deploy
-
-On the deployment machine, where the Terraform state lives, review the change before applying it:
-
-```bash
-make plan ENV=dev
-make plan ENV=prod
-```
-
-This shows the net change across the layered state model:
-
-1. shared `account`
-2. env-scoped `data_access`
-3. env-scoped `workspace`
-
-## 3. Release from the persistent deployment workspace
-
-After approval, deploy from the persistent deployment workspace. **For prod,
-re-derive facts from prod's own classification first** — never re-run `generate`
-in prod (that re-invokes the LLM and could drift from the reviewed rules):
-
-```bash
-# prod facts: enable/wait for native classification first
-make release ENV=prod   # row-pairing keys: picked per table and proven before apply
-```
-
-`make release` re-derives assignments from prod's own tags (no LLM), validates,
-runs the coverage check and the rulebook audit, applies all layers in order
-(masks and policies before grants), then proves masking with `verify-access`.
-It never re-generates via the LLM. Terraform itself refuses new or wider
-business `SELECT` / Genie `CAN_RUN` without a recent passing coverage result,
-so no path can grant access past the gate.
-
-## Promotion in CI/CD
-
-There are two common models:
-
-### Model A: Promote locally, release from the deployment workspace
-
-Recommended for most teams.
-
-1. A developer runs:
-
-   ```bash
-   make promote-to ENV=prod   # promote_from/catalog_map are reviewed in envs/prod/env.auto.tfvars
-   ```
-
-2. The promoted config is reviewed and committed
-3. CI runs `make check ENV=prod` against the reviewed configuration; it includes `make promote-to ENV=prod CHECK=1`, which fails if the committed promotion differs from what `promote-to` writes
-4. After approval, the operator enables/waits for prod native classification and runs `make release ENV=prod` from the persistent deployment workspace; if its coverage check fails, fix the rules in dev and re-promote
-
-This is the best model when you want promotion to stay explicit and reviewable in Git.
-
-### Model B: Generate independent environments
-
-Use this for separate business units or environments that should not inherit `dev` governance.
-
-1. A developer runs:
-
-   ```bash
-   make generate ENV=bu2
-   ```
-
-2. The generated config is reviewed and committed
-3. CI validates and plans `ENV=bu2`; the persistent deployment workspace applies the approved change
+- Make the PR check a required status check, and require branches to be up to
+  date before merging.
+- Put CODEOWNERS on `envs/prod/**`, `envs/account/**` and `shared/` so
+  governance changes need the governance team.
+- Protect the prod environment: required reviewers, no self-approval, `main` only.
 
 ## Pipeline samples: where each command runs
 
@@ -199,27 +107,13 @@ The only file it can leave outside the copy is Terraform's own
   to `release-plan` with the two-phase release (rollout step 9), as do the
   release manifest and per-commit receipts.
 
----
+## Drift between releases
 
-## Schema Drift Detection in CI
+`make audit-schema ENV=prod` is read-only and safe to schedule in CI: it exits
+`1` on untagged sensitive columns or tags on deleted columns. Fix drift with
+`make maintain ENV=prod` on the deployment machine; it re-derives from prod's
+tags with no LLM. GenieRails also ships an opt-in, read-only scheduled
+Databricks job; see [Scheduled governance](scheduled-governance.md).
 
-Use `make audit-schema` as a scheduled CI check to detect when new columns need governance:
-
-```bash
-make audit-schema ENV=prod
-```
-
-This exits `1` if untagged sensitive columns are found (forward drift) or if existing tag assignments reference deleted columns (reverse drift). Use GitHub's built-in failed-run notifications to alert when drift is detected.
-
-When drift is found, prefer letting native classification tag the new columns, then re-derive deterministically with `make maintain ENV=prod` (runs `derive-assignments`, reusing the promoted rules, no LLM). `make generate-delta` is an exceptional/legacy remediation that invokes the LLM — it is not the routine dev-to-prod path.
-
----
-
-## Notes and Gotchas
-
-- Avoid running `make generate` automatically in CI — and never in prod. Dev drafts locally with the LLM (reviewed, committed); prod re-derives facts with `make derive-assignments` (no LLM), so prod enforcement can't drift from the reviewed rules.
-- Every plan/apply (`make apply`, `plan`, `apply-governance`, `apply-genie`, and `release`) re-reads live UC state and runs the enforced coverage check. Still keep `make coverage-gate` as a required PR check, so uncovered columns fail early on the generated config.
-- `make apply ENV=<workspace>` also applies the shared account layer, so the deployment-workspace identity must be authorized for both account and workspace operations.
-- If you deploy multiple environments from the same repo, parameterize `ENV` and inject the matching workspace secrets per environment.
-- Destroy is a deployment-workspace operation, for example `make destroy ENV=dev`; it is refused in CI.
-- If you are adopting existing Databricks resources, run the import from the persistent deployment workspace before planning the managed resources in CI.
+Independent environments that should not inherit dev governance (for example
+one per business unit) are covered in [Advanced](advanced.md#independent-environments).
