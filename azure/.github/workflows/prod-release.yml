@@ -10,10 +10,18 @@ name: GenieRails prod release (azure)
 #
 # REQUIRES PROD REMOTE STATE (deferred; design section 15) and the two-phase
 # release (rollout step 9). Until both exist the operator releases on the
-# deployment machine with make release ENV=prod, from a clean checkout of
-# the commit this run names, and the CI guard refuses every applying target
-# here. Do not set GENIERAILS_ALLOW_CI_APPLY: it exists only for the
-# throwaway integration-test workspace. In v1 the plan job re-runs the
+# deployment machine with make release ENV=prod, at the commit this run names,
+# in that machine's one persistent checkout: v1 keeps Terraform state, the
+# env lock and the Genie ID files under its gitignored envs/, so a re-clone
+# loses them. Move the checkout with
+# `git fetch && git checkout --force --detach <sha>` (--force drops earlier
+# runs' edits to tracked generated/ and layer files and leaves the ignored
+# state alone), confirm `git status --porcelain` prints nothing, and never
+# run `git clean -x` or re-clone. (State outside the checkout, in
+# GENIERAILS_STATE_DIR, is the target.)
+# The CI guard refuses every applying target here. Do not set
+# GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
+# integration-test workspace. In v1 the plan job re-runs the
 # read-only check of that exact commit, and the release job only records the
 # approval gate and the commit to release.
 #
@@ -32,11 +40,14 @@ on:
     types: [completed]
     branches: [main]
 
-# One prod run at a time. A newer pending release supersedes an older
-# pending one; the running one is never cancelled.
-concurrency:
-  group: genierails-prod-azure
-  cancel-in-progress: false
+# Deliberately no concurrency group, as in the dev workflow: GitHub keeps
+# only one pending run per group and cancels the older one, so a newer run
+# (even one that does not touch envs/prod) or a scheduled maintain could
+# cancel a release still waiting for approval. Every release run waits for
+# its own approval and none is cancelled. Release and maintain must never
+# apply to prod at the same time: in v1 neither applies here, and on the
+# deployment machine the GenieRails env lock (envs/prod/generated/
+# .governance.lock in the persistent checkout) serialises them.
 
 permissions:
   contents: read

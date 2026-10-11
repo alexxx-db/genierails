@@ -76,8 +76,8 @@ checkout and run from `aws/` or `azure/`.
 |---|---|---|---|
 | 2. PR check | `pr-check.yml` | every PR to `main`; make it required and require branches to be up to date, so a PR is re-checked against the latest `main` before it can merge (Azure Repos: a build-validation policy that re-runs when the target branch changes) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` |
 | 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev` on the merged commit |
-| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval | `make check ENV=prod` on that commit, then the approval gate |
-| 5. Keep protected | `prod-maintain.yml` | a schedule | `make audit-schema ENV=prod` (read-only drift audit) |
+| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; every run waits for its own approval and none is cancelled (GitHub: no concurrency group; Azure DevOps: `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=prod` on that commit, then the approval gate |
+| 5. Keep protected | `prod-maintain.yml` | a schedule (GitHub: its own concurrency group, never the release's) | `make audit-schema ENV=prod` (read-only drift audit) |
 
 **Auth.** Every Databricks credential is a service principal through OIDC
 workload identity federation (`github-oidc` or `azure-devops-oidc`); no PATs
