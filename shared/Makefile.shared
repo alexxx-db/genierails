@@ -547,7 +547,7 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 	@$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)"
 
 _apply-account-locked:
-	@$(call _ENV_LOCK,apply-account); \
+	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,apply-account); \
 	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace
 
 rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (verify-access picks and proves a row-pairing key per masked table; VERIFY_KEY_COLUMN optionally overrides)

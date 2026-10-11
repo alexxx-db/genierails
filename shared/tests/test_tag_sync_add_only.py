@@ -275,3 +275,13 @@ def test_standalone_sync_tags_env_account_with_a_deterministic_env_is_add_only(t
     result = repo.make("sync-tags", "account")
     assert result.returncode != 0 and "make apply-account" in result.stdout
     assert repo.wrote() == []
+
+
+# make -n runs recipe lines that call $(MAKE); the lock must not be one of them.
+@pytest.mark.parametrize("args", [("apply-account", "dev"), ("apply", "account")])
+def test_dry_run_takes_no_lock_and_writes_nothing(tmp_path, args):
+    repo = Repo(tmp_path, LIVE)
+    result = repo.make(args[0], args[1], "-n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not repo.lock.parent.exists() or list(repo.lock.parent.iterdir()) == []
+    assert repo.applies() == [] and repo.wrote() == []
