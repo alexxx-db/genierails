@@ -28,8 +28,16 @@ locals {
     : databricks_sql_endpoint.warehouse[0].id
   )
 
+  # Keyed without the value, so a treatment change updates the tag in place.
+  treatment_tag_assignments = var.governance_mode == "deterministic" ? {
+    for ta in var.tag_assignments : "${ta.entity_type}|${ta.entity_name}|${ta.tag_key}" => ta
+    if ta.entity_type == "columns" && ta.tag_key == "gr_treatment"
+  } : {}
+  legacy_tag_assignments = [for ta in var.tag_assignments : ta if !(
+    var.governance_mode == "deterministic" && ta.entity_type == "columns" && ta.tag_key == "gr_treatment"
+  )]
   _grouped_tag_assignments = {
-    for ta in var.tag_assignments :
+    for ta in local.legacy_tag_assignments :
     "${ta.entity_type}|${ta.entity_name}|${ta.tag_key}|${ta.tag_value}" => ta...
   }
 
@@ -43,7 +51,7 @@ locals {
   # Built-in principals such as "account users" are intentionally absent from
   # the managed groups map, but still need catalog/schema/table grants. Derive
   # the access set from both managed groups and policy targets.
-  access_principals = distinct(concat(
+  access_principals = var.governance_mode == "deterministic" ? [] : distinct(concat(
     keys(var.groups),
     flatten([
       for p in var.fgac_policies : p.to_principals
@@ -73,7 +81,7 @@ locals {
     )
   }
 
-  table_access_pairs = flatten([
+  table_access_pairs = var.governance_mode == "deterministic" ? [] : flatten([
     for table, principals in local.table_access_principals : [
       for principal in principals : { table = table, principal = principal }
     ]
@@ -296,6 +304,23 @@ resource "databricks_entity_tag_assignment" "assignments" {
   }
 }
 
+# Retagged only after the masking functions and every policy exist (the
+# account layer has already added the allowed value), so a column never
+# carries a treatment that no policy masks yet.
+resource "databricks_entity_tag_assignment" "treatment" {
+  for_each    = local.treatment_tag_assignments
+  provider    = databricks.workspace
+  entity_type = each.value.entity_type
+  entity_name = each.value.entity_name
+  tag_key     = each.value.tag_key
+  tag_value   = each.value.tag_value
+  depends_on = [
+    databricks_grant.terraform_sp_manage_catalog,
+    terraform_data.masking_functions,
+    databricks_policy_info.policies,
+  ]
+}
+
 resource "time_sleep" "wait_for_tag_propagation" {
   depends_on      = [databricks_entity_tag_assignment.assignments]
   create_duration = "30s"
@@ -364,6 +389,7 @@ resource "databricks_grant" "table_access" {
     time_sleep.wait_for_tag_propagation,
     terraform_data.masking_functions,
     databricks_policy_info.policies,
+    databricks_entity_tag_assignment.treatment,
     time_sleep.wait_for_policy_enforcement,
   ]
 
@@ -518,13 +544,14 @@ resource "databricks_policy_info" "policies" {
   ]
 }
 
-# Unity Catalog policy creation can return before enforcement is observable.
-# New table grants wait out that window. The wait restarts when the policies
-# change or the masking functions are redeployed (any terraform_data
-# replacement: SQL, warehouse, host, client ID), which delays grants created in
-# the same apply; SELECT grants that already exist stay in place throughout.
+# Unity Catalog policy creation and treatment retags can return before
+# enforcement is observable. New table grants wait out that window. The wait
+# restarts when the policies change or the masking functions are redeployed
+# (any terraform_data replacement: SQL, warehouse, host, client ID), which
+# delays grants created in the same apply; SELECT grants that
+# already exist stay in place throughout.
 resource "time_sleep" "wait_for_policy_enforcement" {
-  depends_on      = [databricks_policy_info.policies]
+  depends_on      = [databricks_policy_info.policies, databricks_entity_tag_assignment.treatment]
   create_duration = "30s"
 
   triggers = {

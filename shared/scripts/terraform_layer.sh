@@ -184,6 +184,13 @@ case "$COMMAND" in
   plan|apply|destroy|import|console)
     CMD=(terraform "$COMMAND" "${VAR_ARGS[@]}" "$@")
     ;;
+  show)
+    CMD=(terraform show "$@")
+    ;;
+  apply-plan)
+    # A saved plan already carries its variables; Terraform refuses -var-file.
+    CMD=(terraform apply -input=false "$@")
+    ;;
   state-list)
     CMD=(terraform state list "$@")
     ;;
