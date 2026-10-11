@@ -163,21 +163,43 @@ row_filters = [
 | CI | Every applying target refuses in CI, except the dev and prod pipelines of section 17, and only once that env has remote locked state. |
 | Coverage freshness | A pass counts only for the same commit (`check`) and the same live snapshot (`rehearse`, `release`, `maintain`). |
 
-**Acknowledgements live in a committed file**, `envs/<env>/ack.txt`, one typed and fully scoped entry per line, so every acknowledgement is reviewed, code-owned and part of the receipt fingerprint:
+**Acknowledgements live in a committed file**, `envs/<env>/ack.txt`, one typed and fully scoped entry per line, so every acknowledgement is reviewed, code-owned and part of the receipt fingerprint. Each line includes the environment again so copying a file to a different environment fails closed:
 
 ```text
-weaken:cat.sch.t.col:etl-sp
-unclassified:cat.sch.t.col
-reader:cat.sch.t:bi-sp
-rollback:<commit>
+prod:weaken:cat.sch.t.col:etl-sp
+prod:unclassified:cat.sch.t.col
+prod:reader:cat.sch.t:bi-sp
+prod:rollback:<commit>
 ```
 
-GenieRails prints the before/after consequence of each entry and refuses entries that match nothing. The `ACK` environment variable is accepted only for `rehearse ENV=dev`, never for prod.
+Each entry names the env, kind and exact object. GenieRails prints the
+before/after consequence of each and refuses entries that match nothing after
+all checks (weakening, reader and unclassified) are reconciled together, once.
+Entries for another env are refused. The weakening keys are
+`<env>:weaken:<column|table|treatment>:<principal>` (`*` for readers outside a
+removed row filter, `partial` for `partial = "raw"`); reader keys are
+`<env>:reader:<table>:<principal>`.
+Repositories must add `envs/*/ack.txt` to `CODEOWNERS` using the existing
+governance-owner team or users; the project deliberately does not prescribe an
+organization-specific owner name. The `ACK` environment variable is accepted only for `rehearse ENV=dev`, never for prod.
 
 **Residual risks (stated, not solved):**
 - Owners, metastore admins and `MANAGE` holders can grant `SELECT` outside GenieRails at any time; acknowledgements can't catch that. Keep ownership and `MANAGE` off human principals; `maintain` reports new readers on its next run.
 - Readers with schema- or catalog-level `SELECT` can read a new table raw until it is classified and `maintain` runs. Run `maintain` on a schedule.
 - In dev, tables added to an agent in the UI but not yet captured are not governed.
+- Reader inventory is bounded by the deployer's Unity Catalog visibility.
+  `information_schema` returns only the grants the caller may see, so the
+  check fails unless the deployer is the metastore admin (the metastore owner,
+  read from the API) or an owner or `MANAGE` holder of each inventoried
+  securable or a parent, including the schemas and catalogs of dependent
+  views. It also fails if a table, view, schema or catalog is missing or has
+  no visible owner, or if any query fails or times out. An incomplete
+  inventory is never treated as empty. Group membership comes from the
+  workspace SCIM API (users by user name/email, service principals by
+  application id, nested groups by name).
+- Delta Sharing recipients and file-level paths such as `READ FILES` are not
+  covered by the v1 table-reader inventory. Govern those paths separately and
+  do not treat this report as proof that they are absent.
 
 ## 7. Verification
 
@@ -192,7 +214,7 @@ GenieRails prints the before/after consequence of each entry and refuses entries
 - New functions are created under new names; policies change in tighten-before-loosen phases; old functions are kept until no policy uses them. Tag state moves with generated `terraform state mv`.
 - Existing AI-drafted row filters are frozen as they are until declared ones replace them.
 - Cutover is reported done only after a fresh classification read and a passing tier-aware verification.
-- Rollback: one PR reverts **both** the source change and its promotion (or reverts the source change and re-runs `promote-to`), adds `rollback:<commit>` to `envs/prod/ack.txt`, and goes through the normal stages. The previous version's functions and policies are kept until a later release has succeeded, so masks switch back in place.
+- Rollback: one PR reverts **both** the source change and its promotion (or reverts the source change and re-runs `promote-to`), adds `prod:rollback:<commit>` to `envs/prod/ack.txt`, and goes through the normal stages. The previous version's functions and policies are kept until a later release has succeeded, so masks switch back in place.
 
 ## 9. Files and version control
 
@@ -216,7 +238,7 @@ GenieRails prints the before/after consequence of each entry and refuses entries
 | Release | after the promotion PR is merged and rehearse has passed on that merge commit: the prod pipeline (section 17), or in v1 the operator on the deployment machine | prod |
 
 - **Rehearse writes a receipt per commit** (append-only, keyed by commit) next to dev's state: commit, clean-tree flag, fingerprint of code and inputs, result, target env mapping, and the digest of what `promote-to` produces for each target. If the dev fingerprint matches a passing receipt, rehearse writes a receipt for the new commit without re-applying, and still recomputes the `promote-to` digests.
-- **`release` recomputes everything and refuses unless** `HEAD` equals the receipt's commit, the tree is clean, `HEAD` is on freshly fetched `origin/main`, the fingerprints match, and the digest of `envs/prod/generated` matches the receipt. It also refuses a commit that is an ancestor of the last release (an out-of-order or stale approval) unless `rollback:<commit>` is acknowledged. The promotion PR's merge commit is the one that must pass rehearse, so code merged after it can't reach prod untested.
+- **`release` recomputes everything and refuses unless** `HEAD` equals the receipt's commit, the tree is clean, `HEAD` is on freshly fetched `origin/main`, the fingerprints match, and the digest of `envs/prod/generated` matches the receipt. It also refuses a commit that is an ancestor of the last release (an out-of-order or stale approval) unless `<env>:rollback:<commit>` is acknowledged. The promotion PR's merge commit is the one that must pass rehearse, so code merged after it can't reach prod untested.
 - **Unfinished agents** never reach git, because capture is explicit. Promoting A carries B's last captured version unchanged.
 - **Removing an agent revokes `CAN_RUN` only. Removing a `table_readers` entry revokes the `SELECT` it granted.** Masks stay until `make ungovern`.
 - A failed rehearse blocks release until a fix merges and rehearse passes. CI also regenerates each open promotion PR and fails it if it differs.
@@ -250,7 +272,7 @@ GenieRails prints the before/after consequence of each entry and refuses entries
 | Remove agent A | A PR sets `acl_groups = []` and `detached = true` and is released (`CAN_RUN` revoked); then `make detach-agent`; then a PR removes it from config with a no-destroy plan. Table access and masks unchanged. |
 | Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, release. Additions are checked as widening. |
 | Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR, rehearse and release apply the removal. |
-| Roll back | One revert PR covering the source change and its promotion, with `rollback:<commit>` acknowledged; normal stages; masks switch back in place. |
+| Roll back | One revert PR covering the source change and its promotion, with `prod:rollback:<commit>` acknowledged; normal stages; masks switch back in place. |
 | Upgrade GenieRails | A governance change: upgrade, rehearse, promote, release. |
 | Several teams | Per-agent files with code owners; a central team owns governance files. |
 
@@ -260,7 +282,7 @@ The README shows one golden-path config (three tiers, one agent, `catalog_map`);
 
 
 - **Settings:** `access_tier_groups`, `table_readers`, `uc_tables`, `catalog_map`, per-agent `genie_space_id` / `acl_groups` / `delete`, and optionally `raw_exempt_principals`, `treatment_versions`, `column_overrides`, `tag_treatments`, `row_filters`. `governance_mode` exists only during migration.
-- **One file:** `envs/<env>/ack.txt` for acknowledgements.
+- **One acknowledgement file:** `envs/<env>/ack.txt` (env-scoped entries, code-owned).
 - **Commands:** `setup`, `generate`, `capture`, `rehearse`, `promote-to`, `release-plan`, `release`, `maintain`; occasionally `ungovern`, `detach-agent`, `apply-account`, `scaffold-treatments`.
 
 ## 14. Platform checks (before step 4)
@@ -319,7 +341,7 @@ A change that needs an intermediate replan (staged policy changes, tier moves, m
 **Provenance for operations.** Every applying command enforces its own provenance, independent of pipeline settings:
 - `detach-agent`: HEAD is the last released commit, and that release had the agent with `detached = true`.
 - `apply-account`: clean `origin/main` HEAD; a saved account plan and manifest; approval; the account lock; it writes an account receipt.
-- Migration and policy phases: a clean checkout whose `HEAD` is on freshly fetched `origin/main`, with a matching passing dev receipt, and not older than the last release unless `rollback:<commit>` is acknowledged; one manifest and approval per phase, each recording the commit and this provenance result.
+- Migration and policy phases: a clean checkout whose `HEAD` is on freshly fetched `origin/main`, with a matching passing dev receipt, and not older than the last release unless `<env>:rollback:<commit>` is acknowledged; one manifest and approval per phase, each recording the commit and this provenance result.
 
 **`make check ENV=<env>`** is read-only. It runs `validate`, a regeneration that fails if any committed generated file differs, `validate-generated`, the offline coverage check, the mask-library unit tests and `plan`. With `ENV=prod` it also runs `make promote-to ENV=prod CHECK=1`, which regenerates into a scratch directory and fails if the committed output differs. Before an env has remote state, `plan` is a structural plan against empty state; state-aware plans start with remote state.
 
