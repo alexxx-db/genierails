@@ -333,6 +333,15 @@ class ClassificationSource(SensitivitySource):
             return classified
         return {c for c in classified if c in wanted}
 
+    def classes_by_column(self, columns: Sequence[str] | None = None) -> dict[str, list[str]]:
+        """Every native class semantic per column, mapped or not."""
+        wanted = set(columns) if columns else None
+        out: dict[str, set[str]] = {}
+        for entity_name, semantic, _raw in self._iter_semantics():
+            if semantic and (wanted is None or entity_name in wanted):
+                out.setdefault(entity_name, set()).add(semantic)
+        return {column: sorted(classes) for column, classes in sorted(out.items())}
+
     def unmapped_columns(self, columns: Sequence[str] | None = None) -> list[tuple[str, str]]:
         """(entity_name, semantic) for classified columns we produced no tag for.
 

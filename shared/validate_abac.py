@@ -20,6 +20,7 @@ import argparse
 from pathlib import Path
 
 from tag_vocabulary import REGISTRY
+from governance_policies import parse_treatment_value
 from treatment_derivation import load_treatment_config
 
 try:
@@ -543,6 +544,20 @@ def validate_coverage_gate(
         if not matching:
             missing_policies.add(f"{treatment} (catalog {catalog}; used by {column})")
             unprotected.append(f"{column} (treatment {treatment}; no covering column-mask policy)")
+            continue
+        if parse_treatment_value(treatment):
+            # Deterministic values name their functions; the full one always
+            # covers the column, so it must be policed and deployed.
+            expected_fn = f"gr_mask_{treatment}_full"
+            used = {p.get("function_name") for p in matching}
+            if expected_fn not in used or not used <= {expected_fn, f"gr_mask_{treatment}_partial"}:
+                missing_policies.add(f"{treatment} (catalog {catalog}; expected masking function {expected_fn})")
+                unprotected.append(f"{column} (treatment {treatment}; covering policy does not resolve to {expected_fn})")
+                continue
+            absent = sorted(fn for fn in used if sql_functions is None or fn not in sql_functions)
+            if absent:
+                missing_functions.update(f"{fn} (treatment {treatment}; used by {column})" for fn in absent)
+                unprotected.append(f"{column} (treatment {treatment}; masking function {absent[0]} missing)")
             continue
         expected_fn = treatment_functions.get(treatment)
         if not expected_fn:
