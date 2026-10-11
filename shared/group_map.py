@@ -15,8 +15,8 @@ and agent checks read the destination's own, mapped config).
 
 promote-to stays a pure function of committed files. What needs the live
 destination runs in rehearse and release (release-plan once it exists):
-``check-live`` refuses any resulting group that doesn't exist there, mapped
-or not, and ``check-ack`` refuses a changed ``group_map`` (added, removed or
+``check`` refuses any resulting group that doesn't exist there, mapped or
+not, including every principal of the committed promoted policies, and ``check-ack`` refuses a changed ``group_map`` (added, removed or
 retargeted mapping, against the one the last apply used) unless each change
 is acknowledged as ``<env>:weaken:group_map:<dev>=<target>`` in
 ``envs/<env>/ack.txt`` (for a removed mapping the target is the dev group
@@ -111,12 +111,35 @@ def referenced_groups(cfg: Mapping) -> list[str]:
     return sorted(g for g in groups if isinstance(g, str) and g.lower() not in EVERYONE)
 
 
-def missing_groups(cfg: Mapping, existing: Iterable[str]) -> list[str]:
-    present = set(existing)
-    return [group for group in referenced_groups(cfg) if group not in present]
+# Committed promotion output whose policies name principals: the split
+# data_access config Terraform applies and the generated config it comes from.
+PROMOTED_CONFIGS = (Path("data_access") / "abac.auto.tfvars", Path("generated") / "abac.auto.tfvars")
+
+
+def policy_principals(env_dir: Path) -> list[str]:
+    """Every to_principals / except_principals of the committed promoted policies."""
+    names: set[str] = set()
+    for relative in PROMOTED_CONFIGS:
+        for policy in _load_hcl(Path(env_dir) / relative).get("fgac_policies") or []:
+            if not isinstance(policy, dict):
+                raise GroupMapError(f"{Path(env_dir) / relative}: fgac_policies entries must be objects")
+            for field in ("to_principals", "except_principals"):
+                names.update(str(p) for p in policy.get(field) or [])
+    return sorted(n for n in names if n.lower() not in EVERYONE)
+
+
+def _deployer(env_dir: Path) -> str:
+    return str(_load_hcl(Path(env_dir) / "auth.auto.tfvars").get("databricks_client_id") or "")
+
+
+def missing_groups(cfg: Mapping, existing: Iterable[str], policy_names: Iterable[str] = (),
+                   deployer: str = "") -> list[str]:
+    present = set(existing) | ({deployer} if deployer else set())
+    return sorted({g for g in [*referenced_groups(cfg), *policy_names] if g not in present})
 
 
 def _workspace_groups(env_dir: Path) -> list[str]:
+    """Group names and service principal application IDs visible in the workspace."""
     from scripts.audit_schema_drift import _get_sdk_client
 
     client = _get_sdk_client(env_dir)
@@ -125,6 +148,9 @@ def _workspace_groups(env_dir: Path) -> list[str]:
         if not getattr(group, "display_name", None):
             raise GroupMapError(f"group {getattr(group, 'id', '?')!r} has no visible name")
         names.append(str(group.display_name))
+    for sp in client.service_principals.list(attributes="applicationId"):
+        if getattr(sp, "application_id", None):
+            names.append(str(sp.application_id))
     return names
 
 
@@ -203,7 +229,8 @@ def main(argv: list[str] | None = None, lister: Callable[[Path], Iterable[str]] 
             record_applied(args.env_dir, cfg)
             return 0
         problems = validation_errors(cfg)
-        missing = missing_groups(cfg, lister(args.env_dir)) if not problems else []
+        policy_names = policy_principals(args.env_dir) if not problems else []
+        missing = missing_groups(cfg, lister(args.env_dir), policy_names, _deployer(args.env_dir)) if not problems else []
         unacked = ack_problems(args.env_dir, args.env, cfg) if not problems else []
     except Exception as exc:  # an unreadable account or ack file never passes
         print(f"ERROR: {args.command_name} refused: the group check could not run: {exc}", file=sys.stderr)
@@ -211,9 +238,11 @@ def main(argv: list[str] | None = None, lister: Callable[[Path], Iterable[str]] 
     for problem in problems:
         print(f"ERROR: {args.command_name} refused: {problem}", file=sys.stderr)
     if missing:
+        in_policies = [name for name in missing if name in set(policy_names)]
+        where = (f" ({', '.join(in_policies)} named in the promoted policies)" if in_policies else "")
         print(f"ERROR: {args.command_name} refused: these groups don't exist in {args.env} "
-              f"(after group_map): {', '.join(missing)}. Create them, or map the dev names with "
-              "group_map in env.auto.tfvars.", file=sys.stderr)
+              f"(after group_map): {', '.join(missing)}{where}. Create them, or map the dev names with "
+              "group_map in env.auto.tfvars and re-run make promote-to.", file=sys.stderr)
     if unacked:
         print(f"ERROR: {args.command_name} refused: group_map changed since the last apply, which is a "
               f"weakening. Review, then add to {args.env_dir / 'ack.txt'}:", file=sys.stderr)

@@ -63,9 +63,10 @@ GenieRails' own governance:
    generates: a table-attached mask or a policy made in the UI or by another
    tool doesn't count, and the external-mask inventory refuses rehearse,
    release and maintain while one is on a governed table;
-2. every `acl_groups` group can `SELECT` each table (directly, through a
-   group it is nested in, or `account users`, with `USE CATALOG` and
-   `USE SCHEMA`), or owns it.
+2. every `acl_groups` group can `SELECT` each table (directly or through a
+   group it is nested in, with `USE CATALOG` and `USE SCHEMA`), or owns it.
+   Access that only `account users` holds never counts: GenieRails always
+   refuses `account users` as a reader.
 
 It writes `envs/<env>/.agent_coverage.json`: a fingerprint of the agents,
 groups and tables Terraform computed, the check time and a verdict per
@@ -98,8 +99,13 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
   tiers or readers), and so is mapping `account users`.
 - `promote-to` reads only committed files. `rehearse` and `release` check
   live, before the lock: every group the env names (tiers, readers,
-  `acl_groups`, row-filter groups, mapped or not) must exist in the
-  workspace.
+  `acl_groups`, row-filter groups, mapped or not) and every principal of the
+  committed promoted policies (`data_access/abac.auto.tfvars` and
+  `generated/abac.auto.tfvars`, `to_principals` and `except_principals`)
+  must exist in the workspace, as a group or a service principal
+  (application ID). `account users` is built in and not looked up; the
+  env's own deployer SP is accepted. Dev's `raw_exempt_principals` are not
+  carried into prod policies: promotion replaces them with prod's own.
 - Nested groups are expanded only after mapping: the reader and agent
   checks read the destination's own (mapped) config.
 - Adding, removing or retargeting a mapping is a weakening. Compared with

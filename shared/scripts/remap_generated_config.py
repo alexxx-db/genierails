@@ -339,34 +339,43 @@ _PRINCIPALS_LINE = re.compile(r'^(?P<lead>\s*(?:to|except)_principals\s*=\s*)(?P
                               re.MULTILINE)
 
 
-def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str]) -> str:
-    """Rename policy principals through group_map (decision 8); nothing else changes."""
-    if not group_map:
+def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str],
+                   dest_exempt: list[str] | None = None) -> str:
+    """Rename policy principals through group_map (decision 8).
+
+    raw_exempt_principals are env-owned and never mapped: where a policy
+    names the source's, the destination's own take their place (in that
+    list only), so a promoted policy never names a dev-only exempt principal.
+    """
+    dest_exempt = list(dest_exempt or [])
+    if not group_map and not (exempt and dest_exempt is not None):
         return hcl_text
 
     def rename(match: re.Match) -> str:
         names = json.loads(match["list"])
         mapped = []
         for name in names:
-            target = name if name in exempt else group_map.get(name, name)
-            if target not in mapped:
-                mapped.append(target)
+            targets = dest_exempt if name in exempt else [group_map.get(name, name)]
+            for target in targets:
+                if target not in mapped:
+                    mapped.append(target)
         return f"{match['lead']}[{', '.join(json.dumps(n) for n in mapped)}]{match['tail']}"
 
     return _PRINCIPALS_LINE.sub(rename, hcl_text)
 
 
-def _group_map_inputs(args) -> tuple[dict[str, str], set[str]]:
+def _group_map_inputs(args) -> tuple[dict[str, str], set[str], list[str] | None]:
     import hcl2
 
     if not args.group_map_env or not args.group_map_env.is_file():
-        return {}, set()
+        return {}, set(), None
     dest = hcl2.loads(args.group_map_env.read_text())
     if dest.get("governance_mode", "legacy") != "deterministic":
-        return {}, set()
+        return {}, set(), None
     source = hcl2.loads(args.source_env.read_text()) if args.source_env and args.source_env.is_file() else {}
     return ({str(k): str(v) for k, v in (dest.get("group_map") or {}).items()},
-            {str(p) for p in source.get("raw_exempt_principals") or []})
+            {str(p) for p in source.get("raw_exempt_principals") or []},
+            [str(p) for p in dest.get("raw_exempt_principals") or []])
 
 
 def parse_catalog_pairs(raw_pairs: list[str]) -> list[tuple[str, str]]:
@@ -511,8 +520,8 @@ def main() -> None:
         elif not args.quiet_remaps:
             print(f"  Catalog remap: {src} -> {dest}")
 
-    group_map, exempt = _group_map_inputs(args)
-    args.out_abac.write_text(map_principals(remapped_hcl, group_map, exempt))
+    group_map, exempt, dest_exempt = _group_map_inputs(args)
+    args.out_abac.write_text(map_principals(remapped_hcl, group_map, exempt, dest_exempt))
     print(f"  Wrote remapped generated config: {args.out_abac}")
 
     if remapped_sql is not None:

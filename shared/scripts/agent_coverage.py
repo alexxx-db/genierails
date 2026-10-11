@@ -21,9 +21,10 @@ governance it generates):
      inventory refuses those before rehearse, release and maintain;
   2. every acl_groups group can SELECT each table: SELECT (or ALL
      PRIVILEGES) at table, schema or catalog level plus USE CATALOG and USE
-     SCHEMA, held by the group, a group it is nested in, or account users
-     (the grants and SCIM membership reader_inventory.py reads), or it owns
-     the table.
+     SCHEMA, held by the group or a group it is nested in (the grants and
+     SCIM membership reader_inventory.py reads), or it owns the table.
+     Access only account users holds never counts: GenieRails always refuses
+     account users as a reader.
 
 The result goes to envs/<env>/.agent_coverage.json: the fingerprint, the
 time of the check (refreshed_at) and one pass/fail per agent with its
@@ -100,7 +101,12 @@ class Snapshot:
 
 
 def _identities(group: str, groups: Mapping[str, Iterable[str]]) -> set[str]:
-    """The group, every group it is nested in (transitively), and account users."""
+    """The group and every group it is nested in (transitively).
+
+    Never account users: GenieRails always refuses it as a reader, so access
+    that only account users holds doesn't make an acl_groups group able to
+    read (a grant to everyone isn't one GenieRails would make or rely on).
+    """
     found = {group}
     changed = True
     while changed:
@@ -109,7 +115,7 @@ def _identities(group: str, groups: Mapping[str, Iterable[str]]) -> set[str]:
             if parent not in found and found & set(members):
                 found.add(parent)
                 changed = True
-    return found | {EVERYONE}
+    return found - {EVERYONE}
 
 
 def _scopes(table: str) -> tuple[tuple[str, str], tuple[str, str], tuple[str, str]]:
@@ -122,9 +128,12 @@ def read_problem(group: str, table: str, snapshot: Snapshot) -> str | None:
     who = _identities(group, snapshot.groups)
     catalog, schema, base = _scopes(table)
 
-    def holds(scope: tuple[str, str], privileges: frozenset[str]) -> bool:
-        return any(principal in who and _privilege(privilege) in privileges
+    def holds_as(principals: set[str], scope: tuple[str, str], privileges: frozenset[str]) -> bool:
+        return any(principal in principals and _privilege(privilege) in privileges
                    for principal, privilege in snapshot.grants.get(scope, set()))
+
+    def holds(scope: tuple[str, str], privileges: frozenset[str]) -> bool:
+        return holds_as(who, scope, privileges)
 
     if snapshot.owners.get(base) in who:
         return None
@@ -136,7 +145,14 @@ def read_problem(group: str, table: str, snapshot: Snapshot) -> str | None:
     if not any(holds(scope, READ) for scope in (base, schema, catalog)):
         missing.append("SELECT")
     if missing:
-        return f"group {group!r} cannot read {table} (no {', '.join(missing)})"
+        everyone = {EVERYONE}
+        via_everyone = (
+            ("USE CATALOG" in missing and holds_as(everyone, catalog, USE_CATALOG))
+            or ("USE SCHEMA" in missing and (holds_as(everyone, schema, USE_SCHEMA) or holds_as(everyone, catalog, USE_SCHEMA)))
+            or ("SELECT" in missing and any(holds_as(everyone, scope, READ) for scope in (base, schema, catalog)))
+        )
+        note = "; only account users holds it, and account users is never counted" if via_everyone else ""
+        return f"group {group!r} cannot read {table} (no {', '.join(missing)}{note})"
     return None
 
 

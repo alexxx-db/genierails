@@ -279,14 +279,30 @@ def test_live_check_fails_a_group_that_cannot_read():
       ("TABLE", "cat.sch.t"): {("parent", "SELECT")}}, {"parent": {"mid"}, "mid": {"partial"}}, {}),
     # Inherited: catalog-level privileges.
     ({("CATALOG", "cat"): {("partial", "USE_CATALOG"), ("partial", "USE_SCHEMA"), ("partial", "SELECT")}}, {}, {}),
-    # account users holds them.
-    ({("CATALOG", "cat"): {("account users", "ALL_PRIVILEGES")}}, {}, {}),
     # It owns the table.
     ({}, {}, {("TABLE", "cat.sch.t"): "partial"}),
 ])
 def test_live_check_reads_inherited_and_nested_access(grants, groups, owners):
     snapshot = _snapshot(grants=grants, groups=groups, owners=owners)
     assert ac.evaluate(AGENT, snapshot)["a"]["status"] == "pass"
+
+
+@pytest.mark.parametrize("grants", [
+    # Everything through account users.
+    {("CATALOG", "cat"): {("account users", "ALL_PRIVILEGES")}},
+    {("CATALOG", "cat"): {("account users", "USE_CATALOG")}, ("SCHEMA", "cat.sch"): {("account users", "USE_SCHEMA")},
+     ("TABLE", "cat.sch.t"): {("account users", "SELECT")}},
+    # Only the SELECT through account users.
+    {("CATALOG", "cat"): {("partial", "USE_CATALOG")}, ("SCHEMA", "cat.sch"): {("partial", "USE_SCHEMA")},
+     ("TABLE", "cat.sch.t"): {("account users", "SELECT")}},
+])
+def test_account_users_never_counts_as_an_acl_group_reading(grants):
+    # The contract: account users is always refused, so access it alone
+    # provides never makes an acl_groups group "able to read".
+    result = ac.evaluate(AGENT, _snapshot(grants=grants))["a"]
+    assert result["status"] == "fail"
+    assert len(result["problems"]) == 1 and result["problems"][0].startswith("group 'partial' cannot read cat.sch.t (no ")
+    assert "account users is never counted" in result["problems"][0]
 
 
 def test_live_check_fails_a_missing_table_and_an_agent_with_no_tables():
@@ -483,9 +499,14 @@ def test_promoted_policy_principals_go_through_group_map(tmp_path):
     from remap_generated_config import map_principals
 
     hcl = ('  {\n    to_principals    = ["dev_partial"]\n    except_principals = ["dev_raw", "dev_etl", "sp-1"]\n  }\n')
-    mapped = map_principals(hcl, {"dev_partial": "prod_partial", "dev_raw": "prod_raw", "dev_etl": "x"}, {"dev_etl"})
+    mapped = map_principals(hcl, {"dev_partial": "prod_partial", "dev_raw": "prod_raw", "dev_etl": "x"}, {"dev_etl"},
+                            ["prod_etl"])
     assert '    to_principals    = ["prod_partial"]\n' in mapped
-    assert '    except_principals = ["prod_raw", "dev_etl", "sp-1"]\n' in mapped
+    # Dev's raw-exempt principal is never mapped: prod's own takes its place.
+    assert '    except_principals = ["prod_raw", "prod_etl", "sp-1"]\n' in mapped
+    # A list that named no dev exempt principal gains none (never-raw policies stay closed).
+    closed = map_principals('    except_principals = []\n', {}, {"dev_etl"}, ["prod_etl"])
+    assert closed == '    except_principals = []\n'
 
 
 @pytest.mark.parametrize("group_map,error", [
@@ -536,6 +557,72 @@ def test_every_resulting_group_must_exist_live_mapped_or_not(tmp_path, capsys):
     assert _check(env, ["prod_raw", "prod_partial", "full", "prod_rf"]) == 0
     assert _check(env, ["prod_raw", "prod_partial", "prod_rf"]) == 1  # unmapped "full" is missing
     assert "don't exist in prod (after group_map): full" in capsys.readouterr().err
+
+
+POLICY_ONLY = '''fgac_policies = [
+  {
+    name             = "gr_mask_c_email_partial__string__0a1b2c3d_partial"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "c"
+    to_principals    = ["prod_policy_only"]
+    except_principals = ["prod_raw", "deployer-sp-id"]
+    match_condition  = "hasTagValue('gr_treatment', 'email_partial__string__0a1b2c3d')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_email_partial__string__0a1b2c3d_partial"
+    function_catalog = "c"
+    function_schema  = "s"
+  },
+  {
+    name             = "gr_mask_c_email_partial__string__0a1b2c3d_full"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "c"
+    to_principals    = ["account users"]
+    except_principals = ["prod_raw", "prod_partial"]
+    match_condition  = "hasTagValue('gr_treatment', 'email_partial__string__0a1b2c3d')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_email_partial__string__0a1b2c3d_full"
+    function_catalog = "c"
+    function_schema  = "s"
+  },
+]
+'''
+LIVE = ["prod_raw", "prod_partial", "full", "prod_rf", "deployer-sp-id"]
+
+
+def test_a_principal_named_only_in_a_promoted_policy_must_exist_live(tmp_path, capsys):
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    (env / "data_access" / "abac.auto.tfvars").write_text(POLICY_ONLY)
+    assert _check(env, LIVE) == 1
+    err = capsys.readouterr().err
+    assert "prod_policy_only" in err and "don't exist in prod" in err
+    # account users (the full policy's target) is built in, never looked up.
+    assert "account users" not in err.split("don't exist in prod", 1)[1]
+    assert _check(env, LIVE + ["prod_policy_only"]) == 0
+
+
+def test_the_generated_promotion_output_is_checked_too(tmp_path, capsys):
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    (env / "generated" / "abac.auto.tfvars").write_text(POLICY_ONLY)
+    assert _check(env, LIVE) == 1
+    assert "prod_policy_only" in capsys.readouterr().err
+
+
+@needs_make
+def test_release_refuses_a_policy_only_principal_before_the_lock(tmp_path):
+    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    (env / "data_access" / "abac.auto.tfvars").write_text(POLICY_ONLY)
+    # The real group_map.py check; only the live group listing is fixed.
+    script = tmp_path / "group_check.py"
+    script.write_text(f"import sys\nsys.path.insert(0, {str(SHARED)!r})\nimport group_map\n"
+                      f"raise SystemExit(group_map.main(sys.argv[1:], lister=lambda _d: {LIVE!r}))\n")
+    wrapper = tmp_path / "group-check"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" check --env-dir "{env}" --env prod --command-name "$*"\n')
+    wrapper.chmod(0o755)
+    result, calls = _make(tmp_path, env, "release", "ENV=prod", f"_GROUP_CHECK={wrapper}")
+    assert result.returncode != 0
+    assert "make release refused" in result.stderr and "prod_policy_only" in result.stderr
+    assert calls == []
+    assert not (env / "generated" / ".governance.lock").exists()
 
 
 def test_the_group_check_fails_closed_when_groups_cannot_be_listed(tmp_path, capsys):
