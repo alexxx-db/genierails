@@ -54,9 +54,11 @@ acknowledgements stay accounted for, so they never turn stale.
 The staged policy controller ([deterministic-policies.md](deterministic-policies.md))
 adopts the legacy deployment as the live generation:
 
-1. Under the env lock, each legacy treatment tag moves to its stable key with
-   `terraform state mv` (never destroyed). Legacy sensitivity tags the config
-   drops are forgotten with `terraform state rm`; they stay on the column.
+1. **adopt**: under the env lock, each legacy treatment tag moves to its
+   stable key with `terraform state mv` (never destroyed). Legacy sensitivity
+   tags the config drops are forgotten with `terraform state rm`; they stay on
+   the column. A marker written before the first move makes the env refuse
+   legacy applies from then on, even if the adoption is interrupted.
 2. **create**: the new functions and policies are added under new names; every
    column keeps its legacy value and mask. Verified live and with the legacy
    verify-access checks.
@@ -64,6 +66,11 @@ adopts the legacy deployment as the live generation:
    deterministic one. One tag per column, so no column is ever unmasked or
    doubly masked. Verified against the tier rule.
 4. **grant**: `SELECT` from `table_readers` and `CAN_RUN` from `acl_groups`.
+
+`release-plan` changes nothing: in prod the first manifest holds only the
+approved state moves, which `release MANIFEST=` runs before stopping; the next
+`release-plan` plans **create** against the moved state. In dev, `rehearse`
+adopts and runs every phase in one go.
 
 In prod each changing phase is one `release-plan` manifest and approval, with
 release-plan's provenance (clean checkout on freshly fetched `origin/main`, a

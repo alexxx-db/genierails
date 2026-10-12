@@ -496,7 +496,10 @@ class Controller:
         out_dir.mkdir(parents=True, exist_ok=True)
         with env_lock(self.env_dir, "staged-policy-plan"):
             desired = pg.desired_generation(self.env_dir)
-            journal = load_journal(self.env_dir) or self._adopt(desired)
+            journal = load_journal(self.env_dir)
+            if journal is None and self._legacy_pending():
+                return self._plan_adoption(out_dir, desired)
+            journal = journal or self._adopt(desired)
             t = self._transition_for(journal, desired)
             remaining = [p for p in t["phases"] if p not in t["completed"]]
             steps: list[dict] = []
@@ -557,6 +560,8 @@ class Controller:
             if desired["fingerprint"] != planned["to"]:
                 raise Refused(f"the generated config is generation {desired['fingerprint']}, the manifest planned "
                               f"{planned['to']}; run make release-plan again")
+            if [s["kind"] for s in saved["steps"]] == ["adopt"]:
+                return self._apply_adoption(saved["steps"][0])
             journal = load_journal(self.env_dir) or self._adopt(desired)
             t = self._transition_for(journal, desired)
             for key in ("from", "to", "retain", "retire", "tier_move", "phases"):
@@ -596,6 +601,68 @@ class Controller:
             self._finish(journal, t)
             print(f"Staged policy apply: generation {t['to']} is live and verified (saved plans).")
             return 0
+
+    # -- migration from legacy (make release-plan / release MANIFEST=) --------------
+    def _legacy_pending(self) -> bool:
+        from scripts import migration
+
+        return migration.deployment(self.env_dir)["legacy"]
+
+    def _adoption_step(self) -> dict:
+        """What adopting the legacy deployment does: checked, but nothing changes."""
+        from scripts import migration
+        from scripts.runtime_overlay import effective
+
+        dep = migration.deployment(self.env_dir)
+        legacy = migration.legacy_generation(dep)
+        try:
+            migration.check(self.env_dir, self.env_name, legacy)
+        except migration.Refused as exc:
+            raise Refused(str(exc)) from exc
+        forget = migration.forgotten_tags(dep, pg._load(effective(self.env_dir, "abac.auto.tfvars")))
+        return {"phase": "adopt", "kind": "adopt", "legacy": legacy["fingerprint"],
+                "moves": [list(m) for m in dep["moves"]], "forget": forget}
+
+    def _plan_adoption(self, out_dir: Path, desired: dict) -> int:
+        """release-plan of a pending migration: the state moves are this manifest's only operation.
+
+        Nothing is moved, journaled or recorded here; release MANIFEST= runs
+        exactly these moves under the env lock, and the next release-plan plans
+        the create phase against the moved state.
+        """
+        step = self._adoption_step()
+        summary = {
+            "transition": {"from": step["legacy"], "to": desired["fingerprint"], "retain": "", "retire": "",
+                           "tier_move": False, "phases": ["adopt"], "completed": [], "resumed": False},
+            "steps": [step], "final": False, "planned_at": _now(),
+        }
+        pg.write_json(Path(out_dir) / PHASES_FILE, summary)
+        print(f"Staged policy plan ({self.env_name}): adopt the legacy deployment {step['legacy']} "
+              f"({len(step['moves'])} terraform state mv, {len(step['forget'])} state rm, nothing applied); "
+              "the create phase needs another release-plan once this manifest is applied")
+        for source, target in step["moves"]:
+            print(f"  terraform state mv '{source}' '{target}'")
+        return 0
+
+    def _apply_adoption(self, planned: dict) -> int:
+        """release MANIFEST= of an adoption manifest: exactly the approved moves, then stop."""
+        from scripts import migration
+
+        if load_journal(self.env_dir) is not None:
+            raise Refused("the legacy deployment was adopted since release-plan; run make release-plan again")
+        now = self._adoption_step()
+        for key in ("legacy", "moves", "forget"):
+            if now[key] != planned[key]:
+                raise Refused(f"the data_access state changed since release-plan ({key}); nothing was moved. "
+                              "Run make release-plan again")
+        try:
+            journal = migration.adopt(self.env_dir, self.env_name)
+        except migration.Refused as exc:
+            raise Refused(str(exc)) from exc
+        self._save(journal)
+        print(f"Staged policy apply: adopted the legacy deployment {planned['legacy']} (the approved state moves); "
+              f"run make release-plan ENV={self.env_name} again for the create phase.")
+        return MORE_PHASES
 
     def abandon(self) -> int:
         """Drop an unfinished transition that never switched, back to the active generation."""

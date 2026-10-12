@@ -12,7 +12,9 @@ legacy and the deterministic protection mask, never doubly masked.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -83,13 +85,14 @@ def legacy_policy(to=("regional", "masked"), value=LEGACY_VALUE, catalog="cat"):
 
 
 def write_legacy_state(env_dir: Path, *, policies=None, grants=("regional", "masked"), can_run=("regional",),
-                       extra=()):
+                       extra=(), columns=(COLUMN,)):
     """What legacy GenieRails left in the data_access and workspace states."""
     policies = {LEGACY_POLICY: legacy_policy()} if policies is None else policies
+    tags = {f"columns|{c}|gr_treatment|{LEGACY_VALUE}": {"entity_name": c, "tag_value": LEGACY_VALUE}
+            for c in columns}
     resources = [
         _resource("databricks_policy_info", "policies", policies),
-        _resource("databricks_entity_tag_assignment", "assignments",
-                  {TAG_KEY: {"entity_name": COLUMN, "tag_value": LEGACY_VALUE}}),
+        _resource("databricks_entity_tag_assignment", "assignments", tags),
         _resource("databricks_grant", "table_access",
                   {f"cat.sch.t|{g}": {"table": "cat.sch.t", "principal": g} for g in grants}),
         _resource("databricks_grant", "catalog_access", {f"cat|{g}": {} for g in grants}),
@@ -104,9 +107,10 @@ def write_legacy_state(env_dir: Path, *, policies=None, grants=("regional", "mas
         {"sales": {"triggers": {"space_id": "s1", "groups": ",".join(can_run)}}}, module="module.workspace")]}))
 
 
-def opt_in(env_dir: Path, *, readers=("regional", "masked"), acl_groups=("regional",), ack=(), tiers=None):
+def opt_in(env_dir: Path, *, readers=("regional", "masked"), acl_groups=("regional",), ack=(), tiers=None,
+           columns=("email",)):
     """The committed opt-in: deterministic generated config, table_readers, the agent and ack.txt."""
-    write_env(env_dir, **({"tiers": tiers} if tiers else {}))
+    write_env(env_dir, columns=columns, **({"tiers": tiers} if tiers else {}))
     with (env_dir / "env.auto.tfvars").open("a") as f:
         f.write(f'table_readers = {{ "cat.sch.t" = {json.dumps(list(readers))} }}\n')
         acl = "" if acl_groups is None else f", acl_groups = {json.dumps(list(acl_groups))}"
@@ -422,6 +426,14 @@ def test_saved_plans_take_one_manifest_per_changing_phase(cutover, env_dir, tmp_
     opt_in(env_dir)
     cutover.legacy = migration.legacy_generation(migration.deployment(env_dir))
     controller = cutover.controller()
+    adopt = tmp_path / "plan0"
+    assert controller.plan(adopt) == 0
+    phases = json.loads((adopt / spa.PHASES_FILE).read_text())
+    assert [s["phase"] for s in phases["steps"]] == ["adopt"] and not phases["final"]
+    assert phases["steps"][0]["moves"] == [list(m) for m in migration.deployment(env_dir)["moves"]]
+    assert controller.apply_saved(adopt) == spa.MORE_PHASES  # the approved moves, and nothing else
+    assert migration.deployment(env_dir)["moves"] == [] and cutover.calls == []
+    assert spa.load_journal(env_dir)["active"] == cutover.legacy["fingerprint"]
     first = tmp_path / "plan1"
     assert controller.plan(first) == 0
     phases = json.loads((first / spa.PHASES_FILE).read_text())
@@ -504,6 +516,49 @@ def test_a_migrated_env_cannot_go_back_to_legacy(cutover, env_dir):
     rg.apply_guard(env_dir, ENV, "_apply-layer:workspace")
 
 
+# -- release-plan never changes anything (review blocker 1) ----------------------------------
+def _runtime_bytes(env_dir: Path) -> dict[str, bytes]:
+    """Terraform state, the policy journal, the migration record and every ledger file."""
+    files = [env_dir / "data_access" / "terraform.tfstate", env_dir / "terraform.tfstate"]
+    files += sorted(pg.ledger_dir(env_dir).rglob("*")) if pg.ledger_dir(env_dir).is_dir() else []
+    return {str(f.relative_to(env_dir)): f.read_bytes() for f in files if f.is_file()}
+
+
+def test_release_plan_of_a_migration_changes_no_state_journal_or_record(cutover, env_dir, tmp_path):
+    opt_in(env_dir)
+    before = _runtime_bytes(env_dir)
+    assert cutover.controller().plan(tmp_path / "plan") == 0  # what make release-plan runs
+    assert _runtime_bytes(env_dir) == before
+    assert not (env_dir / "state_tool.log").exists() and cutover.calls == []
+    assert spa.load_journal(env_dir) is None and migration.load_record(env_dir) is None
+    step = json.loads((tmp_path / "plan" / spa.PHASES_FILE).read_text())["steps"][0]
+    assert step["kind"] == "adopt" and step["moves"][0][0].endswith(f'assignments["{TAG_KEY}"]')
+    # A never-approved manifest is just dropped; the next release-plan plans the same moves.
+    assert cutover.controller().plan(tmp_path / "again") == 0
+    assert _runtime_bytes(env_dir) == before
+
+
+def test_a_refused_release_plan_of_a_migration_changes_nothing(cutover, env_dir, tmp_path):
+    write_legacy_state(env_dir, grants=("regional", "masked", "bi-sp"))
+    opt_in(env_dir)
+    before = _runtime_bytes(env_dir)
+    with pytest.raises(spa.Refused, match="unacknowledged revocation"):
+        cutover.controller().plan(tmp_path / "plan")
+    assert _runtime_bytes(env_dir) == before and not (env_dir / "state_tool.log").exists()
+
+
+def test_the_adoption_manifest_refuses_a_state_that_moved_since_release_plan(cutover, env_dir, tmp_path):
+    opt_in(env_dir)
+    assert cutover.controller().plan(tmp_path / "plan") == 0
+    state = live_state(env_dir)
+    state["resources"][1]["instances"][0]["index_key"] += "-changed"
+    (env_dir / "data_access" / "terraform.tfstate").write_text(json.dumps(state))
+    before = _runtime_bytes(env_dir)
+    with pytest.raises(spa.Refused, match="the data_access state changed since release-plan"):
+        cutover.controller().apply_saved(tmp_path / "plan")
+    assert _runtime_bytes(env_dir) == before
+
+
 def test_the_external_mask_inventory_knows_the_legacy_masks_it_manages(env_dir):
     from scripts.external_mask_inventory import legacy_policy_names
 
@@ -534,3 +589,4 @@ def test_the_same_value_in_two_catalogs_is_not_a_double_mask():
     assert pg.stage_problems("create", other, other, None) == ["a.s.t.c would carry v, which no policy masks"]
     double = {"fgac_policies": [policy("a"), policy("a", "x")], "tags": {"a.s.t.c": "v"}}
     assert "2 masks" in pg.stage_problems("create", double, double, None)[0]
+
