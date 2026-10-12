@@ -32,6 +32,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from state_layout import state_json  # noqa: E402
+
 LEGACY_TYPE = "null_resource"
 LEGACY_NAME = "genie_space_create"
 
@@ -47,10 +50,9 @@ def marker_for(env_dir: Path, key: str) -> Path:
 
 def legacy_agents(env_dir: Path) -> list[tuple[str, str]]:
     """Return (key, recorded host) for each legacy agent in the workspace state."""
-    state_path = env_dir / "terraform.tfstate"
-    if not state_path.exists():
+    state = state_json(env_dir, env_dir.name, "workspace")
+    if state is None:
         return []
-    state = json.loads(state_path.read_text())
     found = []
     for resource in state.get("resources", []):
         if resource.get("type") != LEGACY_TYPE or resource.get("name") != LEGACY_NAME:
@@ -67,8 +69,7 @@ CREATED_NAME = "genie_space"
 
 
 def _state(env_dir: Path) -> dict:
-    state_path = env_dir / "terraform.tfstate"
-    return json.loads(state_path.read_text()) if state_path.exists() else {}
+    return state_json(env_dir, env_dir.name, "workspace") or {}
 
 
 def _workspace_instances(state: dict, name: str, rtype: str):
@@ -155,8 +156,8 @@ def check_id_files(env_dir: Path, warn: bool, env_name: str = "", runner: str = 
         state = _state(env_dir)
         missing = [key for key in created_agents(env_dir)
                    if not (id_file_for(env_dir, key).is_file() and id_file_for(env_dir, key).read_text().strip())]
-    except (OSError, ValueError) as exc:
-        print(f"{label}: cannot read {env_dir / 'terraform.tfstate'} to check Genie ID files ({exc})"
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"{label}: cannot read workspace Terraform state to check Genie ID files ({exc})"
               + ("" if warn else "; nothing was applied"), file=sys.stderr)
         return 0 if warn else 1
     if not missing:
@@ -242,7 +243,11 @@ def main(argv: list[str] | None = None) -> int:
     out = lines.append if args.quiet else print
     env_dir = Path(args.env_dir).resolve()
 
-    legacy = legacy_agents(env_dir)
+    try:
+        legacy = legacy_agents(env_dir)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}; nothing was applied.", file=sys.stderr)
+        return 1
     if not legacy:
         if not (args.arm or args.quiet):
             print(f"Genie adoption preflight ({env_dir.name}): no legacy Genie agents; nothing to adopt.")

@@ -17,8 +17,8 @@
 # `git fetch && git checkout --force --detach <sha>` (--force drops earlier
 # runs' edits to tracked generated/ and layer files and leaves the ignored
 # state alone), confirm `git status --porcelain` prints nothing, and never
-# run `git clean -x` or re-clone. (State outside the checkout, in
-# GENIERAILS_STATE_DIR, is the target.)
+# run `git clean -x` or re-clone. (Or keep state outside the checkout:
+# set GENIERAILS_STATE_DIR and run make migrate-state-dir once per env.)
 # The CI guard refuses every applying target here (TF_BUILD is set). Do
 # not set GENIERAILS_ALLOW_CI_APPLY. In v1 the plan stage re-runs the
 # read-only check of that exact commit, and the release stage only records
@@ -66,10 +66,6 @@ stages:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
-
-          - download: dev
-            artifact: genierails-dev-receipt-azure-$(resources.pipeline.dev.sourceCommit)
-            displayName: Download this commit's dev receipt (read-only)
             fetchDepth: 2
 
           - script: |
@@ -77,7 +73,8 @@ stages:
                 echo "##[error]checked out $(Build.SourceVersion), but dev rehearsed $(resources.pipeline.dev.sourceCommit)"
                 exit 1
               fi
-              if git diff --name-only HEAD^ HEAD -- envs/prod | grep -q .; then
+              changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?
+              if [ -n "$changed" ]; then
                 echo "##vso[task.setvariable variable=prod;isOutput=true]true"
               fi
             name: diff

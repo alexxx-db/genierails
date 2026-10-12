@@ -9,21 +9,14 @@ name: GenieRails dev (aws)
 # pending run when a newer one queues); the queue job instead waits until
 # every earlier run of this workflow has finished.
 #
-# Requires committed envs/dev/remote_state.hcl (S3 + DynamoDB locking).
+# Requires locked remote_state.hcl files for both envs/dev and envs/account.
 #
 #   make rehearse ENV=dev
 #
-# and it applies to dev, so it needs dev Terraform state with locking that
-# every runner shares. Until that exists the operator runs it on the
-# deployment machine, at each merged commit in order,
-# in that machine's one persistent checkout: v1 keeps Terraform state, the
-# env lock and the Genie ID files under its gitignored envs/, so a re-clone
-# loses them. Move the checkout with
-# `git fetch && git checkout --force --detach <sha>` (--force drops earlier
-# runs' edits to tracked generated/ and layer files and leaves the ignored
-# state alone), confirm `git status --porcelain` prints nothing, and never
-# run `git clean -x` or re-clone. (State outside the checkout, in
-# GENIERAILS_STATE_DIR, is the target.)
+# Both dev and the read-only account plan use shared, locked remote state;
+# the runner's GENIERAILS_STATE_DIR holds only throwaway runtime files. A run
+# whose commit is no longer the head of main stops (the newer run rehearses
+# it), so re-running an old run never applies older code after newer.
 # The CI guard's only customer-pipeline exception is this exact command.
 #
 # Auth: OIDC workload identity federation, no PATs or secrets. The "dev"
@@ -84,6 +77,24 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
+      # A re-run of an older run keeps its run_number, so the queue alone
+      # would let it apply older code after a newer commit rehearsed: only
+      # the head of main rehearses.
+      - name: Refuse an obsolete commit
+        run: |
+          git fetch --no-tags origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            echo "::error::${{ github.sha }} is no longer the head of main; the newer commit's run rehearses it."
+            exit 1
+          fi
+
+      - name: Require locked remote state for dev and account
+        run: |
+          test -f envs/dev/remote_state.hcl && test -f envs/account/remote_state.hcl || {
+            echo "::error::commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/cicd.md)"
+            exit 1
+          }
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -121,7 +132,9 @@ jobs:
       - name: Rehearse dev
         run: make rehearse ENV=dev
 
-      - name: Publish immutable rehearsal receipt
+      # For the record only: release-plan trusts a receipt only in the store
+      # that wrote it, and the prod workflow doesn't download this.
+      - name: Publish the rehearsal receipt (informational)
         uses: actions/upload-artifact@v4
         with:
           name: genierails-dev-receipt-aws-${{ github.sha }}

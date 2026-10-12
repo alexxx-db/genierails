@@ -14,7 +14,7 @@ APPLYING_TARGETS = (
     "apply-governance", "apply-genie", "_apply-layer", "integration-test",
     "test-champion", "test-all", "test-ci", "test-ci-parallel",
     "destroy", "destroy-governance", "destroy-genie", "_destroy-layer",
-    "import", "migrate-state",
+    "import", "migrate-state", "migrate-state-dir", "ungovern", "apply-account", "policy-abandon",
 )
 CI_MARKERS = ("CI", "TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI")
 
@@ -153,6 +153,18 @@ def test_dev_samples_queue_every_commit_and_never_cancel():
         assert "needs: queue" in github
         devops = (ROOT / cloud / "azure-pipelines" / "dev-rehearse.yml").read_text()
         assert "lockBehavior: sequential" in devops and "batch: false" in devops
+        assert "envs/account/remote_state.hcl" in github + devops
+        assert github.count("FETCH_HEAD") and devops.count("FETCH_HEAD")
+
+
+def test_prod_samples_do_not_consume_unsigned_receipt_artifacts():
+    for cloud in ("aws", "azure"):
+        github = (ROOT / cloud / ".github/workflows/prod-release.yml").read_text()
+        ado = (ROOT / cloud / "azure-pipelines/prod-release.yml").read_text()
+        assert "download-artifact" not in github
+        assert "download: dev" not in ado
+        assert re.search(r"checkout: self\n\s+fetchDepth: 2", ado)
+        assert 'changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?' in ado
 
 
 def _concurrency_group(text):

@@ -308,18 +308,28 @@ def _is_for_this_deployment(state: dict, layer_dir: Path) -> bool:
     return str(applied.get("deployment_binding", "")) == deployment_binding(layer_dir)
 
 
+def _layer_state(layer_dir: Path, layer: str | None = None) -> dict | None:
+    from state_layout import state_json
+    layer_dir = Path(layer_dir)
+    resolved_layer = layer or ("data_access" if layer_dir.name == DATA_ACCESS_SUBDIR else "workspace")
+    env_dir = layer_dir.parent if resolved_layer == "data_access" else layer_dir
+    try:
+        return state_json(env_dir, env_dir.name, resolved_layer)
+    except RuntimeError as exc:
+        raise GateError(f"cannot read {resolved_layer} state: {exc}") from exc
+
+
 def granted_tables(layer_dir: Path) -> set[str]:
     """Tables the data_access state already grants business SELECT on.
 
-    The layer runner always uses the local backend at this path. No state file
-    means nothing is granted yet (every table is a first exposure); a state
-    that exists but can't be read fails the gate.
+    Read through scripts/state_layout.py (local, GENIERAILS_STATE_DIR or
+    remote). No state means nothing is granted yet (every table is a first
+    exposure); a state that should exist but can't be read fails the gate.
     """
-    state_path = layer_dir / "terraform.tfstate"
-    if not state_path.exists():
+    state = _layer_state(layer_dir)
+    if state is None:
         return set()
     try:
-        state = json.loads(state_path.read_text())
         if not _is_for_this_deployment(state, layer_dir):
             return set()
         tables = set()
@@ -334,7 +344,7 @@ def granted_tables(layer_dir: Path) -> set[str]:
                 tables.add(str(instance["index_key"]).split("|", 1)[0].lower())
         return tables
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-        raise GateError(f"cannot read data_access state {state_path}: {exc}") from exc
+        raise GateError(f"cannot read data_access state: {exc}") from exc
 
 
 def write_result(path: Path, record: dict) -> None:
@@ -561,15 +571,6 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
     return 0
 
 
-def _state(path: Path) -> dict | None:
-    """A layer's local state, or None if missing or unreadable."""
-    try:
-        state = json.loads(path.read_text())
-        return state if isinstance(state, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
 def _current_instances(state: dict | None, module: str, rtype: str, names: tuple[str, ...]) -> dict:
     """index_key -> attributes of current (not tainted or deposed) instances."""
     found: dict = {}
@@ -587,7 +588,7 @@ def _current_instances(state: dict | None, module: str, rtype: str, names: tuple
 
 def withheld_access(layer: str, layer_dir: Path) -> list[str]:
     """Access the config asks for that the layer's state doesn't hold."""
-    state = _state(layer_dir / "terraform.tfstate")
+    state = _layer_state(layer_dir)
     if layer == "data_access":
         try:
             desired = json.loads((layer_dir / GATE_FILENAME).read_text()).get("grant_keys")
@@ -631,7 +632,7 @@ def skip_key(layer: str, layer_dir: Path) -> str:
     data_access state it reads, and never skip while CAN_RUN is withheld.
     """
     if layer == "data_access":
-        state = _state(layer_dir / "terraform.tfstate") or {}
+        state = _layer_state(layer_dir) or {}
         try:
             ours = _is_for_this_deployment(state, layer_dir)
         except GateError:
@@ -645,7 +646,7 @@ def skip_key(layer: str, layer_dir: Path) -> str:
             return "noskip"
     if withheld_access(layer, layer_dir):
         return "noskip"
-    outputs = (_state(layer_dir / DATA_ACCESS_SUBDIR / "terraform.tfstate") or {}).get("outputs", {})
+    outputs = (_layer_state(layer_dir / DATA_ACCESS_SUBDIR, "data_access") or {}).get("outputs", {})
     key = "data_access " + hashlib.sha256(json.dumps(
         [outputs.get("coverage_gate"), outputs.get("table_grant_resource_keys")], sort_keys=True,
     ).encode()).hexdigest()
@@ -717,7 +718,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "withheld":
             return report_withheld(args.layer, args.layer_dir, args.env_name)
         if args.command == "skip-key":
-            print(skip_key(args.layer, args.layer_dir))
+            try:
+                print(skip_key(args.layer, args.layer_dir))
+            except GateError as exc:  # an unreadable state never lets an apply skip
+                print(f"coverage check: {exc}; not skipping the apply", file=sys.stderr)
+                print("noskip")
             return 0
         if args.command == "warn-retired-flag":
             # APPLY_FLAGS comes through the environment, so its quoting survives.

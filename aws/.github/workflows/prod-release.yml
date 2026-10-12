@@ -17,8 +17,8 @@ name: GenieRails prod release (aws)
 # `git fetch && git checkout --force --detach <sha>` (--force drops earlier
 # runs' edits to tracked generated/ and layer files and leaves the ignored
 # state alone), confirm `git status --porcelain` prints nothing, and never
-# run `git clean -x` or re-clone. (State outside the checkout, in
-# GENIERAILS_STATE_DIR, is the target.)
+# run `git clean -x` or re-clone. (Or keep state outside the checkout:
+# set GENIERAILS_STATE_DIR and run make migrate-state-dir once per env.)
 # The CI guard refuses every applying target here. Do not set
 # GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
 # integration-test workspace. In v1 the plan job re-runs the
@@ -71,7 +71,8 @@ jobs:
 
       - id: diff
         run: |
-          if git diff --name-only HEAD^ HEAD -- envs/prod | grep -q .; then
+          changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?
+          if [ -n "$changed" ]; then
             echo "prod=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -90,14 +91,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Download this commit's dev receipt (read-only)
-        uses: actions/download-artifact@v4
-        with:
-          name: genierails-dev-receipt-aws-${{ github.event.workflow_run.head_sha }}
-          path: ${{ runner.temp }}/genierails-state/aws/dev/receipts/rehearse
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
 
       - uses: actions/setup-python@v5
         with:

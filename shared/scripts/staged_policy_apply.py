@@ -180,13 +180,11 @@ def state_problems(live: dict, active: dict | None, pending: list[dict]) -> list
 
 
 def _read_state(env_dir: Path) -> dict | None:
-    path = env_dir / "data_access" / "terraform.tfstate"
-    if not path.is_file():
-        return None
+    from state_layout import state_json
     try:
-        return json.loads(path.read_text())
-    except ValueError as exc:
-        raise Refused(f"the data_access state {path} is unreadable: {exc}") from exc
+        return state_json(env_dir, env_dir.name, "data_access")
+    except RuntimeError as exc:
+        raise Refused(str(exc)) from exc
 
 
 @contextmanager

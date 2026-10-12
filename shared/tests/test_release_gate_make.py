@@ -250,7 +250,8 @@ def test_release_refuses_a_drifted_manifest_and_applies_nothing(make, repo, drif
     if drift == "commit":
         repo.commit({"aws/envs/prod/ack.txt": "# later\n"})
     elif drift == "serial":
-        state = repo.prod / "terraform.tfstate"
+        state = rg.root_state_paths(repo.prod)["workspace"]
+        state.parent.mkdir(parents=True, exist_ok=True)
         state.write_text(json.dumps({"version": 4, "serial": 3, "lineage": "L"}))
     elif drift == "live":
         make.live.write_text("live-2\n")
@@ -408,7 +409,7 @@ def test_the_same_env_split_reads_the_overlay_and_writes_nothing_committed(tmp_p
 def test_a_deterministic_promotion_never_reads_prod_state_or_lists_live_policies():
     text = (ROOT / "shared" / "Makefile.shared").read_text()
     promote = text[text.index("\npromote:"):text.index("\n# make promote-to")]
-    assert 'name_flags=(--state "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/terraform.tfstate" --auth' in promote
+    assert 'name_flags=(--state-env-dir "$$dest_env_dir" --auth' in promote
     assert ('if [ "$$($(_IS_DETERMINISTIC) "$(SOURCE_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then '
             "name_flags=(--pure); fi") in promote
     assert '"$${name_flags[@]}"' in promote

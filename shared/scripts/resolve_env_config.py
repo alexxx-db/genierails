@@ -14,6 +14,7 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 from scripts.footprint import load_hcl
+from scripts.state_layout import state_json
 
 WAREHOUSE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -28,18 +29,13 @@ def _valid_warehouse_id(value: object) -> str:
 
 
 def _warehouse_from_local_state(env_dir: Path) -> str:
-    """Read the workspace output without Terraform init, subprocesses, or locks.
-
-    Every root in this repository declares the local backend, and
-    terraform_layer.sh pins workspace state to ``env_dir/terraform.tfstate``.
-    """
-    state_path = env_dir / "terraform.tfstate"
-    if not state_path.is_file():
-        return ""
+    """Read the workspace output through the configured state backend."""
     try:
-        state = json.loads(state_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"could not read Terraform state {state_path}: {exc}") from exc
+        state = state_json(env_dir, env_dir.name, "workspace")
+    except RuntimeError as exc:
+        raise ValueError(f"could not read Terraform state: {exc}") from exc
+    if state is None:
+        return ""
     output = (state.get("outputs") or {}).get("sql_warehouse_id") or {}
     if not isinstance(output, dict):
         raise ValueError("Terraform sql_warehouse_id output has an invalid state shape")

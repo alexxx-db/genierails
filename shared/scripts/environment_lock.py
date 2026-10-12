@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Exclusive, stale-owner-aware per-environment governance lock.
 
-The lock file (envs/<env>/generated/.governance.lock, mode 0600) records the
+The lock file (envs/<env>/generated/.governance.lock, or outside envs/ with
+GENIERAILS_STATE_DIR or remote state: lock_path; mode 0600) records the
 holder's pid and that process's start time, and a random nonce. ``lock``
 prints the nonce; make's _ENV_LOCK exports it to every child as
 GENIERAILS_LOCK_NONCE_<ENV> (``nonce_var``). ``held_by_ancestor`` (the
@@ -28,19 +29,33 @@ from pathlib import Path
 
 LOCK_RELPATH = Path("generated/.governance.lock")
 
-def lock_path(env_dir: Path) -> Path:
-    base = os.environ.get("GENIERAILS_STATE_DIR", "").strip()
-    if not base:
-        return Path(env_dir) / LOCK_RELPATH
-    cloud = Path(env_dir).resolve().parent.parent.name
-    return Path(base).expanduser().resolve() / cloud / Path(env_dir).name / "locks" / ".governance.lock"
+def lock_path(env_dir: Path, state_dir: str | None = None) -> Path:
+    """The env's lock file. ``state_dir`` None reads GENIERAILS_STATE_DIR; "" is the layout without it.
+
+    Without a state dir the lock is envs/<env>/generated/.governance.lock, or
+    <cloud>/.genierails-state/<env>/locks/ for an env with remote_state.hcl
+    (scripts/state_layout.py), which never writes runtime files under envs/.
+    """
+    if state_dir is None:
+        base = os.environ.get("GENIERAILS_STATE_DIR", "").strip()
+        if not base and (Path(env_dir) / ".state-moved").exists():
+            raise RuntimeError(f"state was moved to GENIERAILS_STATE_DIR ({Path(env_dir) / '.state-moved'}); "
+                               "set it before running")
+    else:
+        base = state_dir
+    cloud = Path(env_dir).resolve().parent.parent
+    if base:
+        return Path(base).expanduser().resolve() / cloud.name / Path(env_dir).name / "locks" / ".governance.lock"
+    if (Path(env_dir) / "remote_state.hcl").is_file():
+        return cloud / ".genierails-state" / Path(env_dir).name / "locks" / ".governance.lock"
+    return Path(env_dir) / LOCK_RELPATH
 
 
 @contextmanager
-def _guard(env_dir: Path):
-    path = lock_path(env_dir)
+def _guard(env_dir: Path, state_dir: str | None = None):
+    path = lock_path(env_dir, state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if os.environ.get("GENIERAILS_STATE_DIR", "").strip():
+    if path.parent.name == "locks":
         os.chmod(path.parent.parent, 0o700)
     with open(path.with_suffix(".guard"), "a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -119,8 +134,8 @@ def held_by_ancestor(env_dir: Path) -> str | None:
     return str(held.get("owner") or "?")
 
 
-def owns_lock(env_dir: Path, pid: int) -> bool:
-    held = _read_lock(lock_path(env_dir))
+def owns_lock(env_dir: Path, pid: int, state_dir: str | None = None) -> bool:
+    held = _read_lock(lock_path(env_dir, state_dir))
     return bool(held) and held["pid"] == pid and held["host"] == socket.gethostname()
 
 
@@ -129,11 +144,11 @@ def acquire_lock(env_dir: Path, pid: int, owner: str):
     return ok, message
 
 
-def acquire(env_dir: Path, pid: int, owner: str):
+def acquire(env_dir: Path, pid: int, owner: str, state_dir: str | None = None):
     """Take the lock for ``pid``: (ok, message, nonce); the holder exports the nonce (nonce_var)."""
-    path = lock_path(env_dir)
+    path = lock_path(env_dir, state_dir)
     host = socket.gethostname()
-    with _guard(env_dir):
+    with _guard(env_dir, state_dir):
         note = ""
         if path.exists() or path.is_symlink():
             held = _read_lock(path)
@@ -161,12 +176,12 @@ def acquire(env_dir: Path, pid: int, owner: str):
         return True, note, nonce
 
 
-def release_lock(env_dir: Path, pid: int) -> None:
-    path = lock_path(env_dir)
+def release_lock(env_dir: Path, pid: int, state_dir: str | None = None) -> None:
+    path = lock_path(env_dir, state_dir)
     if not path.parent.is_dir():
         return
-    with _guard(env_dir):
-        if owns_lock(env_dir, pid):
+    with _guard(env_dir, state_dir):
+        if owns_lock(env_dir, pid, state_dir):
             path.unlink(missing_ok=True)
 
 

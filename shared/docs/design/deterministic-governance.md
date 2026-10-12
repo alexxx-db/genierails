@@ -169,7 +169,7 @@ row_filters = [
 | Policy changes | Any change that replaces or removes a policy or function runs as separate applies under the env lock: (1) create new functions and policies, removing nothing; (2) verify with `SHOW EFFECTIVE POLICIES` and queries as every affected tier; (3) retag or move principals; (4) verify; (5) remove the old policies and functions. Outside phase 5, policies and functions are protected from destroy. A brief `MULTIPLE_MASKS` error is acceptable only for the principals being moved; any raw value fails the run. Run tier moves as maintenance windows. |
 | External masks | Before every `rehearse`, `release` and `maintain`, GenieRails inventories effective policies and table-attached masks on governed tables. One it didn't create on a governed column stops the run, because it would break queries with `MULTIPLE_MASKS`. |
 | Tags | One treatment tag key for everything. Each column has one treatment-tag resource keyed by `entity_type|entity_name|tag_key` (never by value) with no `ignore_changes`, so value changes update in place (verified in the provider). Classifier-owned `class.*` tags are never managed by Terraform. Order for a column moving to a new treatment: add the value to the tag policy, create the new treatment's policies, then retag. A column is never tagged with a value no policy matches. |
-| CI | Every applying target refuses in CI except exactly `make rehearse ENV=dev` in the dev pipeline, and only once dev has remote state with locking. Prod and account applying targets still refuse. |
+| CI | Every applying target refuses in CI except exactly `make rehearse ENV=dev` in the dev pipeline, on `<cloud>/envs/dev` itself (not a promote-to destination), and only once dev has remote state with locking. The applies it runs through recursive makes pass only while they inherit that rehearse's env lock. Prod and account applying targets still refuse. |
 | Coverage freshness | A pass counts only for the same commit (`check`) and the same live snapshot (`rehearse`, `release`, `maintain`). |
 
 **Acknowledgements live in a committed file**, `envs/<env>/ack.txt`, one typed and fully scoped entry per line, so every acknowledgement is reviewed, code-owned and part of the receipt fingerprint. Each line includes the environment again so copying a file to a different environment fails closed:
@@ -253,7 +253,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 - **Removing an agent revokes `CAN_RUN` only. Removing a `table_readers` entry revokes the `SELECT` it granted.** Masks stay until `make ungovern`.
 - A failed rehearse blocks release until a fix merges and rehearse passes. CI also regenerates each open promotion PR and fails it if it differs.
 - v1 runs every applying target from one deployment machine; the env lock allows one run at a time. No hand edits in prod; remove `CAN_EDIT` on prod agents from everyone except the deployer SP.
-- Until dev has remote state (rollout step 12), the operator runs the post-merge rehearse.
+- Until dev has remote state (`envs/dev/remote_state.hcl`, rollout step 12b), the operator runs the post-merge rehearse.
 
 ## 11. Flows
 

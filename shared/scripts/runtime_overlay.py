@@ -264,7 +264,9 @@ def build_kept_names(env_dir: Path, *, state_keys=None, live_names=None) -> dict
         current = [str(p.get("name")) for p in policies]
         promoted = [dict(p) | {"name": reverse.get(name, name)} for p, name in zip(policies, current)]
         if state_keys is None:
-            state_keys = read_state_policy_keys(env_dir / "data_access" / "terraform.tfstate")
+            from state_layout import state_json
+            state = state_json(env_dir, env_dir.name, "data_access") or {}
+            state_keys = read_state_policy_keys(state=state)
         if live_names is None:
             live_names = live_policy_lister(env_dir / "data_access" / "auth.auto.tfvars")
         kept = kept_policy_names(promoted, catalog_map, state_keys, live_names)

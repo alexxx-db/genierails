@@ -41,15 +41,27 @@ case "$LAYER" in
     ;;
 esac
 
-STATE_ENV_DIR="$ENVS_DIR/$ENV_NAME"
-[ "$LAYER" = "account" ] && STATE_ENV_DIR="$ENV_DIR"
+# The env dir that owns this layer's state and remote_state.hcl: the dir the
+# layer runs in (envs/<env>, or envs/account), never one rebuilt from
+# ENVS_DIR, so the CI guard (state_layout.py ci-allowed) and this runner read
+# the same remote_state.hcl.
+STATE_ENV_DIR="$ENV_DIR"
+if [ "$LAYER" = "data_access" ] && [ "$(dirname "$ENV_DIR")" != "$ENVS_DIR" ]; then
+  STATE_ENV_DIR="$(dirname "$ENV_DIR")"
+fi
+# state-pull prints only the state on stdout (state_layout.py state_json reads it).
+if [ "$COMMAND" = "state-pull" ]; then
+  exec 3>&1 1>&2
+fi
 STATE_BASE="$ENV_DIR"
 USE_STATE_LAYOUT=0
 if [ -n "${GENIERAILS_STATE_DIR:-}" ] || [ -f "$STATE_ENV_DIR/remote_state.hcl" ]; then
   USE_STATE_LAYOUT=1
 fi
-if [ -n "${GENIERAILS_STATE_DIR:-}" ]; then
-  STATE_BASE="$(python3 "$SCRIPT_DIR/state_layout.py" lock-dir --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME")/../layers/$LAYER"
+# Refuses a moved-state marker without GENIERAILS_STATE_DIR, and a state dir
+# that lacks a state the checkout still holds (a split, not an empty env).
+if [ "$USE_STATE_LAYOUT" = 1 ] || [ -f "$STATE_ENV_DIR/.state-moved" ]; then
+  STATE_BASE="$(python3 "$SCRIPT_DIR/state_layout.py" layer-dir --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")" || exit 2
 fi
 mkdir -p "$STATE_BASE"
 
@@ -78,11 +90,29 @@ INIT_CMD=(
 )
 REMOTE_BACKEND_ARGS=()
 if [ "$USE_STATE_LAYOUT" = 1 ]; then
-  while IFS= read -r arg; do [ -n "$arg" ] && REMOTE_BACKEND_ARGS+=("$arg"); done < <(python3 "$SCRIPT_DIR/state_layout.py" backend-args --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")
+  # An invalid remote_state.hcl fails here; it never falls back to local state.
+  backend_lines="$(python3 "$SCRIPT_DIR/state_layout.py" backend-args --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")" || exit 2
+  while IFS= read -r arg; do
+    if [ -n "$arg" ]; then REMOTE_BACKEND_ARGS+=("$arg"); fi
+  done <<< "$backend_lines"
 fi
 if [ "${#REMOTE_BACKEND_ARGS[@]}" -gt 0 ]; then
   INIT_CMD+=("${REMOTE_BACKEND_ARGS[@]}")
 else
+  ci_value="$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')"
+  is_ci=
+  case "$ci_value" in true|1|yes) is_ci=1 ;; esac
+  [ -n "${TF_BUILD:-}${JENKINS_URL:-}${GITLAB_CI:-}${BUILDKITE:-}${CIRCLECI:-}" ] && is_ci=1
+  # Second line behind the make guard: in CI a write to a local backend would
+  # land in the runner's throwaway state.
+  case "$COMMAND" in
+    apply|apply-plan|destroy|import|state-rm|state-mv)
+      if [ "$is_ci" = 1 ] && [ "${GENIERAILS_ALLOW_CI_APPLY:-}" != 1 ]; then
+        echo "ERROR: refusing terraform $COMMAND in CI: $STATE_ENV_DIR has no remote_state.hcl, so the backend is local." >&2
+        exit 2
+      fi
+      ;;
+  esac
   INIT_CMD+=(-backend-config="path=$STATE_BASE/terraform.tfstate")
 fi
 WRITABLE_INIT_CMD=("${INIT_CMD[@]}")
@@ -219,6 +249,11 @@ case "$COMMAND" in
     ;;
   state-show)
     CMD=(terraform state show "$@")
+    ;;
+  state-pull)
+    echo "+ terraform state pull"
+    terraform state pull >&3
+    exit $?
     ;;
   state-rm)
     CMD=(terraform state rm "$@")

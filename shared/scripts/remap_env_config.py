@@ -103,14 +103,15 @@ def _space_key(name: str) -> str:
 
 def _deployed_space_keys(dest_env_dir: str) -> dict[str, list[str]]:
     """Map each Genie space key in the destination workspace state to its resource addresses (without the key)."""
-    state_path = Path(dest_env_dir) / "terraform.tfstate"
-    if not state_path.exists():
-        return {}
+    from state_layout import state_json
+    env_dir = Path(dest_env_dir)
     try:
-        state = json.loads(state_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"ERROR: cannot read {state_path} to check deployed Genie spaces: {exc}")
+        state = state_json(env_dir, env_dir.name, "workspace")
+    except RuntimeError as exc:
+        print(f"ERROR: cannot read workspace Terraform state to check deployed Genie spaces: {exc}")
         sys.exit(1)
+    if state is None:
+        return {}
     keys: dict[str, list[str]] = {}
     for resource in state.get("resources", []):
         rtype = resource.get("type")

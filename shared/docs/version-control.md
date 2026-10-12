@@ -48,6 +48,7 @@ envs/
 | `envs/<env>/data_access/abac.auto.tfvars` | Tag assignments and FGAC policies |
 | `envs/<env>/data_access/masking_functions.sql` | Masking SQL UDFs deployed to the warehouse |
 | `envs/<env>/generated/` | Reviewed rules; `make check` re-derives and verifies the layer files from it |
+| `envs/dev/remote_state.hcl`, `envs/account/remote_state.hcl` | Remote state backend (non-secret settings only), when the dev pipeline runs in CI ([CI/CD](cicd.md#state-location-and-dev-remote-state)) |
 
 ### Never commit
 
@@ -59,6 +60,7 @@ envs/
 | `.terraform/` | Provider binaries and cache |
 | `.genie_space_id` | Auto-managed by Terraform lifecycle |
 | `.genierails-state/` | Rehearse and release receipts and release manifests (when `GENIERAILS_STATE_DIR` isn't set) |
+| `envs/<env>/.state-moved` | Left by `make migrate-state-dir` on the machine whose state moved; other checkouts don't have its state dir |
 
 **Deterministic envs** (`governance_mode = "deterministic"`): applying commands
 (`rehearse`, `release-plan`, `release`, `maintain`) never write committed files
@@ -91,6 +93,7 @@ auth.auto.tfvars
 **/envs/**/.can_run_check.json
 **/envs/**/generated/.*
 **/envs/**/ddl/_fetched.sql
+**/envs/**/.state-moved
 .genierails-state/
 # Deterministic envs: the layer files are runtime outputs (see above). With a
 # legacy env in the same repo, list the deterministic envs' paths instead.

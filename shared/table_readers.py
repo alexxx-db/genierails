@@ -345,11 +345,11 @@ def describe(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
 
 def applied_grants(env_dir: Path) -> list[str]:
     """``table|principal`` SELECT grants the data_access state holds (current instances)."""
-    path = Path(env_dir) / "data_access" / "terraform.tfstate"
     try:
-        state = json.loads(path.read_text()) if path.is_file() else {}
-    except (OSError, ValueError):
-        return []
+        from scripts.state_layout import state_json
+        state = state_json(Path(env_dir), Path(env_dir).name, "data_access") or {}
+    except RuntimeError as exc:
+        raise TableReadersError(str(exc)) from exc
     keys = []
     for resource in state.get("resources") or []:
         if (resource.get("module"), resource.get("type"), resource.get("name")) != (
