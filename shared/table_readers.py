@@ -56,6 +56,16 @@ def _load_hcl(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def env_config(env_dir: Path, cfg: Mapping | None = None) -> dict:
+    """env.auto.tfvars (or cfg) with the per-agent files merged into genie_spaces."""
+    from agent_files import AgentFileError, merged_config
+
+    try:
+        return merged_config(Path(env_dir), dict(cfg) if cfg is not None else None)
+    except AgentFileError as exc:
+        raise TableReadersError(str(exc)) from exc
+
+
 def deterministic(cfg: Mapping) -> bool:
     return cfg.get("governance_mode", "legacy") == "deterministic"
 
@@ -174,7 +184,7 @@ def agents(env_dir: Path, cfg: Mapping | None = None) -> list[dict]:
     make generate attributed to it (data_access/discovered_uc_tables.auto.tfvars).
     """
     env_dir = Path(env_dir)
-    cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
+    cfg = env_config(env_dir, cfg)
     generated = _load_hcl(env_dir / "generated" / "abac.auto.tfvars")
     id_to_name = generated.get("genie_space_id_to_name") or {}
     discovered = _discovered_attribution(env_dir)
@@ -201,7 +211,7 @@ def access_problems(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
     ([] means nobody).
     """
     env_dir = Path(env_dir)
-    cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
+    cfg = env_config(env_dir, cfg)
     if not deterministic(cfg):
         return []
     problems: list[str] = []
@@ -254,7 +264,7 @@ def proposals(env_dir: Path, cfg: Mapping | None = None) -> tuple[dict[str, list
     raw_exempt_principals) are left out, so the access check names them.
     """
     env_dir = Path(env_dir)
-    cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
+    cfg = env_config(env_dir, cfg)
     if not deterministic(cfg):
         return {}, []
     existing = normalize(cfg.get(SETTING), str(cfg.get("uc_catalog") or ""))
@@ -324,7 +334,7 @@ def governed_tables(env_dir: Path, cfg: Mapping) -> list[str]:
 
 def describe(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
     env_dir = Path(env_dir)
-    cfg = cfg if cfg is not None else _load_hcl(env_dir / "env.auto.tfvars")
+    cfg = env_config(env_dir, cfg)
     if not deterministic(cfg):
         return []
     if cfg.get(SETTING) is None:
@@ -371,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     env_dir = args.env_dir
     try:
-        cfg = _load_hcl(env_dir / "env.auto.tfvars")
+        cfg = env_config(env_dir)
         if args.command == "show":
             for line in describe(env_dir, cfg):
                 print(line)
@@ -386,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {table} = {', '.join(groups)}")
             if imported:
                 record_proposed(env_dir, imported)
-            for line in describe(env_dir, _load_hcl(env_dir / "env.auto.tfvars")):
+            for line in describe(env_dir, env_config(env_dir)):
                 print(line)
             return 0
         problems = access_problems(env_dir, cfg)

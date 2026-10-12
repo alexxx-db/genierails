@@ -2,7 +2,8 @@
 """Parse and reconcile committed deterministic-governance acknowledgements.
 
 Each ``envs/<env>/ack.txt`` line is ``<env>:<kind>:<object>[:<principal>]``, for
-example ``prod:weaken:cat.sch.t.col:etl-sp``. An entry whose env differs from
+example ``prod:weaken:cat.sch.t.col:etl-sp``; ``<env>:rollback:<commit>`` and
+``<env>:delete-agent:<agent key>`` take no principal. An entry whose env differs from
 the env being checked is refused. The file is an approval record, so the
 repository must make it code-owned (a ``CODEOWNERS`` rule for
 ``envs/*/ack.txt`` naming the team that approves governance exceptions).
@@ -23,6 +24,7 @@ _ENV = re.compile(rf"^{_IDENT}$")
 _OBJECT = re.compile(rf"^{_IDENT}(?:\.{_IDENT})*$")
 _PRINCIPAL = re.compile(r"^[^\s:#,]+(?: [^\s:#,]+)*$")
 _COMMIT = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_AGENT_KEY = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 _OBJECT_PARTS = {
     "weaken": {1, 3, 4},  # treatment, table, or column
     "unclassified": {4},
@@ -57,7 +59,7 @@ def parse_line(text: str, line_number: int = 1, expected_env: str | None = None)
     if "#" in value:
         raise AckFileError(f"line {line_number}: inline comments are not allowed")
     parts = value.split(":")
-    if len(parts) < 3 or parts[0] in {*_OBJECT_PARTS, "rollback"}:
+    if len(parts) < 3 or parts[0] in {*_OBJECT_PARTS, "rollback", "delete-agent"}:
         raise AckFileError(
             f"line {line_number}: acknowledgement must begin <env>:<kind>:"
         )
@@ -74,6 +76,14 @@ def parse_line(text: str, line_number: int = 1, expected_env: str | None = None)
                 f"line {line_number}: rollback must be <env>:rollback:<7-64 hex commit>"
             )
         return AckEntry(env, kind, parts[2].lower(), line=line_number)
+    if kind == "delete-agent":
+        # Deleting a Genie agent (delete = true) deletes its conversations too.
+        if len(parts) != 3 or not _AGENT_KEY.fullmatch(parts[2]):
+            raise AckFileError(
+                f"line {line_number}: delete-agent must be <env>:delete-agent:<agent key> "
+                "(lowercase letters, digits and '_', as in .genie_space_id_<key>)"
+            )
+        return AckEntry(env, kind, parts[2], line=line_number)
     if kind not in _OBJECT_PARTS:
         raise AckFileError(f"line {line_number}: unknown acknowledgement kind {kind!r}")
     expected_fields = 3 if kind == "unclassified" else 4

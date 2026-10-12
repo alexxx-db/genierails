@@ -7,6 +7,7 @@ from pathlib import Path
 import hcl2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from agent_files import AgentFileError, merged_config  # noqa: E402
 from deterministic_governance import validate_config  # noqa: E402
 
 
@@ -14,6 +15,11 @@ def main() -> int:
     path = Path(sys.argv[1])
     try:
         cfg = hcl2.loads(path.read_text())
+        # The per-agent files (agents/*.auto.tfvars) are validated with it.
+        cfg = merged_config(path.parent, cfg)
+    except AgentFileError as exc:
+        print(f"env config validation: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         print(f"env config validation: {path}: {exc}", file=sys.stderr)
         return 1

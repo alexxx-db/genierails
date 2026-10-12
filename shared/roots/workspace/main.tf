@@ -8,6 +8,10 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.2"
     }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.3"
+    }
   }
   required_version = ">= 1.7"
 
@@ -71,6 +75,7 @@ locals {
       uc_tables        = local.legacy_full_uc_tables
       acl_groups       = null
       delete           = false
+      captured         = false
     }] : []
   )
 
@@ -140,9 +145,12 @@ locals {
       configured_sql_warehouse_id = s.sql_warehouse_id
       uc_tables                   = s.uc_tables
       # Deterministic: the agent's own acl_groups, never a derived or drafted list.
+      # A captured agent (agents/<name>.space.json) gets no config from
+      # Terraform: dev's stays as curated in the UI, and release pushes prod's
+      # from the captured file (scripts/agent_ownership.py).
       config = (local.deterministic
-        ? merge(try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
-        : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
+        ? merge(s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
+        : s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
       )
     }
   }
@@ -391,9 +399,10 @@ variable "genie_spaces" {
     uc_tables        = optional(list(string), [])
     acl_groups       = optional(list(string), null)
     delete           = optional(bool, false)
+    captured         = optional(bool, false)
   }))
   default     = []
-  description = "User-owned Genie agent definitions. 'name' is the semantic-config lookup key. acl_groups omitted/null derives fresh from policy principals, [] explicitly grants nobody, and a non-empty list is the durable override; generated semantic drafts do not own ACLs."
+  description = "User-owned Genie agent definitions. captured is set by the agent-file loader (agent_files.py) for an agent with agents/<name>.space.json. 'name' is the semantic-config lookup key. acl_groups omitted/null derives fresh from policy principals, [] explicitly grants nobody, and a non-empty list is the durable override; generated semantic drafts do not own ACLs."
 }
 
 variable "genie_space_id_to_name" {
@@ -800,6 +809,8 @@ module "workspace" {
   genie_spaces                     = local.merged_spaces
   genie_id_file_prefix             = "${var.env_dir}/.genie_space_id"
   genie_script_path                = "${local.project_root}/scripts/genie_space.sh"
+  record_created_agent_ids         = local.deterministic
+  genie_id_reader_path             = "${local.project_root}/scripts/genie_id_record.py"
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
@@ -861,6 +872,11 @@ output "genie_space_missing_grants" {
 output "genie_space_can_run_widening" {
   description = "Per Genie agent: CAN_RUN groups its ACL adds beyond what the last apply left in place. Only these need the coverage check and the agent's grants."
   value       = local.genie_space_can_run_widening
+}
+
+output "genie_space_id_records" {
+  description = "Deterministic envs: per create-path agent key, the ID file whose agent ID the state records."
+  value       = module.workspace.genie_space_id_records
 }
 
 output "genie_existing_space_warehouse_intent" {

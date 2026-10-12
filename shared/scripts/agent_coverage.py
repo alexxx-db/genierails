@@ -356,8 +356,10 @@ def run(env_dir: Path, env_name: str, runner: Path, apply_flags: str, *, strict:
         snapshot_factory: Callable[[Path], object] = LiveSnapshot) -> int:
     from table_readers import deterministic
 
+    from table_readers import env_config
+
     env_dir = env_dir.resolve()
-    cfg = _load_hcl(env_dir / "env.auto.tfvars")
+    cfg = env_config(env_dir)
     if not deterministic(cfg):
         return 0
     path = env_dir / RESULT_FILENAME

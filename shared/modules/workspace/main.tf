@@ -9,6 +9,10 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.2"
     }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.3"
+    }
   }
 }
 
@@ -312,6 +316,22 @@ resource "terraform_data" "genie_space" {
     databricks_mws_permission_assignment.group_assignments,
     databricks_sql_endpoint.warehouse,
   ]
+}
+
+# Deterministic envs: the agent ID each create resource left in its ID file,
+# read back after it ran (depends_on defers the read to apply while a create is
+# pending), so the state records which agent that create made or adopted.
+# Release pushes config only to an agent whose ID file still holds this ID
+# (scripts/agent_ownership.py verify_created). Reads a file; changes nothing.
+data "external" "genie_space_id" {
+  for_each = var.record_created_agent_ids ? local.managed_created_spaces : {}
+
+  program = ["python3", var.genie_id_reader_path]
+  query = {
+    id_file = "${var.genie_id_file_prefix}_${each.key}"
+  }
+
+  depends_on = [terraform_data.genie_space]
 }
 
 # Earlier versions created spaces with this null_resource, whose triggers kept
