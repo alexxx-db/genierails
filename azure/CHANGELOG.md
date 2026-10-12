@@ -65,6 +65,17 @@
 
 ### Added
 
+- **Migration from legacy governance** (`make migrate-plan ENV=<env>`): a
+  read-only dry run that reports, per column and principal, what changes when a
+  legacy env opts in to deterministic governance, every `SELECT` and `CAN_RUN`
+  the cutover revokes, and a proposed `table_readers` reproducing today's grants.
+  The cutover runs through `rehearse` (dev) or `release-plan` / `release
+  MANIFEST=` (one manifest per phase): legacy tags move to their stable keys
+  with `terraform state mv`, new policies are created first, columns are
+  retagged in place, and the legacy policies stay until a later release.
+  Weakenings and revocations need `ack.txt` entries (`<env>:revoke:...`);
+  legacy row filters stay frozen. See `shared/docs/legacy-migration.md`.
+
 - **Fixing a coverage gap prod found**: `make scaffold-treatments ENV=<env>
   TREATMENT=<existing>` maps each unmapped `class.*` tag to an existing
   treatment in `shared/treatment_config.json`. It refuses before writing if the

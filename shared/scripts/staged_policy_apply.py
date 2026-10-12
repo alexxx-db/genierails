@@ -245,10 +245,19 @@ class Controller:
         save_journal(self.env_dir, journal)
 
     def _snapshot(self, fingerprint: str) -> dict | None:
-        return pg.load_snapshot(self.env_dir, fingerprint)
+        preview = getattr(self, "_preview_snapshots", {})
+        return preview[fingerprint] if fingerprint in preview else pg.load_snapshot(self.env_dir, fingerprint)
 
     def _adopt(self, desired: dict) -> dict:
-        """A journal for an env that has none: fresh, or exactly the desired generation live."""
+        """A journal for an env that has none: fresh, the legacy deployment, or exactly the desired generation live."""
+        from scripts import migration
+
+        if migration.deployment(self.env_dir)["legacy"]:
+            # A legacy env that opted in: its deployment is the live generation (design section 8).
+            try:
+                return migration.adopt(self.env_dir, self.env_name)
+            except migration.Refused as exc:
+                raise Refused(str(exc)) from exc
         journal = empty_journal()
         live = live_from_state(_read_state(self.env_dir))
         if not live["policies"] and not live["tags"]:
@@ -273,7 +282,10 @@ class Controller:
         old = self._snapshot(active)
         held = pending[0] if pending else None
         retain = self._snapshot(held["fingerprint"]) if held else None
-        problems = state_problems(live_from_state(_read_state(self.env_dir)), old, [retain] if retain else [])
+        # A migration preview (make plan) runs before the legacy tags are moved; the adoption checks the state.
+        previewed = bool(old) and old["fingerprint"] in getattr(self, "_preview_snapshots", {})
+        problems = [] if previewed else state_problems(live_from_state(_read_state(self.env_dir)), old,
+                                                       [retain] if retain else [])
         if problems:
             raise Refused(
                 "the data_access state doesn't match the policy journal (applied outside the staged "
@@ -484,7 +496,10 @@ class Controller:
         out_dir.mkdir(parents=True, exist_ok=True)
         with env_lock(self.env_dir, "staged-policy-plan"):
             desired = pg.desired_generation(self.env_dir)
-            journal = load_journal(self.env_dir) or self._adopt(desired)
+            journal = load_journal(self.env_dir)
+            if journal is None and self._legacy_pending():
+                return self._plan_adoption(out_dir, desired)
+            journal = journal or self._adopt(desired)
             t = self._transition_for(journal, desired)
             remaining = [p for p in t["phases"] if p not in t["completed"]]
             steps: list[dict] = []
@@ -545,6 +560,8 @@ class Controller:
             if desired["fingerprint"] != planned["to"]:
                 raise Refused(f"the generated config is generation {desired['fingerprint']}, the manifest planned "
                               f"{planned['to']}; run make release-plan again")
+            if [s["kind"] for s in saved["steps"]] == ["adopt"]:
+                return self._apply_adoption(saved["steps"][0])
             journal = load_journal(self.env_dir) or self._adopt(desired)
             t = self._transition_for(journal, desired)
             for key in ("from", "to", "retain", "retire", "tier_move", "phases"):
@@ -584,6 +601,68 @@ class Controller:
             self._finish(journal, t)
             print(f"Staged policy apply: generation {t['to']} is live and verified (saved plans).")
             return 0
+
+    # -- migration from legacy (make release-plan / release MANIFEST=) --------------
+    def _legacy_pending(self) -> bool:
+        from scripts import migration
+
+        return migration.deployment(self.env_dir)["legacy"]
+
+    def _adoption_step(self) -> dict:
+        """What adopting the legacy deployment does: checked, but nothing changes."""
+        from scripts import migration
+        from scripts.runtime_overlay import effective
+
+        dep = migration.deployment(self.env_dir)
+        legacy = migration.legacy_generation(dep)
+        try:
+            migration.check(self.env_dir, self.env_name, legacy)
+        except migration.Refused as exc:
+            raise Refused(str(exc)) from exc
+        forget = migration.forgotten_tags(dep, pg._load(effective(self.env_dir, "abac.auto.tfvars")))
+        return {"phase": "adopt", "kind": "adopt", "legacy": legacy["fingerprint"],
+                "moves": [list(m) for m in dep["moves"]], "forget": forget}
+
+    def _plan_adoption(self, out_dir: Path, desired: dict) -> int:
+        """release-plan of a pending migration: the state moves are this manifest's only operation.
+
+        Nothing is moved, journaled or recorded here; release MANIFEST= runs
+        exactly these moves under the env lock, and the next release-plan plans
+        the create phase against the moved state.
+        """
+        step = self._adoption_step()
+        summary = {
+            "transition": {"from": step["legacy"], "to": desired["fingerprint"], "retain": "", "retire": "",
+                           "tier_move": False, "phases": ["adopt"], "completed": [], "resumed": False},
+            "steps": [step], "final": False, "planned_at": _now(),
+        }
+        pg.write_json(Path(out_dir) / PHASES_FILE, summary)
+        print(f"Staged policy plan ({self.env_name}): adopt the legacy deployment {step['legacy']} "
+              f"({len(step['moves'])} terraform state mv, {len(step['forget'])} state rm, nothing applied); "
+              "the create phase needs another release-plan once this manifest is applied")
+        for source, target in step["moves"]:
+            print(f"  terraform state mv '{source}' '{target}'")
+        return 0
+
+    def _apply_adoption(self, planned: dict) -> int:
+        """release MANIFEST= of an adoption manifest: exactly the approved moves, then stop."""
+        from scripts import migration
+
+        if load_journal(self.env_dir) is not None:
+            raise Refused("the legacy deployment was adopted since release-plan; run make release-plan again")
+        now = self._adoption_step()
+        for key in ("legacy", "moves", "forget"):
+            if now[key] != planned[key]:
+                raise Refused(f"the data_access state changed since release-plan ({key}); nothing was moved. "
+                              "Run make release-plan again")
+        try:
+            journal = migration.adopt(self.env_dir, self.env_name)
+        except migration.Refused as exc:
+            raise Refused(str(exc)) from exc
+        self._save(journal)
+        print(f"Staged policy apply: adopted the legacy deployment {planned['legacy']} (the approved state moves); "
+              f"run make release-plan ENV={self.env_name} again for the create phase.")
+        return MORE_PHASES
 
     def abandon(self) -> int:
         """Drop an unfinished transition that never switched, back to the active generation."""
@@ -643,7 +722,7 @@ class Controller:
             return 0
         try:
             return self._describe()
-        except (Refused, pg.StageError, OSError, ValueError) as exc:
+        except (Refused, pg.StageError, OSError, ValueError, RuntimeError) as exc:
             print(f"Staged policy apply: no phase preview ({exc}); an apply would stop on this first.")
             return 0
 
@@ -666,7 +745,18 @@ class Controller:
         return 0
 
     def _adopt_preview(self, desired: dict) -> dict:
+        from scripts import migration
+
         journal = empty_journal()
+        dep = migration.deployment(self.env_dir)
+        if dep["legacy"]:
+            legacy = migration.legacy_generation(dep)
+            migration.check(self.env_dir, self.env_name, legacy)
+            print(f"Staged policy apply ({self.env_name}): migrates from the legacy deployment "
+                  f"(generation {legacy['fingerprint']}); see make migrate-plan ENV={self.env_name}")
+            self._preview_snapshots = {legacy["fingerprint"]: legacy}
+            journal["active"] = legacy["fingerprint"]
+            return journal
         live = live_from_state(_read_state(self.env_dir))
         if live["policies"] or live["tags"]:
             journal["active"] = desired["fingerprint"]
