@@ -1443,6 +1443,29 @@ policy-status: _guard-workspace-target ## Show the staged policy journal (determ
 policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched (deterministic envs)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
 
+# Read-only dry run of moving a legacy env to deterministic governance (design
+# section 8, scripts/migration.py): what every principal sees on every column
+# today and after, the mask functions, the policy principals, every SELECT and
+# CAN_RUN the cutover revokes, the frozen row filters and the generated tag
+# state moves, with the ack.txt entries it needs. The proposed table_readers
+# (today's GenieRails grants) goes to the ignored state dir; nothing committed
+# or live changes. The cutover runs through rehearse (dev) or release-plan and
+# release MANIFEST= (one manifest and approval per phase).
+migrate-plan: _guard-workspace-target ## [migration] Read-only dry run of legacy -> deterministic: per column and principal, revocations, proposed table_readers
+	@$(_GUARD_WORKSPACE_ENV); \
+	out="$$($(_RELEASE_GATE) state-dir --env-dir "$(ENV_DIR)" --env "$(ENV)")/migration" || exit 1; \
+	inventory_rc=0; \
+	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "=== Masks GenieRails didn't create ($(ENV)) ==="; \
+		$(_EXTERNAL_MASK_INVENTORY) || inventory_rc=$$?; \
+	fi; \
+	rc=0; python3 "$(SHARED_ROOT)/scripts/migration.py" report --env-dir "$(ENV_DIR)" --env "$(ENV)" --out-dir "$$out" || rc=$$?; \
+	if [ $$inventory_rc -ne 0 ]; then \
+		echo "migrate-plan: masks GenieRails didn't create block the cutover until they are removed (above)." >&2; \
+		if [ $$rc -eq 0 ]; then rc=1; fi; \
+	fi; \
+	exit $$rc
+
 genie-adopt-preflight: _guard-workspace-target ## Read-only: check every legacy Genie agent can be adopted (ID file, host, GET 200) before migrating
 	@python3 "$(SHARED_ROOT)/scripts/genie_adopt_preflight.py" "$(ENV_DIR)"
 

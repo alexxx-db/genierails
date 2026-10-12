@@ -245,10 +245,19 @@ class Controller:
         save_journal(self.env_dir, journal)
 
     def _snapshot(self, fingerprint: str) -> dict | None:
-        return pg.load_snapshot(self.env_dir, fingerprint)
+        preview = getattr(self, "_preview_snapshots", {})
+        return preview[fingerprint] if fingerprint in preview else pg.load_snapshot(self.env_dir, fingerprint)
 
     def _adopt(self, desired: dict) -> dict:
-        """A journal for an env that has none: fresh, or exactly the desired generation live."""
+        """A journal for an env that has none: fresh, the legacy deployment, or exactly the desired generation live."""
+        from scripts import migration
+
+        if migration.deployment(self.env_dir)["legacy"]:
+            # A legacy env that opted in: its deployment is the live generation (design section 8).
+            try:
+                return migration.adopt(self.env_dir, self.env_name)
+            except migration.Refused as exc:
+                raise Refused(str(exc)) from exc
         journal = empty_journal()
         live = live_from_state(_read_state(self.env_dir))
         if not live["policies"] and not live["tags"]:
@@ -273,7 +282,10 @@ class Controller:
         old = self._snapshot(active)
         held = pending[0] if pending else None
         retain = self._snapshot(held["fingerprint"]) if held else None
-        problems = state_problems(live_from_state(_read_state(self.env_dir)), old, [retain] if retain else [])
+        # A migration preview (make plan) runs before the legacy tags are moved; the adoption checks the state.
+        previewed = bool(old) and old["fingerprint"] in getattr(self, "_preview_snapshots", {})
+        problems = [] if previewed else state_problems(live_from_state(_read_state(self.env_dir)), old,
+                                                       [retain] if retain else [])
         if problems:
             raise Refused(
                 "the data_access state doesn't match the policy journal (applied outside the staged "
@@ -643,7 +655,7 @@ class Controller:
             return 0
         try:
             return self._describe()
-        except (Refused, pg.StageError, OSError, ValueError) as exc:
+        except (Refused, pg.StageError, OSError, ValueError, RuntimeError) as exc:
             print(f"Staged policy apply: no phase preview ({exc}); an apply would stop on this first.")
             return 0
 
@@ -666,7 +678,18 @@ class Controller:
         return 0
 
     def _adopt_preview(self, desired: dict) -> dict:
+        from scripts import migration
+
         journal = empty_journal()
+        dep = migration.deployment(self.env_dir)
+        if dep["legacy"]:
+            legacy = migration.legacy_generation(dep)
+            migration.check(self.env_dir, self.env_name, legacy)
+            print(f"Staged policy apply ({self.env_name}): migrates from the legacy deployment "
+                  f"(generation {legacy['fingerprint']}); see make migrate-plan ENV={self.env_name}")
+            self._preview_snapshots = {legacy["fingerprint"]: legacy}
+            journal["active"] = legacy["fingerprint"]
+            return journal
         live = live_from_state(_read_state(self.env_dir))
         if live["policies"] or live["tags"]:
             journal["active"] = desired["fingerprint"]
