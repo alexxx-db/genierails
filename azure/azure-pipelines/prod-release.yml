@@ -66,6 +66,10 @@ stages:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
+
+          - download: dev
+            artifact: genierails-dev-receipt-azure-$(resources.pipeline.dev.sourceCommit)
+            displayName: Download this commit's dev receipt (read-only)
             fetchDepth: 2
 
           - script: |

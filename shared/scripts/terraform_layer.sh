@@ -41,6 +41,18 @@ case "$LAYER" in
     ;;
 esac
 
+STATE_ENV_DIR="$ENVS_DIR/$ENV_NAME"
+[ "$LAYER" = "account" ] && STATE_ENV_DIR="$ENV_DIR"
+STATE_BASE="$ENV_DIR"
+USE_STATE_LAYOUT=0
+if [ -n "${GENIERAILS_STATE_DIR:-}" ] || [ -f "$STATE_ENV_DIR/remote_state.hcl" ]; then
+  USE_STATE_LAYOUT=1
+fi
+if [ -n "${GENIERAILS_STATE_DIR:-}" ]; then
+  STATE_BASE="$(python3 "$SCRIPT_DIR/state_layout.py" lock-dir --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME")/../layers/$LAYER"
+fi
+mkdir -p "$STATE_BASE"
+
 if [ ! -d "$ROOT_DIR" ]; then
   echo "Missing Terraform root: $ROOT_DIR" >&2
   exit 1
@@ -52,7 +64,10 @@ mkdir -p "$ENV_DIR"
 # file is always in the working directory — use -lockfile=readonly during init
 # to prevent concurrent writes from corrupting it. On first run (no lock file),
 # skip -lockfile=readonly so Terraform can generate the lock file.
-export TF_DATA_DIR="$ENV_DIR/.terraform"
+export TF_DATA_DIR="$STATE_BASE/.terraform"
+if [ "$USE_STATE_LAYOUT" = 1 ]; then
+  ROOT_DIR="$(python3 "$SCRIPT_DIR/state_layout.py" root --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER" --source "$ROOT_DIR")"
+fi
 cd "$ROOT_DIR"
 
 INIT_CMD=(
@@ -60,8 +75,16 @@ INIT_CMD=(
   init
   -input=false
   -reconfigure
-  -backend-config="path=$ENV_DIR/terraform.tfstate"
 )
+REMOTE_BACKEND_ARGS=()
+if [ "$USE_STATE_LAYOUT" = 1 ]; then
+  while IFS= read -r arg; do [ -n "$arg" ] && REMOTE_BACKEND_ARGS+=("$arg"); done < <(python3 "$SCRIPT_DIR/state_layout.py" backend-args --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")
+fi
+if [ "${#REMOTE_BACKEND_ARGS[@]}" -gt 0 ]; then
+  INIT_CMD+=("${REMOTE_BACKEND_ARGS[@]}")
+else
+  INIT_CMD+=(-backend-config="path=$STATE_BASE/terraform.tfstate")
+fi
 WRITABLE_INIT_CMD=("${INIT_CMD[@]}")
 if [ -f .terraform.lock.hcl ]; then
   INIT_CMD+=(-lockfile=readonly)

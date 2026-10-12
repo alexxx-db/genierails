@@ -50,7 +50,7 @@ def test_every_applying_target_refuses_in_ci(cloud, target):
     proc = _run_guarded_make(cloud, target, env=_clean_env(CI="true"))
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0
-    assert "GenieRails v1 runs Terraform applies on the deployment machine" in output
+    assert "applying targets cannot run in CI" in output
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
@@ -87,7 +87,7 @@ def test_throwaway_integration_workflow_has_explicit_ci_apply_opt_out(cloud):
 def test_guard_detects_common_ci_markers(marker, value):
     proc = _run_guarded_make("aws", "_guard-not-ci-apply", env=_clean_env(**{marker: value}))
     assert proc.returncode != 0
-    assert "GenieRails v1 runs Terraform applies on the deployment machine" in proc.stderr
+    assert "applying targets cannot run in CI" in proc.stderr
 
 
 def test_ci_workflow_scopes_apply_opt_out_to_integration_steps():
@@ -115,7 +115,7 @@ def _sample_workflows():
     )
 
 
-def test_shipped_workflows_do_not_run_guarded_targets_without_opt_out():
+def test_shipped_workflows_scope_the_only_applying_command_to_dev_rehearse():
     workflow_paths = _sample_workflows()
     assert {sample_dir for sample_dir, _ in workflow_paths} == set(SAMPLE_DIRS)
     for sample_dir, path in workflow_paths:
@@ -128,15 +128,15 @@ def test_shipped_workflows_do_not_run_guarded_targets_without_opt_out():
             executed_targets.update(targets)
             opted_out = bool(re.search(r"GENIERAILS_ALLOW_CI_APPLY:\s*['\"]?1['\"]?", step))
             guarded = set(targets) & set(APPLYING_TARGETS)
-            assert not guarded or opted_out, f"{path} runs guarded targets without opt-out: {sorted(guarded)}"
-        # Samples are for customer pipelines, never the throwaway integration
-        # workspace: none opts out of the guard or runs an applying target.
+            assert not guarded or guarded == {"rehearse"} and "dev-rehearse" in path.name, path
+        # Customer samples never use the integration-test bypass. Only stage 3
+        # may apply, and the make guard independently proves dev locked state.
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         assert "GENIERAILS_ALLOW_CI_APPLY" not in code, path
-        assert not (executed_targets & set(APPLYING_TARGETS)), f"{path}: {sorted(executed_targets)}"
+        assert (executed_targets & set(APPLYING_TARGETS)) <= ({"rehearse"} if "dev-rehearse" in path.name else set())
 
 
-@pytest.mark.parametrize("stage", ["dev-rehearse", "prod-release", "prod-maintain"])
+@pytest.mark.parametrize("stage", ["prod-release", "prod-maintain"])
 def test_applying_stage_samples_are_marked_as_needing_remote_state(stage):
     for cloud in ("aws", "azure"):
         for sample_dir in SAMPLE_DIRS:

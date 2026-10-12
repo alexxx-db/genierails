@@ -28,11 +28,20 @@ from pathlib import Path
 
 LOCK_RELPATH = Path("generated/.governance.lock")
 
+def lock_path(env_dir: Path) -> Path:
+    base = os.environ.get("GENIERAILS_STATE_DIR", "").strip()
+    if not base:
+        return Path(env_dir) / LOCK_RELPATH
+    cloud = Path(env_dir).resolve().parent.parent.name
+    return Path(base).expanduser().resolve() / cloud / Path(env_dir).name / "locks" / ".governance.lock"
+
 
 @contextmanager
 def _guard(env_dir: Path):
-    path = env_dir / LOCK_RELPATH
+    path = lock_path(env_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("GENIERAILS_STATE_DIR", "").strip():
+        os.chmod(path.parent.parent, 0o700)
     with open(path.with_suffix(".guard"), "a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
@@ -97,7 +106,7 @@ def held_by_ancestor(env_dir: Path) -> str | None:
     pid is an ancestor on this host, and that pid's start time is the one
     recorded when the lock was taken. Anything missing means not held.
     """
-    held = _read_lock(Path(env_dir) / LOCK_RELPATH)
+    held = _read_lock(lock_path(env_dir))
     inherited = os.environ.get(nonce_var(env_dir), "")
     if not held or not inherited or not isinstance(held.get("nonce"), str) or not isinstance(held.get("pid_start"), str):
         return None
@@ -111,7 +120,7 @@ def held_by_ancestor(env_dir: Path) -> str | None:
 
 
 def owns_lock(env_dir: Path, pid: int) -> bool:
-    held = _read_lock(env_dir / LOCK_RELPATH)
+    held = _read_lock(lock_path(env_dir))
     return bool(held) and held["pid"] == pid and held["host"] == socket.gethostname()
 
 
@@ -122,7 +131,7 @@ def acquire_lock(env_dir: Path, pid: int, owner: str):
 
 def acquire(env_dir: Path, pid: int, owner: str):
     """Take the lock for ``pid``: (ok, message, nonce); the holder exports the nonce (nonce_var)."""
-    path = env_dir / LOCK_RELPATH
+    path = lock_path(env_dir)
     host = socket.gethostname()
     with _guard(env_dir):
         note = ""
@@ -153,7 +162,7 @@ def acquire(env_dir: Path, pid: int, owner: str):
 
 
 def release_lock(env_dir: Path, pid: int) -> None:
-    path = env_dir / LOCK_RELPATH
+    path = lock_path(env_dir)
     if not path.parent.is_dir():
         return
     with _guard(env_dir):

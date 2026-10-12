@@ -9,7 +9,7 @@ name: GenieRails dev (aws)
 # pending run when a newer one queues); the queue job instead waits until
 # every earlier run of this workflow has finished.
 #
-# REQUIRES DEV REMOTE STATE (rollout step 12). The stage's command is
+# Requires committed envs/dev/remote_state.hcl (S3 + DynamoDB locking).
 #
 #   make rehearse ENV=dev
 #
@@ -24,10 +24,7 @@ name: GenieRails dev (aws)
 # state alone), confirm `git status --porcelain` prints nothing, and never
 # run `git clean -x` or re-clone. (State outside the checkout, in
 # GENIERAILS_STATE_DIR, is the target.)
-# The CI guard refuses every applying target here. Do not set
-# GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
-# integration-test workspace. In v1 this job re-runs the read-only check on
-# the merged commit, and the prod pipeline starts only after it passes.
+# The CI guard's only customer-pipeline exception is this exact command.
 #
 # Auth: OIDC workload identity federation, no PATs or secrets. The "dev"
 # environment holds the dev deployer service principal's IDs as variables:
@@ -71,7 +68,7 @@ jobs:
           done
 
   rehearse:
-    name: Dev rehearsal (v1, check only; REQUIRES DEV REMOTE STATE)
+    name: Dev rehearsal
     needs: queue
     runs-on: ubuntu-latest
     environment: dev
@@ -80,6 +77,7 @@ jobs:
       id-token: write
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
+      GENIERAILS_STATE_DIR: ${{ runner.temp }}/genierails-state
 
     steps:
       - uses: actions/checkout@v4
@@ -96,6 +94,11 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEV_STATE_ROLE_ARN }}
+          aws-region: ${{ vars.DEV_STATE_REGION }}
 
       - name: Write OIDC auth file (IDs only, no secrets)
         env:
@@ -115,13 +118,13 @@ jobs:
       - name: Read-only check of the merged commit
         run: make check ENV=dev
 
-      # TODO(rollout step 12): replace this step with the dev rehearsal once
-      # dev remote state with locking exists; TODO(rollout step 9): it then
-      # writes the commit's receipt to the append-only receipt store.
-      - name: Dev rehearsal runs on the deployment machine (v1)
-        run: |
-          {
-            echo "### Dev rehearsal not run in CI (v1)"
-            echo "It applies to dev and requires dev remote state (rollout step 12)."
-            echo "Run the rehearse command from this workflow's header on the deployment machine, at ${{ github.sha }}."
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Rehearse dev
+        run: make rehearse ENV=dev
+
+      - name: Publish immutable rehearsal receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: genierails-dev-receipt-aws-${{ github.sha }}
+          path: ${{ runner.temp }}/genierails-state/aws/dev/receipts/rehearse/
+          if-no-files-found: error
+          retention-days: 90

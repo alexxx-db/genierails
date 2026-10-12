@@ -2,7 +2,7 @@
 
 How to run GenieRails from a pipeline. The full design is
 [section 17 of the design doc](design/deterministic-governance.md#17-where-each-command-runs);
-this page is what works **today (v1)**, with target-only items marked.
+this page describes the shipped pipeline boundary today.
 
 ## Who runs what
 
@@ -14,9 +14,8 @@ this page is what works **today (v1)**, with target-only items marked.
 | 4. Prod release | after the promotion PR is merged and rehearsed | deterministic: `make release-plan ENV=prod` → approve its manifest → `make release ENV=prod MANIFEST=…` ([release gating](#release-gating-deterministic-envs)); legacy: `make release ENV=prod` | prod |
 | 5. Keep protected | schedule, at the last released commit | `make maintain ENV=prod` | prod, governance only |
 
-- **In v1, stages 3–5 run on the deployment machine**, not in CI: every applying
-  target refuses under CI (see [CI guard](#ci-guard)). The samples below carry
-  the triggers and approvals and report the commit to apply.
+- **Stage 3 runs in CI after dev remote state is configured.** Stages 4–5 stay
+  on the deployment machine until prod remote state is delivered.
 - **Promotion is a person, not a pipeline.** `make promote-to ENV=prod` reads
   `promote_from` and `catalog_map` from `envs/prod/env.auto.tfvars`; commit its
   output in a PR. No pipeline writes to git.
@@ -43,7 +42,12 @@ Applying targets (`apply`, `apply-governance`, `apply-genie`, `apply-account`,
 `rehearse`, `release-plan`, `release`, `maintain`, `enable-classification`, `ungovern`,
 `destroy*`, `import`, `migrate-state`) refuse when they detect CI:
 `CI=true|1|yes`, or `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`, `BUILDKITE` or
-`CIRCLECI` set. Only the listed targets are guarded: `make check`, `plan`,
+`CIRCLECI` set. The sole exception is exactly `make rehearse ENV=dev`, and only
+when `envs/dev/remote_state.hcl` proves the cloud's remote backend and locking
+settings are complete (S3 plus DynamoDB on AWS; Azure Storage blob leases on
+Azure). Recursive applies pass only while the real rehearsal lock is held.
+Prod, account, direct apply targets, and a dev rehearsal without locked remote
+state still refuse. Only the listed targets are guarded: `make check`, `plan`,
 `validate` and `audit-schema` are allowed, and `sync-tags` (which adds account
 tag values), `bootstrap-sp` and `generate` are not guarded, so don't run them
 from CI.
@@ -75,7 +79,7 @@ checkout and run from `aws/` or `azure/`.
 | Stage | Sample | Trigger | Runs in CI in v1 |
 |---|---|---|---|
 | 2. PR check | `pr-check.yml` | every PR to `main`; make it required and require branches to be up to date, so a PR is re-checked against the latest `main` before it can merge (Azure Repos: a build-validation policy that re-runs when the target branch changes) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` |
-| 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev` on the merged commit |
+| 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev`, then `make rehearse ENV=dev`; publishes its immutable receipt |
 | 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; every run waits for its own approval and none is cancelled (GitHub: no concurrency group; Azure DevOps: `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=prod` on that commit, then the approval gate |
 | 5. Keep protected | `prod-maintain.yml` | a schedule (GitHub: its own concurrency group, never the release's) | `make audit-schema ENV=prod` (read-only drift audit) |
 
@@ -93,11 +97,44 @@ records; the plan step alone gets the env's auth files. Nothing under
 The only file it can leave outside the copy is Terraform's own
 `shared/roots/*/.terraform.lock.hcl` on a first plan, which is gitignored.
 
-**v1 limits.**
+## State location and dev remote state
 
-- **Applying stages run on the deployment machine** until the env has remote
-  state with locking: `make rehearse ENV=dev` (dev remote state is rollout
-  step 12), `make release ENV=prod` and `make maintain ENV=prod` (prod remote
+With `GENIERAILS_STATE_DIR` unset, all paths and plans are unchanged. When set,
+Terraform state/data, receipts, manifests, and environment/account locks live
+under `$GENIERAILS_STATE_DIR/<cloud>/<env>/`; committed config and auth inputs
+remain in the checkout. Migrate existing local state once, without overwriting
+anything already at the destination:
+
+```bash
+GENIERAILS_STATE_DIR=/protected/genierails-state make migrate-state-dir ENV=dev
+GENIERAILS_STATE_DIR=/protected/genierails-state make migrate-state-dir ENV=account
+```
+
+Opt dev into remote state with `envs/dev/remote_state.hcl`:
+
+```hcl
+# AWS
+backend = "s3"
+bucket = "company-genierails-state"
+region = "ap-southeast-2"
+dynamodb_table = "genierails-terraform-locks"
+key_prefix = "genierails"
+
+# Azure uses instead:
+# backend = "azurerm"
+# resource_group_name = "rg-genierails-state"
+# storage_account_name = "genierailsstate"
+# container_name = "tfstate"
+```
+
+Backend credentials come only from the pipeline's OIDC identity. Dev receipts
+are uploaded as immutable, commit-named pipeline artifacts; grant the prod
+stage read-only artifact access.
+
+**Current limits.**
+
+- **Prod applying stages run on the deployment machine** until prod has remote
+  state with locking: `make release ENV=prod` and `make maintain ENV=prod` (prod remote
   state is deferred, design section 15). The operator runs them there, in
   order, in the machine's one persistent checkout: Terraform state, the env
   lock and Genie ID files live under its gitignored `envs/` today. Move it to
@@ -105,7 +142,7 @@ The only file it can leave outside the copy is Terraform's own
   `--force` discards the edits earlier runs made to tracked `generated/` and
   layer files (applying commands re-derive and rewrite them today) and leaves
   the ignored state, lock and Genie files alone. Then confirm
-  `git status --porcelain` is empty. Never `git clean -x` or re-clone. (Receipts and manifests honour `GENIERAILS_STATE_DIR`; Terraform state outside the checkout is still target.) Every applying
+  `git status --porcelain` is empty. Never `git clean -x` or re-clone. Every prod/account applying
   target keeps refusing in CI, and the samples never set
   `GENIERAILS_ALLOW_CI_APPLY`, which exists only for GenieRails' own throwaway
   integration-test workspace. The dev and prod samples already carry the

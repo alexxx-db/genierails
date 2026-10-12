@@ -82,6 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
       id-token: write
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
@@ -89,6 +90,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download this commit's dev receipt (read-only)
+        uses: actions/download-artifact@v4
+        with:
+          name: genierails-dev-receipt-azure-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/genierails-state/azure/dev/receipts/rehearse
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
 
       - uses: actions/setup-python@v5
         with:

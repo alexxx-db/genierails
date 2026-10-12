@@ -248,11 +248,16 @@ _guard-not-ci-apply:
 	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); is_ci=; \
 	case "$$ci_value" in true|1|yes) is_ci=1 ;; esac; \
 	if [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; then is_ci=1; fi; \
-	if [ "$$is_ci" = "1" ] && [ "$$GENIERAILS_ALLOW_CI_APPLY" != "1" ]; then \
-		echo "ERROR: applying targets cannot run in CI. GenieRails v1 runs Terraform applies on the deployment machine; CI may run tests, validation, coverage, audits, and plans only." >&2; \
+	allow_dev_rehearse=; \
+	if GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" python3 "$(SHARED_ROOT)/scripts/state_layout.py" ci-allowed --env-dir "$(ENV_DIR)" --env "$(ENV)" >/dev/null 2>&1; then allow_dev_rehearse=1; fi; \
+	if [ "$$is_ci" = "1" ] && [ "$$GENIERAILS_ALLOW_CI_APPLY" != "1" ] && [ "$$allow_dev_rehearse" != "1" ]; then \
+		echo "ERROR: applying targets cannot run in CI (except make rehearse ENV=dev with configured remote state and locking). Prod and account applies stay on the deployment machine." >&2; \
 		echo "Only isolated integration-test workflows may opt out with GENIERAILS_ALLOW_CI_APPLY=1." >&2; \
 		exit 1; \
 	fi
+
+migrate-state-dir: ## Move local state and locks to GENIERAILS_STATE_DIR without overwriting
+	@python3 "$(SHARED_ROOT)/scripts/state_layout.py" migrate --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 # business_access_enabled is deprecated and ignored (business access is granted
 # whenever the coverage check passes). One warning line per run, whether it
