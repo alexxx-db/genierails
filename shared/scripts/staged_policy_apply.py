@@ -195,12 +195,19 @@ def env_lock(env_dir: Path, owner: str):
     if environment_lock.held_by_ancestor(env_dir) is not None:
         yield
         return
-    ok, message = environment_lock.acquire_lock(env_dir, os.getpid(), owner)
+    ok, message, nonce = environment_lock.acquire(env_dir, os.getpid(), owner)
     if not ok:
         raise Refused(message)
+    var = environment_lock.nonce_var(env_dir)
+    previous = os.environ.get(var)
+    os.environ[var] = nonce  # what a make _ENV_LOCK holder exports to its children
     try:
         yield
     finally:
+        if previous is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = previous
         environment_lock.release_lock(env_dir, os.getpid())
 
 

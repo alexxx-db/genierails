@@ -32,6 +32,9 @@ with open({log!r}, "a") as log:
     log.write(json.dumps(args) + "\n")
 if {fail!r} and {fail!r} in args:
     sys.exit(1)
+if set(args) & set({passthrough!r}):
+    # Run the real recipe (its own recursive makes come back to this stub via MAKEFLAGS).
+    os.execvp("make", ["make", *args])
 if "_release-plan-roots" in args:
     plan_dir = Path(next(a.split("=", 1)[1] for a in args if a.startswith("PLAN_DIR=")))
     (plan_dir / "account.tfplan").write_bytes(b"account")
@@ -64,12 +67,13 @@ sys.exit(int(Path({rc!r}).read_text()) if Path({rc!r}).exists() else 0)
 
 
 class Make:
-    def __init__(self, tmp_path: Path, repo: Repo, cloud: str = "aws", fail: str = ""):
+    def __init__(self, tmp_path: Path, repo: Repo, cloud: str = "aws", fail: str = "", passthrough=()):
         self.tmp, self.repo, self.cloud = tmp_path, repo, cloud
         self.log = tmp_path / "calls.jsonl"
         self.live = tmp_path / "live.txt"
         self.live.write_text("live-1\n")
-        self.make = self._write("make-stub", MAKE_STUB.format(python=sys.executable, log=str(self.log), fail=fail))
+        self.make = self._write("make-stub", MAKE_STUB.format(python=sys.executable, log=str(self.log), fail=fail,
+                                                              passthrough=list(passthrough)))
         self.stubs = {name: self._recorder(name) for name in
                       ("staged", "gate", "runner", "reports", "live", "inventory", "classification", "audit")}
 
@@ -443,3 +447,26 @@ def test_dry_runs_of_release_targets_execute_nothing(tmp_path, repo, cloud, targ
     assert result.returncode == 0, result.stderr
     assert make.calls() == [] and not rg.state_root(repo.cloud).exists()
     assert shlex.split  # the recipe is printed, not run
+
+
+# -- the real lock opens the side-door gate for the commands that hold it ----------------
+
+def test_rehearse_applies_dev_through_the_gate_with_its_own_lock(tmp_path, repo):
+    """rehearse's real _ENV_LOCK exports its nonce; the real apply recipe it runs passes the gate."""
+    make = Make(tmp_path, repo, passthrough=("apply",))
+    result = make("rehearse", "dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "refused" not in result.stderr
+    assert [c for c in make.calls() if "_apply-layer" in c]  # recorded from inside the real apply
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head())["applied"] is True
+
+
+def test_maintain_applies_prod_governance_through_the_gate_with_its_own_lock(tmp_path, repo):
+    plain = Make(tmp_path, repo)
+    manifest = _planned(plain)
+    assert plain("_release-manifest", "prod", f"MANIFEST={manifest}").returncode == 0
+    make = Make(tmp_path, repo, passthrough=("apply-governance",))
+    result = make("maintain", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "refused" not in result.stderr
+    assert [c for c in make.calls() if "_apply-layer" in c and "LAYER=data_access" in c]

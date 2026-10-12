@@ -337,7 +337,8 @@ def test_targets_take_over_stale_lock(tmp_path):
     stub, _log, audit = _stub(tmp_path)
     result = _make("release", env_dir, stub, audit)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "stale lock" in result.stdout
+    # stdout carries the lock's nonce to make; the note goes to stderr.
+    assert "stale lock" in result.stderr
     assert not (env_dir / lock.LOCK_RELPATH).exists()
 
 

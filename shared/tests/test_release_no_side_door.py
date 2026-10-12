@@ -75,14 +75,16 @@ def applied(calls) -> list:
 
 
 @pytest.fixture
-def lock(envs):
-    """Hold an env's lock as make <owner> does (this test process is an ancestor of make)."""
+def lock(envs, monkeypatch):
+    """Hold an env's lock as make <owner> does: this process (an ancestor of make) takes it
+    and exports its nonce to its children, as _ENV_LOCK does."""
     cloud, _ = envs
     held = []
 
     def take(env: str, owner: str):
-        ok, message = environment_lock.acquire_lock(cloud / "envs" / env, os.getpid(), owner)
+        ok, message, nonce = environment_lock.acquire(cloud / "envs" / env, os.getpid(), owner)
         assert ok, message
+        monkeypatch.setenv(environment_lock.nonce_var(cloud / "envs" / env), nonce)
         held.append(cloud / "envs" / env)
 
     yield take
@@ -207,13 +209,15 @@ def test_ungovern_applies_the_rehearse_env_governance_only(tmp_path, envs, lock)
     assert result.returncode != 0 and applied(calls) == []
 
 
-def test_another_process_holding_the_lock_does_not_open_the_gate(tmp_path, envs):
-    """The lock must be held by an ancestor: a lock file of an unrelated process is not a pass."""
+def test_another_process_holding_the_lock_does_not_open_the_gate(tmp_path, envs, monkeypatch):
+    """The lock must be held by an ancestor: an unrelated live holder is not a pass, even with
+    its nonce leaked into this environment (say, exported in a shell)."""
     cloud, _ = envs
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        ok, message = environment_lock.acquire_lock(cloud / "envs" / "dev", other.pid, "rehearse")
+        ok, message, nonce = environment_lock.acquire(cloud / "envs" / "dev", other.pid, "rehearse")
         assert ok, message
+        monkeypatch.setenv(environment_lock.nonce_var(cloud / "envs" / "dev"), nonce)
         result, calls = run(tmp_path, envs, "apply", "dev")
         assert result.returncode != 0 and applied(calls) == []
     finally:
@@ -235,3 +239,71 @@ def test_legacy_destroy_needs_no_confirmation(tmp_path, envs):
     result, calls = run(tmp_path, envs, "destroy", "legacy", stub_make=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert [c[1] for c in calls if c[0] == "runner"] == ["workspace", "data_access"]
+
+
+# -- the lock must be the one the enclosing gated command took ---------------------------
+# A hand-written, copied or leftover lock file is never a pass, even when its pid is an
+# ancestor (threat model: stale files and accidental misuse; a deliberate forger on the
+# deployment machine could run Terraform directly).
+
+def _write_lock(env_dir: Path, **fields) -> None:
+    import socket
+
+    record = {"pid": os.getpid(), "host": socket.gethostname(), "owner": "maintain"} | fields
+    (env_dir / environment_lock.LOCK_RELPATH).write_text(json.dumps(record))
+
+
+def test_a_forged_ancestor_lock_without_a_nonce_is_refused(tmp_path, envs):
+    cloud, _ = envs
+    _write_lock(cloud / "envs" / "prod")  # pid: this process, an ancestor of make
+    for target in ("apply-governance",):
+        result, calls = run(tmp_path, envs, target, "prod")
+        assert result.returncode != 0 and "make apply-governance refused" in result.stderr
+        assert applied(calls) == []
+    result, calls = run(tmp_path, envs, "_apply-layer", "prod", "LAYER=data_access", "TARGET_ENV=prod",
+                        f"LAYER_ENV_DIR={cloud / 'envs' / 'prod' / 'data_access'}", "FORCE_APPLY=1")
+    assert result.returncode != 0 and calls == []
+
+
+def test_a_matching_nonce_on_a_reused_pid_is_refused(tmp_path, envs, monkeypatch):
+    cloud, _ = envs
+    env_dir = cloud / "envs" / "prod"
+    # A stale file whose pid now belongs to another process (this one): its start time differs.
+    _write_lock(env_dir, nonce="n" * 64, pid_start="Mon Jan  1 00:00:00 2001")
+    monkeypatch.setenv(environment_lock.nonce_var(env_dir), "n" * 64)
+    result, calls = run(tmp_path, envs, "apply-governance", "prod")
+    assert result.returncode != 0 and applied(calls) == []
+
+
+def test_the_nonce_of_another_run_is_refused(tmp_path, envs, monkeypatch):
+    cloud, _ = envs
+    env_dir = cloud / "envs" / "prod"
+    _write_lock(env_dir, nonce="a" * 64, pid_start=environment_lock.process_start(os.getpid()))
+    monkeypatch.setenv(environment_lock.nonce_var(env_dir), "b" * 64)
+    result, calls = run(tmp_path, envs, "apply-governance", "prod")
+    assert result.returncode != 0 and applied(calls) == []
+    # The same file with the right nonce is the enclosing run's own lock.
+    monkeypatch.setenv(environment_lock.nonce_var(env_dir), "a" * 64)
+    result, calls = run(tmp_path, envs, "apply-governance", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_an_inherited_nonce_without_a_lock_file_is_refused(tmp_path, envs, monkeypatch):
+    cloud, _ = envs
+    monkeypatch.setenv(environment_lock.nonce_var(cloud / "envs" / "prod"), "c" * 64)
+    result, calls = run(tmp_path, envs, "apply-governance", "prod")
+    assert result.returncode != 0 and applied(calls) == []
+
+
+def test_lock_files_are_owner_only(tmp_path):
+    old = os.umask(0)
+    try:
+        ok, _message = environment_lock.acquire_lock(tmp_path, os.getpid(), "maintain")
+    finally:
+        os.umask(old)
+    assert ok
+    path = tmp_path / environment_lock.LOCK_RELPATH
+    assert path.stat().st_mode & 0o777 == 0o600
+    record = json.loads(path.read_text())
+    assert len(record["nonce"]) == 64 and record["pid_start"] == environment_lock.process_start(os.getpid())
+    environment_lock.release_lock(tmp_path, os.getpid())

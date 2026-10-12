@@ -48,11 +48,13 @@ def _apply_layer(tmp_path: Path, mode: str, *extra: str, cloud: str = "aws"):
 @contextmanager
 def _held_as_rehearse(env_dir: Path):
     """_apply-layer runs inside make rehearse, under its env lock (release_gate.py apply-guard)."""
-    ok, message = environment_lock.acquire_lock(env_dir, os.getpid(), "rehearse")
+    ok, message, nonce = environment_lock.acquire(env_dir, os.getpid(), "rehearse")
     assert ok, message
+    os.environ[environment_lock.nonce_var(env_dir)] = nonce  # as make's _ENV_LOCK exports it
     try:
         yield
     finally:
+        os.environ.pop(environment_lock.nonce_var(env_dir), None)
         environment_lock.release_lock(env_dir, os.getpid())
 
 

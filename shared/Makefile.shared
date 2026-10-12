@@ -773,9 +773,13 @@ _GUARD_WORKSPACE_ENV = if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DAT
 # the group-wide one, and a second signal must not re-run `exit` (skipping the
 # unlock) or kill the unlock helper.
 _NO_SIGNALS = trap "" HUP INT TERM
+# lock prints the lock's nonce; exporting it is what lets the gated targets
+# this recipe runs (release_gate.py apply-guard) tell its lock from a leftover
+# or hand-written file (scripts/environment_lock.py).
 _ENV_LOCK = trap '$(_NO_SIGNALS); $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	trap '$(_NO_SIGNALS); exit 129' HUP; trap '$(_NO_SIGNALS); exit 130' INT; trap '$(_NO_SIGNALS); exit 143' TERM; \
-	$(_ENV_LOCK_HELPER) lock "$(ENV_DIR)" --pid $$$$ --owner $(1) --env "$(ENV)" || exit 1
+	_genierails_lock_nonce="$$($(_ENV_LOCK_HELPER) lock "$(ENV_DIR)" --pid $$$$ --owner $(1) --env "$(ENV)")" || exit 1; \
+	export "GENIERAILS_LOCK_NONCE_$$(printf '%s' "$(notdir $(patsubst %/,%,$(ENV_DIR)))" | tr 'a-z-' 'A-Z_')=$$_genierails_lock_nonce"
 
 # Removed, not aliased: certify used to stop before granting access, so a
 # pipeline running certify -> approval -> release must not grant at certify.

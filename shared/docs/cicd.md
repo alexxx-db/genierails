@@ -181,8 +181,21 @@ Rollout step 9 (design sections 10 and 17). Legacy envs are unchanged.
   changes only through `release MANIFEST=` and `maintain`; the *rehearse* env
   (`dev`) only through `rehearse`. Every other make target that applies the
   data_access or workspace root refuses there and says which command to run.
-  The gate is the env lock, which only the gated commands take, held by a
-  process the target runs under; a variable can't open it.
+  The gate is the env lock of the command that runs the target. When
+  `rehearse`, `maintain` or `ungovern` takes it, the lock file
+  (`envs/<env>/generated/.governance.lock`, mode `0600`) records a random
+  nonce, the holder's pid and that pid's start time, and the command exports
+  the nonce to its children only (`GENIERAILS_LOCK_NONCE_<ENV>`). A target
+  passes only if the nonce it inherited matches, the recorded pid is a process
+  it runs under, and that pid still has the recorded start time. So a
+  leftover, copied or hand-written lock file, a pid reused since, or a nonce
+  without its lock is never a pass.
+
+  Threat model: this guards against stale lock files and accidental misuse,
+  not against someone deliberately forging state on the deployment machine.
+  Anyone who can write the env's files there can also run Terraform against
+  prod directly. Protect that machine and its credentials; the release gates
+  make the reviewed path the only one the make targets offer.
 
   | Target | Promoted env (prod, stg, ...) | Rehearse env (dev) |
   |---|---|---|
