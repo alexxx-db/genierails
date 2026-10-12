@@ -510,10 +510,10 @@ def test_a_migrated_env_cannot_go_back_to_legacy(cutover, env_dir):
     assert cutover.apply() == 0
     env_file = env_dir / "env.auto.tfvars"
     env_file.write_text(env_file.read_text().replace('"deterministic"', '"legacy"'))
-    for target in ("_apply-layer:data_access", "apply", "apply-governance"):
+    for target in ("_apply-layer:data_access", "_apply-layer:workspace", "apply", "apply-governance",
+                   "apply-genie"):
         with pytest.raises(rg.Refused, match="was migrated to deterministic governance"):
             rg.apply_guard(env_dir, ENV, target)
-    rg.apply_guard(env_dir, ENV, "_apply-layer:workspace")
 
 
 # -- release-plan never changes anything (review blocker 1) ----------------------------------
@@ -559,6 +559,65 @@ def test_the_adoption_manifest_refuses_a_state_that_moved_since_release_plan(cut
     assert _runtime_bytes(env_dir) == before
 
 
+# -- no way back, even mid-adoption (review blocker 2) -------------------------------------------
+def _crash_after_one_move(env_dir: Path, monkeypatch):
+    """Adopt a two-column legacy env and crash right after the first terraform state mv."""
+    other = "cat.sch.t.phone"
+    write_legacy_state(env_dir, columns=(COLUMN, other))
+    opt_in(env_dir, columns=("email", "phone"))
+    tool = Path(pg.RUNNER)
+    calls = []
+
+    def terraform(command, *addresses):
+        calls.append(command)
+        rc = subprocess.run([str(tool), "data_access", ENV, command, *addresses], check=False,
+                            env=dict(os.environ, LAYER_ENV_DIR=str(env_dir / "data_access"))).returncode
+        raise KeyboardInterrupt("crash after the first state move")
+    with pytest.raises(KeyboardInterrupt):
+        migration.adopt(env_dir, ENV, terraform=terraform)
+    assert calls == ["state-mv"]
+    state = live_state(env_dir)
+    assert len(_attrs(state, "treatment")) == 1 and len(_attrs(state, "assignments")) == 1
+    assert migration.load_record(env_dir)["status"] == "adopting"  # written before the move
+
+
+def test_an_interrupted_adoption_already_refuses_legacy_applies(cutover, env_dir, monkeypatch):
+    _crash_after_one_move(env_dir, monkeypatch)
+    env_file = env_dir / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace('"deterministic"', '"legacy"'))
+    for target in ("_apply-layer:data_access", "apply", "apply-governance"):
+        with pytest.raises(rg.Refused, match="was migrated to deterministic governance"):
+            rg.apply_guard(env_dir, ENV, target)
+    # Even without the marker, the state itself says a migration began.
+    migration.record_path(env_dir).unlink()
+    with pytest.raises(rg.Refused, match="treatment tags at stable keys"):
+        rg.legacy_guard(env_dir, ENV, "apply")
+    # Resuming in deterministic mode finishes the adoption.
+    env_file.write_text(env_file.read_text().replace('"legacy"', '"deterministic"'))
+    assert migration.pending(env_dir) and len(migration.deployment(env_dir)["moves"]) == 1
+
+
+@pytest.mark.parametrize("target", ["apply", "apply-governance", "rehearse", "maintain", "release"])
+@pytest.mark.parametrize("marker", [True, False])
+def test_every_legacy_apply_path_refuses_after_an_interrupted_adoption(cutover, tmp_path, monkeypatch,
+                                                                        side_door_envs, target, marker):
+    from tests.test_release_no_side_door import LEGACY, applied, run
+
+    cloud, _ = side_door_envs
+    legacy_dir = cloud / "envs" / "legacy"
+    cutover.env_dir = legacy_dir
+    for name in ("generated", "data_access"):
+        shutil.rmtree(legacy_dir / name)
+    _crash_after_one_move(legacy_dir, monkeypatch)
+    if not marker:
+        migration.record_path(legacy_dir).unlink()
+    (legacy_dir / "env.auto.tfvars").write_text(LEGACY)  # governance_mode back to legacy
+    result, calls = run(tmp_path, side_door_envs, target, "legacy")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"make {target} refused: ENV=legacy was migrated to deterministic governance" in result.stderr
+    assert applied(calls) == [], calls
+
+
 def test_the_external_mask_inventory_knows_the_legacy_masks_it_manages(env_dir):
     from scripts.external_mask_inventory import legacy_policy_names
 
@@ -590,3 +649,9 @@ def test_the_same_value_in_two_catalogs_is_not_a_double_mask():
     double = {"fgac_policies": [policy("a"), policy("a", "x")], "tags": {"a.s.t.c": "v"}}
     assert "2 masks" in pg.stage_problems("create", double, double, None)[0]
 
+
+@pytest.fixture
+def side_door_envs(tmp_path):
+    from tests.test_release_no_side_door import envs
+
+    return envs.__wrapped__(tmp_path) if hasattr(envs, "__wrapped__") else envs(tmp_path)

@@ -221,6 +221,29 @@ def load_record(env_dir: Path) -> dict | None:
         raise Refused(f"the migration record {path} is unreadable: {exc}") from exc
 
 
+def adopted(record: Mapping | None) -> bool:
+    """A record of a finished adoption (an "adopting" one was interrupted and resumes)."""
+    return bool(record) and record.get("status", "adopted") == "adopted"
+
+
+def migrated(env_dir: Path) -> str:
+    """Why an env's state is no longer legacy-applicable ("" when it is), read from the state itself.
+
+    Legacy mode never writes the stable-key treatment tag resource, a policy
+    journal or a migration record, so any of them means a migration began.
+    """
+    from scripts.staged_policy_apply import journal_path
+
+    env_dir = Path(env_dir)
+    if record_path(env_dir).is_file():
+        return f"a migration record ({record_path(env_dir)})"
+    if journal_path(env_dir).is_file():
+        return f"a policy journal ({journal_path(env_dir)})"
+    state = _read_state(env_dir / "data_access" / "terraform.tfstate")
+    moved = [k for k, _ in _instances(state, "databricks_entity_tag_assignment", "treatment")]
+    return f"treatment tags at stable keys in the data_access state ({moved[0]}, ...)" if moved else ""
+
+
 def pending(env_dir: Path) -> bool:
     """A deterministic env whose state still holds an un-adopted legacy deployment."""
     from scripts.staged_policy_apply import load_journal
@@ -431,6 +454,12 @@ def adopt(env_dir: Path, env: str, *, terraform: Callable[..., int] | None = Non
     terraform = terraform or _terraform_state(env_dir, env)
     forget = forgotten_tags(dep, _load_hcl(effective(env_dir, "abac.auto.tfvars")))
     print(f"=== Migration ({env}): adopting the legacy deployment as generation {generation['fingerprint']} ===")
+    # The no-way-back marker lands before the first move, so a crash part-way
+    # still leaves the env refusing legacy applies (release_gate.legacy_guard).
+    pg.write_json(record_path(env_dir), {
+        "status": "adopting", "legacy": generation["fingerprint"], "started_at": _now(),
+        "moves": [t for _, t in dep["moves"]], "forget": forget,
+    })
     for source, target in dep["moves"]:
         print(f"  terraform state mv '{source}' '{target}'")
         if terraform("state-mv", source, target):
@@ -442,7 +471,7 @@ def adopt(env_dir: Path, env: str, *, terraform: Callable[..., int] | None = Non
             raise Refused(f"terraform state rm {key} failed; re-run the same command to resume")
     pg.save_snapshot(env_dir, generation)
     pg.write_json(record_path(env_dir), {
-        "legacy": generation["fingerprint"], "adopted_at": _now(),
+        "status": "adopted", "legacy": generation["fingerprint"], "adopted_at": _now(),
         "moved": [t for _, t in dep["moves"]], "forgotten": forget,
         "acknowledged": result["consequences"],
     })
@@ -463,7 +492,7 @@ def accounted(env_dir: Path, env: str) -> tuple[dict[str, str], list[str]]:
     """
     env_dir = Path(env_dir)
     record = load_record(env_dir)
-    if record is not None:
+    if adopted(record):
         return dict(record.get("acknowledged") or {}), []
     if not pending(env_dir):
         return {}, []
@@ -500,7 +529,10 @@ def report(env_dir: Path, env: str) -> tuple[list[str], dict]:
     data: dict = {"env": env, "legacy_generation": generation["fingerprint"], "deterministic": deterministic(env_dir),
                   "proposed_table_readers": proposed_table_readers(generation)}
     record = load_record(env_dir)
-    if record is not None:
+    if record is not None and not adopted(record):
+        lines.append(f"An adoption started at {record.get('started_at')} was interrupted; the next rehearse or "
+                     f"release-plan ENV={env} resumes it. The report below is against the current state.")
+    if adopted(record):
         lines.append(f"Already migrated: the legacy deployment was adopted at {record.get('adopted_at')} "
                      f"(generation {record.get('legacy')}); make policy-status ENV={env} shows where it stands.")
         return lines, data | {"ok": True, "migrated": True}

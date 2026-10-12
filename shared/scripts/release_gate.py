@@ -1097,14 +1097,7 @@ def apply_guard(env_dir: Path, env: str, target: str) -> None:
 
     role = env_role(env_dir)
     if role == LEGACY:
-        from scripts import migration
-
-        if target.endswith("data_access") or target in ("apply", "apply-governance"):
-            if migration.load_record(Path(env_dir)) is not None:
-                raise Refused(f"make {target.split(':')[0]} refused: ENV={env} was migrated to deterministic "
-                              "governance (its state holds the moved treatment tags), and going back to legacy "
-                              "would destroy them. Restore governance_mode = \"deterministic\"; to undo a change, "
-                              "roll back within deterministic governance (a revert PR and <env>:rollback:<commit>)")
+        legacy_guard(env_dir, env, target.split(":")[0])
         return
     allowed = APPLY_OWNERS[role].get(target)
     if allowed is None:
@@ -1124,6 +1117,23 @@ def apply_guard(env_dir: Path, env: str, target: str) -> None:
         why = f"ENV={env} is a deterministic env, applied only by rehearse"
     ran = f" (it runs under make {owner})" if owner else ""
     raise Refused(f"make {name}{layer} refused{ran}: {why}; {how}.")
+
+
+def legacy_guard(env_dir: Path, env: str, command: str) -> None:
+    """A legacy-mode applying command refuses once a migration to deterministic began.
+
+    Read from the data_access state as well as the migration record, so an
+    adoption interrupted after its first state move is caught too.
+    """
+    from scripts import migration
+
+    if not deterministic(env_dir):
+        why = migration.migrated(Path(env_dir))
+        if why:
+            raise Refused(f"make {command} refused: ENV={env} was migrated to deterministic governance ({why}), "
+                          "and a legacy apply would destroy and recreate its moved treatment tags. Restore "
+                          "governance_mode = \"deterministic\"; to undo a change, roll back within deterministic "
+                          "governance (a revert PR and <env>:rollback:<commit>)")
 
 
 def destroy_guard(env_dir: Path, env: str, confirm: str) -> None:
@@ -1179,6 +1189,7 @@ def main(argv: list[str] | None = None) -> int:
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
     command("env-role")
+    command("legacy-guard").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "state-dir":
@@ -1234,6 +1245,8 @@ def main(argv: list[str] | None = None) -> int:
             apply_guard(args.env_dir, args.env, args.target)
         elif args.command == "destroy-guard":
             destroy_guard(args.env_dir, args.env, args.confirm)
+        elif args.command == "legacy-guard":
+            legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":
             print(env_role(args.env_dir))
         elif args.command == "maintain-check":

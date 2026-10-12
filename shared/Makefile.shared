@@ -653,6 +653,9 @@ _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)
 # apply in a promoted env (promote_from set, or prod), which otherwise changes
 # only through release MANIFEST=. Legacy envs are never gated.
 _APPLY_GUARD = $(_RELEASE_GATE) apply-guard --env-dir "$(1)" --env "$(2)" --target $(3)
+# A legacy env whose state a migration to deterministic already changed refuses
+# every legacy applying command (scripts/migration.py; no way back).
+_LEGACY_GUARD = $(_RELEASE_GATE) legacy-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 # Destroying a promoted deterministic env needs CONFIRM_DESTROY=<env> on the command line.
 _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)),$(CONFIRM_DESTROY))
 # Live checks the release targets run (overridable so tests never reach Databricks).
@@ -725,6 +728,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result failed --reason "a rehearse step failed (above)" $(_RELEASE_GATE_MAKE); \
 		exit 1; \
 	fi; \
+	$(_LEGACY_GUARD) rehearse || exit 1; \
 	$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 	$(_GROUP_CHECK) "make rehearse" || exit 1; \
 	$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
@@ -796,6 +800,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		exit $$?; \
 	fi; \
 	export GENIERAILS_RERUN_TARGET=release; \
+	$(_LEGACY_GUARD) release || exit 1; \
 	$(_ACCESS_CHECK) "make release" || exit 1; \
 	$(_GROUP_CHECK) "make release" || exit 1; \
 	mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
@@ -1027,7 +1032,8 @@ _release-manifest: _guard-not-ci-apply
 maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): audit-schema -> derive-assignments -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); export GENIERAILS_RERUN_TARGET=maintain; mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
-	if [ "$$mode" = deterministic ]; then $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; fi; \
+	if [ "$$mode" = deterministic ]; then $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
+	else $(_LEGACY_GUARD) maintain || exit 1; fi; \
 	if [ "$$mode" = deterministic ]; then $(_EXTERNAL_MASK_INVENTORY) || exit 1; fi; $(call _ENV_LOCK,maintain); \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) --no-print-directory _guarded-bootstrap _guard-workspace-target ENV="$(ENV)" || exit 1; \
