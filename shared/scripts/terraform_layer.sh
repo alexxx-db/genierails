@@ -189,7 +189,7 @@ case "$LAYER:$COMMAND" in
       trap 'rm -rf "$AGENTS_TMP_DIR"' EXIT
       agents_rc=0
       python3 "$PROJECT_ROOT/agent_files.py" tfvars --env-dir "$workspace_env_dir" --layer "$LAYER" \
-        --out "$AGENTS_TMP_DIR/agents.tfvars.json" || agents_rc=$?
+        --var-file "$AGENTS_TMP_DIR/agents.tfvars.json" || agents_rc=$?
       if [ "$agents_rc" -eq 0 ]; then
         VAR_ARGS+=(-var-file="$AGENTS_TMP_DIR/agents.tfvars.json")
       elif [ "$agents_rc" -ne 3 ]; then

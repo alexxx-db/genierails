@@ -462,6 +462,12 @@ def _git_repo(path: Path) -> str:
                           capture_output=True).stdout.strip()
 
 
+def test_receipt_outside_git_records_no_commit(tmp_path, capsys):
+    prod = _prod(tmp_path)
+    assert ownership.write_receipt(prod, "prod")["commit"] == ""
+    assert "records no commit" in capsys.readouterr().out
+
+
 def test_receipt_keeps_prod_ids_out_of_git_and_restores_lost_id_files(tmp_path):
     prod = _prod(tmp_path)
     head = _git_repo(tmp_path)
@@ -542,6 +548,9 @@ def test_detach_refuses_unless_the_detached_change_is_the_released_head(tmp_path
         ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
     (prod / ownership.RECEIPT).unlink()
     with pytest.raises(ownership.AgentError, match="no release receipt"):
+        ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
+    ownership.write_receipt(prod, "prod", commit="")
+    with pytest.raises(ownership.AgentError, match="recorded no commit"):
         ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
     assert not log.exists(), "no state command runs before every check passed"
 

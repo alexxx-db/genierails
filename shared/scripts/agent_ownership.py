@@ -317,6 +317,7 @@ def tree_clean(env_dir: Path) -> bool:
 
 
 def write_receipt(env_dir: Path, env: str, commit: str | None = None) -> dict:
+    """Record the release. Outside a git checkout the commit is empty, so detach-agent refuses."""
     agents = {}
     for agent in agent_files.load_all(env_dir):
         agents[agent["name"]] = {
@@ -326,15 +327,21 @@ def write_receipt(env_dir: Path, env: str, commit: str | None = None) -> dict:
             "detached": agent["detached"],
             "delete": agent["delete"],
         }
+    if commit is None:
+        try:
+            commit = head_commit(env_dir)
+        except AgentError:
+            commit = ""
+            print(f"NOTE: {env_dir} is not in a git checkout; the release receipt records no commit.")
     receipt = {
         "env": env,
-        "commit": commit or head_commit(env_dir),
+        "commit": commit,
         "clean_tree": tree_clean(env_dir),
         "released_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "agents": agents,
     }
     (env_dir / RECEIPT).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    print(f"Release receipt: {env_dir.name}/{RECEIPT} (commit {receipt['commit'][:12]}, {len(agents)} agent(s))")
+    print(f"Release receipt: {env_dir.name}/{RECEIPT} (commit {receipt['commit'][:12] or 'none'}, {len(agents)} agent(s))")
     return receipt
 
 
@@ -368,6 +375,9 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
     receipt = load_receipt(env_dir)
     if not receipt:
         raise AgentError(f"no release receipt in {env_dir}: release the detached = true change first")
+    if not receipt.get("commit"):
+        raise AgentError("the last release recorded no commit (it ran outside a git checkout): release the "
+                         "detached = true change from a checkout of main first")
     head = commit or head_commit(env_dir)
     if receipt.get("commit") != head:
         raise AgentError(f"HEAD {head[:12]} is not the last released commit "

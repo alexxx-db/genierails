@@ -259,16 +259,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-dir", type=Path, required=True,
                         help="envs/<env> (the workspace env dir, not data_access/)")
     parser.add_argument("--layer", choices=("workspace", "data_access"), default="workspace")
-    parser.add_argument("--out", type=Path)
+    parser.add_argument("--var-file", dest="var_file", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
             merged_config(args.env_dir)
             return 0
-        if args.out is None:
-            parser.error("tfvars needs --out")
+        if args.var_file is None:
+            parser.error("tfvars needs --var-file")
         # Exit 3: no agent files, nothing written.
-        return 0 if write_tfvars(args.env_dir, args.layer, args.out) else 3
+        return 0 if write_tfvars(args.env_dir, args.layer, args.var_file) else 3
     except AgentFileError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
