@@ -10,7 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 APPLYING_TARGETS = (
-    "enable-classification", "rehearse", "release", "maintain", "apply",
+    "enable-classification", "rehearse", "release", "release-plan", "_release-manifest", "maintain", "apply",
     "apply-governance", "apply-genie", "_apply-layer", "integration-test",
     "test-champion", "test-all", "test-ci", "test-ci-parallel",
     "destroy", "destroy-governance", "destroy-genie", "_destroy-layer",

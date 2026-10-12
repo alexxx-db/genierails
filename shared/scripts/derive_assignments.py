@@ -165,10 +165,14 @@ def refresh_ddl_only(auth_path: Path, env_path: Path, ddl_out: Path) -> None:
 
 def derive_assignments(
     config_path: Path, auth_path: Path, env_path: Path, ddl_out: Path | None = None,
+    *, record_governed: bool = True,
 ) -> int:
     """Atomically replace only the promoted config's tag_assignments section.
 
     With ``ddl_out``, also refresh the fetched DDL the coverage check reads.
+    ``record_governed=False`` (a runtime overlay, scripts/runtime_overlay.py)
+    leaves the committed governed-table record alone; deployed tags keep the
+    tables governed once applied.
     """
     if not config_path.is_file():
         raise RuntimeError(
@@ -197,7 +201,8 @@ def derive_assignments(
     if runtime.get("governance_mode", "legacy") == "deterministic":
         ddl_text = (ddl_out.read_text() if ddl_out is not None
                     else fetched_ddl_text(table_refs, runtime, footprint))
-        return _derive_deterministic(config_path, env_path, runtime, native, ddl_text)
+        return _derive_deterministic(config_path, env_path, runtime, native, ddl_text,
+                                     record_governed=record_governed)
 
     config = load_treatment_config()
     unmapped = native.unmapped_columns(sorted(native.classified_columns()))
@@ -255,7 +260,8 @@ def derive_assignments(
         )
     ]
     _assert_promoted_masks_cover(refreshed, promoted, config.tag_key)
-    record(env_path.parent, refreshed, config.tag_key)
+    if record_governed:
+        record(env_path.parent, refreshed, config.tag_key)
     updated = _replace_bracket_section(
         original,
         "tag_assignments",
@@ -267,7 +273,8 @@ def derive_assignments(
     return sum(1 for item in refreshed if item.get("tag_key") == config.tag_key)
 
 
-def _derive_deterministic(config_path: Path, env_path: Path, runtime: dict, native, ddl_text: str) -> int:
+def _derive_deterministic(config_path: Path, env_path: Path, runtime: dict, native, ddl_text: str,
+                          *, record_governed: bool = True) -> int:
     """Rebuild the whole deterministic model from live class.* tags and column types.
 
     Unmapped classes don't stop the refresh: their columns get the never-raw
@@ -281,7 +288,8 @@ def _derive_deterministic(config_path: Path, env_path: Path, runtime: dict, nati
         print(f"WARNING: {column} has unmapped class.{semantic}; redacted for every tier "
               "and new access is blocked until it is mapped (make scaffold-treatments)",
               file=sys.stderr)
-    record(env_path.parent, model.tag_assignments, TAG_KEY)
+    if record_governed:
+        record(env_path.parent, model.tag_assignments, TAG_KEY)
     write_deterministic_model(config_path, config_path.with_name("masking_functions.sql"), model)
     return len(model.tag_assignments)
 
@@ -303,18 +311,34 @@ def main(argv: list[str] | None = None) -> int:
                              "tag_assignments are left as make generate wrote them")
     parser.add_argument("--env-name", default="",
                         help="env name, so a coverage gap prints its fix commands")
+    parser.add_argument("--out-dir", type=Path, metavar="DIR",
+                        help="write the derived config (and its masking_functions.sql) here instead of over "
+                             "--config: a fresh copy of the committed files, so committed files never change "
+                             "(deterministic envs: generated/.runtime, scripts/runtime_overlay.py)")
     args = parser.parse_args(argv)
     if args.ddl_only and not args.write_ddl:
         parser.error("--ddl-only requires --write-ddl")
     if args.refresh_record:
         args.refresh_record.unlink(missing_ok=True)
+    committed_config = Path(args.config)
+    config = committed_config
+    if args.out_dir and not args.ddl_only:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        for name in (committed_config.name, "masking_functions.sql"):
+            target = args.out_dir / name
+            target.unlink(missing_ok=True)
+            source = committed_config.with_name(name)
+            if source.is_file():
+                target.write_bytes(source.read_bytes())
+        config = args.out_dir / committed_config.name
     try:
         if args.ddl_only:
             refresh_ddl_only(Path(args.auth_file), Path(args.env_file), args.write_ddl)
             message = f"Refreshed live DDL ({args.write_ddl}); tag_assignments were not changed."
         else:
             count = derive_assignments(
-                Path(args.config), Path(args.auth_file), Path(args.env_file), ddl_out=args.write_ddl,
+                config, Path(args.auth_file), Path(args.env_file), ddl_out=args.write_ddl,
+                record_governed=args.out_dir is None,
             )
             message = f"Derived {count} gr_treatment assignment(s); reviewed rules were not changed."
         if args.refresh_record:
@@ -322,11 +346,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.refresh_record,
                 mode="ddl" if args.ddl_only else "full",
                 ddl_path=args.write_ddl,
-                config_path=None if args.ddl_only else Path(args.config),
+                config_path=None if args.ddl_only else config,
             )
     except (RuntimeError, NativeClassificationRequiredError, FootprintError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        env_dir = Path(args.config).resolve().parent.parent
+        env_dir = committed_config.resolve().parent.parent
         if isinstance(exc, UnmappedClassError) and args.env_name:
             print("\n".join(fix_lines(args.env_name, env_dir, exc.gaps)), file=sys.stderr)
         elif isinstance(exc, MissingMaskError) and args.env_name:

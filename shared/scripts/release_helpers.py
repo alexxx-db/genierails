@@ -15,8 +15,10 @@ def clear_old_receipts(env_dir: Path) -> None:
 
 def column_mask_policies(env_dir: Path) -> list[str]:
     """Column-mask policy names in the env's generated and promoted config."""
+    from scripts.runtime_overlay import effective
+
     names = []
-    for path in (env_dir / "generated" / "abac.auto.tfvars", env_dir / "data_access" / "abac.auto.tfvars"):
+    for path in (effective(env_dir, "abac.auto.tfvars"), env_dir / "data_access" / "abac.auto.tfvars"):
         if path.is_file():
             names += [str(policy.get("name", "?")) for policy in hcl2.load(path.open()).get("fgac_policies") or []
                       if policy.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"]

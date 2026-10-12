@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
-"""Exclusive, stale-owner-aware per-environment governance lock."""
+"""Exclusive, stale-owner-aware per-environment governance lock.
+
+The lock file (envs/<env>/generated/.governance.lock, mode 0600) records the
+holder's pid and that process's start time, and a random nonce. ``lock``
+prints the nonce; make's _ENV_LOCK exports it to every child as
+GENIERAILS_LOCK_NONCE_<ENV> (``nonce_var``). ``held_by_ancestor`` (the
+side-door gate of scripts/release_gate.py) counts a lock only when the
+inherited nonce matches, the recorded pid is an ancestor, and that pid still
+has the recorded start time. A leftover, copied or hand-written lock file, or
+a pid reused since, is therefore never a pass. This guards against stale
+files and accidental misuse, not a deliberate forger on the deployment
+machine, who could run Terraform directly anyway.
+"""
 
 import argparse
 import errno
+import hmac
+import secrets
 import fcntl
 import json
 import os
@@ -49,12 +63,65 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _ancestors() -> set[int]:
+    import subprocess
+
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], text=True, capture_output=True, check=False)
+        try:
+            pid = int(out.stdout.strip())
+        except ValueError:
+            break
+    return pids
+
+
+def nonce_var(env_dir: Path) -> str:
+    """The variable a lock holder exports its nonce in (the env dir's name, shell-safe)."""
+    return "GENIERAILS_LOCK_NONCE_" + Path(env_dir).name.upper().replace("-", "_")
+
+
+def process_start(pid: int) -> str:
+    """The start time ps reports for ``pid`` ("" when there is no such process)."""
+    import subprocess
+
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True, check=False)
+    return " ".join(out.stdout.split()) if out.returncode == 0 else ""
+
+
+def held_by_ancestor(env_dir: Path) -> str | None:
+    """The owner (make target) of the env lock when a process this one runs under took it.
+
+    All of: the nonce this process inherited matches the lock's, the recorded
+    pid is an ancestor on this host, and that pid's start time is the one
+    recorded when the lock was taken. Anything missing means not held.
+    """
+    held = _read_lock(Path(env_dir) / LOCK_RELPATH)
+    inherited = os.environ.get(nonce_var(env_dir), "")
+    if not held or not inherited or not isinstance(held.get("nonce"), str) or not isinstance(held.get("pid_start"), str):
+        return None
+    if not hmac.compare_digest(held["nonce"], inherited):
+        return None
+    if held["host"] != socket.gethostname() or held["pid"] not in _ancestors():
+        return None
+    if not held["pid_start"] or process_start(held["pid"]) != held["pid_start"]:
+        return None
+    return str(held.get("owner") or "?")
+
+
 def owns_lock(env_dir: Path, pid: int) -> bool:
     held = _read_lock(env_dir / LOCK_RELPATH)
     return bool(held) and held["pid"] == pid and held["host"] == socket.gethostname()
 
 
 def acquire_lock(env_dir: Path, pid: int, owner: str):
+    ok, message, _nonce = acquire(env_dir, pid, owner)
+    return ok, message
+
+
+def acquire(env_dir: Path, pid: int, owner: str):
+    """Take the lock for ``pid``: (ok, message, nonce); the holder exports the nonce (nonce_var)."""
     path = env_dir / LOCK_RELPATH
     host = socket.gethostname()
     with _guard(env_dir):
@@ -62,25 +129,27 @@ def acquire_lock(env_dir: Path, pid: int, owner: str):
         if path.exists() or path.is_symlink():
             held = _read_lock(path)
             if held is None:
-                return False, f"cannot determine the owner of {path}; delete it manually if no release/maintain is running"
+                return False, f"cannot determine the owner of {path}; delete it manually if no release/maintain is running", ""
             if held["host"] == host and not _pid_alive(held["pid"]):
                 note = f"removed stale lock from dead pid {held['pid']} (make {held.get('owner', '?')})"
                 path.unlink()
             else:
                 return False, (f"{path} is held by make {held.get('owner', '?')} "
-                               f"(pid {held['pid']} on {held['host']}, since {held.get('started_at', '?')}); wait for it to finish")
+                               f"(pid {held['pid']} on {held['host']}, since {held.get('started_at', '?')}); wait for it to finish"), ""
+        nonce = secrets.token_hex(32)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except OSError as exc:
             if exc.errno == errno.EEXIST:
-                return False, f"{path} was taken concurrently; retry"
+                return False, f"{path} was taken concurrently; retry", ""
             raise
+        os.fchmod(fd, 0o600)  # whatever the umask
         with os.fdopen(fd, "w") as handle:
-            json.dump({"pid": pid, "host": host, "owner": owner,
+            json.dump({"pid": pid, "host": host, "owner": owner, "nonce": nonce, "pid_start": process_start(pid),
                        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        return True, note
+        return True, note, nonce
 
 
 def release_lock(env_dir: Path, pid: int) -> None:
@@ -103,12 +172,13 @@ def main() -> int:
     if args.command == "unlock":
         release_lock(args.env_dir, args.pid)
         return 0
-    ok, message = acquire_lock(args.env_dir, args.pid, args.owner)
+    ok, message, nonce = acquire(args.env_dir, args.pid, args.owner)
     if not ok:
         print(f"{args.owner}: {args.env or args.env_dir.name} is locked: {message}", file=sys.stderr)
         return 1
     if message:
-        print(f"=== Governance lock: {message} ===")
+        print(f"=== Governance lock: {message} ===", file=sys.stderr)
+    print(nonce)  # make's _ENV_LOCK exports it to its children (nonce_var)
     return 0
 
 

@@ -119,11 +119,23 @@ any unfinished transition with its completed phases. Writes are atomic.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
 
-Until two-phase release (step 9) and the pipelines (step 12) exist, these
-phases run inside the applying command on the deployment machine; section 17
-of the design moves them to operations with a manifest and approval per phase.
+In `rehearse`, `apply` and `maintain` these phases run inside the applying
+command. A prod release is two-phase (rollout step 9, [cicd.md](cicd.md#release-gating-deterministic-envs)):
+`make release-plan` runs the controller's `plan --out-dir`, which saves the
+plan of each remaining apply phase in order (a phase that changes nothing is
+recorded and planning goes on) and stops after the first phase that changes
+something, with the verifications right after it; `make release
+MANIFEST=...` runs `apply-saved`, which applies exactly those saved plans
+(a saved plan that changes nothing isn't applied) and runs those
+verifications. It refuses when the journal, the generated config or a stage's
+render moved since the plan. A change that replaces policies or moves tiers
+is therefore one manifest and approval per changing phase; a release with no
+policy change is one manifest. A failed tighten or switch still restores the
+previous protection at once.
 
-Hook environment:
+Hook environment (also `GENIERAILS_POLICY_PLAN_OUT`, `GENIERAILS_POLICY_PLAN_BASIS`
+and `GENIERAILS_POLICY_SAVED_PLAN` for the saved-plan modes; see
+`scripts/policy_generations.py`):
 
 | Variable | Meaning |
 |---|---|

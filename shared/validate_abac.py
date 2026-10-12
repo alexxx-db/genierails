@@ -363,6 +363,17 @@ def parse_ddl_columns(ddl_text: str) -> list[str]:
     return columns
 
 
+def logical_path(path: Path) -> Path:
+    """Where a runtime-overlay file stands in for (scripts/runtime_overlay.py).
+
+    ``generated/.runtime/<file>`` is read as ``generated/<file>``, so the env
+    dir, its env.auto.tfvars and ddl/ resolve as for the committed file.
+    """
+    if path.parent.name == ".runtime" and path.parent.parent.name == "generated":
+        return path.parent.parent / path.name
+    return path
+
+
 def find_fetched_ddl(tfvars_path: Path) -> Path | None:
     """Locate ``ddl/_fetched.sql`` next to or one level above the tfvars dir."""
     for base in (tfvars_path.parent, tfvars_path.parent.parent):
@@ -1439,10 +1450,11 @@ def main():
             else:
                 result.ok(f"SQL file: {len(sql_functions)} function(s) found — {sorted(sql_functions)}")
 
-    merged_cfg = load_validation_context(cfg, result, tfvars_path)
+    anchor = logical_path(tfvars_path)
+    merged_cfg = load_validation_context(cfg, result, anchor)
 
     # --- Run validations ---
-    validate_auth(cfg, result, tfvars_path)
+    validate_auth(cfg, result, anchor)
     group_names = validate_groups(merged_cfg, result)
     tag_map = validate_tag_policies(merged_cfg, result)
     validate_tag_assignments(merged_cfg, tag_map, result)
@@ -1453,7 +1465,7 @@ def main():
     if args.coverage_gate:
         if sql_path is None:
             result.error("COVERAGE CHECK — masking_functions.sql is required")
-        ddl_path = Path(args.ddl).resolve() if args.ddl else find_fetched_ddl(tfvars_path)
+        ddl_path = Path(args.ddl).resolve() if args.ddl else find_fetched_ddl(anchor)
         ddl_columns = None
         if ddl_path and ddl_path.exists():
             ddl_columns = parse_ddl_columns(ddl_path.read_text())
@@ -1468,7 +1480,7 @@ def main():
         validate_coverage_gate(
             merged_cfg, sql_functions, tfvars_path.read_text(), result,
             ddl_columns=ddl_columns, exposure=exposure,
-            env_name=args.env_name, env_dir=tfvars_path.parent.parent,
+            env_name=args.env_name, env_dir=anchor.parent.parent,
         )
 
     result.print_report(args.summary_label, args.verbose)

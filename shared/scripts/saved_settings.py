@@ -201,6 +201,28 @@ def save_table_keys(env_file: Path, result_file: Path | None) -> int:
     return 0
 
 
+def report_verify_keys(env_file: Path, value: str, result_file: Path | None = None) -> int:
+    """Print the keys a passing run proved; write nothing (deterministic applying runs).
+
+    Applying commands never edit committed files (design section 9), so a
+    deterministic env pins its keys only when someone commits them.
+    """
+    proven = proven_table_keys(result_file)
+    value = value.strip()
+    lines = []
+    if proven and normalize_key_map(_load(env_file).get("verify_key_columns") if env_file.is_file() else {}) != proven:
+        rendered = ", ".join(f"{_hcl_string(t)} = {_hcl_string(k)}" for t, k in sorted(proven.items()))
+        lines.append(f"  verify_key_columns = {{ {rendered} }}")
+    if value and key_proven(result_file, value) and (
+            not env_file.is_file() or _saved(_load(env_file), "verify_key_column") != value):
+        lines.append(f"  verify_key_column = {_hcl_string(value)}")
+    if lines:
+        print(f"NOTE: verify-access proved these row-pairing keys; applying commands don't edit committed "
+              f"files, so to pin them add to {display_path(env_file)} in a PR:")
+        print("\n".join(lines))
+    return 0
+
+
 def save_verify_key(env_file: Path, value: str, result_file: Path | None = None) -> int:
     save_table_keys(env_file, result_file)
     value = value.strip()
@@ -442,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     key.add_argument("--env-file", type=Path, required=True)
     key.add_argument("--value", default="")
     key.add_argument("--result-file", type=Path)
+    key.add_argument("--report-only", action="store_true",
+                     help="print the proven keys instead of saving them (deterministic envs)")
     resolve = sub.add_parser("promote-resolve")
     resolve.add_argument("--env", required=True)
     resolve.add_argument("--env-dir", type=Path, required=True)
@@ -455,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "verify-key":
+        if args.report_only:
+            return report_verify_keys(args.env_file, args.value, args.result_file)
         return save_verify_key(args.env_file, args.value, args.result_file)
     if args.command == "promote-save":
         return save_promote(args.env_file, args.source, args.catalog_map)

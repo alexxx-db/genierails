@@ -58,6 +58,18 @@ envs/
 | `*.tfstate`, `*.tfstate.backup` | Terraform state may contain secrets |
 | `.terraform/` | Provider binaries and cache |
 | `.genie_space_id` | Auto-managed by Terraform lifecycle |
+| `.genierails-state/` | Rehearse and release receipts and release manifests (when `GENIERAILS_STATE_DIR` isn't set) |
+
+**Deterministic envs** (`governance_mode = "deterministic"`): applying commands
+(`rehearse`, `release-plan`, `release`, `maintain`) never write committed files
+(design section 9). What they re-derive from live tags goes to
+`generated/.runtime/`, and the layer files (`envs/<env>/abac.auto.tfvars`,
+`envs/<env>/data_access/`, `envs/account/abac.auto.tfvars`) and
+`generated/genie_space_derived_acl_groups.auto.tfvars` are their runtime
+outputs, so don't commit them: commit `env.auto.tfvars`, `generated/`,
+`ack.txt` and `agents/`. `make check` re-derives and checks the layer files
+from `generated/`. A release needs a clean checkout: an untracked or edited
+file under the cloud dir or `shared/` makes `release-plan` refuse.
 
 ### Setting up git tracking
 
@@ -79,6 +91,12 @@ auth.auto.tfvars
 **/envs/**/.can_run_check.json
 **/envs/**/generated/.*
 **/envs/**/ddl/_fetched.sql
+.genierails-state/
+# Deterministic envs: the layer files are runtime outputs (see above). With a
+# legacy env in the same repo, list the deterministic envs' paths instead.
+**/envs/*/abac.auto.tfvars
+**/envs/*/data_access/
+**/envs/*/generated/genie_space_derived_acl_groups.auto.tfvars
 
 # Option 2: Force-track specific files (leave .gitignore as-is)
 git add -f envs/account/abac.auto.tfvars
