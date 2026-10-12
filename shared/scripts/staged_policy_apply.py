@@ -53,7 +53,6 @@ import argparse
 import json
 import os
 import shlex
-import socket
 import subprocess
 import sys
 import uuid
@@ -190,23 +189,10 @@ def _read_state(env_dir: Path) -> dict | None:
         raise Refused(f"the data_access state {path} is unreadable: {exc}") from exc
 
 
-def _ancestors() -> set[int]:
-    pids, pid = set(), os.getpid()
-    while pid > 1 and pid not in pids:
-        pids.add(pid)
-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], text=True, capture_output=True, check=False)
-        try:
-            pid = int(out.stdout.strip())
-        except ValueError:
-            break
-    return pids
-
-
 @contextmanager
 def env_lock(env_dir: Path, owner: str):
     """The env lock: reused when an enclosing make release/maintain holds it, else taken."""
-    held = environment_lock._read_lock(env_dir / environment_lock.LOCK_RELPATH)
-    if held and held["host"] == socket.gethostname() and held["pid"] in _ancestors():
+    if environment_lock.held_by_ancestor(env_dir) is not None:
         yield
         return
     ok, message = environment_lock.acquire_lock(env_dir, os.getpid(), owner)

@@ -430,6 +430,11 @@ ungovern: _guard-not-ci-apply ## Remove governance (treatment tags, masks) from 
 	fi; \
 	$(call _ENV_LOCK,ungovern); \
 	$(_STICKY) ungovern --env-dir "$(ENV_DIR)" --table "$(TABLE)" --commit >/dev/null || exit 1; \
+	if [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" = promoted ]; then \
+		echo "ungovern: removed $(TABLE) from $(_SETUP_ENV_REL)/generated; ENV=$(ENV) is promoted, so nothing was applied."; \
+		echo "  Commit it in a PR; after rehearse, make release-plan ENV=$(ENV) and make release ENV=$(ENV) MANIFEST=<manifest> apply the removal."; \
+		exit 0; \
+	fi; \
 	if ! GENIERAILS_UNGOVERN_TABLE="$(TABLE)" $(MAKE) --no-print-directory apply-governance ENV="$(ENV)" APPLY_FLAGS=; then \
 		echo "ungovern: apply failed; $(TABLE) stays governed while its tags are deployed. Fix the error and re-run." >&2; \
 		exit 1; \
@@ -641,6 +646,15 @@ RELEASE_BRANCH ?= main
 # Live UC as release-plan saw it, and again (re-derived) before release applies.
 _LIVE_SNAPSHOT = $(_RELEASE_GATE) live-snapshot --env-dir "$(ENV_DIR)" --env "$(ENV)"
 _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)"
+# No side door (release_gate.py apply-guard): in a deterministic env, apply,
+# apply-governance, apply-genie and _apply-layer (data_access, workspace) run
+# only under the env lock of the command allowed to run them there: rehearse
+# (and ungovern's governance apply) in the rehearse env, maintain's governance
+# apply in a promoted env (promote_from set, or prod), which otherwise changes
+# only through release MANIFEST=. Legacy envs are never gated.
+_APPLY_GUARD = $(_RELEASE_GATE) apply-guard --env-dir "$(1)" --env "$(2)" --target $(3)
+# Destroying a promoted deterministic env needs CONFIRM_DESTROY=<env> on the command line.
+_CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)),$(CONFIRM_DESTROY))
 # Live checks the release targets run (overridable so tests never reach Databricks).
 _EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
 _CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
@@ -695,6 +709,10 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 	fi; \
 	$(_DRY_RUN_GUARD); \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		if [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" = promoted ]; then \
+			echo "rehearse: ENV=$(ENV) is promoted (promote_from is set): rehearse its source env, then make release-plan ENV=$(ENV) and make release ENV=$(ENV) MANIFEST=<manifest>." >&2; \
+			exit 1; \
+		fi; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
@@ -1261,6 +1279,8 @@ wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to 
 _apply-layer: _guard-not-ci-apply
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
+	if [ "$$layer" = data_access ]; then $(call _APPLY_GUARD,$$(dirname "$$env_dir"),$$target_env,_apply-layer:data_access); \
+	elif [ "$$layer" = workspace ]; then $(call _APPLY_GUARD,$$env_dir,$$target_env,_apply-layer:workspace); fi; \
 	apply_flags="$(if $(filter data_access workspace,$(LAYER)),$(APPLY_FLAGS),)"; \
 	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK); fi; \
 	if [ "$$layer" = "workspace" ] && [ "$$($(_GOVERNANCE_ONLY) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
@@ -1363,6 +1383,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		fi; \
 		$(MAKE) --no-print-directory wait-tag-policies; \
 	else \
+		$(call _APPLY_GUARD,$(ENV_DIR),$(ENV),apply); \
 		$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
 		python3 "$(SHARED_ROOT)/scripts/genie_adopt_preflight.py" "$(ENV_DIR)" --arm; \
 		if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
@@ -1390,6 +1411,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 
 apply-governance: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## [Governance team] Apply account + data_access layers only (no Genie agents)
 	@set -e; $(_DRY_RUN_GUARD); \
+	$(call _APPLY_GUARD,$(ENV_DIR),$(ENV),apply-governance); \
 	$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
 	if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 	if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
@@ -1430,6 +1452,7 @@ genie-adopt-preflight: _guard-workspace-target ## Read-only: check every legacy 
 # applied, applies everything else, then exits non-zero naming them.
 apply-genie: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## [BU team] Apply workspace layer only — groups + Genie agents (assumes governance already applied)
 	@set -e; $(_DRY_RUN_GUARD); \
+	$(call _APPLY_GUARD,$(ENV_DIR),$(ENV),apply-genie); \
 	$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
 	if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 	if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
@@ -1511,6 +1534,8 @@ migrate-state: _guard-not-ci-apply _bootstrap ## Migrate legacy state into accou
 
 _destroy-layer: _guard-not-ci-apply
 	@layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
+	if [ "$$layer" = data_access ]; then guard_dir="$$(dirname "$(LAYER_ENV_DIR)")"; elif [ "$$layer" = workspace ]; then guard_dir="$(LAYER_ENV_DIR)"; else guard_dir=; fi; \
+	if [ -n "$$guard_dir" ]; then $(_RELEASE_GATE) destroy-guard --env-dir "$$guard_dir" --env "$$target_env" --confirm "$(_CONFIRM_DESTROY)" || exit 1; fi; \
 	echo "=== Terraform Destroy ($$layer:$$target_env) ==="; \
 	LAYER_ENV_DIR="$(LAYER_ENV_DIR)" "$(ROOT_RUNNER)" "$$layer" "$$target_env" destroy -auto-approve $$([ "$$layer" = data_access ] && echo "-var=policy_stage=destroy") $(DESTROY_FLAGS)
 

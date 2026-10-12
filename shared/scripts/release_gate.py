@@ -39,6 +39,18 @@ release-receipt / maintain-check
     A finished release writes a receipt (commit, digests, manifest);
     ``make maintain`` refuses unless HEAD is that commit with matching digests.
 
+apply-guard / destroy-guard
+    No side door around those gates. In a deterministic env, the targets that
+    apply the data_access or workspace root (apply, apply-governance,
+    apply-genie, _apply-layer) run only inside a gated command: the env lock
+    must be held by a process this one runs under, by an owner allowed for the
+    env's role. A **promoted** env (promote_from set, or prod) changes only
+    through ``release MANIFEST=`` (which applies saved plans, never these
+    targets) and ``maintain`` (apply-governance, from the released commit). The
+    **rehearse** env (dev) applies only through ``rehearse`` (and ``ungovern``'s
+    governance apply). The lock can't be faked with a variable: only those
+    commands take it. Destroying a promoted env needs CONFIRM_DESTROY=<env>.
+
 Exit codes: 0 ok, 1 refused (the message says why and what to run), 2 error.
 """
 
@@ -1046,6 +1058,61 @@ def maintain_check(env_dir: Path, env: str) -> dict:
     return last
 
 
+# -- no side door: applying targets in deterministic envs -----------------------
+
+PROMOTED, REHEARSE, LEGACY = "promoted", "rehearse", "legacy"
+# target -> lock owners (make targets) it may run under, per env role.
+APPLY_OWNERS = {
+    PROMOTED: {"apply": (), "apply-genie": (), "apply-governance": ("maintain",),
+               "_apply-layer:data_access": ("maintain",), "_apply-layer:workspace": ()},
+    REHEARSE: {"apply": ("rehearse",), "apply-genie": ("rehearse",), "apply-governance": ("rehearse", "ungovern"),
+               "_apply-layer:data_access": ("rehearse", "ungovern"), "_apply-layer:workspace": ("rehearse",)},
+}
+
+
+def env_role(env_dir: Path) -> str:
+    """legacy; promoted (a promote-to target: promote_from set, or prod); else the rehearse env."""
+    env_dir = Path(env_dir)
+    if not deterministic(env_dir):
+        return LEGACY
+    cfg = _load_hcl(env_dir / "env.auto.tfvars")
+    return PROMOTED if cfg.get("promote_from") or env_dir.name == "prod" else REHEARSE
+
+
+def apply_guard(env_dir: Path, env: str, target: str) -> None:
+    from scripts.environment_lock import held_by_ancestor
+
+    role = env_role(env_dir)
+    if role == LEGACY:
+        return
+    allowed = APPLY_OWNERS[role].get(target)
+    if allowed is None:
+        raise Refused(f"unknown applying target {target!r}")
+    owner = held_by_ancestor(env_dir)
+    if owner in allowed:
+        return
+    name = target.split(":")[0]
+    layer = f" (the {target.split(':')[1]} layer)" if ":" in target else ""
+    if role == PROMOTED:
+        how = (f"changes reach it only through make release-plan ENV={env}, then make release ENV={env} "
+               f"MANIFEST=<the manifest it printed>" + ("; make maintain ENV=" + env + " re-applies governance "
+                                                         "from the released commit" if "maintain" in allowed else ""))
+        why = f"ENV={env} is a deterministic env promoted from {source_env(env_dir)}"
+    else:
+        how = f"run make rehearse ENV={env} (it applies, verifies and writes the receipt release-plan needs)"
+        why = f"ENV={env} is a deterministic env, applied only by rehearse"
+    ran = f" (it runs under make {owner})" if owner else ""
+    raise Refused(f"make {name}{layer} refused{ran}: {why}; {how}.")
+
+
+def destroy_guard(env_dir: Path, env: str, confirm: str) -> None:
+    if env_role(env_dir) != PROMOTED or confirm == env:
+        return
+    raise Refused(f"make destroy refused: ENV={env} is a deterministic promoted env; destroying it removes its "
+                  f"masks and grants outside any manifest. If you mean it (a throwaway env, an operations "
+                  f"teardown), re-run with CONFIRM_DESTROY={env} on the command line.")
+
+
 # -- CLI ------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -1088,6 +1155,9 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("release-receipt", "phase-record"):
         command(name).add_argument("--manifest", type=Path, required=True)
     command("maintain-check")
+    command("apply-guard").add_argument("--target", required=True)
+    command("destroy-guard").add_argument("--confirm", default="")
+    command("env-role")
     args = parser.parse_args(argv)
     try:
         if args.command == "state-dir":
@@ -1139,6 +1209,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Release receipt: {release_receipt(args.env_dir, args.env, args.manifest)}")
         elif args.command == "phase-record":
             print(f"Phase record: {phase_record(args.env_dir, args.env, args.manifest)}")
+        elif args.command == "apply-guard":
+            apply_guard(args.env_dir, args.env, args.target)
+        elif args.command == "destroy-guard":
+            destroy_guard(args.env_dir, args.env, args.confirm)
+        elif args.command == "env-role":
+            print(env_role(args.env_dir))
         elif args.command == "maintain-check":
             last = maintain_check(args.env_dir, args.env)
             print(f"maintain: HEAD is the last released commit {last['commit'][:12]} (digests match).")

@@ -177,6 +177,36 @@ Rollout step 9 (design sections 10 and 17). Legacy envs are unchanged.
 - **`make maintain ENV=prod`** refuses unless HEAD is the last release
   receipt's commit, the checkout is clean and the code, prod-input and
   `envs/prod/generated` digests match the receipt.
+- **No side door.** A *promoted* env (one with `promote_from`, or `prod`)
+  changes only through `release MANIFEST=` and `maintain`; the *rehearse* env
+  (`dev`) only through `rehearse`. Every other make target that applies the
+  data_access or workspace root refuses there and says which command to run.
+  The gate is the env lock, which only the gated commands take, held by a
+  process the target runs under; a variable can't open it.
+
+  | Target | Promoted env (prod, stg, ...) | Rehearse env (dev) |
+  |---|---|---|
+  | `apply`, `apply-genie` | refused | only under `rehearse` |
+  | `apply-governance` | only under `maintain` | only under `rehearse` or `ungovern` |
+  | `_apply-layer LAYER=data_access` | only under `maintain` | only under `rehearse` or `ungovern` |
+  | `_apply-layer LAYER=workspace` | refused | only under `rehearse` |
+  | `rehearse` | refused (rehearse the source env) | the way to apply it |
+  | `ungovern` | edits the governed-table list only; the next release applies it | edits, then applies governance |
+  | `destroy`, `destroy-governance`, `destroy-genie`, `_destroy-layer` | needs `CONFIRM_DESTROY=<env>` on the command line | unchanged |
+  | `release` without `MANIFEST=` | refused | refused |
+
+  Not gated, and why: `apply-account` (`ENV=account`) is the operations path
+  with its own account lock and approval, and applies only the account root.
+  `enable-classification` applies only the classification catalog config
+  (`-target`); it changes no mask, tag or grant. `import`, `migrate-state` and
+  `rebuild-governed-tables` change Terraform state or a local record, not
+  Databricks. `policy-abandon` drops only the new policies of a staged change
+  that never retagged a column or moved a principal (it refuses otherwise),
+  so it can't weaken protection. Each of these, like raw `terraform` or
+  `scripts/terraform_layer.sh` run by hand, moves a state serial or leaves a
+  committed file changed, so a manifest planned before it is refused, and
+  `release-plan` and `maintain` refuse a dirty checkout. Legacy envs are never
+  gated.
 - **Where receipts live.** `$GENIERAILS_STATE_DIR/<cloud>/<env>/` when set,
   else `<cloud>/.genierails-state/<env>/` in the checkout (gitignored). The
   default only works for one persistent checkout: set `GENIERAILS_STATE_DIR`

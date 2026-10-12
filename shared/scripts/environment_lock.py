@@ -49,6 +49,28 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _ancestors() -> set[int]:
+    import subprocess
+
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], text=True, capture_output=True, check=False)
+        try:
+            pid = int(out.stdout.strip())
+        except ValueError:
+            break
+    return pids
+
+
+def held_by_ancestor(env_dir: Path) -> str | None:
+    """The owner (make target) of the env lock when a process this one runs under holds it."""
+    held = _read_lock(Path(env_dir) / LOCK_RELPATH)
+    if held and held["host"] == socket.gethostname() and held["pid"] in _ancestors():
+        return str(held.get("owner") or "?")
+    return None
+
+
 def owns_lock(env_dir: Path, pid: int) -> bool:
     held = _read_lock(env_dir / LOCK_RELPATH)
     return bool(held) and held["pid"] == pid and held["host"] == socket.gethostname()
