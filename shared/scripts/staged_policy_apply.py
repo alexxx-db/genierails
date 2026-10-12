@@ -22,6 +22,18 @@ verification, in this order:
    grants (``policy_stage``), so access opens only once its protection is
    applied and verified.
 
+Two-phase release (rollout step 9). ``plan --out-dir D`` (make release-plan)
+saves the next phases' plans instead of applying them: it plans each remaining
+apply phase in order, recording a phase whose plan changes nothing and
+planning on, and stops after the first phase that changes something (with the
+verify phases right after it). Terraform can't plan a phase against state an
+earlier unapplied phase would leave, so a staged policy change takes one
+manifest (and approval) per changing phase; a release that changes no policy
+is one manifest. ``apply-saved --plan-dir D`` (make release MANIFEST=...)
+applies exactly those saved plans and runs those verifications, refusing when
+the journal or the generated config moved since they were planned. Exit 10
+means phases remain for the next release-plan.
+
 The journal (``<env>/data_access/.policy_generations/journal.json``, next to
 the layer's state) records the active generation, the obsolete one waiting
 for retirement and the transition in progress. A failed tighten or switch
@@ -31,7 +43,8 @@ on; ``abandon`` drops one that never switched. Legacy envs are never staged:
 the controller exits 0 and touches nothing.
 
 Exit codes: 0 done, 1 a phase failed (the journal says what is live), 2 a
-usage or internal error, 3 refused before applying anything.
+usage or internal error, 3 refused before applying anything, 10 (apply-saved)
+the saved phases are applied and more remain.
 """
 
 from __future__ import annotations
@@ -76,6 +89,10 @@ HISTORY_LIMIT = 20
 
 class Refused(RuntimeError):
     """The run stops before applying anything."""
+
+
+PHASES_FILE = "phases.json"
+MORE_PHASES = 10
 
 
 def _now() -> str:
@@ -456,6 +473,125 @@ class Controller:
                   + (f"; retired {t['retire']}" if t["retire"] else "") + ".")
             return 0
 
+    # -- two-phase release -------------------------------------------------------
+    def _transition_for(self, journal: dict, desired: dict) -> dict:
+        t = journal.get("transition")
+        if t and t["to"] != desired["fingerprint"]:
+            raise Refused(self._unfinished_message(t, desired))
+        return t or self._new_transition(journal, desired)
+
+    def plan(self, out_dir: Path) -> int:
+        """Save the plans of the next phases (make release-plan); applies nothing."""
+        if governance_mode(self.env_dir) != "deterministic":
+            print("Staged policy apply: legacy governance mode; nothing to plan.")
+            return 0
+        from scripts.policy_generations import PLAN_BASIS_ENV, PLAN_OUT_ENV, load_sidecar
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with env_lock(self.env_dir, "staged-policy-plan"):
+            desired = pg.desired_generation(self.env_dir)
+            journal = load_journal(self.env_dir) or self._adopt(desired)
+            t = self._transition_for(journal, desired)
+            remaining = [p for p in t["phases"] if p not in t["completed"]]
+            steps: list[dict] = []
+            basis = ""
+            stopped = False
+            for index, phase in enumerate(remaining):
+                if stopped:
+                    if phase in VERIFY_PHASES:
+                        steps.append({"phase": phase, "kind": "verify"})
+                        continue
+                    break
+                if phase in VERIFY_PHASES:
+                    steps.append({"phase": phase, "kind": "verify"})
+                    continue
+                plan_file = out_dir / f"{len(steps):02d}-{phase}.tfplan"
+                env = self._hook_env(t) | {PLAN_OUT_ENV: str(plan_file)} | ({PLAN_BASIS_ENV: basis} if basis else {})
+                print(f"=== Policy phase {phase} ({self.env_name}): saving its plan ===", flush=True)
+                rc = self.run_cmd([str(self.hook_dir / APPLY_PHASES[phase])], env=env, check=False).returncode
+                if rc:
+                    print(f"ERROR: planning policy phase {phase} failed (exit {rc}); nothing was applied.",
+                          file=sys.stderr)
+                    return 1
+                side = load_sidecar(plan_file)
+                steps.append({"phase": phase, "kind": "apply", "file": plan_file.name,
+                              "sha256": _sha256(plan_file), "changes": bool(side.get("changes"))})
+                basis = str(plan_file)
+                stopped = bool(side.get("changes"))
+            planned = {s["phase"] for s in steps}
+            final = all(p in planned for p in remaining)
+            summary = {
+                "transition": {key: t[key] for key in ("from", "to", "retain", "retire", "tier_move", "phases",
+                                                       "completed")} | {"resumed": bool(journal.get("transition"))},
+                "steps": steps, "final": final, "planned_at": _now(),
+            }
+            pg.write_json(out_dir / PHASES_FILE, summary)
+            print(f"Staged policy plan ({self.env_name}): "
+                  + " -> ".join(f"{s['phase']}{'' if s['kind'] == 'verify' or s['changes'] else ' (no changes)'}"
+                                for s in steps)
+                  + ("" if final else f"; later phases ({', '.join(p for p in remaining if p not in planned)}) "
+                                      "need another release-plan once these are applied"))
+            return 0
+
+    def apply_saved(self, plan_dir: Path) -> int:
+        """Apply exactly the saved phases of a manifest (make release MANIFEST=...)."""
+        if governance_mode(self.env_dir) != "deterministic":
+            print("Staged policy apply: legacy governance mode; nothing is staged and nothing changes.")
+            return 0
+        from scripts.policy_generations import SAVED_PLAN_ENV
+
+        plan_dir = Path(plan_dir)
+        try:
+            saved = json.loads((plan_dir / PHASES_FILE).read_text())
+        except (OSError, ValueError) as exc:
+            raise Refused(f"no saved policy phases in {plan_dir} ({exc})") from exc
+        planned = saved["transition"]
+        with env_lock(self.env_dir, "staged-policy-apply"):
+            desired = pg.desired_generation(self.env_dir)
+            if desired["fingerprint"] != planned["to"]:
+                raise Refused(f"the generated config is generation {desired['fingerprint']}, the manifest planned "
+                              f"{planned['to']}; run make release-plan again")
+            journal = load_journal(self.env_dir) or self._adopt(desired)
+            t = self._transition_for(journal, desired)
+            for key in ("from", "to", "retain", "retire", "tier_move", "phases"):
+                if t[key] != planned[key]:
+                    raise Refused(f"the policy journal moved since release-plan ({key}: planned {planned[key]!r}, "
+                                  f"now {t[key]!r}); run make release-plan again")
+            if sorted(t["completed"]) != sorted(planned["completed"]):
+                raise Refused("policy phases were applied since release-plan; run make release-plan again")
+            if not journal.get("transition"):
+                journal["transition"] = t
+                self._save(journal)
+            print(f"=== Policy staged apply ({self.env_name}, saved plans): "
+                  f"{' -> '.join(s['phase'] for s in saved['steps'])} ===")
+            for step in saved["steps"]:
+                phase = step["phase"]
+                t.update(current=phase, status="running")
+                if phase in ("switch", "verify-switched"):
+                    t["switch_attempted"] = True
+                self._save(journal)
+                print(f"=== Policy phase {phase} ({self.env_name}) ===", flush=True)
+                if step["kind"] == "apply":
+                    env = self._hook_env(t) | {SAVED_PLAN_ENV: str(plan_dir / step["file"])}
+                    rc = self.run_cmd([str(self.hook_dir / APPLY_PHASES[phase])], env=env, check=False).returncode
+                else:
+                    rc = self._verify(t, phase)
+                if rc:
+                    return self._fail(journal, t, phase, rc)
+                t["completed"].append(phase)
+                self._save(journal)
+            remaining = [p for p in t["phases"] if p not in t["completed"]]
+            if remaining:
+                t.update(current="", status="waiting")
+                self._save(journal)
+                print(f"Staged policy apply: the saved phases are applied and verified; {', '.join(remaining)} "
+                      f"remain. Run make release-plan ENV={self.env_name} again for the next phase.")
+                return MORE_PHASES
+            self._finish(journal, t)
+            print(f"Staged policy apply: generation {t['to']} is live and verified (saved plans).")
+            return 0
+
     def abandon(self) -> int:
         """Drop an unfinished transition that never switched, back to the active generation."""
         if governance_mode(self.env_dir) != "deterministic":
@@ -582,6 +718,12 @@ def _write_subset(tfvars: Path, tags: dict) -> None:
                                                [_render_tag_assignment_block(a) for a in assignments]))
 
 
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def _git_head() -> str:
     out = subprocess.run(["git", "-C", str(SHARED), "rev-parse", "HEAD"], text=True, capture_output=True, check=False)
     return out.stdout.strip() if out.returncode == 0 else ""
@@ -589,7 +731,8 @@ def _git_head() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("run", "confirm", "abandon", "status", "describe"))
+    parser.add_argument("command", choices=("run", "confirm", "abandon", "status", "describe", "plan",
+                                            "apply-saved"))
     parser.add_argument("--env-dir", type=Path, required=True)
     parser.add_argument("--env-name", default="")
     parser.add_argument("--hook-dir", type=Path, default=HOOK_DIR)
@@ -598,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
                              "and GENIERAILS_VERIFY_ENV_FILE")
     parser.add_argument("--inventory-cmd", default="", help="override the live policy check (argv, shell-split)")
     parser.add_argument("--commit", default="")
+    parser.add_argument("--out-dir", type=Path, help="plan: where the saved phase plans go")
+    parser.add_argument("--plan-dir", type=Path, help="apply-saved: the saved phase plans to apply")
     args = parser.parse_args(argv)
     controller = Controller(
         args.env_dir, args.env_name, hook_dir=args.hook_dir, verify_access_cmd=args.verify_access_cmd,
@@ -619,6 +764,14 @@ def main(argv: list[str] | None = None) -> int:
                 if journal.get("transition"):
                     print(controller.describe_transition(journal["transition"]))
             return 0
+        if args.command == "plan":
+            if not args.out_dir:
+                parser.error("plan needs --out-dir")
+            return controller.plan(args.out_dir)
+        if args.command == "apply-saved":
+            if not args.plan_dir:
+                parser.error("apply-saved needs --plan-dir")
+            return controller.apply_saved(args.plan_dir)
         return getattr(controller, args.command)()
     except Refused as exc:
         print(f"ERROR: staged policy apply refused: {exc}", file=sys.stderr)

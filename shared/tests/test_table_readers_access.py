@@ -685,9 +685,10 @@ def test_release_refuses_a_policy_only_principal_before_the_lock(tmp_path):
     wrapper = tmp_path / "group-check"
     wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" check --env-dir "{env}" --env prod --command-name "$*"\n')
     wrapper.chmod(0o755)
-    result, calls = _make(tmp_path, env, "release", "ENV=prod", f"_GROUP_CHECK={wrapper}")
+    # A deterministic prod is released through release-plan (rollout step 9).
+    result, calls = _make(tmp_path, env, "release-plan", "ENV=prod", f"_GROUP_CHECK={wrapper}")
     assert result.returncode != 0
-    assert "make release refused" in result.stderr and "prod_policy_only" in result.stderr
+    assert "make release-plan refused" in result.stderr and "prod_policy_only" in result.stderr
     assert calls == []
     assert not (env / "generated" / ".governance.lock").exists()
 
@@ -774,7 +775,7 @@ def _make(tmp_path, env, *args):
 
 
 @needs_make
-@pytest.mark.parametrize("target,env_name", [("rehearse", "dev"), ("release", "prod")])
+@pytest.mark.parametrize("target,env_name", [("rehearse", "dev"), ("release-plan", "prod")])
 def test_rehearse_and_release_refuse_acl_groups_that_cannot_read_before_anything_runs(tmp_path, target, env_name):
     env = _env(tmp_path, AGENT_ENV + 'uc_tables = ["cat.sch.t"]\n', {"Sales": ["cat.sch.t"]}, name=env_name)
     result, calls = _make(tmp_path, env, target, f"ENV={env_name}")
@@ -786,7 +787,7 @@ def test_rehearse_and_release_refuse_acl_groups_that_cannot_read_before_anything
 
 
 @needs_make
-@pytest.mark.parametrize("target,env_name", [("rehearse", "dev"), ("release", "prod")])
+@pytest.mark.parametrize("target,env_name", [("rehearse", "dev"), ("release-plan", "prod")])
 def test_rehearse_and_release_stop_on_the_group_check_before_anything_runs(tmp_path, target, env_name):
     env = _env(tmp_path, AGENT_ENV + 'table_readers = { "cat.sch.*" = ["raw", "partial"] }\n',
                {"Sales": ["cat.sch.t"]}, name=env_name)

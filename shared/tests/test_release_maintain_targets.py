@@ -259,7 +259,7 @@ def test_every_in_recipe_same_env_promote_clears_cross_env_variables():
     definition = definition[:definition.index("\n\n")]
     for setting in ('SOURCE_ENV="$(ENV)"', 'DEST_ENV= ', "DEST_ENV_DIR= ", "DEST_CATALOG_MAP="):
         assert setting in definition
-    # release, apply, apply-governance and plan's PROMOTE_AFTER all use it;
+    # release, release-plan, apply, apply-governance and plan's PROMOTE_AFTER all use it;
     # the only raw promote calls left are the explicit cross-env test targets
     # and promote-to, which passes every cross-env variable explicitly.
     raw = [line.strip() for line in makefile.splitlines()
@@ -271,7 +271,7 @@ def test_every_in_recipe_same_env_promote_clears_cross_env_variables():
     to = makefile[makefile.index("\npromote-to:"):]
     to = to[:to.index("\n\n")]
     assert 'DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map"' in to
-    assert makefile.count("$(_SAME_ENV_PROMOTE)") == 4
+    assert makefile.count("$(_SAME_ENV_PROMOTE)") == 5
 
 
 def test_release_without_key_still_calls_verify_access(tmp_path):

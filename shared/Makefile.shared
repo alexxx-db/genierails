@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -312,7 +312,12 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
-		echo "  5. Run: make release ENV=$(ENV)"; \
+		if [ "$$det" = 1 ]; then \
+			echo "  5. Run: make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
+			echo "     Get that manifest approved, then: make release ENV=$(ENV) MANIFEST=<the manifest it printed>"; \
+		else \
+			echo "  5. Run: make release ENV=$(ENV)"; \
+		fi; \
 		echo "$$access_note"; \
 		echo "     It proves a row-pairing key for every masked table before applying (no key to set)."; \
 		echo "  6. Steady state (scheduled): make maintain ENV=$(ENV)"; \
@@ -472,7 +477,15 @@ materialize-treatment: _guard-workspace-target ## Add TREATMENT=<t>'s mask polic
 derive-assignments: _guarded-bootstrap _guard-workspace-target ## Re-derive only tag_assignments from live native class.* tags (requires prior promote; never calls an LLM)
 	@echo "=== Derive Assignments ($(ENV)) ==="
 	@$(_COVERAGE_GATE) invalidate --env-dir "$(ENV_DIR)"
-	@cd "$(ENV_DIR)" && python3 "$(DERIVE_ASSIGNMENTS_SCRIPT)" --auth-file auth.auto.tfvars --env-file env.auto.tfvars --config generated/abac.auto.tfvars --write-ddl ddl/_fetched.sql --refresh-record generated/.live_refresh.json --env-name "$(ENV)"
+	@if [ "$$($(_OVERLAY) enabled --env-dir "$(ENV_DIR)")" = 1 ]; then \
+		out_dir="$$($(_OVERLAY) begin --env-dir "$(ENV_DIR)")" || exit 1; \
+		(cd "$(ENV_DIR)" && python3 "$(DERIVE_ASSIGNMENTS_SCRIPT)" --auth-file auth.auto.tfvars --env-file env.auto.tfvars --config generated/abac.auto.tfvars --write-ddl ddl/_fetched.sql --refresh-record generated/.live_refresh.json --env-name "$(ENV)" --out-dir "$$out_dir") || exit 1; \
+		$(_OVERLAY) seal --env-dir "$(ENV_DIR)" && $(_OVERLAY) kept-names --env-dir "$(ENV_DIR)" \
+			|| { $(_COVERAGE_GATE) invalidate --env-dir "$(ENV_DIR)"; exit 1; }; \
+		echo "  (deterministic: derived into $(_SETUP_ENV_REL)/generated/.runtime; committed files are unchanged)"; \
+	else \
+		cd "$(ENV_DIR)" && python3 "$(DERIVE_ASSIGNMENTS_SCRIPT)" --auth-file auth.auto.tfvars --env-file env.auto.tfvars --config generated/abac.auto.tfvars --write-ddl ddl/_fetched.sql --refresh-record generated/.live_refresh.json --env-name "$(ENV)"; \
+	fi
 
 audit-schema: _guarded-bootstrap _guard-workspace-target ## Report untagged sensitive columns and stale tag assignments in managed tables
 	@echo "=== Schema Drift Audit ($(ENV)) ==="
@@ -500,14 +513,14 @@ generate-delta: _guarded-bootstrap _guard-workspace-target ## [Legacy] LLM/name-
 
 validate-generated: _guarded-bootstrap _guard-workspace-target ## Validate generated/ files in the selected workspace environment
 	@echo "=== Validate (generated/) [$(ENV)] ==="
-	@cd "$(ENV_DIR)" && if [ -f generated/masking_functions.sql ]; then \
-		python3 "$(SHARED_ROOT)/validate_abac.py" generated/abac.auto.tfvars generated/masking_functions.sql $(call _VALIDATION_FLAGS,validate-generated) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
+	@$(_EFFECTIVE_GENERATED); cd "$(ENV_DIR)" && if [ -f "$$gen_sql" ]; then \
+		python3 "$(SHARED_ROOT)/validate_abac.py" "$$gen_abac" "$$gen_sql" $(call _VALIDATION_FLAGS,validate-generated) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
 	else \
-		python3 "$(SHARED_ROOT)/validate_abac.py" generated/abac.auto.tfvars $(call _VALIDATION_FLAGS,validate-generated) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
+		python3 "$(SHARED_ROOT)/validate_abac.py" "$$gen_abac" $(call _VALIDATION_FLAGS,validate-generated) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
 	fi
 
 coverage-gate: _guarded-bootstrap _guard-workspace-target ## Block on any sensitive-column coverage gap in generated config
-	@cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" --coverage-gate generated/abac.auto.tfvars generated/masking_functions.sql --env-name "$(ENV)" $(call _VALIDATION_FLAGS,coverage-gate)
+	@$(_EFFECTIVE_GENERATED); cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" --coverage-gate "$$gen_abac" "$$gen_sql" --env-name "$(ENV)" $(call _VALIDATION_FLAGS,coverage-gate)
 
 # Terraform-enforced gate for the split data_access config (scripts/coverage_gate.py).
 # _apply-layer and _plan-layer run it before every data_access plan/apply; the
@@ -550,6 +563,9 @@ _refresh-live-ddl: _guarded-bootstrap _guard-workspace-target
 	@echo "=== Refresh Live DDL ($(ENV)) ==="
 	@$(_COVERAGE_GATE) invalidate --env-dir "$(ENV_DIR)"
 	@cd "$(ENV_DIR)" && python3 "$(DERIVE_ASSIGNMENTS_SCRIPT)" --ddl-only --auth-file auth.auto.tfvars --env-file env.auto.tfvars --write-ddl ddl/_fetched.sql --refresh-record generated/.live_refresh.json
+	@if [ "$$($(_OVERLAY) enabled --env-dir "$(ENV_DIR)")" = 1 ]; then \
+		$(_OVERLAY) kept-names --env-dir "$(ENV_DIR)" || { $(_COVERAGE_GATE) invalidate --env-dir "$(ENV_DIR)"; exit 1; }; \
+	fi
 
 # After verify-access passes with a proven key for EVERY masked table, the
 # keys are saved as exactly that run's verify_key_columns (stale entries this
@@ -558,7 +574,8 @@ _refresh-live-ddl: _guarded-bootstrap _guard-workspace-target
 # passing mask checks were paired by it. A partial run saves nothing.
 _SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
 _VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
-_SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)"
+_SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)" \
+	$$([ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ] && echo --report-only)
 
 # 1 when any workspace env of this checkout ($(CLOUD_ROOT)/envs/*, not account
 # or data_access) is deterministic. The account layer is shared, so its
@@ -603,6 +620,31 @@ _STAGED_VERIFY_ACCESS = $(MAKE) --no-print-directory verify-access ENV="$(TARGET
 	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
 _STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
 
+# Deterministic envs: applying commands never rewrite committed files (design
+# section 9). What they re-derive from live UC (and the same-env split of it)
+# goes to the ignored runtime overlay envs/<env>/generated/.runtime
+# (scripts/runtime_overlay.py); _EFFECTIVE_GENERATED sets gen_abac/gen_sql to
+# the files a reader uses (the overlay when current, else the committed ones;
+# always the committed ones in legacy envs).
+_OVERLAY = python3 "$(SHARED_ROOT)/scripts/runtime_overlay.py"
+_EFFECTIVE_GENERATED = gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)" && \
+	gen_sql="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" masking_functions.sql)" || exit 1
+
+# Release gating (scripts/release_gate.py, rollout step 9): rehearse receipts,
+# release-plan provenance and manifests, release receipts, maintain gating.
+# Receipts and manifests are ignored runtime files under GENIERAILS_STATE_DIR
+# (or <cloud>/.genierails-state). Deterministic envs only.
+_RELEASE_GATE = python3 "$(SHARED_ROOT)/scripts/release_gate.py"
+_RELEASE_GATE_MAKE = --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
+RELEASE_REMOTE ?= origin
+RELEASE_BRANCH ?= main
+# Live UC as release-plan saw it, and again (re-derived) before release applies.
+_LIVE_SNAPSHOT = $(_RELEASE_GATE) live-snapshot --env-dir "$(ENV_DIR)" --env "$(ENV)"
+_RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)"
+# Live checks the release targets run (overridable so tests never reach Databricks).
+_EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
+_CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
+
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
 	if [ "$$mode" = deterministic ]; then \
@@ -632,12 +674,40 @@ _apply-account-locked:
 	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,apply-account); \
 	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace
 
+# A deterministic env's rehearse takes the env lock and writes an append-only
+# receipt per commit (scripts/release_gate.py): commit, clean-tree flag, the
+# fingerprint of code and dev inputs, result, and each promotion target's
+# promote-to digest. Unchanged inputs since a passing rehearsal write a receipt
+# without re-applying. release-plan releases only a commit with a passing one.
+_REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
+	$(MAKE) validate-generated ENV="$(ENV)" && \
+	$(MAKE) coverage-gate ENV="$(ENV)" && \
+	$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0 && \
+	$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+	$(_SAVE_VERIFY_KEY) && \
+	$(_GROUP_MAP_RECORD) && \
+	$(_STAGED_CONFIRM_RUN)
+
 rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (verify-access picks and proves a row-pairing key per masked table; VERIFY_KEY_COLUMN optionally overrides)
 	@if [ "$(ENV)" = "prod" ]; then \
 		echo "rehearse: ENV=prod is not allowed; use make release ENV=prod" >&2; \
 		exit 1; \
 	fi; \
-	$(_DRY_RUN_GUARD); $(_ACCESS_CHECK) "make rehearse" || exit 1; \
+	$(_DRY_RUN_GUARD); \
+	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
+		$(_GROUP_CHECK) "make rehearse" || exit 1; \
+		$(call _ENV_LOCK,rehearse); \
+		gate=0; $(_RELEASE_GATE) rehearse-start --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || gate=$$?; \
+		if [ $$gate -eq 10 ]; then exit 0; elif [ $$gate -ne 0 ]; then exit $$gate; fi; \
+		if $(_REHEARSE_STEPS); then \
+			$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result passed $(_RELEASE_GATE_MAKE); \
+			exit $$?; \
+		fi; \
+		$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result failed --reason "a rehearse step failed (above)" $(_RELEASE_GATE_MAKE); \
+		exit 1; \
+	fi; \
+	$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 	$(_GROUP_CHECK) "make rehearse" || exit 1; \
 	$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 		$(MAKE) validate-generated ENV="$(ENV)" && \
@@ -696,9 +766,13 @@ certify:
 	@echo "  To review before granting, run make plan ENV=$(or $(ENV),<env>) and gate make release behind your approval step." >&2
 	@exit 1
 
-release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove coverage, audit, apply all layers, and verify access
+release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove coverage, audit, apply all layers, and verify access (deterministic envs: MANIFEST=<from make release-plan>)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
+	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		$(MAKE) --no-print-directory _release-manifest ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" MANIFEST="$(MANIFEST)"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); \
+		exit $$?; \
+	fi; \
 	export GENIERAILS_RERUN_TARGET=release; \
 	$(_ACCESS_CHECK) "make release" || exit 1; \
 	$(_GROUP_CHECK) "make release" || exit 1; \
@@ -757,10 +831,182 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	echo "  Verification:  make verify-access ENV=$(ENV) passed"; \
 	echo "  Steady state:  make maintain ENV=$(ENV)"
 
+# Two-phase release (design section 17), deterministic envs only.
+#
+# make release-plan ENV=prod checks provenance (release_gate.py provenance:
+# a passing clean rehearsal of HEAD, a clean checkout, HEAD on freshly fetched
+# origin/main, matching fingerprints and envs/prod/generated digest, not older
+# than the last release unless prod:rollback:<commit> is acknowledged), then,
+# under the prod lock, re-derives prod's config from live tags into the
+# runtime overlay with the deployed policy names kept, runs the reader and
+# refuse-weakening checks, saves a Terraform plan for every root (data_access
+# through the staged policy controller) and writes ONE immutable manifest.
+# Nothing in Databricks changes.
+release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Plan a release: provenance, live re-derive, reader + weakening checks, saved plans -> one immutable manifest to approve
+	@$(_GUARD_WORKSPACE_ENV); \
+	$(_DRY_RUN_GUARD); \
+	export GENIERAILS_RERUN_TARGET=release-plan; \
+	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" != 1 ]; then \
+		echo "release-plan: ENV=$(ENV) is not in deterministic governance mode; release-plan and MANIFEST releases are for deterministic envs. Legacy envs keep: make release ENV=$(ENV)" >&2; \
+		exit 1; \
+	fi; \
+	$(_ACCESS_CHECK) "make release-plan" || exit 1; \
+	$(_GROUP_CHECK) "make release-plan" || exit 1; \
+	prov="$$(mktemp)"; \
+	$(_RELEASE_GATE) provenance --env-dir "$(ENV_DIR)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
+	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
+	$(_CLASSIFICATION_CHECK) --mode deterministic --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
+	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
+	$(_REQUIRE_MASK_PROOF) || exit 1; \
+	$(call _ENV_LOCK,release-plan); \
+	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
+	$(MAKE) derive-assignments ENV="$(ENV)" || exit 1; \
+	$(MAKE) validate-generated ENV="$(ENV)" || exit 1; \
+	$(MAKE) coverage-gate ENV="$(ENV)" || exit 1; \
+	$(_SAME_ENV_PROMOTE) || exit 1; \
+	$(_REQUIRE_MASK_PROOF) || exit 1; \
+	if ! $(MAKE) verify-access-keys ENV="$(ENV)"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
+		echo "release-plan: no provable row-pairing key for every masked table (above); no manifest was written." >&2; \
+		exit 1; \
+	fi; \
+	$(_RUN_AUDIT_RULEBOOK); \
+	if [ $$audit_rc -ne 0 ]; then \
+		echo "release-plan: audit-rulebook $$([ $$audit_rc -eq 1 ] && echo reported drift || echo failed) (output above); no manifest was written." >&2; \
+		exit $$audit_rc; \
+	fi; \
+	plan_dir="$$($(_RELEASE_GATE) plan-dir --env-dir "$(ENV_DIR)" --env "$(ENV)")" || exit 1; \
+	cp "$$prov" "$$plan_dir/provenance.json"; rm -f "$$prov"; \
+	echo "=== Reader and weakening checks ($(ENV)) ==="; \
+	warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --allow-unset)" || { rm -rf "$$plan_dir"; exit 1; }; \
+	if ! $(_RELEASE_REPORTS) --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json" --warehouse-id "$$warehouse_id"; then \
+		rm -rf "$$plan_dir"; \
+		echo "release-plan: refused by the reader or weakening check (above); add the reviewed acknowledgements to $(_SETUP_ENV_REL)/ack.txt in a PR, or fix the config. No manifest was written." >&2; \
+		exit 1; \
+	fi; \
+	if ! $(MAKE) --no-print-directory _release-plan-roots ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" PLAN_DIR="$$plan_dir"; then \
+		rm -rf "$$plan_dir"; echo "release-plan: planning failed (above); no manifest was written." >&2; exit 1; \
+	fi; \
+	live="$$($(_LIVE_SNAPSHOT))" || { rm -rf "$$plan_dir"; echo "release-plan: the live snapshot could not be taken; no manifest was written." >&2; exit 1; }; \
+	manifest="$$($(_RELEASE_GATE) manifest-write --env-dir "$(ENV_DIR)" --env "$(ENV)" --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json" --live-snapshot "$$live")" || { rm -rf "$$plan_dir"; exit 1; }; \
+	echo ""; \
+	echo "=== Release plan ($(ENV)) ==="; \
+	echo "  Manifest (immutable): $$manifest"; \
+	echo "  Review it and its saved plans, get it approved, then run:"; \
+	echo "    make release ENV=$(ENV) MANIFEST=$$manifest"
+
+# Saves one plan per root into PLAN_DIR for release-plan. The account plan must
+# be empty (only make apply-account changes the account layer). data_access is
+# planned by the staged policy controller; a staged policy change saves only
+# its next changing phase, and the workspace is planned with the last one.
+_release-plan-roots:
+	@set -e; $(_DRY_RUN_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
+	echo "=== Saved plan (account) ==="; \
+	set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null; status=$$?; set -e; \
+	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: account plan failed." >&2; exit 1; fi; \
+	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
+	echo "=== Saved plans (data_access:$(ENV), staged policy phases) ==="; \
+	layer_dir="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
+	$(_STICKY) check-layout --env-dir "$(ENV_DIR)" --env-name "$(ENV)"; \
+	$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$(ENV)" CLASSIFICATION_ENV_DIR="$(ENV_DIR)" IMPORT_CLASSIFICATION=1; \
+	(cd "$$layer_dir" && LAYER_ENV_DIR="$$layer_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
+	$(_COVERAGE_GATE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" $(if $(filter 1,$(VERBOSE)),--verbose,); \
+	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) plan --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --out-dir "$$plan_dir/data_access"; \
+	final="$$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["final"]))' "$$plan_dir/data_access/phases.json")"; \
+	env_dir="$(ENV_DIR)"; \
+	if [ "$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo '{"skipped": "governance-only (no agents): GenieRails creates and grants nothing in the workspace layer"}' > "$$plan_dir/workspace.json"; \
+	elif [ "$$final" != 1 ]; then \
+		echo '{"skipped": "deferred: staged policy phases remain; the workspace is planned with the last one"}' > "$$plan_dir/workspace.json"; \
+	elif [ ! -f "$(ENV_DIR)/abac.auto.tfvars" ]; then \
+		echo '{"skipped": "no workspace config (abac.auto.tfvars)"}' > "$$plan_dir/workspace.json"; \
+	else \
+		echo "=== Saved plan (workspace:$(ENV)) ==="; \
+		$(_GENIE_ID_FILE_CHECK); \
+		$(_AGENT_COVERAGE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" || true; \
+		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
+		python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --arm --quiet; \
+		(cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
+		set +e; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"; status=$$?; set -e; \
+		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: workspace plan failed." >&2; exit 1; fi; \
+		printf '{"file": "workspace.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/workspace.json"; \
+	fi
+
+# make release ENV=<deterministic env> MANIFEST=<path>: applies ONLY the
+# manifest's saved plans (data_access through the staged policy controller),
+# then verifies. It refuses, and asks for a fresh release-plan, if the commit,
+# any state serial, a saved plan, the effective config or live UC changed. A
+# finished release writes the release receipt make maintain checks.
+_release-manifest: _guard-not-ci-apply
+	@$(_GUARD_WORKSPACE_ENV); \
+	$(_DRY_RUN_GUARD); \
+	export GENIERAILS_RERUN_TARGET=release; \
+	if [ -z "$(strip $(MANIFEST))" ]; then \
+		echo "release: ENV=$(ENV) is in deterministic governance mode, where releases are two-phase:" >&2; \
+		echo "  1. make release-plan ENV=$(ENV)   (checks provenance, saves every plan, writes one manifest)" >&2; \
+		echo "  2. get that manifest approved" >&2; \
+		echo "  3. make release ENV=$(ENV) MANIFEST=<the manifest release-plan printed>" >&2; \
+		exit 1; \
+	fi; \
+	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
+	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
+	$(call _ENV_LOCK,release); \
+	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
+	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
+	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only || exit 1; \
+	$(MAKE) --no-print-directory wait-tag-policies REQUIRED_VALUES_TFVARS="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" || exit 1; \
+	staged_rc=0; GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) apply-saved --env-dir "$(ENV_DIR)" --env-name "$(ENV)" \
+		--plan-dir "$$plans/data_access" --verify-access-cmd '$(_STAGED_VERIFY_ACCESS)' || staged_rc=$$?; \
+	if [ $$staged_rc -eq 10 ]; then \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		echo ""; \
+		echo "=== Release phase applied ($(ENV)) ==="; \
+		echo "  This manifest held one phase of a staged policy change; it is applied and verified."; \
+		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV) MANIFEST=<it>."; \
+		exit 0; \
+	fi; \
+	if [ $$staged_rc -ne 0 ]; then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the saved data_access plans failed"; \
+		exit 1; \
+	fi; \
+	ws_file="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.file)"; \
+	ws_changes="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.changes)"; \
+	if [ "$$ws_file" != null ] && [ "$$ws_changes" = true ]; then \
+		echo "=== Apply saved plan (workspace:$(ENV)) ==="; \
+		if ! LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" apply-plan "$$plans/$$ws_file"; then \
+			$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the saved workspace plan failed"; \
+			exit 1; \
+		fi; \
+	fi; \
+	withheld_rc=0; \
+	$(_COVERAGE_GATE) withheld --layer data_access --layer-dir "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" --env-name "$(ENV)" || withheld_rc=1; \
+	if [ "$$ws_file" != null ]; then $(_COVERAGE_GATE) withheld --layer workspace --layer-dir "$(ENV_DIR)" --env-name "$(ENV)" || withheld_rc=1; fi; \
+	if [ $$withheld_rc -ne 0 ]; then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was withheld (above); once its protection is live, run make release-plan ENV=$(ENV) again to open it"; \
+		exit 1; \
+	fi; \
+	if ! $(MAKE) verify-access ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was applied but verify-access failed"; \
+		exit 1; \
+	fi; \
+	$(_SAVE_VERIFY_KEY); \
+	$(_GROUP_MAP_RECORD); \
+	if ! $(_STAGED_CONFIRM_RUN); then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the staged policy journal could not be confirmed"; \
+		exit 1; \
+	fi; \
+	$(_RELEASE_GATE) release-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	echo ""; \
+	echo "=== Release complete ($(ENV)) ==="; \
+	$(_RELEASE_HELPER) access-summary "$(ENV_DIR)"; \
+	echo "  Verification:  make verify-access ENV=$(ENV) passed"; \
+	echo "  Steady state:  make maintain ENV=$(ENV) (from this commit)"
+
 maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): audit-schema -> derive-assignments -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); export GENIERAILS_RERUN_TARGET=maintain; mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
-	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; $(call _ENV_LOCK,maintain); \
+	if [ "$$mode" = deterministic ]; then $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; fi; \
+	if [ "$$mode" = deterministic ]; then $(_EXTERNAL_MASK_INVENTORY) || exit 1; fi; $(call _ENV_LOCK,maintain); \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) --no-print-directory _guarded-bootstrap _guard-workspace-target ENV="$(ENV)" || exit 1; \
 	if [ "$$($(call _HAS_AGENTS,$(ENV_DIR)/env.auto.tfvars))" = 1 ]; then python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --id-files --warn; fi; \
@@ -833,13 +1079,14 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		python3 "$(SHARED_ROOT)/scripts/remap_env_config.py" "$(SOURCE_ENV_DIR)" "$$dest_env_dir" "$(DEST_CATALOG_MAP)" || exit 1; \
 		mkdir -p "$$dest_env_dir/generated"; \
 		map_flags=$$(python3 -c 'pairs = [p.strip() for p in "$(DEST_CATALOG_MAP)".split(",") if "=" in p]; print(" ".join("--map " + p for p in pairs))'); \
+		name_flags=(--state "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/terraform.tfstate" --auth "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/auth.auto.tfvars"); \
+		if [ "$$($(_IS_DETERMINISTIC) "$(SOURCE_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then name_flags=(--pure); fi; \
 		python3 "$(SHARED_ROOT)/scripts/remap_generated_config.py" \
 			"$(SOURCE_ENV_DIR)/generated/abac.auto.tfvars" \
 			"$(SOURCE_ENV_DIR)/generated/masking_functions.sql" \
 			"$$dest_env_dir/generated/abac.auto.tfvars" \
 			"$$dest_env_dir/generated/masking_functions.sql" \
-			--state "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/terraform.tfstate" \
-			--auth "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/auth.auto.tfvars" \
+			"$${name_flags[@]}" \
 			--group-map-env "$$dest_env_dir/env.auto.tfvars" --source-env "$(SOURCE_ENV_DIR)/env.auto.tfvars" \
 			$$map_flags $(if $(filter 1,$(VERBOSE)),,--quiet-remaps); \
 		python3 "$(SHARED_ROOT)/scripts/derive_genie_acls.py" \
@@ -870,19 +1117,21 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 			exit 0; \
 		fi; \
 		echo "=== Split generated/ to account + data_access + workspace ($(ENV)) ==="; \
-		acl_ok=0; trap 'if [ "$$acl_ok" != 1 ]; then rm -f "$(ENV_DIR)/generated/genie_space_derived_acl_groups.auto.tfvars" "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" "$(ENV_DIR)/abac.auto.tfvars"; fi' EXIT; \
+		$(_OVERLAY) ensure --env-dir "$(ENV_DIR)" || exit 1; \
+		$(_EFFECTIVE_GENERATED); \
+		acl_ok=0; trap 'if [ "$$acl_ok" != 1 ]; then rm -f "$$(dirname "$$gen_abac")/genie_space_derived_acl_groups.auto.tfvars" "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" "$(ENV_DIR)/abac.auto.tfvars"; fi' EXIT; \
 		python3 "$(SHARED_ROOT)/scripts/derive_genie_acls.py" \
-			"$(ENV_DIR)/generated/abac.auto.tfvars" \
+			"$$gen_abac" \
 			"$(ENV_DIR)/env.auto.tfvars"; \
-		if [ -f "$(ENV_DIR)/generated/masking_functions.sql" ]; then \
-			cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" generated/abac.auto.tfvars generated/masking_functions.sql $(call _VALIDATION_FLAGS,promote-generated); \
+		if [ -f "$$gen_sql" ]; then \
+			cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" "$$gen_abac" "$$gen_sql" $(call _VALIDATION_FLAGS,promote-generated); \
 		else \
-			cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" generated/abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-generated); \
+			cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" "$$gen_abac" $(call _VALIDATION_FLAGS,promote-generated); \
 		fi; \
-		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/split_abac_config.py" generated/abac.auto.tfvars ../$(ACCOUNT_ENV)/abac.auto.tfvars $(DATA_ACCESS_SUBDIR)/abac.auto.tfvars abac.auto.tfvars; \
+		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/split_abac_config.py" "$$gen_abac" ../$(ACCOUNT_ENV)/abac.auto.tfvars $(DATA_ACCESS_SUBDIR)/abac.auto.tfvars abac.auto.tfvars; \
 		acl_ok=1; \
-		if [ -f "$(ENV_DIR)/generated/masking_functions.sql" ]; then \
-			cp "$(ENV_DIR)/generated/masking_functions.sql" "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/masking_functions.sql"; \
+		if [ -f "$$gen_sql" ]; then \
+			cp "$$gen_sql" "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/masking_functions.sql"; \
 		fi; \
 		cd "$(ACCOUNT_ENV_DIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-account); fi; \
 		cd "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars masking_functions.sql $(call _VALIDATION_FLAGS,promote-data-access); fi; \
@@ -1185,11 +1434,13 @@ apply-genie: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## [
 	if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 	if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
 		echo "=== Extracting workspace config from genie draft ($(ENV)) ==="; \
+		$(_OVERLAY) ensure --env-dir "$(ENV_DIR)"; \
+		gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)"; \
 		python3 "$(SHARED_ROOT)/scripts/derive_genie_acls.py" \
-			"$(ENV_DIR)/generated/abac.auto.tfvars" \
+			"$$gen_abac" \
 			"$(ENV_DIR)/env.auto.tfvars"; \
 		python3 "$(SHARED_ROOT)/scripts/split_abac_config.py" \
-			"$(ENV_DIR)/generated/abac.auto.tfvars" \
+			"$$gen_abac" \
 			"$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" \
 			"$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" \
 			"$(ENV_DIR)/abac.auto.tfvars"; \

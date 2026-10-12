@@ -202,6 +202,7 @@ def remap_policy_names(
     pairs: list[tuple[str, str]],
     state_keys: set[tuple[str, str]] | None = None,
     live_names: Callable[[str], set[str] | None] | None = None,
+    *, pure: bool = False,
 ) -> tuple[str, list[str]]:
     """Carry the destination catalog into fgac policy names.
 
@@ -215,6 +216,11 @@ def remap_policy_names(
     when the state holds it under the new key (the same managed policy);
     otherwise this raises, since neither name can be applied safely. Drafts and
     config files are never evidence.
+
+    ``pure`` (a deterministic source, design section 9): every policy takes its
+    destination name and neither state nor the live listing is read, so the
+    output is a function of the commit alone. make release-plan keeps the names
+    prod already deploys in an ignored overlay (scripts/runtime_overlay.py).
     """
     import hcl2
 
@@ -232,7 +238,7 @@ def remap_policy_names(
         src = policy.get("catalog") or ""
         dest = mapping.get(src, src)
         new_name = remap_policy_name(name, src, dest)
-        if new_name != name:
+        if new_name != name and not pure:
             if dest not in live_cache:
                 live_cache[dest] = live_names(dest) if live_names else None
             live = live_cache[dest]
@@ -295,6 +301,7 @@ def parse_args() -> argparse.Namespace:
         ns.quiet_remaps = False
         ns.state = None
         ns.auth = None
+        ns.pure = False
         return ns
 
     parser = argparse.ArgumentParser(
@@ -336,6 +343,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--source-env", metavar="PATH", type=Path,
                         help="Source env.auto.tfvars (its raw_exempt_principals).")
+    parser.add_argument("--pure", action="store_true",
+                        help="Name every promoted policy after its destination catalog without reading "
+                             "--state or listing live policies (deterministic promotions).")
     return parser.parse_args()
 
 
@@ -513,8 +523,9 @@ def main() -> None:
             args.source_abac.read_text(),
             remap_hcl(args.source_abac.read_text(), pairs),
             pairs,
-            read_state_policy_keys(args.state),
-            live_policy_lister(args.auth),
+            None if args.pure else read_state_policy_keys(args.state),
+            None if args.pure else live_policy_lister(args.auth),
+            pure=args.pure,
         )
     except (RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}")

@@ -24,6 +24,9 @@ masking_functions.sql
 # User-created environment directories
 envs/
 
+# Rehearse/release receipts and release manifests (unless GENIERAILS_STATE_DIR is set)
+.genierails-state/
+
 # Local import IDs
 import_ids.env
 

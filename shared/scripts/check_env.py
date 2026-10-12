@@ -15,9 +15,11 @@ lands in the scratch dir, which is deleted afterwards. Nothing under envs/ is
 written, no Databricks write API is called and no applying target runs, so
 both commands are safe under CI=true and never trip the CI apply guard.
 
-TODO(rollout step 9): check the dev receipt store (PR check) and the
-release-plan overlay of deployed policy names; until then promote-to output
-is compared as promote-to writes it with no prod state.
+promote-to is a pure function of the commit (design section 9): for a
+deterministic source it never reads prod state or lists live policies, so
+the comparison is exact. The deployed policy names prod keeps are an ignored
+overlay make release-plan builds (scripts/runtime_overlay.py).
+TODO(rollout step 12): check the dev receipt store in the PR check.
 TODO(rollout step 12, remote state): a state-aware plan once an env has remote
 state; until then the plan is always structural (empty state).
 """
@@ -172,6 +174,9 @@ class Scratch:
     def make(self, target: str, *args: str) -> int:
         env = {k: v for k, v in os.environ.items() if k not in LEAKED_VARS}
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # The copy has no runtime overlay: regenerations write generated/ in
+        # place, which is what the comparison checks (scripts/runtime_overlay.py).
+        env["GENIERAILS_NO_OVERLAY"] = "1"
         command = [self.make_bin, "-C", str(self.cloud), "--no-print-directory", target,
                    f"CLOUD_ROOT={self.cloud}", f"SHARED_ROOT={SHARED_ROOT}", *args]
         sys.stdout.flush()
