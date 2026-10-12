@@ -745,7 +745,11 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     rollbacks = rollback_consequences(env_dir, env, entries)
     if rollback:
         rollbacks[rollback["key"]] = rollback["consequence"]
-    consequences = merge_consequences(weak.consequences, reader_consequences, group_consequences, rollbacks)
+    from scripts.agent_ownership import delete_consequences
+
+    deletes = delete_consequences(env_dir, env)
+    consequences = merge_consequences(weak.consequences, reader_consequences, group_consequences, rollbacks,
+                                      deletes)
     # Unclassified acks belong to the classification check (ACK_UNCLASSIFIED today)
     # and revoke acks to the migration (rollout step 10): not reconciled here.
     reconciled = [e for e in entries if e.kind not in ("unclassified", "revoke")]
@@ -756,7 +760,7 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         "weakening": {"acknowledged": [asdict(w) for w in weak.acknowledged],
                       "unacknowledged": [asdict(w) for w in weak.unacknowledged]},
         "readers": {"tables": tables, "inventories": reader_reports, "checks": reader_checks},
-        "group_map": group_consequences, "rollback": rollbacks,
+        "group_map": group_consequences, "rollback": rollbacks, "agent_deletions": deletes,
         "unmatched_acknowledgements": [e.key for e in unmatched],
     }
 
@@ -1016,7 +1020,7 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
         "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
         "phase_manifests": [m["id"] for m in phase_records(cloud_dir, env, manifest["commit"])],
         # Prod agent IDs live here and in state, never in git (design section 5).
-        "agents": receipt_agents(env_dir),
+        "agents": receipt_agents(env_dir, manifest),
         "state_serials": state_serials(env_dir), "host": socket.gethostname(), "created_at": _now(),
     }
     stamp = receipt["created_at"].replace(":", "").replace(".", "")

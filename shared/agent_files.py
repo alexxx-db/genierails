@@ -8,12 +8,15 @@ genie_spaces list.
 
 An agent file holds:
 
-    genie_space_id   = ""        # dev: the agent's ID. prod: leave "" (kept in
-                                 # state and the release receipt, never in git)
+    genie_space_id   = ""        # dev: the agent's ID. prod (any promoted
+                                 # deterministic env): must stay "" -- kept in
+                                 # state and the release receipt, never in git
     acl_groups       = ["analysts"]
     detached         = false     # true (with acl_groups = []) revokes CAN_RUN;
                                  # then make detach-agent forgets it
-    delete           = false     # true deletes the agent on the next apply
+    delete           = false     # true deletes the agent (and its conversations)
+                                 # on the next release; needs the committed ack
+                                 # <env>:delete-agent:<key> in envs/<env>/ack.txt
     uc_tables        = []        # optional; else the captured payload's tables
     sql_warehouse_id = ""        # optional per-agent warehouse
 
@@ -48,6 +51,13 @@ STATE_RESOURCES = (
 
 class AgentFileError(ValueError):
     pass
+
+
+def promoted(env_dir: Path) -> bool:
+    """A deterministic promote-to target (promote_from set, or prod), as release_gate.env_role says."""
+    cfg = _load_hcl(Path(env_dir) / "env.auto.tfvars")
+    return cfg.get("governance_mode", "legacy") == "deterministic" and bool(
+        cfg.get("promote_from") or Path(env_dir).name == "prod")
 
 
 def _load_hcl(path: Path) -> dict:
@@ -117,6 +127,11 @@ def load(env_dir: Path, name: str) -> dict[str, Any]:
         "uc_tables": list(tables),
         "sql_warehouse_id": str(raw.get("sql_warehouse_id") or "").strip(),
     }
+    if agent["genie_space_id"] and promoted(env_dir):
+        raise AgentFileError(
+            f"{path}: genie_space_id must be empty in {Path(env_dir).name}: a promoted env's agent IDs live in "
+            "its Terraform state and release receipt, never in git (to adopt an existing agent, write its ID "
+            f"into {Path(env_dir).name}/.genie_space_id_{space_key(name)}; release-plan then shows it)")
     if agent["detached"] and agent["delete"]:
         raise AgentFileError(f"{path}: set detached or delete, not both")
     if agent["detached"] and agent["acl_groups"] != []:
