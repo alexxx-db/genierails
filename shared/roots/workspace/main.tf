@@ -71,6 +71,7 @@ locals {
       uc_tables        = local.legacy_full_uc_tables
       acl_groups       = null
       delete           = false
+      captured         = false
     }] : []
   )
 
@@ -140,9 +141,12 @@ locals {
       configured_sql_warehouse_id = s.sql_warehouse_id
       uc_tables                   = s.uc_tables
       # Deterministic: the agent's own acl_groups, never a derived or drafted list.
+      # A captured agent (agents/<name>.space.json) gets no config from
+      # Terraform: dev's stays as curated in the UI, and release pushes prod's
+      # from the captured file (scripts/agent_ownership.py).
       config = (local.deterministic
-        ? merge(try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
-        : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
+        ? merge(s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
+        : s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
       )
     }
   }
@@ -391,9 +395,10 @@ variable "genie_spaces" {
     uc_tables        = optional(list(string), [])
     acl_groups       = optional(list(string), null)
     delete           = optional(bool, false)
+    captured         = optional(bool, false)
   }))
   default     = []
-  description = "User-owned Genie agent definitions. 'name' is the semantic-config lookup key. acl_groups omitted/null derives fresh from policy principals, [] explicitly grants nobody, and a non-empty list is the durable override; generated semantic drafts do not own ACLs."
+  description = "User-owned Genie agent definitions. captured is set by the agent-file loader (agent_files.py) for an agent with agents/<name>.space.json. 'name' is the semantic-config lookup key. acl_groups omitted/null derives fresh from policy principals, [] explicitly grants nobody, and a non-empty list is the durable override; generated semantic drafts do not own ACLs."
 }
 
 variable "genie_space_id_to_name" {

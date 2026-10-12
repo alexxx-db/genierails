@@ -27,7 +27,7 @@ SHARED = Path(__file__).resolve().parents[1]
 if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
 
-from scripts.footprint import FootprintError, resolve_footprint  # noqa: E402
+from scripts.footprint import FootprintError, load_env_config, resolve_footprint  # noqa: E402
 
 MANIFEST = Path("generated/governed_tables.json")
 STATE = Path("data_access/terraform.tfstate")
@@ -243,8 +243,8 @@ def check_layout(env_dir: Path, env_name: str, tag_key: str | None = None) -> No
 
 def _agent_tables(env_dir: Path) -> list[str]:
     """Every table (or pattern) a configured agent still reads, fully qualified."""
-    cfg = _load_hcl(env_dir / "env.auto.tfvars")
     try:
+        cfg = load_env_config(env_dir)
         entries = list(resolve_footprint(env_dir))
     except FootprintError as exc:
         raise GovernedTablesError(str(exc)) from exc

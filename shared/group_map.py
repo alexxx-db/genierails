@@ -222,7 +222,9 @@ def main(argv: list[str] | None = None, lister: Callable[[Path], Iterable[str]] 
     parser.add_argument("--command-name", default="this command")
     args = parser.parse_args(argv)
     try:
-        cfg = _load_hcl(args.env_dir / "env.auto.tfvars")
+        from agent_files import merged_config
+
+        cfg = merged_config(args.env_dir)
         if cfg.get("governance_mode", "legacy") != "deterministic":
             return 0
         if args.command == "record":

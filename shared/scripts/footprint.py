@@ -9,6 +9,21 @@ from pathlib import Path
 import hcl2
 
 
+def load_env_config(env_dir: str | Path) -> dict:
+    """envs/<env>/env.auto.tfvars with the per-agent files merged in (shared/agent_files.py)."""
+    import sys
+
+    shared = str(Path(__file__).resolve().parents[1])
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    from agent_files import AgentFileError, merged_config
+
+    try:
+        return merged_config(Path(env_dir))
+    except AgentFileError as exc:
+        raise FootprintError(str(exc)) from exc
+
+
 class FootprintError(ValueError):
     """A footprint file cannot be parsed or has an unsafe shape."""
 
@@ -63,7 +78,7 @@ def resolve_footprint(
 ) -> list[str]:
     """Return top-level, per-space, and discovered tables in stable order."""
     env_dir = Path(env_dir)
-    config = load_hcl(Path(env_file) if env_file is not None else env_dir / "env.auto.tfvars")
+    config = load_hcl(Path(env_file)) if env_file is not None else load_env_config(env_dir)
     tables = list(config.get("uc_tables") or [])
     for space in config.get("genie_spaces") or []:
         tables.extend(space.get("uc_tables") or [])

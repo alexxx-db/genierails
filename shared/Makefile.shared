@@ -3,9 +3,9 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
-# ── Variables expected from the including Makefile ──────────────
 .PHONY: capture detach-agent
 
+# ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
 # CLOUD_ROOT   — absolute path to aws/ or azure/
 # CLOUD        — "aws" or "azure"
@@ -213,7 +213,6 @@ _guarded-bootstrap:
 	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(MAKE) --no-print-directory _guard-root ENV="$(ENV)" ENV_ORIGIN="$(ENV_ORIGIN)"
 	@$(MAKE) --no-print-directory _prepare-env ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
-	@python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" assemble --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _guard-workspace-target:
 	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -409,20 +408,30 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	@if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ] && grep -Eq '^[[:space:]]*governance_mode[[:space:]]*=[[:space:]]*"deterministic"' "$(ENV_DIR)/env.auto.tfvars"; then \
 		$(_STICKY) record --env-dir "$(ENV_DIR)" --config "$(ENV_DIR)/generated/abac.auto.tfvars"; \
 	fi
+	@if [ "$(ENV)" = "$(DEFAULT_ENV)" ]; then $(_AGENT_OWNERSHIP) import-new --env-dir "$(ENV_DIR)" --env "$(ENV)"; fi
 	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars")" = 1 ]; then \
 		$(_TABLE_READERS) propose --env-dir "$(ENV_DIR)" && $(_ACCESS_CHECK) "make generate"; \
 	fi
 
-capture: _guarded-bootstrap _guard-workspace-target ## Export one dev Genie agent to agents/<name>.space.json (read-only)
+# Agents (scripts/agent_ownership.py, design section 5). capture is authoring:
+# one read-only GET, writes only envs/dev/agents/<agent>.space.json; no
+# governance drafting, no model call, no Terraform state. A plain generate
+# captures only agents with no capture yet (import-new) and never re-captures.
+_AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
+capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/dev/agents/<agent>.space.json: SPACE="<agent>" (read-only)
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
-	@$(_DRY_RUN_GUARD); python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" capture \
-		--env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)"
+	@if [ "$(ENV)" != "$(DEFAULT_ENV)" ]; then echo "ERROR: capture runs only with ENV=$(DEFAULT_ENV); promote-to carries agents to $(ENV)." >&2; exit 1; fi
+	@$(_DRY_RUN_GUARD); $(_AGENT_OWNERSHIP) capture --env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)"
 
-detach-agent: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Revoke CAN_RUN and detach one agent without deleting it
+# Step 2 of removing an agent (operations stage). Step 1, a released PR with
+# acl_groups = [] and detached = true, revoked CAN_RUN; this only forgets the
+# agent's exact workspace-state addresses, so the agent and its conversations
+# stay. Refuses unless HEAD is the last released commit and that release had
+# the agent detached. Writes no committed file.
+detach-agent: _guard-not-ci-apply _guard-workspace-target ## Forget a released, detached agent from Terraform state (never deletes it): SPACE="<agent>"
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
 	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,detach-agent); \
-	python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" detach --env-dir "$(ENV_DIR)" \
-		--env "$(ENV)" --space "$(SPACE)" --runner "$(ROOT_RUNNER)"
+	$(_AGENT_OWNERSHIP) detach --env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)" --runner "$(ROOT_RUNNER)"
 
 # Takes one table out of a deterministic env's governed set, removes its
 # treatment tags and applies governance. Refuses while any agent uses it; the
@@ -581,12 +590,12 @@ _ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2
 
 # 1 when the env is deterministic and configures no agent: governance only.
 # A genie_space_title alone also creates an agent (the legacy single-space path).
-_GOVERNANCE_ONLY = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id") and not c.get("genie_space_title")))'
+_GOVERNANCE_ONLY = python3 -c 'import glob,hcl2,os,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id") and not c.get("genie_space_title") and not glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars"))))'
 # 1 when the env is deterministic: CAN_RUN rests on the live agent coverage check.
 _IS_DETERMINISTIC = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic"))'
 # 1 when the env configures an agent or its workspace state still holds one
 # (envs/<env>/terraform.tfstate next to env.auto.tfvars; unreadable counts).
-_HAS_AGENTS = { python3 -c 'import hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); st=os.path.join(os.path.dirname(sys.argv[1]),"terraform.tfstate"); r=json.load(open(st)).get("resources",[]) if os.path.exists(st) else []; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or any(str(x.get("name","")).startswith("genie_space") for x in r))))' "$(1)" 2>/dev/null || echo 1; }
+_HAS_AGENTS = { python3 -c 'import glob,hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); st=os.path.join(os.path.dirname(sys.argv[1]),"terraform.tfstate"); r=json.load(open(st)).get("resources",[]) if os.path.exists(st) else []; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars")) or any(str(x.get("name","")).startswith("genie_space") for x in r))))' "$(1)" 2>/dev/null || echo 1; }
 # Live "agent tables covered" check (scripts/agent_coverage.py): run before
 # every deterministic workspace plan/apply; the workspace root reads its result.
 _AGENT_COVERAGE = python3 "$(SHARED_ROOT)/scripts/agent_coverage.py"
@@ -747,8 +756,13 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		fi; \
 		exit $$audit_rc; \
 	fi; \
+	$(_AGENT_OWNERSHIP) restore-ids --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	if ! $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0; then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "apply failed"; \
+		exit 1; \
+	fi; \
+	if ! $(_AGENT_OWNERSHIP) sync --env-dir "$(ENV_DIR)" --env "$(ENV)"; then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "a captured Genie agent config was rejected"; \
 		exit 1; \
 	fi; \
 	if ! $(MAKE) verify-access ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
@@ -761,6 +775,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the staged policy journal could not be confirmed"; \
 		exit 1; \
 	fi; \
+	$(_AGENT_OWNERSHIP) receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	echo ""; \
 	echo "=== Release complete ($(ENV)) ==="; \
 	if [ "$$mode" = deterministic ]; then \
@@ -933,6 +948,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	if [ -f "$$src_dir/generated/abac.auto.tfvars" ]; then \
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
 	fi; \
+	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
 	$(_TABLE_READERS) show --env-dir "$$dest_dir"
 
 # Read-only PR check (scripts/check_env.py): every step runs in a scratch copy
@@ -970,7 +986,7 @@ _plan-layer:
 		exit 0; \
 	fi; \
 	if [ "$$layer" = "workspace" ]; then \
-		python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" guard-removals --env-dir "$$env_dir" --env "$$target_env" --runner "$(ROOT_RUNNER)"; \
+		$(_AGENT_OWNERSHIP) guard-removals --env-dir "$$env_dir" --env "$$target_env"; \
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(_STICKY) check-layout --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env"; \
@@ -1056,7 +1072,7 @@ _apply-layer: _guard-not-ci-apply
 		exit 0; \
 	fi; \
 	if [ "$$layer" = "workspace" ]; then \
-		python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" guard-removals --env-dir "$$env_dir" --env "$$target_env" --runner "$(ROOT_RUNNER)"; \
+		$(_AGENT_OWNERSHIP) guard-removals --env-dir "$$env_dir" --env "$$target_env"; \
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(_COVERAGE_GATE) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags" $(if $(filter 1,$(VERBOSE)),--verbose,); \
@@ -1152,7 +1168,6 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		echo "=== Waiting 30s for data_access resources to propagate before workspace apply ==="; \
 		sleep 30; \
 		$(MAKE) --no-print-directory _apply-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)" DEFER_WITHHELD=1; \
-		python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" sync-prod --env-dir "$(ENV_DIR)" --env "$(ENV)"; \
 		withheld_rc=0; \
 		$(_COVERAGE_GATE) withheld --layer data_access --layer-dir "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" --env-name "$(ENV)" || withheld_rc=1; \
 		$(_COVERAGE_GATE) withheld --layer workspace --layer-dir "$(ENV_DIR)" --env-name "$(ENV)" || withheld_rc=1; \
@@ -1219,8 +1234,7 @@ apply-genie: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## [
 	fi; \
 	$(_COVERAGE_GATE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" --apply-flags="$(APPLY_FLAGS)" $(if $(filter 1,$(VERBOSE)),--verbose,) \
 		|| echo "WARNING: the coverage check did not pass; only CAN_RUN changes that keep, shrink or clear what is applied can proceed." >&2; \
-	$(MAKE) --no-print-directory _apply-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
-	python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" sync-prod --env-dir "$(ENV_DIR)" --env "$(ENV)"
+	$(MAKE) --no-print-directory _apply-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"
 
 destroy-governance: _guard-not-ci-apply _bootstrap _guard-workspace-target ## [Governance team] Destroy data_access layer for the selected env (leaves workspace/Genie untouched)
 	@$(MAKE) --no-print-directory _destroy-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"
