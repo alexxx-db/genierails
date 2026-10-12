@@ -1,0 +1,80 @@
+# GenieRails prod maintain (azure), Azure DevOps.
+#
+# Stage 5, "Keep protected", of shared/docs/cicd.md: on a schedule.
+#
+#   make maintain ENV=prod     at the last released commit
+#
+# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the release
+# receipt (rollout step 9), which names the last released commit. Until both
+# exist the operator runs make maintain ENV=prod on the deployment machine,
+# on its own schedule, at the last released commit, in the same persistent
+# checkout as releases (`git fetch && git checkout --force --detach <sha>`,
+# an empty `git status --porcelain`, never `git clean -x` or a re-clone; see
+# prod-release.yml). The CI guard refuses every applying target here
+# (TF_BUILD is set). Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 this
+# pipeline runs the read-only drift audit, which exits non-zero when
+# sensitive columns are untagged or tag assignments are stale; subscribe the
+# owning team to failed-run notifications.
+#
+# It uses no environment, so it never takes or waits for the release
+# pipeline's Exclusive Lock on "genierails-prod", and a release waiting
+# for approval cannot hold it back. Release and maintain must never apply
+# to prod at the same time; on the deployment machine the GenieRails env
+# lock serialises them.
+#
+# Auth: OIDC workload identity federation (azure-devops-oidc), no PATs or
+# secrets. Variable group "genierails-ids" holds the prod read-only SP's IDs;
+# that SP also needs CAN_USE on a SQL warehouse:
+#   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
+#   PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: '0 3 * * *'
+    displayName: Daily drift audit
+    branches:
+      include: [main]
+    always: true
+
+variables:
+  - group: genierails-ids
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  # TODO(rollout step 9): check out the last released commit, read from the
+  # release receipt, instead of main.
+  - checkout: self
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+
+  - script: pip install python-hcl2 databricks-sdk
+    displayName: Install dependencies
+
+  - script: |
+      mkdir -p envs/prod
+      printf '%s\n' \
+        "databricks_account_id     = \"$ACCOUNT_ID\"" \
+        "databricks_client_id      = \"$CLIENT_ID\"" \
+        'databricks_client_secret  = ""' \
+        "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
+        "databricks_workspace_host = \"$HOST\"" > envs/prod/auth.auto.tfvars
+    displayName: Write OIDC auth file (IDs only, no secrets)
+    workingDirectory: azure
+    env:
+      ACCOUNT_ID: $(DATABRICKS_ACCOUNT_ID)
+      CLIENT_ID: $(PROD_READONLY_CLIENT_ID)
+      WORKSPACE_ID: $(PROD_DATABRICKS_WORKSPACE_ID)
+      HOST: $(PROD_DATABRICKS_WORKSPACE_HOST)
+
+  - script: make audit-schema ENV=prod
+    displayName: Read-only drift audit (v1; maintain REQUIRES PROD REMOTE STATE)
+    workingDirectory: azure
+    env:
+      DATABRICKS_AUTH_TYPE: azure-devops-oidc
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)

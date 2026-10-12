@@ -89,7 +89,7 @@ def test_release_runs_unified_pipeline_in_order_and_writes_no_receipt(tmp_path):
         _same_env_promote(env_dir),
         ["verify-access-keys", "ENV=prod", "VERIFY_KEY_COLUMN=customer_id"],
         ["audit-rulebook", "ENV=prod"],
-        ["apply", "ENV=prod", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1"],
+        ["apply", "ENV=prod", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
         ["verify-access", "ENV=prod", "VERIFY_REQUIRE_MASKS=1", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate to open or persist: release neither passes nor writes it. The
@@ -524,7 +524,9 @@ def test_retired_flag_in_caller_apply_flags_warns_once_though_nested_apply_clear
     assert "(APPLY_FLAGS)" in warnings[0]
     # What reaches Terraform is unchanged: the nested apply still gets empty flags.
     nested_calls = [call for call in calls if call[0] == nested]
-    assert nested_calls == [[nested, f"ENV={env_name}", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1"]]
+    # rehearse and release confirm the staged policy journal themselves, after their verification.
+    confirm = ["_STAGED_CONFIRM=0"] if nested == "apply" else []
+    assert nested_calls == [[nested, f"ENV={env_name}", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", *confirm]]
     assert not any(f"APPLY_FLAGS={flags}" in call for call in calls)
 
 
@@ -543,3 +545,15 @@ def test_no_retired_flag_means_no_warning_through_nested_apply(tmp_path, target,
     assert warnings == []
 
 
+
+
+@pytest.mark.parametrize("target", ["release", "maintain"])
+@pytest.mark.parametrize("script_rc,says", [(1, "reported drift"), (2, "failed (error, not drift)")])
+def test_audit_rulebook_script_exit_code_survives_the_nested_make(tmp_path, target, script_rc, says):
+    """A failed $(MAKE) exits 2; the audit's own code comes back through its rc file."""
+    env_dir = _env_dir(tmp_path)
+    stub, _log, audit = _stub(tmp_path, on={
+        "audit-rulebook": f'echo {script_rc} > "$GENIERAILS_AUDIT_RC_FILE"; exit 2'})
+    result = _make(target, env_dir, stub, audit)
+    assert result.returncode != 0  # the outer make exits 2 either way
+    assert f"{target}: audit-rulebook {says}" in result.stderr

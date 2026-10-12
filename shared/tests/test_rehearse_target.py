@@ -102,7 +102,7 @@ def test_rehearse_with_key_derives_validates_gates_applies_and_verifies(tmp_path
         ["_derive-before-exposure", "ENV=dev", "APPLY_FLAGS="],
         ["validate-generated", "ENV=dev"],
         ["coverage-gate", "ENV=dev"],
-        ["apply", "ENV=dev", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1"],
+        ["apply", "ENV=dev", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
         ["verify-access", "ENV=dev", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate toggle: nothing passes or writes the retired flag.
@@ -129,7 +129,7 @@ def test_rehearse_without_key_runs_key_independent_live_verification(tmp_path):
         ["_derive-before-exposure", "ENV=dev", "APPLY_FLAGS="],
         ["validate-generated", "ENV=dev"],
         ["coverage-gate", "ENV=dev"],
-        ["apply", "ENV=dev", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1"],
+        ["apply", "ENV=dev", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
         ["verify-access", "ENV=dev"],
     ]
     assert "skipped verify-access" not in output

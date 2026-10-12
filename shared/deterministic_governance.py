@@ -165,6 +165,9 @@ def _validate_ack_list(name: str, value: str | None, *, principal: bool) -> list
     return errors
 
 
+from table_readers import is_everyone  # noqa: E402
+
+
 def validate_config(
     cfg: Mapping[str, Any], *, ack_unclassified: str | None = None,
     ack_weaken: str | None = None,
@@ -178,6 +181,12 @@ def validate_config(
     if not isinstance(raw_exempt, list) or not all(
             isinstance(x, str) and x.strip() for x in raw_exempt):
         errors.append("raw_exempt_principals must be a list of non-empty principal names")
+    elif any(is_everyone(principal) for principal in raw_exempt):
+        named = ", ".join(repr(p) for p in raw_exempt if is_everyone(p))
+        errors.append(
+            f"raw_exempt_principals may not name {named}: that built-in group is everyone, so "
+            "everyone would see raw values on every masked column (exempt specific groups or "
+            "service principals instead)")
     elif any("@" in principal for principal in raw_exempt):
         errors.append(
             "raw_exempt_principals must name account groups; user emails cannot be verified. "
@@ -335,6 +344,10 @@ def validate_config(
                     errors.append(f"agent {name} acl_groups must not contain duplicates")
             if "delete" in space and not isinstance(space["delete"], bool):
                 errors.append(f"agent {name} delete must be a boolean")
+    from table_readers import validation_errors as table_readers_errors
+    errors.extend(table_readers_errors(cfg))
+    from group_map import validation_errors as group_map_errors
+    errors.extend(group_map_errors(cfg))
     errors.extend(_validate_ack_list("ACK_UNCLASSIFIED", ack_unclassified, principal=False))
     errors.extend(_validate_ack_list("ACK_WEAKEN", ack_weaken, principal=True))
     return errors

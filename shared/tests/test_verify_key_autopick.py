@@ -928,7 +928,8 @@ def test_verify_access_passes_the_per_table_map():
     body = makefile[makefile.index("\nverify-access:"):]
     body = body[:body.index("\n\n")]
     assert "$(_VERIFY_KEY_FLAGS)" in body
-    assert '_VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(ENV_DIR)/env.auto.tfvars"' in makefile
+    # VERIFY_ENV_FILE is set only by the staged policy controller, for one stage's tier settings.
+    assert '_VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)"' in makefile
 
 
 def test_resolve_warehouse_allow_unset_only_relaxes_the_unset_case(tmp_path):

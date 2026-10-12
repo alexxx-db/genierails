@@ -165,6 +165,35 @@ variable "tag_assignments" {
   description = "Classifier-owned tag-to-entity facts. Promotion leaves this empty so each environment derives assignments from its own classification scan."
 }
 
+variable "governance_mode" {
+  type    = string
+  default = "legacy"
+}
+
+variable "table_readers" {
+  type        = map(list(string))
+  default     = null
+  description = "Deterministic envs: fully qualified table (or catalog.schema.*) => groups granted SELECT; a table's readers are the union of every matching entry. null (unset) grants nothing and refuses to revoke grants already applied; {} grants nothing."
+}
+
+variable "access_tier_groups" {
+  type        = list(string)
+  default     = []
+  description = "Deterministic tiers; every table_readers group must be one, or in raw_exempt_principals."
+}
+
+variable "raw_exempt_principals" {
+  type        = list(string)
+  default     = []
+  description = "Deterministic raw-exempt principals; also allowed as table_readers groups."
+}
+
+variable "governed_tables" {
+  type        = list(string)
+  default     = []
+  description = "Other tables known to be governed (generated/governed_tables.json), so catalog.schema.* readers reach them."
+}
+
 variable "fgac_policies" {
   type = list(object({
     name              = string
@@ -221,4 +250,10 @@ variable "deploy_masking_script" {
 variable "auth_file" {
   type        = string
   description = "Path to the layer's auth.auto.tfvars; deploy_masking_functions.py reads the current SP credentials from it."
+}
+
+variable "withhold_new_table_grants" {
+  type        = bool
+  default     = false
+  description = "Plan no new SELECT (grants already applied are kept). The root sets it for every staged policy phase but the final grant phase, so new access opens only after the new protection is switched in and verified."
 }

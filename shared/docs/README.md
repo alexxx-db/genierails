@@ -12,7 +12,7 @@ New here? Start with the **[Dev-to-Prod Walkthrough](../examples/dev_to_prod/)**
 - **[Prerequisites](prerequisites.md)** — OS, Python, Terraform, network, Databricks account, cloud credentials.
 - **[Architecture](architecture.md)** — layers, artifact ownership, config files, Genie agent lifecycle.
 - **[Version Control & Standalone Terraform](version-control.md)** — what to commit, version pinning, running Terraform directly.
-- **[CI/CD](cicd.md)** — validate and deploy from a pipeline.
+- **[CI/CD](cicd.md)** — which stage runs in CI and which on the deployment machine.
 
 ### Customize
 - **[Country & Region Overlays](country-overlays.md)** — region-specific PII governance (ANZ, India, Southeast Asia).

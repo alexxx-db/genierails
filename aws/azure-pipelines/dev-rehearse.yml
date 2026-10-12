@@ -1,0 +1,104 @@
+# GenieRails dev (aws), Azure DevOps. Name the pipeline "genierails-dev-aws":
+# the prod pipeline triggers on it by that name.
+#
+# Stage 3, "Dev rehearsal", of shared/docs/cicd.md: on every merge to main that
+# touches code, governance or envs/**. Every commit gets its own run
+# (batch: false), runs queue in commit order and none is ever cancelled:
+# lockBehavior: sequential plus an Exclusive Lock check on the
+# "genierails-dev" environment.
+#
+# REQUIRES DEV REMOTE STATE (rollout step 12). The stage's command is
+#
+#   make rehearse ENV=dev
+#
+# and it applies to dev, so it needs dev Terraform state with locking that
+# every agent shares. Until that exists the operator runs it on the
+# deployment machine, at each merged commit in order,
+# in that machine's one persistent checkout: v1 keeps Terraform state, the
+# env lock and the Genie ID files under its gitignored envs/, so a re-clone
+# loses them. Move the checkout with
+# `git fetch && git checkout --force --detach <sha>` (--force drops earlier
+# runs' edits to tracked generated/ and layer files and leaves the ignored
+# state alone), confirm `git status --porcelain` prints nothing, and never
+# run `git clean -x` or re-clone. (State outside the checkout, in
+# GENIERAILS_STATE_DIR, is the target.)
+# The CI guard refuses every applying target here (TF_BUILD is set). Do
+# not set GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
+# integration-test workspace. In v1 this stage re-runs the read-only check on
+# the merged commit, and the prod pipeline starts only after it passes.
+#
+# Auth: OIDC workload identity federation (azure-devops-oidc), no PATs or
+# secrets. Variable group "genierails-ids" holds the IDs:
+#   DATABRICKS_ACCOUNT_ID  DEV_DEPLOYER_CLIENT_ID
+#   DEV_DATABRICKS_WORKSPACE_ID  DEV_DATABRICKS_WORKSPACE_HOST
+
+trigger:
+  batch: false
+  branches:
+    include: [main]
+  paths:
+    include: [aws, shared]
+
+pr: none
+
+lockBehavior: sequential
+
+variables:
+  - group: genierails-ids
+  - name: TERRAFORM_VERSION
+    value: '1.11.4'
+
+stages:
+  - stage: Rehearse
+    displayName: Dev rehearsal (v1, check only; REQUIRES DEV REMOTE STATE)
+    jobs:
+      - deployment: rehearse
+        pool:
+          vmImage: ubuntu-latest
+        environment: genierails-dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: UsePythonVersion@0
+                  inputs:
+                    versionSpec: '3.11'
+
+                - script: |
+                    pip install python-hcl2 databricks-sdk pytest
+                    curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
+                    sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
+                  displayName: Install dependencies and Terraform
+
+                - script: |
+                    mkdir -p envs/dev
+                    printf '%s\n' \
+                      "databricks_account_id     = \"$ACCOUNT_ID\"" \
+                      "databricks_client_id      = \"$CLIENT_ID\"" \
+                      'databricks_client_secret  = ""' \
+                      "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
+                      "databricks_workspace_host = \"$HOST\"" > envs/dev/auth.auto.tfvars
+                  displayName: Write OIDC auth file (IDs only, no secrets)
+                  workingDirectory: aws
+                  env:
+                    ACCOUNT_ID: $(DATABRICKS_ACCOUNT_ID)
+                    CLIENT_ID: $(DEV_DEPLOYER_CLIENT_ID)
+                    WORKSPACE_ID: $(DEV_DATABRICKS_WORKSPACE_ID)
+                    HOST: $(DEV_DATABRICKS_WORKSPACE_HOST)
+
+                - script: make check ENV=dev
+                  displayName: Read-only check of the merged commit
+                  workingDirectory: aws
+                  env:
+                    DATABRICKS_AUTH_TYPE: azure-devops-oidc
+                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+                # TODO(rollout step 12): replace this step with the dev
+                # rehearsal once dev remote state with locking exists;
+                # TODO(rollout step 9): it then writes the commit's receipt.
+                - script: |
+                    echo "##[warning]Dev rehearsal not run in CI (v1): it applies to dev and requires dev remote state (rollout step 12)."
+                    echo "Run the rehearse command from this pipeline's header on the deployment machine, at $(Build.SourceVersion)."
+                  displayName: Dev rehearsal runs on the deployment machine (v1)

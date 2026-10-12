@@ -1,0 +1,127 @@
+name: GenieRails dev (aws)
+
+# Stage 3, "Dev rehearsal", of shared/docs/cicd.md: on every merge to main that
+# touches code, governance or envs/**. Copy to .github/workflows/ at the
+# repository root.
+#
+# Every commit gets its own run, in commit order, and no run is ever
+# cancelled. There is deliberately no concurrency group (GitHub cancels a
+# pending run when a newer one queues); the queue job instead waits until
+# every earlier run of this workflow has finished.
+#
+# REQUIRES DEV REMOTE STATE (rollout step 12). The stage's command is
+#
+#   make rehearse ENV=dev
+#
+# and it applies to dev, so it needs dev Terraform state with locking that
+# every runner shares. Until that exists the operator runs it on the
+# deployment machine, at each merged commit in order,
+# in that machine's one persistent checkout: v1 keeps Terraform state, the
+# env lock and the Genie ID files under its gitignored envs/, so a re-clone
+# loses them. Move the checkout with
+# `git fetch && git checkout --force --detach <sha>` (--force drops earlier
+# runs' edits to tracked generated/ and layer files and leaves the ignored
+# state alone), confirm `git status --porcelain` prints nothing, and never
+# run `git clean -x` or re-clone. (State outside the checkout, in
+# GENIERAILS_STATE_DIR, is the target.)
+# The CI guard refuses every applying target here. Do not set
+# GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
+# integration-test workspace. In v1 this job re-runs the read-only check on
+# the merged commit, and the prod pipeline starts only after it passes.
+#
+# Auth: OIDC workload identity federation, no PATs or secrets. The "dev"
+# environment holds the dev deployer service principal's IDs as variables:
+#   DATABRICKS_ACCOUNT_ID  DEV_DEPLOYER_CLIENT_ID
+#   DEV_DATABRICKS_WORKSPACE_ID  DEV_DATABRICKS_WORKSPACE_HOST
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'aws/**'
+      - 'shared/**'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: aws
+
+jobs:
+  queue:
+    name: Wait for earlier dev runs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Wait until every earlier run of this workflow has finished
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: .
+        run: |
+          workflow="${GITHUB_WORKFLOW_REF%@*}"
+          workflow="${workflow##*/}"
+          while :; do
+            earlier="$(gh api "repos/${{ github.repository }}/actions/workflows/${workflow}/runs?branch=main&per_page=100" \
+              --jq '[.workflow_runs[] | select(.run_number < ${{ github.run_number }} and .status != "completed")] | length')"
+            [ "$earlier" = 0 ] && break
+            echo "Waiting for ${earlier} earlier dev run(s) to finish..."
+            sleep 30
+          done
+
+  rehearse:
+    name: Dev rehearsal (v1, check only; REQUIRES DEV REMOTE STATE)
+    needs: queue
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install python-hcl2 databricks-sdk pytest
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Write OIDC auth file (IDs only, no secrets)
+        env:
+          ACCOUNT_ID: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+          CLIENT_ID: ${{ vars.DEV_DEPLOYER_CLIENT_ID }}
+          WORKSPACE_ID: ${{ vars.DEV_DATABRICKS_WORKSPACE_ID }}
+          HOST: ${{ vars.DEV_DATABRICKS_WORKSPACE_HOST }}
+        run: |
+          mkdir -p envs/dev
+          printf '%s\n' \
+            "databricks_account_id     = \"$ACCOUNT_ID\"" \
+            "databricks_client_id      = \"$CLIENT_ID\"" \
+            'databricks_client_secret  = ""' \
+            "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
+            "databricks_workspace_host = \"$HOST\"" > envs/dev/auth.auto.tfvars
+
+      - name: Read-only check of the merged commit
+        run: make check ENV=dev
+
+      # TODO(rollout step 12): replace this step with the dev rehearsal once
+      # dev remote state with locking exists; TODO(rollout step 9): it then
+      # writes the commit's receipt to the append-only receipt store.
+      - name: Dev rehearsal runs on the deployment machine (v1)
+        run: |
+          {
+            echo "### Dev rehearsal not run in CI (v1)"
+            echo "It applies to dev and requires dev remote state (rollout step 12)."
+            echo "Run the rehearse command from this workflow's header on the deployment machine, at ${{ github.sha }}."
+          } >> "$GITHUB_STEP_SUMMARY"

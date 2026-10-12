@@ -117,6 +117,19 @@ Each env keeps its own Terraform state and local artifacts. `account` is the onl
 
 `make sync-tags` runs against the shared account layer because tag policy definitions are account-scoped.
 
+## Independent Environments
+
+For a business unit or environment that should not inherit dev's governance,
+generate it on its own instead of promoting:
+
+```bash
+make generate ENV=bu2
+```
+
+Review and commit the result. CI runs `make check ENV=bu2`; after approval the
+deployment machine runs `make rehearse ENV=bu2`, which applies and verifies it.
+`make release` is only for envs filled by `make promote-to`. See [CI/CD](cicd.md).
+
 ## Migrating an Existing Root-Based Workspace
 
 If you already used the old root-local workflow, migrate it once before using the new default env dispatch:

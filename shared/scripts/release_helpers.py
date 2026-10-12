@@ -107,9 +107,29 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
     return 0
 
 
+def access_summary(env_dir: Path) -> list[str]:
+    """What a deterministic release granted, by mode; never claims access nothing grants."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from table_readers import _load_hcl, agents, normalize
+
+    cfg = _load_hcl(env_dir / "env.auto.tfvars")
+    lines = []
+    if normalize(cfg.get("table_readers")):
+        lines.append("  Table access:  SELECT from table_readers (new grants only after the coverage check passed)")
+    else:
+        lines.append("  Table access:  none granted (no table_readers); masks apply to whoever already has access")
+    runnable = [agent["name"] for agent in agents(env_dir, cfg) if agent["acl_groups"]]
+    if runnable:
+        lines.append("  Agent access:  CAN_RUN from acl_groups, opened only where the live agent coverage check "
+                     f"passed ({', '.join(runnable)})")
+    else:
+        lines.append("  Agent access:  none (no agent with acl_groups)")
+    return lines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("clear-old-receipts", "failed", "require-mask-proof"))
+    parser.add_argument("command", choices=("clear-old-receipts", "failed", "require-mask-proof", "access-summary"))
     parser.add_argument("env_dir", type=Path)
     parser.add_argument("--env", default="prod")
     parser.add_argument("--reason", default="the release failed")
@@ -123,6 +143,9 @@ def main() -> int:
         return 0
     if args.command == "require-mask-proof":
         return require_mask_proof(args.env_dir, args.env, args.key, args.spec, args.account_tfvars)
+    if args.command == "access-summary":
+        print("\n".join(access_summary(args.env_dir)))
+        return 0
     env_file = args.env_dir / "env.auto.tfvars"
     print(f"release: {args.reason}.\n  Business access (table SELECT / Genie CAN_RUN) for {args.env} may be PARTLY APPLIED;\n"
           f"  Terraform granted only what passed the coverage check. To withdraw access, remove the groups\n"

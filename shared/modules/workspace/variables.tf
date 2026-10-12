@@ -159,3 +159,9 @@ variable "genie_script_path" {
   type        = string
   description = "Path to scripts/genie_space.sh."
 }
+
+variable "manage_acls" {
+  type        = bool
+  default     = null
+  description = "Whether this module sets Genie ACLs. null keeps the legacy rule (only when groups is non-empty); deterministic roots pass true."
+}

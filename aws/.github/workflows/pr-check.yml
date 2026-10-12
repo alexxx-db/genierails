@@ -1,0 +1,100 @@
+name: GenieRails PR check (aws)
+
+# Stage 2, "PR check", of shared/docs/cicd.md: read-only, on every pull request.
+# Copy this file to .github/workflows/ at the repository root. On main, make
+# this job a required status check and require branches to be up to date
+# before merging, so every open PR re-runs against the latest main.
+#
+#   make check ENV=dev                 always
+#   make check ENV=prod                also, when the PR touches envs/prod/**
+#                                      (it includes make promote-to ENV=prod CHECK=1)
+#
+# make check never writes envs/ and runs no applying target, so it is safe
+# under CI=true and never trips the CI apply guard. Until an env has remote
+# state, its plan is a STRUCTURAL plan: the committed config against empty
+# state.
+#
+# Auth: OIDC workload identity federation; no PATs and no client secrets.
+# Give each read-only service principal a federation policy for this
+# repository (issuer https://token.actions.githubusercontent.com), then set
+# these repository variables (IDs, not credentials):
+#   DATABRICKS_ACCOUNT_ID
+#   DEV_READONLY_CLIENT_ID   DEV_DATABRICKS_WORKSPACE_ID   DEV_DATABRICKS_WORKSPACE_HOST
+#   PROD_READONLY_CLIENT_ID  PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
+# Read-only SPs need USE CATALOG, USE SCHEMA, BROWSE, read on
+# system.information_schema and CAN_VIEW on the agents. The Databricks
+# Terraform provider and SDK must support the github-oidc auth type. Pull
+# requests from forks get no OIDC token; their plan step fails.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    working-directory: aws
+
+jobs:
+  check:
+    name: make check
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install python-hcl2 databricks-sdk pytest
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Does this PR touch envs/prod?
+        id: scope
+        run: |
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- envs/prod | grep -q .; then
+            echo "prod=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Runtime files only (gitignored). make check copies them into its
+      # scratch dir for the plan step and never writes back to envs/.
+      - name: Write OIDC auth files (IDs only, no secrets)
+        env:
+          ACCOUNT_ID: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+          DEV_CLIENT_ID: ${{ vars.DEV_READONLY_CLIENT_ID }}
+          DEV_WORKSPACE_ID: ${{ vars.DEV_DATABRICKS_WORKSPACE_ID }}
+          DEV_HOST: ${{ vars.DEV_DATABRICKS_WORKSPACE_HOST }}
+          PROD_CLIENT_ID: ${{ vars.PROD_READONLY_CLIENT_ID }}
+          PROD_WORKSPACE_ID: ${{ vars.PROD_DATABRICKS_WORKSPACE_ID }}
+          PROD_HOST: ${{ vars.PROD_DATABRICKS_WORKSPACE_HOST }}
+        run: |
+          write_auth() {
+            mkdir -p "envs/$1"
+            printf '%s\n' \
+              "databricks_account_id     = \"$ACCOUNT_ID\"" \
+              "databricks_client_id      = \"$2\"" \
+              'databricks_client_secret  = ""' \
+              "databricks_workspace_id   = \"$3\"" \
+              "databricks_workspace_host = \"$4\"" > "envs/$1/auth.auto.tfvars"
+          }
+          write_auth dev "$DEV_CLIENT_ID" "$DEV_WORKSPACE_ID" "$DEV_HOST"
+          write_auth prod "$PROD_CLIENT_ID" "$PROD_WORKSPACE_ID" "$PROD_HOST"
+
+      - name: make check ENV=dev
+        run: make check ENV=dev
+
+      - name: make check ENV=prod
+        if: steps.scope.outputs.prod == 'true'
+        run: make check ENV=prod

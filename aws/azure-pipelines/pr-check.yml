@@ -1,0 +1,102 @@
+# GenieRails PR check (aws), Azure DevOps.
+#
+# Stage 2, "PR check", of shared/docs/cicd.md: read-only, on every pull
+# request. Create a pipeline from this file. For Azure Repos, add it to the
+# main branch policy as a required build validation (the pr: block below only
+# applies to GitHub and Bitbucket repos), and set the policy to re-run when
+# main changes, so every open PR re-checks against the latest main.
+#
+#   make check ENV=dev                 always
+#   make check ENV=prod                also, when the PR touches envs/prod/**
+#                                      (it includes make promote-to ENV=prod CHECK=1)
+#
+# make check never writes envs/ and runs no applying target, so it is safe
+# under TF_BUILD and never trips the CI apply guard. Until an env has remote
+# state, its plan is a STRUCTURAL plan: the committed config against empty
+# state.
+#
+# Auth: OIDC workload identity federation (auth type azure-devops-oidc); no
+# PATs and no client secrets. Give each read-only service principal a
+# federation policy for this Azure DevOps organization, and put these IDs
+# (not credentials) in the variable group "genierails-ids":
+#   DATABRICKS_ACCOUNT_ID
+#   DEV_READONLY_CLIENT_ID   DEV_DATABRICKS_WORKSPACE_ID   DEV_DATABRICKS_WORKSPACE_HOST
+#   PROD_READONLY_CLIENT_ID  PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
+# Read-only SPs need USE CATALOG, USE SCHEMA, BROWSE, read on
+# system.information_schema and CAN_VIEW on the agents. The Databricks
+# Terraform provider and SDK must support the azure-devops-oidc auth type.
+
+trigger: none
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  - group: genierails-ids
+  - name: TERRAFORM_VERSION
+    value: '1.11.4'
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+
+  - script: |
+      pip install python-hcl2 databricks-sdk pytest
+      curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
+      sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
+    displayName: Install dependencies and Terraform
+
+  - script: |
+      if git diff --name-only "origin/${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}...HEAD" -- envs/prod | grep -q .; then
+        echo "##vso[task.setvariable variable=CHECK_PROD]true"
+      fi
+    displayName: Does this PR touch envs/prod?
+    workingDirectory: aws
+
+  # Runtime files only (gitignored). make check copies them into its scratch
+  # dir for the plan step and never writes back to envs/.
+  - script: |
+      write_auth() {
+        mkdir -p "envs/$1"
+        printf '%s\n' \
+          "databricks_account_id     = \"$ACCOUNT_ID\"" \
+          "databricks_client_id      = \"$2\"" \
+          'databricks_client_secret  = ""' \
+          "databricks_workspace_id   = \"$3\"" \
+          "databricks_workspace_host = \"$4\"" > "envs/$1/auth.auto.tfvars"
+      }
+      write_auth dev "$DEV_CLIENT_ID" "$DEV_WORKSPACE_ID" "$DEV_HOST"
+      write_auth prod "$PROD_CLIENT_ID" "$PROD_WORKSPACE_ID" "$PROD_HOST"
+    displayName: Write OIDC auth files (IDs only, no secrets)
+    workingDirectory: aws
+    env:
+      ACCOUNT_ID: $(DATABRICKS_ACCOUNT_ID)
+      DEV_CLIENT_ID: $(DEV_READONLY_CLIENT_ID)
+      DEV_WORKSPACE_ID: $(DEV_DATABRICKS_WORKSPACE_ID)
+      DEV_HOST: $(DEV_DATABRICKS_WORKSPACE_HOST)
+      PROD_CLIENT_ID: $(PROD_READONLY_CLIENT_ID)
+      PROD_WORKSPACE_ID: $(PROD_DATABRICKS_WORKSPACE_ID)
+      PROD_HOST: $(PROD_DATABRICKS_WORKSPACE_HOST)
+
+  - script: make check ENV=dev
+    displayName: make check ENV=dev
+    workingDirectory: aws
+    env:
+      DATABRICKS_AUTH_TYPE: azure-devops-oidc
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+  - script: make check ENV=prod
+    displayName: make check ENV=prod
+    condition: and(succeeded(), eq(variables['CHECK_PROD'], 'true'))
+    workingDirectory: aws
+    env:
+      DATABRICKS_AUTH_TYPE: azure-devops-oidc
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
