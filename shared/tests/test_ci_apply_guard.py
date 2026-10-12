@@ -164,7 +164,7 @@ def test_prod_samples_do_not_consume_unsigned_receipt_artifacts():
         assert "download-artifact" not in github
         assert "download: dev" not in ado
         assert re.search(r"checkout: self\n\s+fetchDepth: 2", ado)
-        assert 'changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?' in ado
+        assert 'changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?' in ado
 
 
 def _concurrency_group(text):

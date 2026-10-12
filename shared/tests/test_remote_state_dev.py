@@ -538,5 +538,51 @@ def test_dev_samples_rehearse_only_the_head_of_main_with_remote_state(cloud):
 def test_prod_scope_fails_loudly_when_it_cannot_diff(cloud):
     for path in (ROOT / cloud / ".github/workflows/prod-release.yml", ROOT / cloud / "azure-pipelines/prod-release.yml"):
         text = path.read_text()
-        assert 'changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?' in text, path
+        assert 'changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?' in text, path
         assert "grep -q ." not in text, path
+
+
+# -- readers merged from main (#130 migration, #132 scheduled job move) ----------
+
+def _job_state(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 4, "resources": [{"mode": "managed", "type": "databricks_job",
+                                                            "name": "scheduled_governance", "instances": [{}]}]}))
+
+
+def test_migration_reads_follow_the_state_dir(state_dir_env, tmp_path):
+    from scripts import migration
+
+    layers = tmp_path / "state" / "aws" / "dev" / "layers"
+    state = json.loads((layers / "data_access" / "terraform.tfstate").read_text())
+    state["resources"].append({"module": "module.data_access", "mode": "managed", "type": "databricks_entity_tag_assignment",
+                               "name": "treatment", "instances": [{"index_key": "columns|c.s.t.col|pii", "attributes": {}}]})
+    (layers / "data_access" / "terraform.tfstate").write_text(json.dumps(state))
+    assert "stable keys" in migration.migrated(state_dir_env)
+
+
+def test_scheduled_job_move_uses_the_state_dir_files(tmp_path, fake_terraform, monkeypatch):
+    from scripts import move_scheduled_job
+
+    env = tmp_path / "aws" / "envs" / "dev"
+    (env / "data_access").mkdir(parents=True)
+    layers = tmp_path / "state" / "aws" / "dev" / "layers"
+    _job_state(layers / "workspace" / "terraform.tfstate")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    _use_fake(monkeypatch, fake_terraform)
+    assert move_scheduled_job.move(env, env / "data_access") == 0
+    mv = fake_terraform["log"].read_text()
+    assert f"-state={layers / 'workspace' / 'terraform.tfstate'}" in mv
+    assert f"-state-out={layers / 'data_access' / 'terraform.tfstate'}" in mv
+
+
+def test_scheduled_job_still_in_a_remote_workspace_state_refuses(tmp_path, fake_terraform, monkeypatch, capsys):
+    from scripts import move_scheduled_job
+
+    env = _remote("aws", tmp_path / "aws" / "envs" / "dev")
+    _job_state(fake_terraform["state"])
+    _use_fake(monkeypatch, fake_terraform)
+    assert move_scheduled_job.move(env, env / "data_access") == 1
+    assert "remote workspace state" in capsys.readouterr().err
+    fake_terraform["state"].write_text("")
+    assert move_scheduled_job.move(env, env / "data_access") == 0

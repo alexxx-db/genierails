@@ -9,36 +9,54 @@ workspace state of the env still holds the job and the data_access state
 doesn't, ``terraform state mv`` moves it, unchanged. Both roots then plan no
 change for the job: nothing is destroyed or recreated. Envs that never enabled
 the job (and envs already moved) are left alone without running Terraform.
+State is found through scripts/state_layout.py (in the checkout or under
+GENIERAILS_STATE_DIR). A remote-state env still holding the job refuses
+with the commands to move it: -state/-state-out work on local files only.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 ADDRESS = "databricks_job.scheduled_governance"
-STATE = "terraform.tfstate"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import state_layout  # noqa: E402
 
 
-def holds_job(state: Path) -> bool:
-    try:
-        resources = json.loads(state.read_text()).get("resources") or []
-    except (OSError, ValueError):
-        return False
+def holds_job(state: dict | None) -> bool:
+    resources = (state or {}).get("resources") or []
     return any(r.get("mode") == "managed" and r.get("type") == "databricks_job"
                and r.get("name") == "scheduled_governance" and r.get("instances")
                for r in resources)
 
 
+def _state(env_dir: Path, layer: str) -> dict | None:
+    try:
+        return state_layout.state_json(env_dir, env_dir.name, layer)
+    except RuntimeError:
+        return None  # unreadable here: the layer command itself reports it
+
+
 def move(workspace_dir: Path, data_access_dir: Path) -> int:
-    source, target = workspace_dir / STATE, data_access_dir / STATE
-    if not holds_job(source):
+    workspace_dir = Path(workspace_dir)
+    if state_layout.remote_configured(workspace_dir):
+        if not holds_job(_state(workspace_dir, "workspace")):
+            return 0
+        print(f"ERROR: the remote workspace state of {workspace_dir.name} still holds {ADDRESS}. Move it to "
+              f"the data_access state by hand: terraform state pull both, terraform state mv "
+              f"-state=<workspace> -state-out=<data_access> {ADDRESS} {ADDRESS}, then terraform state push "
+              f"both (data_access first).", file=sys.stderr)
+        return 1
+    paths = state_layout.root_state_paths(workspace_dir)
+    source, target = paths["workspace"], paths["data_access"]
+    if not holds_job(_state(workspace_dir, "workspace")):
         return 0
-    if holds_job(target):
+    if holds_job(_state(workspace_dir, "data_access")):
         print(f"ERROR: both {source} and {target} hold {ADDRESS}. Keep the data_access one: "
               f"check that both have the same job ID (terraform state show), then remove the "
               f"workspace copy with terraform state rm (it forgets, never destroys).", file=sys.stderr)

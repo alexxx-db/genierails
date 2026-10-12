@@ -225,8 +225,9 @@ trap - EXIT INT TERM
 # The scheduled governance job moved from the workspace root to data_access:
 # before any command on either root, move it between the env's state files
 # (a no-op unless the workspace state still holds it), so neither root ever
-# plans to destroy or recreate it.
-if [ "$COMMAND" != "print-cmd" ]; then
+# plans to destroy or recreate it. Not for state-pull: that is how
+# move_scheduled_job.py reads a remote state.
+if [ "$COMMAND" != "print-cmd" ] && [ "$COMMAND" != "state-pull" ]; then
   case "$LAYER" in
     workspace) JOB_WS_DIR="$ENV_DIR"; JOB_DA_DIR="$ENV_DIR/data_access" ;;
     data_access) JOB_WS_DIR="$(dirname "$ENV_DIR")"; JOB_DA_DIR="$ENV_DIR" ;;

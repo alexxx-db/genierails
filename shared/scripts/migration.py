@@ -84,11 +84,14 @@ def _load_hcl(path: Path) -> dict:
     return hcl2.loads(Path(path).read_text()) if Path(path).is_file() else {}
 
 
-def _read_state(path: Path) -> dict:
+def _read_state(env_dir: Path, layer: str) -> dict:
+    """A layer's state through scripts/state_layout.py ({} before the first apply)."""
+    from state_layout import state_json
+
     try:
-        return json.loads(Path(path).read_text()) if Path(path).is_file() else {}
-    except ValueError as exc:
-        raise Refused(f"the state {path} is unreadable: {exc}") from exc
+        return state_json(Path(env_dir), Path(env_dir).name, layer) or {}
+    except RuntimeError as exc:
+        raise Refused(str(exc)) from exc
 
 
 def _instances(state: Mapping, rtype: str, name: str, module: str = MODULE):
@@ -145,7 +148,7 @@ def tag_address(key: str, name: str) -> str:
 def deployment(env_dir: Path) -> dict:
     """What GenieRails deployed in an env, read from its Terraform state."""
     env_dir = Path(env_dir)
-    state = _read_state(env_dir / "data_access" / "terraform.tfstate")
+    state = _read_state(env_dir, "data_access")
     masks, others = {}, {}
     for key, attrs in _instances(state, "databricks_policy_info", "policies"):
         policy = policy_from_state(key, attrs)
@@ -171,7 +174,7 @@ def deployment(env_dir: Path) -> dict:
     grants = sorted(k for k, _ in _instances(state, "databricks_grant", "table_access") if "|" in k)
     use_grants = sorted(f"{name}:{k}" for name in ("catalog_access", "schema_access")
                         for k, _ in _instances(state, "databricks_grant", name))
-    workspace = _read_state(env_dir / "terraform.tfstate")
+    workspace = _read_state(env_dir, "workspace")
     can_run: dict[str, list[str]] = {}
     for name in ("genie_space_acls", "genie_space_acls_created"):
         for key, attrs in _instances(workspace, "null_resource", name, "module.workspace"):
@@ -239,7 +242,7 @@ def migrated(env_dir: Path) -> str:
         return f"a migration record ({record_path(env_dir)})"
     if journal_path(env_dir).is_file():
         return f"a policy journal ({journal_path(env_dir)})"
-    state = _read_state(env_dir / "data_access" / "terraform.tfstate")
+    state = _read_state(env_dir, "data_access")
     moved = [k for k, _ in _instances(state, "databricks_entity_tag_assignment", "treatment")]
     return f"treatment tags at stable keys in the data_access state ({moved[0]}, ...)" if moved else ""
 
