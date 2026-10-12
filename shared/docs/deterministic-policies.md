@@ -165,3 +165,5 @@ env of the checkout (`envs/*/env.auto.tfvars`) is deterministic,
 `make apply ENV=account` runs `make apply-account`, and a bare
 `make sync-tags ENV=account` is add-only. Legacy-only checkouts keep `replace`,
 as before.
+
+Migrating a legacy env: [legacy-migration.md](legacy-migration.md).

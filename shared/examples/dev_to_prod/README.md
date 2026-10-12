@@ -16,6 +16,9 @@ make promote-to ENV=prod    # copies the reviewed rules (set catalog_map first)
 #   Catalog Explorer: same classification review on the prod catalog
 make release ENV=prod       # applies in prod and proves the masks work
 make maintain ENV=prod      # run on a schedule
+
+# commit
+make setup ENV=prod GITIGNORE=customer   # then git add .gitignore envs/ and open the first PR
 ```
 
 <a id="prerequisites--gather-required-values"></a>
@@ -103,3 +106,18 @@ make maintain ENV=prod      # schedule it (cron or CI)
 ```
 It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
 
+## Commit it
+
+Put it in your own repo (create an empty one first) and open the first PR. From `aws/` (or `azure/`):
+```bash
+make setup ENV=prod GITIGNORE=customer   # once: commits envs/, ignores credentials, state and runtime files
+git remote rename origin genierails      # keep GenieRails for upgrades
+git remote add origin <your-repo-url>
+git push -u origin main
+git switch -c first-agent
+git add .gitignore envs/                 # plus any ../shared/ file a coverage fix changed
+git status                               # pass looks like: no auth.auto.tfvars, *.tfstate or .genie_* files
+git commit -m "Govern the first agent in dev and prod"
+git push -u origin first-agent
+```
+Open a pull request from `first-agent` into `main`. From then on every change goes through a PR: see [CI/CD](../../docs/cicd.md).

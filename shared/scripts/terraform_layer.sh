@@ -222,6 +222,21 @@ fi
 _unlock_init
 trap - EXIT INT TERM
 
+# The scheduled governance job moved from the workspace root to data_access:
+# before any command on either root, move it between the env's state files
+# (a no-op unless the workspace state still holds it), so neither root ever
+# plans to destroy or recreate it.
+if [ "$COMMAND" != "print-cmd" ]; then
+  case "$LAYER" in
+    workspace) JOB_WS_DIR="$ENV_DIR"; JOB_DA_DIR="$ENV_DIR/data_access" ;;
+    data_access) JOB_WS_DIR="$(dirname "$ENV_DIR")"; JOB_DA_DIR="$ENV_DIR" ;;
+    *) JOB_WS_DIR= ;;
+  esac
+  if [ -n "$JOB_WS_DIR" ] && [ "$(basename "$JOB_DA_DIR")" = "data_access" ]; then
+    python3 "$SCRIPT_DIR/move_scheduled_job.py" --workspace-dir "$JOB_WS_DIR" --data-access-dir "$JOB_DA_DIR"
+  fi
+fi
+
 VAR_ARGS=()
 for tfvars in auth.auto.tfvars env.auto.tfvars abac.auto.tfvars classification.auto.tfvars discovered_uc_tables.auto.tfvars; do
   if [ -f "$ENV_DIR/$tfvars" ]; then

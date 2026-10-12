@@ -2,7 +2,8 @@
 #
 # Stage 4, "Prod release", of shared/docs/cicd.md. It starts only when the
 # Rehearse stage of the dev pipeline ("genierails-dev-aws") succeeds on main,
-# and releases only a commit that touches envs/prod/**.
+# and releases only a commit that touches envs/prod/** or shared/** (a
+# product or mapping change can change prod's generated output).
 #
 #   make release-plan ENV=prod                     publishes the approval manifest
 #   (Approvals check on the "genierails-prod" environment)
@@ -59,7 +60,7 @@ variables:
 
 stages:
   - stage: Scope
-    displayName: Did the commit touch envs/prod?
+    displayName: Did the commit touch envs/prod or shared?
     jobs:
       - job: scope
         pool:
@@ -73,7 +74,7 @@ stages:
                 echo "##[error]checked out $(Build.SourceVersion), but dev rehearsed $(resources.pipeline.dev.sourceCommit)"
                 exit 1
               fi
-              changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?
+              changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?
               if [ -n "$changed" ]; then
                 echo "##vso[task.setvariable variable=prod;isOutput=true]true"
               fi

@@ -14,7 +14,9 @@ env this inventories, on each governed table:
   governance_policies.py, so retained generations a staged change keeps alive
   are recognised too. Any other column-mask policy on a governed table stops
   the run: its match condition depends on tags GenieRails doesn't own, so it
-  can't be proven to miss the governed columns.
+  can't be proven to miss the governed columns. The one exception is a legacy
+  GenieRails mask this env's own data_access state manages: a migration from
+  legacy governance (scripts/migration.py) keeps it live until it retires.
 
 Exit codes: 0 clean, 1 external masks found, 2 the inventory couldn't be read.
 """
@@ -48,6 +50,7 @@ def is_own_policy(name: str, function_name: str) -> bool:
 
 def external_masks(
     governed_columns: set[str], direct_rows: list[list[str]], policies_by_table: dict[str, list[dict]],
+    own_legacy: set[str] = frozenset(),
 ) -> list[str]:
     """Every external mask that could resolve on a governed column, described."""
     governed = {column.lower() for column in governed_columns}
@@ -65,7 +68,7 @@ def external_masks(
                 continue
             name = str(policy.get("name") or "")
             function = str(policy.get("function_name") or "")
-            if not is_own_policy(name, function):
+            if not is_own_policy(name, function) and name not in own_legacy:
                 where = policy.get("on_securable_fullname") or table
                 problems.add(f"{table}: column-mask policy {name!r} on {where} (function {function or '?'})")
     return sorted(problems)
@@ -120,7 +123,15 @@ def inventory(env_dir: Path) -> list[str]:
             "FROM system.information_schema.column_masks WHERE lower(concat_ws('.', table_catalog, "
             f"table_schema, table_name, column_name)) IN ({quoted})",
         )
-    return external_masks(columns, direct, {table: _policy_rows(w, table) for table in tables})
+    return external_masks(columns, direct, {table: _policy_rows(w, table) for table in tables},
+                          legacy_policy_names(env_dir))
+
+
+def legacy_policy_names(env_dir: Path) -> set[str]:
+    """Live names of the legacy GenieRails masks this env's data_access state manages."""
+    from scripts.migration import deployment
+
+    return {f"{p['catalog']}_{p['name']}" for p in deployment(env_dir)["masks"].values()}
 
 
 def main(argv: list[str] | None = None) -> int:

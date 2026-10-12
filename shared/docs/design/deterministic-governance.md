@@ -402,7 +402,7 @@ Agreed in design discussion after the rollout above was set. It starts once roll
 
 ### 18.3 First deployment in git
 
-- `make setup` writes the section 9 `.gitignore` (today it doesn't).
+- `make setup` writes the section 9 `.gitignore`. It writes it only into a customer repo: `GITIGNORE=customer` opts in once, then every `make setup` refreshes its managed block in `<cloud>/.gitignore`; the GenieRails repo never has the block, so `make setup` never changes it there ([version-control.md](../version-control.md#setting-up-git-tracking)).
 - The champion walkthrough ends with a commit step: what to `git add`, and opening the first PR.
 
 ### 18.4 Optional AI helpers (decision 5)
@@ -444,7 +444,7 @@ Each playbook follows the champion README's style: the flow in one code block, s
 ### 18.8 Rollout (continues section 16)
 
 14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample.
-15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2).
+15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2). Built: an existing job moves from the workspace state to the data_access state before any command on either root (`move_scheduled_job.py`), and the workspace root's `removed` block forgets rather than destroys it.
 16. `make bootstrap-pipelines` (18.2).
 17. Optional AI helpers (18.4).
 18. Persona docs (18.5).

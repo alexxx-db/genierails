@@ -35,6 +35,26 @@ source, then `make apply ENV=prod`. Schedule, timezone, Git branch/provider,
 dependencies, notifications, and job name use the existing
 `scheduled_governance_*` variables.
 
+The job is deployed from the data_access root
+(`shared/roots/data_access/scheduled_governance.tf`), so a governance-only env
+(no agents) gets it too. It used to be deployed from the workspace root. An
+existing job is moved, never destroyed or recreated: before any command on
+either root, `terraform_layer.sh` moves `databricks_job.scheduled_governance`
+from `envs/<env>/terraform.tfstate` to `envs/<env>/data_access/terraform.tfstate`
+(`+ moved databricks_job.scheduled_governance ...`), and the workspace root's
+`removed` block makes a direct `terraform plan` there forget the job, never
+destroy it. Run by hand, the move is:
+
+```bash
+cd "$(mktemp -d)" && terraform state mv \
+  -state=<cloud>/envs/prod/terraform.tfstate \
+  -state-out=<cloud>/envs/prod/data_access/terraform.tfstate \
+  databricks_job.scheduled_governance databricks_job.scheduled_governance
+```
+
+After the move, the job's ID and URL outputs come from the data_access root
+(`scheduled_governance_job_id`, `scheduled_governance_job_url`).
+
 ## Legacy mode
 
 Set `scheduled_governance_mode = "legacy"` to retain the explicit legacy

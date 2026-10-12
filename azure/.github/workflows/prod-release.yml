@@ -2,7 +2,8 @@ name: GenieRails prod release (azure)
 
 # Stage 4, "Prod release", of shared/docs/cicd.md. Copy to .github/workflows/
 # at the repository root. It starts only when the dev pipeline ("GenieRails
-# dev (azure)") succeeds on main, and only for a commit that touches envs/prod/**.
+# dev (azure)") succeeds on main, and only for a commit that touches envs/prod/**
+# or shared/** (a product or mapping change can change prod's generated output).
 #
 #   make release-plan ENV=prod                     publishes the approval manifest
 #   (required approval on the "production" environment)
@@ -58,7 +59,7 @@ defaults:
 
 jobs:
   scope:
-    name: Did the commit touch envs/prod?
+    name: Did the commit touch envs/prod or shared?
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
@@ -71,7 +72,7 @@ jobs:
 
       - id: diff
         run: |
-          changed="$(git diff --name-only HEAD^ HEAD -- envs/prod)" || exit $?
+          changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?
           if [ -n "$changed" ]; then
             echo "prod=true" >> "$GITHUB_OUTPUT"
           fi
