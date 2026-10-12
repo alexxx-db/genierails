@@ -613,7 +613,8 @@ def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str]
         levels = {}
         for who in universe:
             on = [p for p in by_value.get(value, []) if covers(p, who)]
-            if any(p["name"].endswith("_full") for p in on):
+            if any(p.get("level", "redacted" if p["name"].endswith("_full") else "partial") == "redacted"
+                   for p in on):
                 levels[who] = ("redacted", f"redacted ({treatment})")
             elif on:
                 levels[who] = ("partial", f"partial ({treatment})")
@@ -626,9 +627,12 @@ def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str]
 def _deployed(env_dir: Path) -> dict:
     """What prod's data_access state says GenieRails deployed."""
     from scripts.staged_policy_apply import _read_state, live_from_state, load_journal
-    from scripts import policy_generations as pg
+    from scripts import migration, policy_generations as pg
     from table_readers import applied_grants
 
+    legacy = migration.baseline(Path(env_dir))
+    if legacy is not None:  # a migration from legacy: compare with what the legacy masks enforce
+        return migration.legacy_view(legacy)
     live = live_from_state(_read_state(Path(env_dir)))
     journal = load_journal(Path(env_dir)) or {}
     snapshot = pg.load_snapshot(Path(env_dir), journal.get("active", "")) if journal.get("active") else None
@@ -718,6 +722,7 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     from reader_inventory import Grant, check_readers, inventory_readers
     from weakening import check_weakenings
     from dataclasses import asdict
+    from scripts import migration
     import group_map
 
     env_dir = Path(env_dir)
@@ -747,16 +752,21 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         rollbacks[rollback["key"]] = rollback["consequence"]
     from scripts.agent_ownership import delete_consequences
 
+    # A migration from legacy: its revocations (and, once adopted, every
+    # acknowledgement the adoption accepted, so none turns stale).
+    migrated, unacked_revocations = migration.accounted(env_dir, env)
     deletes = delete_consequences(env_dir, env)
     consequences = merge_consequences(weak.consequences, reader_consequences, group_consequences, rollbacks,
-                                      deletes)
-    # Unclassified acks belong to the classification check (ACK_UNCLASSIFIED today)
-    # and revoke acks to the migration (rollout step 10): not reconciled here.
-    reconciled = [e for e in entries if e.kind not in ("unclassified", "revoke")]
+                                      migrated, deletes)
+    # Unclassified acks belong to the classification check (ACK_UNCLASSIFIED today).
+    reconciled = [e for e in entries if e.kind != "unclassified"]
     _, unmatched = reconcile(reconciled, consequences)
     unacked_readers = [f for c in reader_checks for f in c["unacknowledged"]]
     return {
-        "ok": weak.ok and not unacked_readers and not unmatched,
+        "ok": weak.ok and not unacked_readers and not unmatched and not unacked_revocations,
+        "revocations": {"acknowledged": sorted(k for k in migrated if k.split(":")[1] == "revoke"
+                                               and k not in unacked_revocations),
+                        "unacknowledged": [{"ack_key": k, "consequence": migrated[k]} for k in unacked_revocations]},
         "weakening": {"acknowledged": [asdict(w) for w in weak.acknowledged],
                       "unacknowledged": [asdict(w) for w in weak.unacknowledged]},
         "readers": {"tables": tables, "inventories": reader_reports, "checks": reader_checks},
@@ -780,6 +790,8 @@ def print_reports(report: Mapping) -> None:
     for check in report["readers"]["checks"]:
         for item in check["unacknowledged"]:
             print(f"ERROR: unacknowledged reader {item['ack_key']}: {item['consequence']}", file=sys.stderr)
+    for item in (report.get("revocations") or {}).get("unacknowledged") or []:
+        print(f"ERROR: unacknowledged revocation {item['ack_key']}: {item['consequence']}", file=sys.stderr)
     for key in report["unmatched_acknowledgements"]:
         print(f"ERROR: ack.txt entry matches nothing (stale): {key}", file=sys.stderr)
 
@@ -1097,6 +1109,7 @@ def apply_guard(env_dir: Path, env: str, target: str) -> None:
 
     role = env_role(env_dir)
     if role == LEGACY:
+        legacy_guard(env_dir, env, target.split(":")[0])
         return
     allowed = APPLY_OWNERS[role].get(target)
     if allowed is None:
@@ -1116,6 +1129,23 @@ def apply_guard(env_dir: Path, env: str, target: str) -> None:
         why = f"ENV={env} is a deterministic env, applied only by rehearse"
     ran = f" (it runs under make {owner})" if owner else ""
     raise Refused(f"make {name}{layer} refused{ran}: {why}; {how}.")
+
+
+def legacy_guard(env_dir: Path, env: str, command: str) -> None:
+    """A legacy-mode applying command refuses once a migration to deterministic began.
+
+    Read from the data_access state as well as the migration record, so an
+    adoption interrupted after its first state move is caught too.
+    """
+    from scripts import migration
+
+    if not deterministic(env_dir):
+        why = migration.migrated(Path(env_dir))
+        if why:
+            raise Refused(f"make {command} refused: ENV={env} was migrated to deterministic governance ({why}), "
+                          "and a legacy apply would destroy and recreate its moved treatment tags. Restore "
+                          "governance_mode = \"deterministic\"; to undo a change, roll back within deterministic "
+                          "governance (a revert PR and <env>:rollback:<commit>)")
 
 
 def destroy_guard(env_dir: Path, env: str, confirm: str) -> None:
@@ -1171,6 +1201,7 @@ def main(argv: list[str] | None = None) -> int:
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
     command("env-role")
+    command("legacy-guard").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "state-dir":
@@ -1226,6 +1257,8 @@ def main(argv: list[str] | None = None) -> int:
             apply_guard(args.env_dir, args.env, args.target)
         elif args.command == "destroy-guard":
             destroy_guard(args.env_dir, args.env, args.confirm)
+        elif args.command == "legacy-guard":
+            legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":
             print(env_role(args.env_dir))
         elif args.command == "maintain-check":

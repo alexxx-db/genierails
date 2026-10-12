@@ -73,32 +73,35 @@ file under the cloud dir or `shared/` makes `release-plan` refuse.
 
 ### Setting up git tracking
 
-The default `.gitignore` excludes `envs/` entirely. To track your configs:
+The default `.gitignore` excludes `envs/` entirely, so the GenieRails repo
+itself never tracks anyone's env. In your own repo, opt in once from the cloud
+dir:
 
 ```bash
-# Option 1 (recommended): in .gitignore, replace the three lines
-# "envs/", "generated/" and "masking_functions.sql" with:
-auth.auto.tfvars
-*.tfstate
-*.tfstate.backup
-.terraform/
-.genie_*
-**/envs/**/data_access/.policy_generations/
-**/envs/**/data_access/classification.auto.tfvars
-**/envs/**/data_access/discovered_uc_tables.auto.tfvars
-**/envs/**/.*.apply.sha
-**/envs/**/.coverage_gate.json
-**/envs/**/.can_run_check.json
-**/envs/**/generated/.*
-**/envs/**/ddl/_fetched.sql
-.genierails-state/
-# Deterministic envs: the layer files are runtime outputs (see above). With a
-# legacy env in the same repo, list the deterministic envs' paths instead.
-**/envs/*/abac.auto.tfvars
-**/envs/*/data_access/
-**/envs/*/generated/genie_space_derived_acl_groups.auto.tfvars
+make setup ENV=dev GITIGNORE=customer
+```
 
-# Option 2: Force-track specific files (leave .gitignore as-is)
+It writes a GenieRails block into `<cloud>/.gitignore` (and prints it as a
+diff) that re-includes `envs/` and ignores every runtime file: credentials,
+Terraform state and plans, locks, receipts, Genie ID and adoption markers,
+every dot-file under `envs/` (such as `generated/.runtime/` and
+`data_access/.policy_generations/`) and, for each deterministic env, its layer
+files. The rule:
+
+- **`GITIGNORE=customer`** writes the block, or refreshes it.
+- **No `GITIGNORE`** (the default): every `make setup` refreshes the block if
+  the file already has it, and otherwise only prints how to opt in. So in the
+  GenieRails repo, which never has the block, `make setup` changes nothing.
+- **`GITIGNORE=off`** leaves the file alone.
+
+Only the lines between the block's markers are ever rewritten; your own lines
+are kept as they are, and re-running is a no-op. The block names each
+deterministic env, so re-run `make setup ENV=<env>` after adding an env or
+changing `governance_mode`.
+
+Or leave `.gitignore` as it is and force-track the files:
+
+```bash
 git add -f envs/account/abac.auto.tfvars
 git add -f envs/dev/env.auto.tfvars
 git add -f envs/dev/abac.auto.tfvars

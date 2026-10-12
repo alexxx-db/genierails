@@ -29,7 +29,7 @@ _OBJECT_PARTS = {
     "weaken": {1, 3, 4},  # treatment, table, or column
     "unclassified": {4},
     "reader": {3},
-    "revoke": {3},
+    "revoke": {1, 3},  # an agent (CAN_RUN) or a table (SELECT), migration only
 }
 
 

@@ -361,6 +361,15 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo ""; \
 		echo "Walkthrough: $(_SETUP_WALKTHROUGH) (the walkthrough's Dev section)"; \
 	fi
+	@echo ""
+	@$(_CUSTOMER_GITIGNORE)
+
+# A customer repo commits envs/; GenieRails' own .gitignore ignores it. Only an
+# explicit GITIGNORE=customer writes the block into $(CLOUD_ROOT)/.gitignore;
+# after that every setup refreshes it (GITIGNORE=off skips). The upstream repo
+# never has the block, so a plain setup there only prints the opt-in line.
+_CUSTOMER_GITIGNORE = python3 "$(SHARED_ROOT)/scripts/customer_gitignore.py" --cloud-dir "$(CLOUD_ROOT)" \
+	--mode "$(GITIGNORE)" --account-env "$(ACCOUNT_ENV)" --env "$(ENV)"
 
 init-env: _bootstrap ## Prepare env directories and default config files
 	@echo "Environment bootstrap ready for $(ENV)."
@@ -678,6 +687,9 @@ _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)
 # apply in a promoted env (promote_from set, or prod), which otherwise changes
 # only through release MANIFEST=. Legacy envs are never gated.
 _APPLY_GUARD = $(_RELEASE_GATE) apply-guard --env-dir "$(1)" --env "$(2)" --target $(3)
+# A legacy env whose state a migration to deterministic already changed refuses
+# every legacy applying command (scripts/migration.py; no way back).
+_LEGACY_GUARD = $(_RELEASE_GATE) legacy-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 # Destroying a promoted deterministic env needs CONFIRM_DESTROY=<env> on the command line.
 _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)),$(CONFIRM_DESTROY))
 # Live checks the release targets run (overridable so tests never reach Databricks).
@@ -750,6 +762,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result failed --reason "a rehearse step failed (above)" $(_RELEASE_GATE_MAKE); \
 		exit 1; \
 	fi; \
+	$(_LEGACY_GUARD) rehearse || exit 1; \
 	$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 	$(_GROUP_CHECK) "make rehearse" || exit 1; \
 	$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
@@ -821,6 +834,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		exit $$?; \
 	fi; \
 	export GENIERAILS_RERUN_TARGET=release; \
+	$(_LEGACY_GUARD) release || exit 1; \
 	$(_ACCESS_CHECK) "make release" || exit 1; \
 	$(_GROUP_CHECK) "make release" || exit 1; \
 	$(_AGENT_OWNERSHIP) check-deletes --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
@@ -1071,7 +1085,8 @@ _release-manifest: _guard-not-ci-apply
 maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): audit-schema -> derive-assignments -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); export GENIERAILS_RERUN_TARGET=maintain; mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
-	if [ "$$mode" = deterministic ]; then $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; fi; \
+	if [ "$$mode" = deterministic ]; then $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
+	else $(_LEGACY_GUARD) maintain || exit 1; fi; \
 	if [ "$$mode" = deterministic ]; then $(_EXTERNAL_MASK_INVENTORY) || exit 1; fi; $(call _ENV_LOCK,maintain); \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) --no-print-directory _guarded-bootstrap _guard-workspace-target ENV="$(ENV)" || exit 1; \
@@ -1493,6 +1508,29 @@ policy-status: _guard-workspace-target ## Show the staged policy journal (determ
 # can start a new one. Takes the env lock.
 policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched (deterministic envs)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
+
+# Read-only dry run of moving a legacy env to deterministic governance (design
+# section 8, scripts/migration.py): what every principal sees on every column
+# today and after, the mask functions, the policy principals, every SELECT and
+# CAN_RUN the cutover revokes, the frozen row filters and the generated tag
+# state moves, with the ack.txt entries it needs. The proposed table_readers
+# (today's GenieRails grants) goes to the ignored state dir; nothing committed
+# or live changes. The cutover runs through rehearse (dev) or release-plan and
+# release MANIFEST= (one manifest and approval per phase).
+migrate-plan: _guard-workspace-target ## [migration] Read-only dry run of legacy -> deterministic: per column and principal, revocations, proposed table_readers
+	@$(_GUARD_WORKSPACE_ENV); \
+	out="$$($(_RELEASE_GATE) state-dir --env-dir "$(ENV_DIR)" --env "$(ENV)")/migration" || exit 1; \
+	inventory_rc=0; \
+	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "=== Masks GenieRails didn't create ($(ENV)) ==="; \
+		$(_EXTERNAL_MASK_INVENTORY) || inventory_rc=$$?; \
+	fi; \
+	rc=0; python3 "$(SHARED_ROOT)/scripts/migration.py" report --env-dir "$(ENV_DIR)" --env "$(ENV)" --out-dir "$$out" || rc=$$?; \
+	if [ $$inventory_rc -ne 0 ]; then \
+		echo "migrate-plan: masks GenieRails didn't create block the cutover until they are removed (above)." >&2; \
+		if [ $$rc -eq 0 ]; then rc=1; fi; \
+	fi; \
+	exit $$rc
 
 genie-adopt-preflight: _guard-workspace-target ## Read-only: check every legacy Genie agent can be adopted (ID file, host, GET 200) before migrating
 	@python3 "$(SHARED_ROOT)/scripts/genie_adopt_preflight.py" "$(ENV_DIR)"

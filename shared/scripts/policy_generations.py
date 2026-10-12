@@ -358,13 +358,18 @@ def stage_problems(stage: str, rendered: dict, desired: dict, old: dict | None) 
     policies = rendered["fgac_policies"]
     universe = _universe(rendered, desired, old)
     old_policies = (old or {}).get("fgac_policies") or []
+
+    # A policy applies only on its catalog, so the same value in two catalogs is two separate checks.
+    def on(catalog: str, items: list[dict]) -> list[dict]:
+        return [p for p in items if p.get("catalog", catalog) == catalog]
+
     for column, value in sorted(rendered["tags"].items()):
-        if not any(policy_value(p) == value for p in policies):
+        if not any(policy_value(p) == value for p in on(column.split(".")[0], policies)):
             problems.append(f"{column} would carry {value}, which no policy masks")
-    for value in sorted(set(rendered["tags"].values())):
-        now = masks_by_principal(policies, value, universe)
-        before = masks_by_principal(old_policies, value, universe)
-        after = masks_by_principal(desired["fgac_policies"], value, universe)
+    for catalog, value in sorted({(c.split(".")[0], v) for c, v in rendered["tags"].items()}):
+        now = masks_by_principal(on(catalog, policies), value, universe)
+        before = masks_by_principal(on(catalog, old_policies), value, universe)
+        after = masks_by_principal(on(catalog, desired["fgac_policies"]), value, universe)
         for who in sorted(universe):
             mover = bool(old) and before[who] != after[who]
             if len(now[who]) > 1 and not (stage == "tighten" and mover):
