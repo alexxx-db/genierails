@@ -17,7 +17,7 @@ them using the same interpreter. Running all three steps in a SINGLE process
 (``--step all``) is what lets ``coverage`` see the file
 ``delta`` just regenerated — they share one working tree.
 
-The scheduled Databricks Job defined in roots/workspace/scheduled_governance.tf
+The scheduled Databricks Job defined in roots/data_access/scheduled_governance.tf
 uses ``--step check``. Legacy per-step modes remain available for existing
 callers.
 

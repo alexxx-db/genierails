@@ -359,6 +359,15 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo ""; \
 		echo "Walkthrough: $(_SETUP_WALKTHROUGH) (the walkthrough's Dev section)"; \
 	fi
+	@echo ""
+	@$(_CUSTOMER_GITIGNORE)
+
+# A customer repo commits envs/; GenieRails' own .gitignore ignores it. Only an
+# explicit GITIGNORE=customer writes the block into $(CLOUD_ROOT)/.gitignore;
+# after that every setup refreshes it (GITIGNORE=off skips). The upstream repo
+# never has the block, so a plain setup there only prints the opt-in line.
+_CUSTOMER_GITIGNORE = python3 "$(SHARED_ROOT)/scripts/customer_gitignore.py" --cloud-dir "$(CLOUD_ROOT)" \
+	--mode "$(GITIGNORE)" --account-env "$(ACCOUNT_ENV)" --env "$(ENV)"
 
 init-env: _bootstrap ## Prepare env directories and default config files
 	@echo "Environment bootstrap ready for $(ENV)."

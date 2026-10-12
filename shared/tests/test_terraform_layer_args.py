@@ -86,6 +86,8 @@ def _runner_with_stale_lock(tmp_path, init_error):
     runner = scripts / RUNNER.name
     runner.write_text(RUNNER.read_text())
     runner.chmod(0o755)
+    # The runner's sibling: it moves the scheduled job between state files.
+    (scripts / "move_scheduled_job.py").write_text((RUNNER.parent / "move_scheduled_job.py").read_text())
     root = tmp_path / "project" / "roots" / "workspace"
     root.mkdir(parents=True)
     (root / ".terraform.lock.hcl").write_text(

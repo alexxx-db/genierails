@@ -25,17 +25,22 @@ this page is what works **today (v1)**, with target-only items marked.
 ## What to commit
 
 GenieRails' own `.gitignore` ignores `envs/`, `generated/` and
-`masking_functions.sql` anywhere in the tree. In your repo, replace those three
-lines with the ignores in [Version control](version-control.md#setting-up-git-tracking),
-then commit `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/`, the layer
+`masking_functions.sql` anywhere in the tree. In your repo, run
+`make setup ENV=dev GITIGNORE=customer` once: it writes a GenieRails block into
+`<cloud>/.gitignore` that commits `envs/` and ignores every runtime file
+([Version control](version-control.md#setting-up-git-tracking)). Then
+`git status` shows only files to commit: `envs/<env>/env.auto.tfvars`,
+`envs/<env>/generated/`, `ack.txt`, `agents/` and, for a legacy env, the layer
 files (`envs/<env>/abac.auto.tfvars`, `envs/<env>/data_access/abac.auto.tfvars`,
 `envs/<env>/data_access/masking_functions.sql`) and `envs/account/abac.auto.tfvars`.
 Without `generated/`, `make check` skips the regeneration and coverage checks.
 
-Never commit `auth.auto.tfvars`, Terraform state, `.terraform/`, Genie ID and adoption marker files (`.genie_*`),
-or the runtime records GenieRails writes (`.*.apply.sha`, `.coverage_gate.json`,
-`.can_run_check.json`, `generated/.*`, `data_access/.policy_generations/`,
-`classification.auto.tfvars`, `discovered_uc_tables.auto.tfvars`).
+The block ignores `auth.auto.tfvars`, Terraform state and plans, `.terraform/`,
+every dot-file under `envs/` (Genie ID and adoption markers `.genie_*`, locks,
+`.*.apply.sha`, `.coverage_gate.json`, `.can_run_check.json`, `generated/.*`
+including `generated/.runtime/` and `generated/.live_refresh.json`,
+`data_access/.policy_generations/`), `classification.auto.tfvars`,
+`discovered_uc_tables.auto.tfvars`, `ddl/_fetched.sql` and `.genierails-state/`.
 
 ## CI guard
 
@@ -76,7 +81,7 @@ checkout and run from `aws/` or `azure/`.
 |---|---|---|---|
 | 2. PR check | `pr-check.yml` | every PR to `main`; make it required and require branches to be up to date, so a PR is re-checked against the latest `main` before it can merge (Azure Repos: a build-validation policy that re-runs when the target branch changes) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` |
 | 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev` on the merged commit |
-| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; every run waits for its own approval and none is cancelled (GitHub: no concurrency group; Azure DevOps: `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=prod` on that commit, then the approval gate |
+| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` or `shared/**` (a product or mapping change can change prod's generated output) (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; every run waits for its own approval and none is cancelled (GitHub: no concurrency group; Azure DevOps: `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=prod` on that commit, then the approval gate |
 | 5. Keep protected | `prod-maintain.yml` | a schedule (GitHub: its own concurrency group, never the release's) | `make audit-schema ENV=prod` (read-only drift audit) |
 
 **Auth.** Every Databricks credential is a service principal through OIDC
