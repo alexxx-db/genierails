@@ -32,11 +32,13 @@ reports
 manifest-write / manifest-check
     One immutable manifest per release-plan: commit, state serial per root,
     plan file hashes, the live-snapshot and effective-config digests, the
-    kept-name mapping and the reports. ``make release MANIFEST=<path>`` refuses
+    kept-name mapping, the reports, and the Genie agent plan (what release
+    pushes to each agent, with its overwrite report; scripts/agent_ownership.py). ``make release MANIFEST=<path>`` refuses
     and asks for a fresh release-plan if any of them changed.
 
 release-receipt / maintain-check
-    A finished release writes a receipt (commit, digests, manifest);
+    A finished release writes a receipt (commit, digests, manifest, and each
+    Genie agent's ID and detach state, which detach-agent and ID recovery read);
     ``make maintain`` refuses unless HEAD is that commit with matching digests.
 
 apply-guard / destroy-guard
@@ -916,6 +918,9 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
     data_access = _data_access_entry(plan_dir)
     plans = {"account": _plan_entry(plan_dir, "account"), "data_access": data_access,
              "workspace": _plan_entry(plan_dir, "workspace")}
+    # The Genie agent plan (scripts/agent_ownership.py plan); release pushes only it. None
+    # recorded means no agents: release refuses if the env's agents differ from it.
+    agents = _read_json(plan_dir / "agents.json") or {"agents": {}}
     if plans["account"].get("changes"):
         raise Refused(f"the account plan is not empty; rehearse and release may only add treatment-tag values. "
                       f"Run make apply-account ENV={env} in the operations stage first")
@@ -928,7 +933,7 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
         "state_serials": state_serials(env_dir), "plans": plans,
         "final": bool(data_access.get("final")),
         "effective_digest": ro.digest(env_dir), "live_snapshot": live,
-        "kept_names": ro.load_kept_names(env_dir), "reports": dict(report),
+        "kept_names": ro.load_kept_names(env_dir), "reports": dict(report), "agents": agents,
         "host": socket.gethostname(), "created_at": created,
     }
     _write_once(plan_dir / "manifest.json", manifest)
@@ -992,6 +997,8 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
 
 
 def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
+    from scripts.agent_ownership import receipt_agents
+
     env_dir, manifest_path = Path(env_dir), Path(manifest_path)
     manifest = load_manifest(manifest_path, env)
     cloud_dir = cloud_dir_of(env_dir)
@@ -1008,6 +1015,8 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
         "kept_names": manifest.get("kept_names", {}),
         "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
         "phase_manifests": [m["id"] for m in phase_records(cloud_dir, env, manifest["commit"])],
+        # Prod agent IDs live here and in state, never in git (design section 5).
+        "agents": receipt_agents(env_dir),
         "state_serials": state_serials(env_dir), "host": socket.gethostname(), "created_at": _now(),
     }
     stamp = receipt["created_at"].replace(":", "").replace(".", "")

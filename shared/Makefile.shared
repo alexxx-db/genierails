@@ -431,8 +431,10 @@ capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/
 # Step 2 of removing an agent (operations stage). Step 1, a released PR with
 # acl_groups = [] and detached = true, revoked CAN_RUN; this only forgets the
 # agent's exact workspace-state addresses, so the agent and its conversations
-# stay. Refuses unless HEAD is the last released commit and that release had
-# the agent detached. Writes no committed file.
+# stay. Refuses unless HEAD is the last released commit (the release receipt;
+# release_gate.py in deterministic envs) and that release had the agent
+# detached. It runs only under its own env lock (the nonce _ENV_LOCK exports),
+# so the script can't be run around it. Writes no committed file.
 detach-agent: _guard-not-ci-apply _guard-workspace-target ## Forget a released, detached agent from Terraform state (never deletes it): SPACE="<agent>"
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
 	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,detach-agent); \
@@ -910,6 +912,8 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
 	$(call _ENV_LOCK,release-plan); \
+	$(_AGENT_OWNERSHIP) restore-ids --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
+	$(_AGENT_OWNERSHIP) guard-removals --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) derive-assignments ENV="$(ENV)" || exit 1; \
 	$(MAKE) validate-generated ENV="$(ENV)" || exit 1; \
@@ -936,6 +940,9 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	fi; \
 	if ! $(MAKE) --no-print-directory _release-plan-roots ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" PLAN_DIR="$$plan_dir"; then \
 		rm -rf "$$plan_dir"; echo "release-plan: planning failed (above); no manifest was written." >&2; exit 1; \
+	fi; \
+	if ! $(_AGENT_OWNERSHIP) plan --env-dir "$(ENV_DIR)" --env "$(ENV)" --plan-dir "$$plan_dir"; then \
+		rm -rf "$$plan_dir"; echo "release-plan: the Genie agent plan failed (above); no manifest was written." >&2; exit 1; \
 	fi; \
 	live="$$($(_LIVE_SNAPSHOT))" || { rm -rf "$$plan_dir"; echo "release-plan: the live snapshot could not be taken; no manifest was written." >&2; exit 1; }; \
 	manifest="$$($(_RELEASE_GATE) manifest-write --env-dir "$(ENV_DIR)" --env "$(ENV)" --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json" --live-snapshot "$$live")" || { rm -rf "$$plan_dir"; exit 1; }; \
@@ -972,6 +979,7 @@ _release-plan-roots:
 		echo '{"skipped": "no workspace config (abac.auto.tfvars)"}' > "$$plan_dir/workspace.json"; \
 	else \
 		echo "=== Saved plan (workspace:$(ENV)) ==="; \
+		$(_AGENT_OWNERSHIP) guard-removals --env-dir "$(ENV_DIR)" --env "$(ENV)"; \
 		$(_GENIE_ID_FILE_CHECK); \
 		$(_AGENT_COVERAGE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" || true; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
@@ -1028,6 +1036,10 @@ _release-manifest: _guard-not-ci-apply
 			$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the saved workspace plan failed"; \
 			exit 1; \
 		fi; \
+	fi; \
+	if ! $(_AGENT_OWNERSHIP) sync --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest"; then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the manifest's Genie agent config was not pushed (above)"; \
+		exit 1; \
 	fi; \
 	withheld_rc=0; \
 	$(_COVERAGE_GATE) withheld --layer data_access --layer-dir "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" --env-name "$(ENV)" || withheld_rc=1; \

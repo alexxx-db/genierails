@@ -468,7 +468,8 @@ def test_receipt_outside_git_records_no_commit(tmp_path, capsys):
     assert "records no commit" in capsys.readouterr().out
 
 
-def test_receipt_keeps_prod_ids_out_of_git_and_restores_lost_id_files(tmp_path):
+def test_receipt_keeps_prod_ids_out_of_git_and_restores_lost_id_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
     prod = _prod(tmp_path)
     head = _git_repo(tmp_path)
     tracked_before = subprocess.run(["git", "-C", str(tmp_path), "status", "--porcelain"],
@@ -477,9 +478,10 @@ def test_receipt_keeps_prod_ids_out_of_git_and_restores_lost_id_files(tmp_path):
     assert receipt["commit"] == head and receipt["agents"]["Sales"]["genie_space_id"] == "prod-1"
     assert "prod-1" not in (prod / "agents" / "Sales.auto.tfvars").read_text()
     (prod / ".genie_space_id_sales").unlink()
-    assert ownership.restore_ids(prod) == ["Sales"]
+    assert ownership.legacy_receipt_path(prod, "prod").is_relative_to(tmp_path / "state")
+    assert ownership.restore_ids(prod, "prod") == ["Sales"]
     assert (prod / ".genie_space_id_sales").read_text() == "prod-1\n"
-    assert ownership.restore_ids(prod) == [], "an ID file in place is never overwritten"
+    assert ownership.restore_ids(prod, "prod") == [], "an ID file in place is never overwritten"
     # Only ignored/untracked runtime files changed: no committed file was written.
     assert subprocess.run(["git", "-C", str(tmp_path), "diff", "--stat"], text=True,
                           capture_output=True).stdout == ""
@@ -515,7 +517,12 @@ def _released_detached(tmp_path):
     return prod, head
 
 
-def test_detach_removes_exactly_the_agents_addresses(tmp_path):
+@pytest.fixture
+def detach_lock(monkeypatch):
+    monkeypatch.setattr(ownership, "_lock_owner", lambda env_dir: "detach-agent")
+
+
+def test_detach_removes_exactly_the_agents_addresses(tmp_path, detach_lock):
     prod, head = _released_detached(tmp_path)
     runner, log = _runner(tmp_path)
     removed = ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
@@ -530,7 +537,7 @@ def test_detach_removes_exactly_the_agents_addresses(tmp_path):
     assert all("destroy" not in c and "apply" not in c for c in calls)
 
 
-def test_detach_refuses_unless_the_detached_change_is_the_released_head(tmp_path):
+def test_detach_refuses_unless_the_detached_change_is_the_released_head(tmp_path, detach_lock):
     runner, log = _runner(tmp_path)
     attached = _prod(tmp_path / "a")
     with pytest.raises(ownership.AgentError, match="not detached"):
@@ -541,12 +548,13 @@ def test_detach_refuses_unless_the_detached_change_is_the_released_head(tmp_path
     with pytest.raises(ownership.AgentError, match="uncommitted changes"):
         ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=False)
     # Released while still attached, detached only in the checkout.
-    receipt = json.loads((prod / ownership.RECEIPT).read_text())
+    receipt_path = ownership.legacy_receipt_path(prod, "prod")
+    receipt = json.loads(receipt_path.read_text())
     receipt["agents"]["Sales"].update(detached=False, acl_groups=["a"])
-    (prod / ownership.RECEIPT).write_text(json.dumps(receipt))
+    receipt_path.write_text(json.dumps(receipt))
     with pytest.raises(ownership.AgentError, match="did not have Sales detached"):
         ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
-    (prod / ownership.RECEIPT).unlink()
+    receipt_path.unlink()
     with pytest.raises(ownership.AgentError, match="no release receipt"):
         ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
     ownership.write_receipt(prod, "prod", commit="")
@@ -669,3 +677,245 @@ def test_detach_agent_is_an_operations_command_that_takes_the_env_lock():
     recipe = makefile[makefile.index("\ndetach-agent:"):]
     recipe = recipe[:recipe.index("\n\n")]
     assert "_guard-not-ci-apply" in recipe.splitlines()[1] and "_ENV_LOCK,detach-agent" in recipe
+
+
+# ── Step 9 integration: manifest, release lock, release receipt ──────────────
+
+def test_detach_refuses_outside_its_own_env_lock(tmp_path, monkeypatch):
+    prod, head = _released_detached(tmp_path)
+    runner, log = _runner(tmp_path)
+    for owner in (None, "release", "maintain"):
+        monkeypatch.setattr(ownership, "_lock_owner", lambda env_dir, owner=owner: owner)
+        with pytest.raises(ownership.AgentError, match="only as make detach-agent"):
+            ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
+    assert not log.exists()
+
+
+def _deterministic_prod(tmp_path, monkeypatch, settings='genie_space_id = ""\nacl_groups = ["a"]\n'):
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    prod = _env(tmp_path, name="prod", env_cfg='governance_mode = "deterministic"\npromote_from = "dev"\n',
+                Sales=settings)
+    ownership.write_payload(_payload(), agent_files.capture_path(prod, "Sales"))
+    (prod / ".genie_space_id_sales").write_text("prod-1\n")
+    return prod
+
+
+def _step9_receipt(prod: Path, commit: str, agents: dict) -> None:
+    from scripts import release_gate as rg
+
+    cloud = rg.cloud_dir_of(prod)
+    rg._write_once(rg.release_dir(cloud, "prod") / f"{rg._now().replace(':', '')}.json",
+                   {"kind": "release", "version": rg.VERSION, "env": "prod", "commit": commit,
+                    "created_at": rg._now(), "agents": agents})
+
+
+def test_deterministic_detach_reads_the_step9_release_receipt(tmp_path, monkeypatch, detach_lock):
+    prod = _deterministic_prod(tmp_path, monkeypatch, 'genie_space_id = ""\nacl_groups = []\ndetached = true\n')
+    head = _git_repo(tmp_path)
+    runner, log = _runner(tmp_path)
+    with pytest.raises(ownership.AgentError, match="has no release receipt"):
+        ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
+    # The legacy receipt doesn't count in a deterministic env.
+    ownership.write_receipt(prod, "prod", commit=head)
+    with pytest.raises(ownership.AgentError, match="has no release receipt"):
+        ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
+    _step9_receipt(prod, head, {"Sales": {"genie_space_id": "prod-1", "acl_groups": ["a"], "detached": False}})
+    with pytest.raises(ownership.AgentError, match="did not have Sales detached"):
+        ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
+    _step9_receipt(prod, head, {"Sales": {"genie_space_id": "prod-1", "acl_groups": [], "detached": True}})
+    assert len(ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)) == 3
+
+
+def test_deterministic_ids_are_recovered_from_the_step9_release_receipt(tmp_path, monkeypatch):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    (prod / ".genie_space_id_sales").unlink()
+    assert ownership.restore_ids(prod, "prod") == []
+    _step9_receipt(prod, "c1", {"Sales": {"genie_space_id": "prod-1"}})
+    assert ownership.restore_ids(prod, "prod") == ["Sales"]
+    assert (prod / ".genie_space_id_sales").read_text() == "prod-1\n"
+
+
+def test_the_release_receipt_records_each_agents_id_and_detach_state(tmp_path, monkeypatch):
+    from scripts import release_gate as rg
+    from tests.test_release_gate import Repo
+
+    repo = Repo(tmp_path, monkeypatch)
+    repo.commit({"aws/envs/prod/agents/Sales.auto.tfvars": 'genie_space_id = ""\nacl_groups = []\ndetached = true\n'})
+    (repo.prod / ".genie_space_id_sales").write_text("prod-9\n")
+    manifest = tmp_path / "m.json"
+    manifest.write_text(json.dumps({"kind": "release-manifest", "version": rg.VERSION, "id": "m", "env": "prod",
+                                    "commit": repo.head(), "effective_digest": "e", "live_snapshot": "l"}))
+    receipt = json.loads(rg.release_receipt(repo.prod, "prod", manifest).read_text())
+    assert receipt["agents"]["Sales"] == {"genie_space_id": "prod-9", "key": "sales", "acl_groups": [],
+                                          "detached": True, "delete": False}
+    assert "prod-9" not in repo.git("show", "HEAD:aws/envs/prod/agents/Sales.auto.tfvars")
+
+
+def test_release_plan_records_what_release_will_push_with_the_overwrite_report(tmp_path, monkeypatch, capsys):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    (prod / "agents" / "New.auto.tfvars").write_text('acl_groups = ["a"]\n')
+    ownership.write_payload({"version": 2}, agent_files.capture_path(prod, "New"))
+    (prod / "agents" / "Old.auto.tfvars").write_text('acl_groups = []\ndetached = true\n')
+    live = copy.deepcopy(_payload())
+    live["instructions"]["text_instructions"][0]["content"] = ["edited in the prod UI"]
+    api = FakeGenie({"prod-1": live})
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    result = ownership.plan(prod, "prod", plan_dir, api)["agents"]
+    assert api.methods() == ["GET"], "release-plan reads, never writes"
+    assert result["Sales"]["genie_space_id"] == "prod-1" and result["Sales"]["action"] == "push"
+    assert result["Sales"]["report"] == ["instructions.text_instructions[id=01f0ti000000000000000000000001].content"]
+    assert result["New"]["genie_space_id"] == "" and result["New"]["live_sha256"] is None
+    assert result["Old"] == {"action": "none", "genie_space_id": "", "reason": "detached"}
+    assert json.loads((plan_dir / "agents.json").read_text()) == {"agents": result}
+    assert "overwrites instructions.text_instructions" in capsys.readouterr().out
+
+
+def _manifest(tmp_path, prod, api) -> Path:
+    from scripts import release_gate as rg
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir(exist_ok=True)
+    agents = ownership.plan(prod, "prod", plan_dir, api)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"kind": "release-manifest", "version": rg.VERSION, "env": "prod", "agents": agents}))
+    return path
+
+
+@pytest.fixture
+def release_lock(monkeypatch):
+    monkeypatch.setattr(ownership, "_lock_owner", lambda env_dir: "release")
+
+
+def test_release_pushes_exactly_the_manifests_agent_config(tmp_path, monkeypatch, release_lock):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    api = FakeGenie({"prod-1": {"version": 1}})
+    manifest = _manifest(tmp_path, prod, api)
+    api.calls.clear()
+    assert ownership.sync_manifest(prod, "prod", manifest, api)["Sales"]
+    assert api.methods() == ["GET", "PATCH"] and api.spaces["prod-1"] == _payload()
+
+
+def test_a_new_agent_gets_the_id_its_saved_plan_created(tmp_path, monkeypatch, release_lock):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    (prod / ".genie_space_id_sales").unlink()
+    api = FakeGenie({})
+    manifest = _manifest(tmp_path, prod, api)
+    assert api.calls == []
+    (prod / ".genie_space_id_sales").write_text("created-1\n")  # the saved workspace plan's create
+    api.spaces["created-1"] = {}
+    ownership.sync_manifest(prod, "prod", manifest, api)
+    assert api.spaces["created-1"] == _payload()
+
+
+@pytest.mark.parametrize("drift, message", [
+    ("capture", "changed since release-plan"),
+    ("live", "changed in the workspace since release-plan"),
+    ("id", "nothing is ever pushed to another agent"),
+    ("agent", "the agents changed since release-plan"),
+])
+def test_release_refuses_agent_drift_since_release_plan_and_pushes_nothing(tmp_path, monkeypatch, release_lock,
+                                                                         drift, message):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    (prod / "agents" / "Ops.auto.tfvars").write_text('genie_space_id = "ops-1"\nacl_groups = ["a"]\n')
+    ownership.write_payload({"version": 2}, agent_files.capture_path(prod, "Ops"))
+    api = FakeGenie({"prod-1": {"version": 1}, "ops-1": {"version": 1}})
+    manifest = _manifest(tmp_path, prod, api)
+    if drift == "capture":
+        ownership.write_payload({"version": 3}, agent_files.capture_path(prod, "Sales"))
+    elif drift == "live":
+        api.spaces["prod-1"] = {"version": 1, "edited": True}
+    elif drift == "id":
+        (prod / ".genie_space_id_sales").write_text("other-1\n")
+    else:
+        (prod / "agents" / "Extra.auto.tfvars").write_text('acl_groups = []\n')
+    api.calls.clear()
+    with pytest.raises(ownership.AgentError, match=message):
+        ownership.sync_manifest(prod, "prod", manifest, api)
+    assert "PATCH" not in api.methods(), "every agent is checked before any is pushed"
+
+
+def test_agent_config_is_pushed_only_under_releases_lock(tmp_path, monkeypatch):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    api = FakeGenie({"prod-1": {}})
+    manifest = _manifest(tmp_path, prod, api)
+    for owner in (None, "maintain", "rehearse", "detach-agent"):
+        monkeypatch.setattr(ownership, "_lock_owner", lambda env_dir, owner=owner: owner)
+        with pytest.raises(ownership.AgentError, match="only by make release MANIFEST="):
+            ownership.sync_manifest(prod, "prod", manifest, api)
+    with pytest.raises(ownership.AgentError, match="only from an approved manifest"):
+        ownership.sync(prod, "prod", api)
+    assert "PATCH" not in api.methods()
+
+
+def test_a_manifest_without_an_agent_plan_is_refused_when_agents_are_captured(tmp_path, monkeypatch, release_lock):
+    from scripts import release_gate as rg
+
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    manifest = tmp_path / "old.json"
+    manifest.write_text(json.dumps({"kind": "release-manifest", "version": rg.VERSION, "env": "prod"}))
+    with pytest.raises(ownership.AgentError, match="records no agent plan"):
+        ownership.sync_manifest(prod, "prod", manifest, FakeGenie())
+
+
+def test_the_release_targets_carry_agents_through_the_manifest():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    plan = makefile[makefile.index("\nrelease-plan:"):makefile.index("\n_release-plan-roots:")]
+    order = [plan.index(s) for s in ("_ENV_LOCK,release-plan", "$(_AGENT_OWNERSHIP) restore-ids",
+                                     "$(_AGENT_OWNERSHIP) guard-removals", "_release-plan-roots",
+                                     "$(_AGENT_OWNERSHIP) plan", "manifest-write")]
+    assert order == sorted(order)
+    release = makefile[makefile.index("\n_release-manifest:"):makefile.index("\nmaintain:")]
+    order = [release.index(s) for s in ("manifest-check", "_ENV_LOCK,release", "apply-plan",
+                                        '$(_AGENT_OWNERSHIP) sync --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest',
+                                        "verify-access ENV", "release-receipt")]
+    assert order == sorted(order)
+    roots = makefile[makefile.index("\n_release-plan-roots:"):makefile.index("\n_release-manifest:")]
+    assert roots.index("guard-removals") < roots.index('workspace "$(ENV)" plan')
+
+
+def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_path, monkeypatch):
+    """The real recipes (step 9's make harness): agents are planned under release-plan's lock and pushed
+    by release MANIFEST= after the saved workspace plan, before verify-access and the receipt."""
+    from tests.test_release_gate import Repo
+    from tests.test_release_gate_make import Make
+
+    repo = Repo(tmp_path, monkeypatch)
+    make = Make(tmp_path, repo)
+    agents = make._recorder("agents")
+    assert make("rehearse", "dev").returncode == 0
+    result = make("release-plan", "prod", f"_AGENT_OWNERSHIP={agents}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = make.calls()
+    agent_calls = [c[1] for c in calls if c[0] == "agents"]
+    assert agent_calls == ["restore-ids", "guard-removals", "plan"]
+    manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    assert json.loads(manifest.read_text())["agents"] == {"agents": {}}
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={agents}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = make.calls()
+    flat = [c[0] if c[0] in ("agents", "runner") else next((a for a in c if not a.startswith("-") and "=" not in a), "?")
+            for c in calls]
+    sync = next(c for c in calls if c[0] == "agents")
+    assert sync[1] == "sync" and sync[sync.index("--manifest") + 1] == str(manifest)
+    assert flat.index("runner") < flat.index("agents") < flat.index("verify-access")
+
+
+def test_make_release_fails_without_a_receipt_when_the_agent_push_fails(tmp_path, monkeypatch):
+    from scripts import release_gate as rg
+    from tests.test_release_gate import Repo
+    from tests.test_release_gate_make import Make
+
+    repo = Repo(tmp_path, monkeypatch)
+    make = Make(tmp_path, repo)
+    agents = make._recorder("agents")
+    assert make("rehearse", "dev").returncode == 0
+    result = make("release-plan", "prod", f"_AGENT_OWNERSHIP={agents}")
+    manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    make.exit_code("agents", 1)
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={agents}")
+    assert result.returncode != 0 and "Genie agent config was not pushed" in result.stderr
+    assert rg.last_release(repo.cloud, "prod") is None
+    assert "verify-access" not in make.names()

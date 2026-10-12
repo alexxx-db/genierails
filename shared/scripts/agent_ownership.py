@@ -6,21 +6,30 @@
                    drafting, no model call, no Terraform state.
     import-new     after make generate ENV=dev: captures the agents that have a
                    settings file but no capture yet. Never re-captures one.
-    restore-ids    release, before apply: an agent whose ID file is gone gets
-                   it back from the release receipt (else create title-adopts, #79).
-    sync           release, after apply: pushes each captured config to its
-                   agent as one full replacement and prints what it overwrote.
-                   A rejected field fails the release. Never in dev.
-    receipt        release, after it passed: records the commit and each
-                   agent's ID in envs/<env>/.release_receipt.json (ignored).
-    detach         make detach-agent: refuses unless HEAD is the released
-                   commit and that release had the agent detached; then
-                   terraform state rm for its exact addresses.
+    restore-ids    release-plan (and legacy release), before planning: an agent
+                   whose ID file is gone gets it back from the last release
+                   receipt (else create title-adopts, #79).
+    plan           release-plan: records, per agent, what release will push
+                   (agent ID, capture digest, live-config digest) and prints
+                   the field-level overwrite report; the manifest carries it.
+    sync           release: pushes each captured config to its agent as one
+                   full replacement and prints what it overwrote. In a
+                   deterministic env only what the approved manifest recorded,
+                   only under release's lock, and only if neither the capture,
+                   the agent ID nor the live config moved since release-plan. A
+                   rejected field fails the release. Never in dev.
+    receipt        legacy release, after it passed: records the commit and each
+                   agent's ID. Deterministic envs record them in step 9's
+                   release receipt (release_gate.py release-receipt).
+    detach         make detach-agent, under its own env lock: refuses unless
+                   HEAD is the last released commit and that release had the
+                   agent detached; then terraform state rm for its exact
+                   addresses.
     guard-removals before each workspace plan/apply: refuses an agent that is
                    gone from config while the workspace state still holds it.
 
-Applying commands write only ignored runtime files (state, ID files, the
-receipt); only capture and import-new write committed files.
+Applying commands write only ignored runtime files (state, ID files, receipts
+in the state dir); only capture and import-new write committed files.
 """
 
 from __future__ import annotations
@@ -41,8 +50,9 @@ if str(SHARED) not in sys.path:
 import agent_files  # noqa: E402
 from agent_files import AgentFileError  # noqa: E402
 
-RECEIPT = ".release_receipt.json"
+LEGACY_RECEIPT = "agents-release-receipt.json"
 DEV_ENV = "dev"
+PLAN_FILE = "agents.json"
 # Outer fields of a space; never part of the captured payload.
 OUTER_FIELDS = ("space_id", "etag", "access_control_list", "permissions", "acl")
 SPACE_API = "/api/2.0/genie/spaces/{}"
@@ -212,8 +222,28 @@ def import_new(env_dir: Path, env: str, get: Getter | None = None) -> list[str]:
 
 # ── Release ──────────────────────────────────────────────────────────────────
 
-def load_receipt(env_dir: Path) -> dict:
-    path = env_dir / RECEIPT
+def _gate():
+    from scripts import release_gate
+
+    return release_gate
+
+
+def deterministic(env_dir: Path) -> bool:
+    cfg = agent_files._load_hcl(Path(env_dir) / "env.auto.tfvars")
+    return cfg.get("governance_mode", "legacy") == "deterministic"
+
+
+def legacy_receipt_path(env_dir: Path, env: str) -> Path:
+    gate = _gate()
+    return gate.env_state(gate.cloud_dir_of(env_dir), env) / LEGACY_RECEIPT
+
+
+def load_receipt(env_dir: Path, env: str) -> dict:
+    """The last release receipt: step 9's in deterministic envs, else the legacy agent receipt."""
+    if deterministic(env_dir):
+        gate = _gate()
+        return gate.last_release(gate.cloud_dir_of(env_dir), env) or {}
+    path = legacy_receipt_path(env_dir, env)
     if not path.is_file():
         return {}
     try:
@@ -223,15 +253,32 @@ def load_receipt(env_dir: Path) -> dict:
     return receipt if isinstance(receipt, dict) else {}
 
 
-def restore_ids(env_dir: Path) -> list[str]:
-    """Rewrite lost ID files from the release receipt; never invents an ID."""
-    receipt_agents = load_receipt(env_dir).get("agents") or {}
+def receipt_agents(env_dir: Path) -> dict[str, dict]:
+    """Each agent as released: its ID (from settings or its ID file), acl_groups and flags."""
+    return {agent["name"]: {
+        "genie_space_id": agent_id(env_dir, agent["name"]),
+        "key": agent_files.space_key(agent["name"]),
+        "acl_groups": agent["acl_groups"],
+        "detached": agent["detached"],
+        "delete": agent["delete"],
+    } for agent in agent_files.load_all(env_dir)}
+
+
+def _lock_owner(env_dir: Path) -> str | None:
+    from scripts.environment_lock import held_by_ancestor
+
+    return held_by_ancestor(env_dir)
+
+
+def restore_ids(env_dir: Path, env: str) -> list[str]:
+    """Rewrite lost ID files from the last release receipt; never invents an ID."""
+    released = load_receipt(env_dir, env).get("agents") or {}
     restored = []
     for agent in agent_files.load_all(env_dir):
         if agent["genie_space_id"] or agent["delete"]:
             continue
         path = id_file(env_dir, agent["name"])
-        recorded = str((receipt_agents.get(agent["name"]) or {}).get("genie_space_id") or "")
+        recorded = str((released.get(agent["name"]) or {}).get("genie_space_id") or "")
         if recorded and not (path.is_file() and path.read_text().strip()):
             path.write_text(recorded + "\n")
             restored.append(agent["name"])
@@ -239,11 +286,50 @@ def restore_ids(env_dir: Path) -> list[str]:
     return restored
 
 
+def _sha(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _live(api, name: str, space_id: str) -> dict | None:
+    """The agent's live payload; None when it doesn't serialize yet (a just-created agent)."""
+    try:
+        return payload_from_response(_get_space(api, space_id))
+    except AgentError:
+        return None
+    except Exception as exc:
+        raise AgentError(f"could not read agent {name!r} ({space_id}): {exc}") from exc
+
+
+def _push(api, name: str, space_id: str, desired: dict, current: dict | None) -> list[str]:
+    """One full-replacement PATCH; no retry that drops a field the API rejects."""
+    report = changed_fields(current or {}, desired)
+    try:
+        response = api.do("PATCH", SPACE_API.format(space_id),
+                          body={"serialized_space": json.dumps(desired, separators=(",", ":"))})
+    except Exception as exc:
+        raise AgentError(f"Genie rejected the captured config for {name!r} ({space_id}); nothing was "
+                         f"skipped, so the release fails: {exc}") from exc
+    returned = str((response or {}).get("space_id") or space_id)
+    if returned != space_id:
+        raise AgentError(f"Genie answered for agent {returned}, not {space_id}, while updating {name!r}")
+    print(f"Genie agent {name} ({space_id}): config replaced from agents/{name}.space.json")
+    for field in report:
+        print(f"  overwrote {field}")
+    if not report:
+        print("  no field changed")
+    return report
+
+
 def sync(env_dir: Path, env: str, api=None) -> dict[str, list[str]]:
-    """Push every captured config to its agent: full replacement, one PATCH each."""
+    """Legacy envs: push every captured config to its agent (full replacement, one PATCH each)."""
     if env == DEV_ENV:
         print("Genie agent config: dev's is never overwritten (curate it in the UI, then make capture).")
         return {}
+    if deterministic(env_dir):
+        raise AgentError("a deterministic env pushes agent config only from an approved manifest: "
+                         f"make release-plan ENV={env}, then make release ENV={env} MANIFEST=<it>")
     reports: dict[str, list[str]] = {}
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
@@ -258,29 +344,104 @@ def sync(env_dir: Path, env: str, api=None) -> dict[str, list[str]]:
                              f"{id_file(env_dir, name).name}); its config was not pushed")
         desired = json.loads(agent_files.capture_path(env_dir, name).read_text())
         api = api or _api(env_dir)
-        try:
-            current = payload_from_response(_get_space(api, space_id))
-        except AgentError:
-            current = {}  # a just-created agent may not serialize yet: report every field
-        except Exception as exc:
-            raise AgentError(f"could not read agent {name!r} ({space_id}) before overwriting it: {exc}") from exc
-        report = changed_fields(current, desired)
-        # One full replacement; no retry that drops a field the API rejects.
-        try:
-            response = api.do("PATCH", SPACE_API.format(space_id),
-                              body={"serialized_space": json.dumps(desired, separators=(",", ":"))})
-        except Exception as exc:
-            raise AgentError(f"Genie rejected the captured config for {name!r} ({space_id}); nothing was "
-                             f"skipped, so the release fails: {exc}") from exc
-        returned = str((response or {}).get("space_id") or space_id)
-        if returned != space_id:
-            raise AgentError(f"Genie answered for agent {returned}, not {space_id}, while updating {name!r}")
-        reports[name] = report
-        print(f"Genie agent {name} ({space_id}): config replaced from agents/{name}.space.json")
-        for field in report:
-            print(f"  overwrote {field}")
-        if not report:
-            print("  no field changed")
+        reports[name] = _push(api, name, space_id, desired, _live(api, name, space_id))
+    return reports
+
+
+def plan(env_dir: Path, env: str, plan_dir: Path, api=None) -> dict:
+    """release-plan: what release will do to each agent, with the overwrite report; writes agents.json."""
+    entries: dict[str, dict] = {}
+    for agent in ([] if env == DEV_ENV else agent_files.load_all(env_dir)):
+        name = agent["name"]
+        capture = agent_files.capture_path(env_dir, name)
+        space_id = agent_id(env_dir, name)
+        if agent["delete"]:
+            entries[name] = {"action": "delete" if agent["genie_space_id"] else "none",
+                             "genie_space_id": agent["genie_space_id"]}
+            continue
+        if agent["detached"] or not capture.is_file():
+            entries[name] = {"action": "none", "genie_space_id": space_id,
+                             "reason": "detached" if agent["detached"] else "not captured"}
+            continue
+        text = capture.read_text()
+        entry = {"action": "push", "genie_space_id": space_id, "capture_sha256": _sha(text),
+                 "live_sha256": None, "report": ["<new agent: every captured field>"]}
+        if space_id:
+            api = api or _api(env_dir)
+            live = _live(api, name, space_id)
+            if live is not None:
+                entry["live_sha256"] = _sha(render(live))
+                entry["report"] = changed_fields(live, json.loads(text))
+        entries[name] = entry
+    result = {"agents": entries}
+    (Path(plan_dir) / PLAN_FILE).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    if entries:
+        print(f"=== Genie agents ({env}): what release will overwrite ===")
+    for name, entry in sorted(entries.items()):
+        if entry["action"] == "push":
+            target = entry["genie_space_id"] or "created by the saved workspace plan"
+            print(f"  {name} ({target}): full replacement from agents/{name}.space.json")
+            for field in entry["report"]:
+                print(f"    overwrites {field}")
+            if not entry["report"]:
+                print("    no field changes")
+        elif entry["action"] == "delete":
+            print(f"  {name} ({entry['genie_space_id']}): deleted (delete = true)")
+        else:
+            print(f"  {name}: not pushed ({entry.get('reason', 'nothing to do')})")
+    return result
+
+
+def sync_manifest(env_dir: Path, env: str, manifest_path: Path, api=None) -> dict[str, list[str]]:
+    """release MANIFEST=: push exactly what release-plan recorded, under release's own lock."""
+    if env == DEV_ENV:
+        raise AgentError("dev's agent config is never overwritten")
+    owner = _lock_owner(env_dir)
+    if owner != "release":
+        raise AgentError("agent config in a deterministic env is pushed only by make release MANIFEST=<it>, "
+                         f"under its env lock{f' (this runs under make {owner})' if owner else ''}")
+    manifest = _gate().load_manifest(Path(manifest_path), env)
+    configured = agent_files.load_all(env_dir)
+    if "agents" not in manifest:
+        captured = [a["name"] for a in configured if agent_files.capture_path(env_dir, a["name"]).is_file()]
+        if captured:
+            raise AgentError(f"{manifest_path} records no agent plan, but {', '.join(captured)} "
+                             f"{'is' if len(captured) == 1 else 'are'} captured; run make release-plan ENV={env} again")
+        return {}
+    entries = (manifest.get("agents") or {}).get("agents") or {}
+    drift = sorted(set(entries) ^ {a["name"] for a in configured})
+    if drift:
+        raise AgentError(f"the agents changed since release-plan ({', '.join(drift)}); "
+                         f"run make release-plan ENV={env} again")
+    # Check every agent before pushing any, so a stale manifest changes nothing.
+    pushes = []
+    for name, entry in sorted(entries.items()):
+        if entry["action"] != "push":
+            continue
+        text = agent_files.capture_path(env_dir, name).read_text()
+        if _sha(text) != entry["capture_sha256"]:
+            raise AgentError(f"agents/{name}.space.json changed since release-plan; "
+                             f"run make release-plan ENV={env} again")
+        space_id = agent_id(env_dir, name)
+        if entry["genie_space_id"] and space_id != entry["genie_space_id"]:
+            raise AgentError(f"agent {name!r} is now {space_id or 'unknown'}, the manifest planned "
+                             f"{entry['genie_space_id']}; nothing is ever pushed to another agent")
+        if not space_id:
+            raise AgentError(f"agent {name!r} has no ID after the saved workspace plan; its config was not pushed")
+        api = api or _api(env_dir)
+        live = _live(api, name, space_id)
+        if entry["live_sha256"] is not None and (live is None or _sha(render(live)) != entry["live_sha256"]):
+            raise AgentError(f"agent {name!r} ({space_id}) was changed in the workspace since release-plan, so "
+                             f"the approved overwrite report is stale; run make release-plan ENV={env} again")
+        pushes.append((name, space_id, json.loads(text), live))
+    reports: dict[str, list[str]] = {}
+    for name, space_id, desired, live in pushes:
+        reports[name] = _push(api, name, space_id, desired, live)
+    for name, entry in sorted(entries.items()):
+        if entry["action"] == "delete":
+            api = api or _api(env_dir)
+            api.do("DELETE", SPACE_API.format(entry["genie_space_id"]))
+            print(f"Genie agent {name} ({entry['genie_space_id']}): deleted (delete = true).")
     return reports
 
 
@@ -317,16 +478,10 @@ def tree_clean(env_dir: Path) -> bool:
 
 
 def write_receipt(env_dir: Path, env: str, commit: str | None = None) -> dict:
-    """Record the release. Outside a git checkout the commit is empty, so detach-agent refuses."""
-    agents = {}
-    for agent in agent_files.load_all(env_dir):
-        agents[agent["name"]] = {
-            "genie_space_id": agent_id(env_dir, agent["name"]),
-            "key": agent_files.space_key(agent["name"]),
-            "acl_groups": agent["acl_groups"],
-            "detached": agent["detached"],
-            "delete": agent["delete"],
-        }
+    """Legacy release: record the release in the state dir, outside the checkout.
+
+    Outside a git checkout the commit is empty, so detach-agent refuses.
+    """
     if commit is None:
         try:
             commit = head_commit(env_dir)
@@ -338,10 +493,13 @@ def write_receipt(env_dir: Path, env: str, commit: str | None = None) -> dict:
         "commit": commit,
         "clean_tree": tree_clean(env_dir),
         "released_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "agents": agents,
+        "agents": receipt_agents(env_dir),
     }
-    (env_dir / RECEIPT).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    print(f"Release receipt: {env_dir.name}/{RECEIPT} (commit {receipt['commit'][:12] or 'none'}, {len(agents)} agent(s))")
+    path = legacy_receipt_path(env_dir, env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    print(f"Release receipt: {path} (commit {receipt['commit'][:12] or 'none'}, "
+          f"{len(receipt['agents'])} agent(s))")
     return receipt
 
 
@@ -372,9 +530,13 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
         raise AgentError(
             f"{name} is not detached. Step 1 is a PR that sets acl_groups = [] and detached = true in "
             f"agents/{name}.auto.tfvars, released normally (it revokes CAN_RUN); then run detach-agent.")
-    receipt = load_receipt(env_dir)
+    owner = _lock_owner(env_dir)
+    if owner != "detach-agent":
+        raise AgentError("detach runs only as make detach-agent, under its env lock"
+                         + (f" (this runs under make {owner})" if owner else ""))
+    receipt = load_receipt(env_dir, env)
     if not receipt:
-        raise AgentError(f"no release receipt in {env_dir}: release the detached = true change first")
+        raise AgentError(f"{env} has no release receipt: release the detached = true change first")
     if not receipt.get("commit"):
         raise AgentError("the last release recorded no commit (it ran outside a git checkout): release the "
                          "detached = true change from a checkout of main first")
@@ -436,12 +598,14 @@ def guard_removals(env_dir: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("capture", "import-new", "restore-ids", "sync", "receipt",
+    parser.add_argument("command", choices=("capture", "import-new", "restore-ids", "plan", "sync", "receipt",
                                             "detach", "guard-removals"))
     parser.add_argument("--env-dir", type=Path, required=True)
     parser.add_argument("--env", required=True)
     parser.add_argument("--space", default="")
     parser.add_argument("--runner", type=Path)
+    parser.add_argument("--plan-dir", type=Path, help="plan: release-plan's plan dir")
+    parser.add_argument("--manifest", type=Path, help="sync: the approved release manifest")
     args = parser.parse_args(argv)
     env_dir = args.env_dir
     try:
@@ -452,10 +616,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "import-new":
             import_new(env_dir, args.env)
         elif args.command == "restore-ids":
-            restore_ids(env_dir)
+            restore_ids(env_dir, args.env)
+        elif args.command == "plan":
+            if not args.plan_dir:
+                raise AgentError("plan needs --plan-dir")
+            plan(env_dir, args.env, args.plan_dir)
         elif args.command == "sync":
-            sync(env_dir, args.env)
-            delete_agents(env_dir, args.env)
+            if args.manifest:
+                sync_manifest(env_dir, args.env, args.manifest)
+            else:
+                sync(env_dir, args.env)
+                delete_agents(env_dir, args.env)
         elif args.command == "receipt":
             write_receipt(env_dir, args.env)
         elif args.command == "detach":
