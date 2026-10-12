@@ -275,29 +275,38 @@ def receipt_agents(env_dir: Path, manifest: dict | None = None) -> dict[str, dic
     """Each agent as released, with the identity a later recovery must match.
 
     key and lifecycle come from the agent file; config_sha256 is the capture
-    release pushed (so a recovered ID must still hold exactly that config);
-    binding says how its ID was established (existing, or created by the saved
-    create resource, whose Terraform resource ID is recorded).
+    release pushed (a recovered ID must still hold exactly that config);
+    binding says how its ID was established (BINDINGS), create_resource_id is
+    the Terraform ID of its create resource and created_space_id the agent ID
+    that resource recorded in state. For a manifest release, an agent the saved
+    plan created or adopted is verified again before the receipt is written.
     """
     planned = ((manifest or {}).get("agents") or {}).get("agents") or {}
     result = {}
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
+        key = agent_files.space_key(name)
         entry = planned.get(name) or {}
         capture = agent_files.capture_path(env_dir, name)
+        space_id = agent_id(env_dir, name)
+        binding = entry.get("binding") or binding_now(env_dir, agent)[0]
+        if manifest is not None and entry.get("action") == "push" and binding in ("create", "adopt"):
+            space_id = verify_created(env_dir, name, key, entry["genie_space_id"] or None)
         pushed = entry.get("capture_sha256") if manifest is not None else (
             _sha(capture.read_text()) if capture.is_file() and lifecycle(agent) == "active" else None)
-        key = agent_files.space_key(name)
+        created = create_instance(env_dir, key)
+        record = recorded_id(env_dir, key)
         result[name] = {
-            "genie_space_id": agent_id(env_dir, name),
+            "genie_space_id": space_id,
             "key": key,
             "acl_groups": agent["acl_groups"],
             "detached": agent["detached"],
             "delete": agent["delete"],
             "lifecycle": lifecycle(agent),
             "config_sha256": pushed if entry.get("action", "push") == "push" else None,
-            "binding": entry.get("binding", "existing" if agent_id(env_dir, name) else "none"),
-            "create_resource_id": (create_instance(env_dir, key) or {}).get("id"),
+            "binding": binding,
+            "create_resource_id": (created or {}).get("id"),
+            "created_space_id": ((record or {}).get("result") or {}).get("id"),
         }
     return result
 
@@ -308,23 +317,102 @@ def _lock_owner(env_dir: Path) -> str | None:
     return held_by_ancestor(env_dir)
 
 
-def create_instance(env_dir: Path, key: str) -> dict | None:
-    """The workspace state's terraform_data.genie_space[key] (the create resource), or None."""
+def _state_resources(env_dir: Path) -> list[dict]:
     path = Path(env_dir) / "terraform.tfstate"
     if not path.is_file():
-        return None
+        return []
     try:
-        resources = json.loads(path.read_text()).get("resources") or []
+        return json.loads(path.read_text()).get("resources") or []
     except (OSError, json.JSONDecodeError) as exc:
         raise AgentError(f"{path}: unreadable Terraform state ({exc})") from exc
-    for resource in resources:
-        if (resource.get("module"), resource.get("type"), resource.get("name")) != (
-                "module.workspace", "terraform_data", "genie_space"):
+
+
+def _instances(env_dir: Path, mode: str, type_: str, name: str) -> dict[str, dict]:
+    """index key -> attributes of the current (non-deposed) module.workspace instances."""
+    found = {}
+    for resource in _state_resources(env_dir):
+        if (resource.get("module"), resource.get("mode", "managed"), resource.get("type"), resource.get("name")) != (
+                "module.workspace", mode, type_, name):
             continue
         for instance in resource.get("instances") or []:
-            if instance.get("index_key") == key and not instance.get("deposed"):
-                return instance.get("attributes") or {}
-    return None
+            if isinstance(instance.get("index_key"), str) and not instance.get("deposed"):
+                found[instance["index_key"]] = instance.get("attributes") or {}
+    return found
+
+
+def create_instance(env_dir: Path, key: str) -> dict | None:
+    """The workspace state's terraform_data.genie_space[key] (the create resource), or None."""
+    return _instances(env_dir, "managed", "terraform_data", "genie_space").get(key)
+
+
+def recorded_id(env_dir: Path, key: str) -> dict | None:
+    """data.external.genie_space_id[key]: the agent ID the create resource left, recorded in state."""
+    return _instances(env_dir, "data", "external", "genie_space_id").get(key)
+
+
+def _same_path(a: object, b: Path) -> bool:
+    return bool(a) and Path(str(a)).resolve() == Path(b).resolve()
+
+
+# How an agent's ID was established. create: release-plan saw no ID and no create
+# resource, so the saved plan creates the agent. adopt: an ID file but no create
+# resource, so the saved plan's create resource adopts that ID. existing: the ID
+# was known at release-plan (its create resource then too, if it has one).
+BINDINGS = ("create", "adopt", "existing")
+
+
+def binding_now(env_dir: Path, agent: dict) -> tuple[str, str | None]:
+    """(binding, create resource ID) as the state and ID files are now."""
+    created = create_instance(env_dir, agent_files.space_key(agent["name"]))
+    space_id = agent_id(env_dir, agent["name"])
+    if not space_id:
+        return "create", None
+    if created is None and not agent["genie_space_id"] and promoted(env_dir):
+        return "adopt", None
+    return "existing", (created or {}).get("id")
+
+
+def verify_created(env_dir: Path, name: str, key: str, expected: str | None) -> str:
+    """After the saved workspace plan: the agent ID came from this agent's create resource.
+
+    The create resource terraform_data.genie_space[key] must be in state and
+    name exactly this agent's ID file, create must not have title-adopted
+    another agent, and the agent ID the resource recorded in state
+    (data.external.genie_space_id[key]) must equal the ID file's contents
+    (and the planned ID, for an adoption). Returns that ID.
+    """
+    path = id_file(env_dir, name)
+    created = create_instance(env_dir, key)
+    if created is None:
+        elsewhere = [k for k, attrs in _instances(env_dir, "managed", "terraform_data", "genie_space").items()
+                     if _same_path((attrs.get("input") or {}).get("id_file"), path)]
+        if elsewhere:
+            raise AgentError(f"the create resource for {name!r}'s ID file is in state under key "
+                             f"{elsewhere[0]!r}, not {key!r}; its config was not pushed")
+        raise AgentError(f"the saved workspace plan didn't create {name!r}: no create resource "
+                         f"terraform_data.genie_space[{key!r}] in state; its config was not pushed")
+    named = (created.get("input") or {}).get("id_file")
+    if not _same_path(named, path):
+        raise AgentError(f"the create resource for {name!r} names the ID file {named}, not {path}; "
+                         "its config was not pushed")
+    if adopted_marker(env_dir, name).exists():
+        raise AgentError(f"creating {name!r} adopted an existing agent titled {name!r} instead of creating one "
+                         f"({adopted_marker(env_dir, name).name}); its config was not pushed")
+    record = recorded_id(env_dir, key)
+    if record is None:
+        raise AgentError(f"the create resource for {name!r} recorded no agent ID in state "
+                         f"(data.external.genie_space_id[{key!r}]); its config was not pushed")
+    if not _same_path((record.get("query") or {}).get("id_file"), path):
+        raise AgentError(f"the agent ID recorded in state for {name!r} was read from "
+                         f"{(record.get('query') or {}).get('id_file')}, not {path}; its config was not pushed")
+    state_id = str((record.get("result") or {}).get("id") or "")
+    file_id = path.read_text().strip() if path.is_file() else ""
+    if not state_id or state_id != file_id:
+        raise AgentError(f"{path.name} holds {file_id or 'nothing'}, but the create resource recorded "
+                         f"{state_id or 'nothing'} in state; nothing is pushed to an agent it didn't create")
+    if expected is not None and state_id != expected:
+        raise AgentError(f"the create resource for {name!r} recorded {state_id}, the manifest planned {expected}")
+    return state_id
 
 
 def adopted_marker(env_dir: Path, name: str) -> Path:
@@ -353,16 +441,20 @@ def _title_matches(api, title: str) -> list[str]:
 def restore_ids(env_dir: Path, env: str, api=None) -> list[str]:
     """Rewrite a lost ID file from the last release receipt, only when the identity still matches.
 
-    The receipt entry must have the agent's key, an active lifecycle and the
-    config that release pushed, and the live agent at that ID must hold
-    exactly that config. Anything else is refused (a changed key, a mismatch)
-    or not recovered (an agent released as detached or deleted: one with that
-    name now is a new agent).
+    The receipt entry must have the agent's key, a known binding, an active
+    lifecycle and the config release pushed. Its create resource must be the
+    one in state now (same Terraform ID, naming exactly this agent's ID file,
+    and the agent ID it recorded), or, for an agent released with none, state
+    must hold none. The live agent at that ID must hold exactly the pushed
+    config. Anything else is refused (recover by writing the ID file yourself),
+    except an agent released as detached or deleted, which isn't recovered: one
+    with that name now is a new agent.
     """
     released = load_receipt(env_dir, env).get("agents") or {}
     restored = []
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
+        key = agent_files.space_key(name)
         if agent["genie_space_id"] or agent["delete"]:
             continue
         path = id_file(env_dir, name)
@@ -372,27 +464,50 @@ def restore_ids(env_dir: Path, env: str, api=None) -> list[str]:
         recorded = str(entry.get("genie_space_id") or "")
         if not recorded:
             continue
-        if entry.get("key") != agent_files.space_key(name):
+        refusal = f"can't prove that agent {recorded} (from the release receipt) is {name!r}"
+        manual = f"If it is, write the ID into {path} yourself; release-plan then shows its live config."
+        if entry.get("key") != key:
             raise AgentError(f"the release receipt's entry for {name!r} has key {entry.get('key')!r}, not "
-                             f"{agent_files.space_key(name)!r}; its ID {recorded} is not recovered")
+                             f"{key!r}; its ID {recorded} is not recovered")
         released_lifecycle = entry.get("lifecycle") or ("detached" if entry.get("detached") else "active")
         if released_lifecycle != "active":
             print(f"Not recovering {name}'s ID: the last release had it {released_lifecycle}, so an agent "
                   f"with this name now is a new one.")
             continue
-        refusal = (f"can't prove that agent {recorded} (from the release receipt) is {name!r}")
+        binding, resource_id = entry.get("binding"), entry.get("create_resource_id")
+        if binding not in BINDINGS:
+            raise AgentError(f"{refusal}: the receipt records no known binding ({binding!r}; written by an earlier "
+                             f"version?). {manual}")
+        if binding in ("create", "adopt") and not resource_id:
+            raise AgentError(f"{refusal}: the receipt says the saved plan {binding}d it but records no create "
+                             f"resource. {manual}")
+        created = create_instance(env_dir, key)
+        if resource_id:
+            if created is None:
+                raise AgentError(f"{refusal}: the receipt names create resource {resource_id}, but the state "
+                                 f"holds no terraform_data.genie_space[{key!r}]. {manual}")
+            if created.get("id") != resource_id:
+                raise AgentError(f"{refusal}: the receipt names create resource {resource_id}, the state holds "
+                                 f"{created.get('id')}. {manual}")
+            if not _same_path((created.get("input") or {}).get("id_file"), path):
+                raise AgentError(f"{refusal}: its create resource names the ID file "
+                                 f"{(created.get('input') or {}).get('id_file')}, not {path}. {manual}")
+            state_id = ((recorded_id(env_dir, key) or {}).get("result") or {}).get("id")
+            if state_id and state_id != recorded:
+                raise AgentError(f"{refusal}: its create resource recorded {state_id} in state. {manual}")
+        elif created is not None:
+            raise AgentError(f"{refusal}: the receipt records no create resource, but the state holds "
+                             f"terraform_data.genie_space[{key!r}] ({created.get('id')}). {manual}")
         if not entry.get("config_sha256"):
-            raise AgentError(f"{refusal}: the receipt records no config release pushed to it. If it is, write "
-                             f"the ID into {path} yourself; release-plan then plans it with its live config.")
+            raise AgentError(f"{refusal}: the receipt records no config release pushed to it. {manual}")
         api = api or _api(env_dir)
         live = _live(api, name, recorded)
         if live is None or _sha(render(live)) != entry["config_sha256"]:
-            raise AgentError(f"{refusal}: its live config isn't the one release last pushed. If it is, write the "
-                             f"ID into {path} yourself; release-plan then shows what it overwrites.")
+            raise AgentError(f"{refusal}: its live config isn't the one release last pushed. {manual}")
         path.write_text(recorded + "\n")
         restored.append(name)
         print(f"Recovered {name}'s agent ID {recorded} from the release receipt ({path.name}); "
-              "its live config matches what release last pushed.")
+              "its create resource and live config match what release recorded.")
     return restored
 
 
@@ -457,12 +572,17 @@ def delete_consequences(env_dir: Path, env: str) -> dict[str, str]:
 
 
 def check_delete_acks(env_dir: Path, env: str) -> list[str]:
-    """Refuse delete = true without its <env>:delete-agent:<key> line in envs/<env>/ack.txt."""
+    """Refuse delete = true without its <env>:delete-agent:<key> ack, and a delete-agent ack nothing needs."""
     needed = delete_consequences(env_dir, env)
-    missing = sorted(set(needed) - _ack_keys(env_dir, env))
+    acked = {k for k in _ack_keys(env_dir, env) if k.startswith(f"{env}:delete-agent:")}
+    missing = sorted(set(needed) - acked)
     if missing:
         raise AgentError("delete = true deletes the agent and its conversations, so it needs a reviewed "
                          f"acknowledgement: add {', '.join(missing)} to envs/{env}/ack.txt in a PR")
+    stale = sorted(acked - set(needed))
+    if stale:
+        raise AgentError(f"envs/{env}/ack.txt acknowledges deleting {', '.join(stale)}, but no agent there has "
+                         "delete = true: remove the stale line in a PR")
     return sorted(needed)
 
 
@@ -505,8 +625,9 @@ def _planned(agent: dict, env_dir: Path, env: str) -> dict:
     if agent["detached"] or not capture.is_file():
         return {"action": "none", "key": key, "genie_space_id": space_id,
                 "reason": "detached" if agent["detached"] else "not captured"}
+    binding, resource_id = binding_now(env_dir, agent)
     return {"action": "push", "key": key, "genie_space_id": space_id, "capture_sha256": _sha(capture.read_text()),
-            "binding": "existing" if space_id else "create"}
+            "binding": binding, "create_resource_id": resource_id}
 
 
 def plan(env_dir: Path, env: str, plan_dir: Path, api=None) -> dict:
@@ -519,7 +640,7 @@ def plan(env_dir: Path, env: str, plan_dir: Path, api=None) -> dict:
         if entry["action"] == "push":
             entry |= {"live_sha256": None, "report": ["<new agent: every captured field>"]}
             api = api or _api(env_dir)
-            if entry["binding"] == "existing":
+            if entry["binding"] != "create":
                 live = _live(api, name, entry["genie_space_id"])
                 if live is not None:
                     entry["live_sha256"] = _sha(render(live))
@@ -567,7 +688,7 @@ def _require_new(env_dir: Path, name: str, key: str, api) -> None:
                          "overwrites); otherwise rename one of them")
 
 
-def _manifest_entries(env_dir: Path, env: str, manifest_path: Path) -> dict[str, dict]:
+def _manifest_entries(env_dir: Path, env: str, manifest_path: Path, *, applied: bool) -> dict[str, dict]:
     if env == DEV_ENV:
         raise AgentError("dev's agent config is never overwritten")
     owner = _lock_owner(env_dir)
@@ -587,12 +708,15 @@ def _manifest_entries(env_dir: Path, env: str, manifest_path: Path) -> dict[str,
     if drift:
         raise AgentError(f"the agents changed since release-plan ({', '.join(drift)}); "
                          f"run make release-plan ENV={env} again")
+    # A planned create or adoption changes binding once the saved plan ran: judged in _check_entry.
+    fields = ("action", "key", "capture_sha256", "ack", "reason") + (() if applied else ("binding", "create_resource_id"))
     for agent in configured:
         entry = entries[agent["name"]]
         now = _planned(agent, env_dir, env)
-        for field in ("action", "key", "capture_sha256", "binding", "ack", "reason"):
-            if field == "binding" and entry.get("binding") == "create" and now.get("binding") == "existing":
-                continue  # judged per phase: a planned create must still be new before apply
+        for field in fields:
+            if field in ("binding", "create_resource_id") and entry.get("binding") == "create" \
+                    and now.get("binding") != "create":
+                continue  # an ID file or create resource that appeared: _require_new says which
             if now.get(field) != entry.get(field):
                 raise AgentError(f"agent {agent['name']!r} changed since release-plan ({field}: "
                                  f"{entry.get(field)!r} -> {now.get(field)!r}); run make release-plan ENV={env} again")
@@ -604,27 +728,33 @@ def _manifest_entries(env_dir: Path, env: str, manifest_path: Path) -> dict[str,
 def _check_entry(env_dir: Path, env: str, name: str, entry: dict, api, *, applied: bool):
     """Raise unless the agent still is what the manifest planned; returns (space_id, live)."""
     stale = f"run make release-plan ENV={env} again"
-    space_id = agent_id(env_dir, name)
-    if entry.get("binding") == "create":
+    binding = entry.get("binding")
+    if binding not in BINDINGS:
+        raise AgentError(f"the manifest records no known binding for {name!r} ({binding!r}); {stale}")
+    if binding == "create":
         if not applied:
             _require_new(env_dir, name, entry["key"], api)
             return "", None
-        # Proof the ID came from the saved create resource: it is in state now, it names this ID
-        # file, and create made the agent rather than adopting one by title.
-        created = create_instance(env_dir, entry["key"])
-        if created is None or not str((created.get("input") or {}).get("id_file", "")).endswith(
-                f".genie_space_id_{entry['key']}"):
-            raise AgentError(f"the saved workspace plan didn't create {name!r} (no create resource for "
-                             f"{entry['key']!r} in state); its config was not pushed")
-        if adopted_marker(env_dir, name).exists():
-            raise AgentError(f"creating {name!r} adopted an existing agent titled {name!r} ({space_id}) instead "
-                             f"of creating one; its config was not pushed. Check that agent, then {stale}")
-        if not space_id:
-            raise AgentError(f"the saved workspace plan created {name!r} but left no ID file; config not pushed")
+        space_id = verify_created(env_dir, name, entry["key"], None)
         return space_id, _live(api, name, space_id)
+    space_id = agent_id(env_dir, name)
     if space_id != entry["genie_space_id"]:
         raise AgentError(f"agent {name!r} is now {space_id or 'unknown'}, the manifest planned "
                          f"{entry['genie_space_id']}; nothing is ever pushed to another agent")
+    if binding == "adopt" and applied:
+        verify_created(env_dir, name, entry["key"], entry["genie_space_id"])
+    elif binding == "existing" and entry.get("create_resource_id"):
+        created = create_instance(env_dir, entry["key"])
+        if (created or {}).get("id") != entry["create_resource_id"]:
+            raise AgentError(f"{name!r}'s create resource is now {(created or {}).get('id')}, the manifest planned "
+                             f"{entry['create_resource_id']}; {stale}")
+        if not _same_path((created.get("input") or {}).get("id_file"), id_file(env_dir, name)):
+            raise AgentError(f"{name!r}'s create resource names the ID file "
+                             f"{(created.get('input') or {}).get('id_file')}, not {id_file(env_dir, name)}")
+        state_id = ((recorded_id(env_dir, entry["key"]) or {}).get("result") or {}).get("id")
+        if state_id and state_id != space_id:
+            raise AgentError(f"{id_file(env_dir, name).name} holds {space_id}, but {name!r}'s create resource "
+                             f"recorded {state_id} in state; nothing is ever pushed to another agent")
     live = _live(api, name, space_id)
     if entry.get("live_sha256") is not None and (live is None or _sha(render(live)) != entry["live_sha256"]):
         raise AgentError(f"agent {name!r} ({space_id}) was changed in the workspace since release-plan, so the "
@@ -634,7 +764,7 @@ def _check_entry(env_dir: Path, env: str, name: str, entry: dict, api, *, applie
 
 def preflight(env_dir: Path, env: str, manifest_path: Path, api=None) -> list[str]:
     """release MANIFEST=, before sync-tags or any saved plan: read-only; raise if any agent moved."""
-    entries = _manifest_entries(env_dir, env, manifest_path)
+    entries = _manifest_entries(env_dir, env, manifest_path, applied=False)
     checked = []
     for name, entry in sorted(entries.items()):
         if entry["action"] != "push":
@@ -650,7 +780,7 @@ def preflight(env_dir: Path, env: str, manifest_path: Path, api=None) -> list[st
 
 def sync_manifest(env_dir: Path, env: str, manifest_path: Path, api=None) -> dict[str, list[str]]:
     """release MANIFEST=, after the saved workspace plan: re-check, then push exactly what was planned."""
-    entries = _manifest_entries(env_dir, env, manifest_path)
+    entries = _manifest_entries(env_dir, env, manifest_path, applied=True)
     pushes = []
     for name, entry in sorted(entries.items()):
         if entry["action"] != "push":

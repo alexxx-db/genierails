@@ -155,6 +155,18 @@ variable "genie_id_file_prefix" {
   description = "Path prefix for per-space Genie ID files. Each space appends _{key} to this prefix."
 }
 
+variable "record_created_agent_ids" {
+  type        = bool
+  default     = false
+  description = "Deterministic envs: record in state the agent ID each create resource left in its ID file (data.external.genie_space_id)."
+}
+
+variable "genie_id_reader_path" {
+  type        = string
+  default     = ""
+  description = "Path to scripts/genie_id_record.py, the program that reads an ID file back for record_created_agent_ids."
+}
+
 variable "genie_script_path" {
   type        = string
   description = "Path to scripts/genie_space.sh."

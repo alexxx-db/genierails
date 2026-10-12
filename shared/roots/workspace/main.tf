@@ -8,6 +8,10 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.2"
     }
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.3"
+    }
   }
   required_version = ">= 1.7"
 
@@ -805,6 +809,8 @@ module "workspace" {
   genie_spaces                     = local.merged_spaces
   genie_id_file_prefix             = "${var.env_dir}/.genie_space_id"
   genie_script_path                = "${local.project_root}/scripts/genie_space.sh"
+  record_created_agent_ids         = local.deterministic
+  genie_id_reader_path             = "${local.project_root}/scripts/genie_id_record.py"
 }
 
 # ── Outputs ───────────────────────────────────────────────────────────────────
@@ -866,6 +872,11 @@ output "genie_space_missing_grants" {
 output "genie_space_can_run_widening" {
   description = "Per Genie agent: CAN_RUN groups its ACL adds beyond what the last apply left in place. Only these need the coverage check and the agent's grants."
   value       = local.genie_space_can_run_widening
+}
+
+output "genie_space_id_records" {
+  description = "Deterministic envs: per create-path agent key, the ID file whose agent ID the state records."
+  value       = module.workspace.genie_space_id_records
 }
 
 output "genie_existing_space_warehouse_intent" {

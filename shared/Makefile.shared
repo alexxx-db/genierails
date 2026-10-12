@@ -823,6 +823,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	export GENIERAILS_RERUN_TARGET=release; \
 	$(_ACCESS_CHECK) "make release" || exit 1; \
 	$(_GROUP_CHECK) "make release" || exit 1; \
+	$(_AGENT_OWNERSHIP) check-deletes --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
 	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)" --mode "$$mode" --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
@@ -854,7 +855,6 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		fi; \
 		exit $$audit_rc; \
 	fi; \
-	$(_AGENT_OWNERSHIP) check-deletes --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	$(_AGENT_OWNERSHIP) restore-ids --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	if ! $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0; then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "apply failed"; \
