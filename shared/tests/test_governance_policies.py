@@ -227,7 +227,19 @@ def _layer(tmp_path, target, env_text):
 
 @pytest.mark.parametrize("target", ["_plan-layer", "_apply-layer"])
 def test_governance_only_env_skips_the_workspace_layer(tmp_path, target):
-    result = _layer(tmp_path, target, 'governance_mode = "deterministic"\nuc_tables = ["cat.sch.t"]\n')
+    from scripts import environment_lock
+
+    # _apply-layer runs inside make rehearse, under its env lock (release_gate.py apply-guard).
+    env_dir = tmp_path / "aws" / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    ok, _message, nonce = environment_lock.acquire(env_dir, os.getpid(), "rehearse")
+    assert ok
+    os.environ[environment_lock.nonce_var(env_dir)] = nonce  # as make's _ENV_LOCK exports it
+    try:
+        result = _layer(tmp_path, target, 'governance_mode = "deterministic"\nuc_tables = ["cat.sch.t"]\n')
+    finally:
+        os.environ.pop(environment_lock.nonce_var(env_dir), None)
+        environment_lock.release_lock(env_dir, os.getpid())
     assert result.returncode == 0, result.stdout + result.stderr
     assert "governance-only (deterministic, no agents); GenieRails creates and grants nothing" in result.stdout
     assert "RUNNER-CALLED" not in result.stdout

@@ -125,8 +125,10 @@ def extract_config_tag_assignments(env_dir: Path) -> list[dict]:
     data_access/abac.auto.tfvars, since generate-delta writes to generated/
     and the split hasn't run yet until the next make apply.
     """
+    from scripts.runtime_overlay import effective
+
     for path in [
-        env_dir / "generated" / "abac.auto.tfvars",
+        effective(env_dir, "abac.auto.tfvars"),
         env_dir / "data_access" / "abac.auto.tfvars",
     ]:
         cfg = _load_hcl(path)

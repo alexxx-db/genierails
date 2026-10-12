@@ -26,6 +26,15 @@ They read:
   governed columns may already carry their new value; keep it.
 * ``GENIERAILS_COVERAGE_GATE_RUNNER``: when set, the coverage check re-runs on
   each render, so its result matches what the stage applies.
+* ``GENIERAILS_POLICY_PLAN_OUT=<file>`` (make release-plan): render, check and
+  plan the stage into ``<file>``, record the render and whether the plan
+  changes anything in ``<file>.json``, and apply nothing.
+* ``GENIERAILS_POLICY_PLAN_BASIS=<file>``: with PLAN_OUT, the grant stage
+  re-applies the render planned into that earlier plan file instead of the
+  last applied one.
+* ``GENIERAILS_POLICY_SAVED_PLAN=<file>`` (make release MANIFEST=...): apply
+  exactly that saved plan, after checking the stage still renders what was
+  planned; a plan that changes nothing is not applied. Nothing is re-planned.
 
 Stages (every one keeps all retained generations' functions):
 
@@ -113,9 +122,15 @@ def _load(path: Path) -> dict:
 
 
 def desired_generation(env_dir: Path) -> dict:
-    """The generation the generated config describes, with the settings behind it."""
-    cfg = _load(env_dir / "generated" / "abac.auto.tfvars")
-    sql_path = env_dir / "generated" / "masking_functions.sql"
+    """The generation the generated config describes, with the settings behind it.
+
+    The effective config: the runtime overlay of a live derivation when there
+    is one (scripts/runtime_overlay.py), else the committed generated/.
+    """
+    from scripts.runtime_overlay import effective
+
+    cfg = _load(effective(env_dir, "abac.auto.tfvars"))
+    sql_path = effective(env_dir, "masking_functions.sql")
     functions = sql_library_block(sql_path.read_text() if sql_path.is_file() else "")
     masks = [p for p in cfg.get("fgac_policies") or [] if p.get("policy_type") == "POLICY_TYPE_COLUMN_MASK"]
     tags = {
@@ -458,6 +473,57 @@ def load_stage_record(env_dir: Path) -> dict | None:
     return json.loads(path.read_text()) if path.is_file() else None
 
 
+PLAN_OUT_ENV = "GENIERAILS_POLICY_PLAN_OUT"
+PLAN_BASIS_ENV = "GENIERAILS_POLICY_PLAN_BASIS"
+SAVED_PLAN_ENV = "GENIERAILS_POLICY_SAVED_PLAN"
+
+
+def sidecar_path(plan_file: Path | str) -> Path:
+    plan_file = Path(plan_file)
+    return plan_file.with_name(plan_file.name + ".json")
+
+
+def _normal(value):
+    return json.loads(json.dumps(value, sort_keys=True))
+
+
+def plan_changes(plan: dict) -> bool:
+    """Whether a Terraform plan changes any resource."""
+    return any(set((c.get("change") or {}).get("actions") or []) - {"no-op", "read"}
+               for c in plan.get("resource_changes") or [])
+
+
+def _plan_json(env_name: str, layer_dir: Path, stage: str, plan_file: Path) -> dict:
+    _runner(env_name, layer_dir, "plan", "-input=false", f"-var=policy_stage={stage}", f"-out={plan_file}")
+    shown = _runner(env_name, layer_dir, "show", "-json", str(plan_file), capture=True)
+    return json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
+
+
+def load_sidecar(plan_file: Path | str) -> dict:
+    path = sidecar_path(plan_file)
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise StageError(f"no record of the saved plan {plan_file} ({exc})") from exc
+
+
+def _apply_saved(env_name: str, layer_dir: Path, stage: str, saved: Path, rendered: dict, expect: dict) -> None:
+    """Apply a saved stage plan, refusing when the stage no longer renders what was planned."""
+    side = load_sidecar(saved)
+    for key, value in expect.items():
+        if side.get(key) != value:
+            raise StageError(f"the saved {stage} plan was made for {key} {side.get(key)!r}, now {value!r}; "
+                             "run make release-plan again")
+    if side.get("stage") != stage or _normal(side.get("rendered")) != _normal(rendered):
+        raise StageError(f"the {stage} stage no longer renders what release-plan planned; "
+                         "run make release-plan again")
+    write_stage(layer_dir, rendered)
+    if side.get("changes"):
+        _runner(env_name, layer_dir, "apply-plan", str(saved))
+    else:
+        print(f"Policy stage {stage}: the saved plan changes nothing; not applied")
+
+
 def run_hook(stage: str, environ: dict | None = None) -> int:
     environ = dict(os.environ if environ is None else environ)
     env_dir = Path(environ.get("GENIERAILS_ENV_DIR") or "")
@@ -495,14 +561,23 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
         for problem in staged["problems"]:
             print(f"  - {problem}", file=sys.stderr)
         return 1
+    record = {"stage": stage, "desired": desired["fingerprint"], "old": old_fp,
+              "retire": retire["fingerprint"] if retire else "", "keep_new_tags": keep_new_tags,
+              "rendered": staged["rendered"]}
+    if environ.get(SAVED_PLAN_ENV):
+        _apply_saved(env_name, layer_dir, stage, Path(environ[SAVED_PLAN_ENV]), staged["rendered"],
+                     {"desired": desired["fingerprint"], "old": old_fp, "retire": record["retire"]})
+        write_json(stage_record_path(env_dir), record | {
+            "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        print(f"Policy stage {stage}: applied the saved plan of generation {desired['fingerprint']}")
+        return 0
     write_stage(layer_dir, staged["rendered"])
     if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
         _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"])
+    plan_out = environ.get(PLAN_OUT_ENV)
     with tempfile.TemporaryDirectory() as tmp:
-        plan_file = Path(tmp) / f"{stage}.tfplan"
-        _runner(env_name, layer_dir, "plan", "-input=false", f"-var=policy_stage={stage}", f"-out={plan_file}")
-        shown = _runner(env_name, layer_dir, "show", "-json", str(plan_file), capture=True)
-        plan = json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
+        plan_file = Path(plan_out) if plan_out else Path(tmp) / f"{stage}.tfplan"
+        plan = _plan_json(env_name, layer_dir, stage, plan_file)
         problems = plan_violations(plan, stage, set(staged["allowed_policy_deletes"]),
                                    set(staged["allowed_tag_deletes"]))
         if problems:
@@ -511,11 +586,13 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
             return 1
+        if plan_out:
+            write_json(sidecar_path(plan_file), record | {"changes": plan_changes(plan)})
+            print(f"Policy stage {stage}: planned generation {desired['fingerprint']} into {plan_file}"
+                  + ("" if plan_changes(plan) else " (no changes)"))
+            return 0
         _runner(env_name, layer_dir, "apply-plan", str(plan_file))
-    write_json(stage_record_path(env_dir), {
-        "stage": stage, "desired": desired["fingerprint"], "old": old_fp,
-        "retire": retire["fingerprint"] if retire else "", "keep_new_tags": keep_new_tags,
-        "rendered": staged["rendered"],
+    write_json(stage_record_path(env_dir), record | {
         "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
     print(f"Policy stage {stage}: applied generation {desired['fingerprint']}"
@@ -528,23 +605,33 @@ def grant(env_dir: Path, environ: dict) -> int:
     env_name = environ.get("GENIERAILS_ENV_NAME") or env_dir.name
     layer_dir = env_dir / "data_access"
     expected = environ.get("GENIERAILS_POLICY_FINGERPRINT", "")
-    record = load_stage_record(env_dir)
+    plan_out = environ.get(PLAN_OUT_ENV)
+    basis = environ.get(PLAN_BASIS_ENV) if plan_out else ""
+    record = load_sidecar(basis) if basis else load_stage_record(env_dir)
     if not record or record.get("desired") != expected or desired_generation(env_dir)["fingerprint"] != expected:
         raise StageError("grant: the last applied stage is not of the generation the controller is applying")
+    if environ.get(SAVED_PLAN_ENV):
+        _apply_saved(env_name, layer_dir, "grant", Path(environ[SAVED_PLAN_ENV]), record["rendered"],
+                     {"desired": expected})
+        print(f"Policy stage grant: access applied on generation {expected} (saved plan)")
+        return 0
     write_stage(layer_dir, record["rendered"])
     if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
         _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"])
     with tempfile.TemporaryDirectory() as tmp:
-        plan_file = Path(tmp) / "grant.tfplan"
-        _runner(env_name, layer_dir, "plan", "-input=false", "-var=policy_stage=grant", f"-out={plan_file}")
-        shown = _runner(env_name, layer_dir, "show", "-json", str(plan_file), capture=True)
-        plan = json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
+        plan_file = Path(plan_out) if plan_out else Path(tmp) / "grant.tfplan"
+        plan = _plan_json(env_name, layer_dir, "grant", plan_file)
         problems = plan_violations(plan, "grant")
         if problems:
             print("ERROR: the grant plan changes protection; nothing was applied:", file=sys.stderr)
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
             return 1
+        if plan_out:
+            write_json(sidecar_path(plan_file), {"stage": "grant", "desired": expected,
+                                                 "rendered": record["rendered"], "changes": plan_changes(plan)})
+            print(f"Policy stage grant: planned into {plan_file}" + ("" if plan_changes(plan) else " (no changes)"))
+            return 0
         _runner(env_name, layer_dir, "apply-plan", str(plan_file))
     print(f"Policy stage grant: access applied on generation {expected}")
     return 0
@@ -595,6 +682,19 @@ def drop_functions(env_dir: Path, environ: dict, *, live_users=None, run=subproc
     old = load_snapshot(env_dir, environ.get("GENIERAILS_OLD_POLICY_FINGERPRINT", ""))
     sql = functions_to_drop(desired, old, retire)
     names = {function_name(stmt).rsplit(".", 1)[-1] for _, _, stmt in _statements(sql)}
+    if environ.get(PLAN_OUT_ENV):
+        # Its plan is the DROP statements it would run (no Terraform here).
+        plan_file = Path(environ[PLAN_OUT_ENV])
+        plan_file.write_text(sql)
+        write_json(sidecar_path(plan_file), {"stage": "drop-functions", "desired": desired["fingerprint"],
+                                             "rendered": {"sql": sql}, "changes": bool(names)})
+        print(f"Policy stage drop-functions: planned {len(names)} function drop(s) into {plan_file}")
+        return 0
+    if environ.get(SAVED_PLAN_ENV):
+        saved = Path(environ[SAVED_PLAN_ENV])
+        if saved.read_text() != sql or load_sidecar(saved).get("desired") != desired["fingerprint"]:
+            raise StageError("drop-functions: the functions to drop changed since release-plan; "
+                             "run make release-plan again")
     if not names:
         print("Policy stage drop-functions: every retired function is still used; nothing to drop")
         return 0

@@ -87,10 +87,16 @@ def _recipe(target: str) -> str:
 
 def test_inventory_runs_before_every_rehearse_release_and_maintain_in_deterministic_envs_only():
     # rehearse reaches apply through _derive-before-exposure, like plan and apply.
-    for target in ("_derive-before-exposure", "release", "maintain"):
+    for target in ("_derive-before-exposure", "release"):
         recipe = _recipe(target)
         assert 'if [ "$$' in recipe and "= deterministic ]; then python3 \"$(SHARED_ROOT)/scripts/external_mask_inventory.py\"" in recipe, target
         assert "external_mask_inventory.py\" --env-dir \"$(ENV_DIR)\" || exit 1" in recipe, target
+    # maintain, release-plan and the manifest release run it through a variable tests can stub.
+    makefile = (SHARED / "Makefile.shared").read_text()
+    assert '_EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"' in makefile
+    assert "= deterministic ]; then $(_EXTERNAL_MASK_INVENTORY) || exit 1" in _recipe("maintain")
+    for target in ("release-plan", "_release-manifest"):
+        assert "$(_EXTERNAL_MASK_INVENTORY) || exit 1" in _recipe(target), target
     assert "$(MAKE) _derive-before-exposure" in _recipe("rehearse").split("$(MAKE) apply")[0]
 
 

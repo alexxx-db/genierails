@@ -805,10 +805,12 @@ def test_lock_held_by_another_run_is_refused(harness):
         other.wait()
 
 
-def test_lock_held_by_the_enclosing_make_is_reused(harness):
+def test_lock_held_by_the_enclosing_make_is_reused(harness, monkeypatch):
     write_env(harness.env_dir)
-    ok, _ = environment_lock.acquire_lock(harness.env_dir, os.getpid(), "release")
+    ok, _, nonce = environment_lock.acquire(harness.env_dir, os.getpid(), "release")
     assert ok
+    # The enclosing make exports the lock's nonce to its children (_ENV_LOCK).
+    monkeypatch.setenv(environment_lock.nonce_var(harness.env_dir), nonce)
     assert harness.apply() == 0
     assert environment_lock.owns_lock(harness.env_dir, os.getpid())  # left for its owner to release
 

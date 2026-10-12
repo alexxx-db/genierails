@@ -5,9 +5,12 @@ import shutil
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+
+from scripts import environment_lock
 
 ROOT = Path(__file__).parents[2]
 
@@ -36,14 +39,32 @@ def _apply_layer(tmp_path: Path, mode: str, *extra: str, cloud: str = "aws"):
     env_dir = _env_dir(tmp_path, mode)
     log = tmp_path / "calls"
     stubs = {name: _stub(tmp_path / name, log) for name in ("runner", "staged", "gate", "sticky", "make")}
-    result = subprocess.run(
+    with _held_as_rehearse(env_dir):
+        result = _run_apply_layer(env_dir, stubs, extra, cloud)
+    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return result, calls, env_dir
+
+
+@contextmanager
+def _held_as_rehearse(env_dir: Path):
+    """_apply-layer runs inside make rehearse, under its env lock (release_gate.py apply-guard)."""
+    ok, message, nonce = environment_lock.acquire(env_dir, os.getpid(), "rehearse")
+    assert ok, message
+    os.environ[environment_lock.nonce_var(env_dir)] = nonce  # as make's _ENV_LOCK exports it
+    try:
+        yield
+    finally:
+        os.environ.pop(environment_lock.nonce_var(env_dir), None)
+        environment_lock.release_lock(env_dir, os.getpid())
+
+
+def _run_apply_layer(env_dir, stubs, extra, cloud):
+    return subprocess.run(
         ["make", "--no-print-directory", "_apply-layer", "LAYER=data_access", "TARGET_ENV=dev", "ENV=dev",
          f"LAYER_ENV_DIR={env_dir / 'data_access'}", f"ENV_DIR={env_dir}", f"ROOT_RUNNER={stubs['runner']}",
          f"_STAGED_POLICY={stubs['staged']}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
          f"MAKE={stubs['make']}", "IMPORT_EXISTING_SCRIPT=true", "FORCE_APPLY=1", *extra],
         cwd=ROOT / cloud, text=True, capture_output=True, env=_env())
-    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-    return result, calls, env_dir
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
@@ -79,12 +100,13 @@ def test_a_failed_staged_apply_fails_the_layer(tmp_path):
     log = tmp_path / "calls"
     stubs = {name: _stub(tmp_path / name, log) for name in ("runner", "gate", "sticky", "make")}
     staged = _stub(tmp_path / "staged", log, rc=1)
-    result = subprocess.run(
-        ["make", "--no-print-directory", "_apply-layer", "LAYER=data_access", "TARGET_ENV=dev", "ENV=dev",
-         f"LAYER_ENV_DIR={env_dir / 'data_access'}", f"ENV_DIR={env_dir}", f"ROOT_RUNNER={stubs['runner']}",
-         f"_STAGED_POLICY={staged}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
-         f"MAKE={stubs['make']}", "IMPORT_EXISTING_SCRIPT=true"],
-        cwd=ROOT / "aws", text=True, capture_output=True, env=_env())
+    with _held_as_rehearse(env_dir):
+        result = subprocess.run(
+            ["make", "--no-print-directory", "_apply-layer", "LAYER=data_access", "TARGET_ENV=dev", "ENV=dev",
+             f"LAYER_ENV_DIR={env_dir / 'data_access'}", f"ENV_DIR={env_dir}", f"ROOT_RUNNER={stubs['runner']}",
+             f"_STAGED_POLICY={staged}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
+             f"MAKE={stubs['make']}", "IMPORT_EXISTING_SCRIPT=true"],
+            cwd=ROOT / "aws", text=True, capture_output=True, env=_env())
     assert result.returncode != 0
     assert not (env_dir / "data_access" / ".data_access.apply.sha").exists()
 

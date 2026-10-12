@@ -75,7 +75,9 @@ def governed_columns_and_tables(env_dir: Path) -> tuple[set[str], list[str]]:
     from scripts.audit_schema_drift import _load_hcl
     from scripts.sticky_governance import load_governed_tables
 
-    cfg = _load_hcl(env_dir / "generated" / "abac.auto.tfvars")
+    from scripts.runtime_overlay import effective
+
+    cfg = _load_hcl(effective(env_dir, "abac.auto.tfvars"))
     columns = {
         str(item.get("entity_name")) for item in cfg.get("tag_assignments") or []
         if item.get("entity_type") == "columns" and item.get("tag_key") == TAG_KEY
