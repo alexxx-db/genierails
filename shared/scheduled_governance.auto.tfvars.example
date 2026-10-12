@@ -1,13 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Scheduled steady-state governance — opt-in snippet
 # ─────────────────────────────────────────────────────────────────────────────
-# These variables are consumed by the workspace root
-# (roots/workspace/scheduled_governance.tf). They are DISABLED by default, so
-# leaving them unset changes nothing about `make apply`.
+# These variables are consumed by the data_access root
+# (roots/data_access/scheduled_governance.tf), so governance-only envs (no
+# agents) get the job too. They are DISABLED by default, so leaving them unset
+# changes nothing about `make apply`.
 #
 # To enable the scheduled prod re-scan, copy the block below into the target
 # environment's env.auto.tfvars (e.g. aws/envs/prod/env.auto.tfvars) — that is
-# the tfvars file the workspace layer loads — then run `make apply ENV=prod`.
+# the tfvars file the data_access layer loads — then run `make apply ENV=prod`.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Turn the scheduled job on. Default is false.
