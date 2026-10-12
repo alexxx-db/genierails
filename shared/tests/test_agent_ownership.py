@@ -20,6 +20,7 @@ import agent_files
 from agent_files import AgentFileError
 from scripts import agent_ownership as ownership
 from scripts import agent_promote
+from scripts import state_layout
 
 SHARED = Path(__file__).resolve().parents[1]
 ROOT = SHARED.parent
@@ -148,10 +149,17 @@ def test_delete_true_leaves_genie_spaces(tmp_path):
     assert agent_files.merged_config(env)["genie_spaces"] == []
 
 
+def _ws_state(env_dir: Path) -> Path:
+    """The workspace state file where the active layout keeps it (GENIERAILS_STATE_DIR or the env dir)."""
+    path = state_layout.root_state_paths(env_dir)["workspace"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _state(env_dir: Path, *keys: str) -> None:
     resources = [{"module": "module.workspace", "mode": "managed", "type": "null_resource",
                   "name": "genie_space_acls", "instances": [{"index_key": k} for k in keys]}]
-    (env_dir / "terraform.tfstate").write_text(json.dumps({"resources": resources}))
+    _ws_state(env_dir).write_text(json.dumps({"resources": resources}))
 
 
 def test_terraform_spaces_keep_a_detached_agent_only_while_state_holds_it(tmp_path):
@@ -365,7 +373,7 @@ def test_promote_seeds_settings_once_and_rewrites_the_capture(tmp_path):
 def test_promote_is_a_pure_function_of_the_committed_files(tmp_path, monkeypatch):
     dev, prod = _promote_envs(tmp_path)
     monkeypatch.setattr(ownership, "_api", lambda *a: pytest.fail("promote-to read live Databricks"))
-    (prod / "terraform.tfstate").write_text("not read")
+    _ws_state(prod).write_text("not read")
     agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
     first = {p.name: p.read_bytes() for p in (prod / "agents").iterdir()}
     shutil.rmtree(prod / "agents")
@@ -944,7 +952,7 @@ def _created(env_dir: Path, key: str, space_id: str, *, record: str | None = "sa
              resource_id: str | None = None) -> None:
     """What a create resource leaves: terraform_data.genie_space[key] and the agent ID it recorded in state
     (data.external.genie_space_id[key]) in the workspace state, and the ID file. Merged into any state."""
-    path = env_dir / "terraform.tfstate"
+    path = _ws_state(env_dir)
     state = json.loads(path.read_text()) if path.is_file() else {"version": 4, "serial": 1, "resources": []}
     named = str(id_file or env_dir / f".genie_space_id_{key}")
     entries = {("managed", "terraform_data"): {"id": resource_id or f"tfdata-{key}", "input": {"id_file": named}}}
@@ -966,7 +974,7 @@ def _created(env_dir: Path, key: str, space_id: str, *, record: str | None = "sa
 
 
 def _forget_state(env_dir: Path) -> None:
-    (env_dir / "terraform.tfstate").unlink(missing_ok=True)
+    _ws_state(env_dir).unlink(missing_ok=True)
     (env_dir / ".genie_space_id_sales").unlink(missing_ok=True)
 
 
@@ -1282,7 +1290,7 @@ def test_receipt_recovery_enforces_the_recorded_binding_and_create_resource(tmp_
                                                                            message):
     prod = _deterministic_prod(tmp_path, monkeypatch)
     if state == "none":
-        (prod / "terraform.tfstate").unlink()
+        _ws_state(prod).unlink()
     elif state == "elsewhere":
         _created(prod, "sales", "prod-1", id_file=tmp_path / "attacker" / ".genie_space_id_sales")
     elif state == "other-record":
@@ -1362,7 +1370,7 @@ def test_two_agents_swapping_id_files_are_refused_before_anything(tmp_path, monk
 
 def test_an_adopted_agent_must_keep_the_planned_id_through_its_create(tmp_path, monkeypatch, release_lock):
     prod = _deterministic_prod(tmp_path, monkeypatch)
-    (prod / "terraform.tfstate").unlink()  # an operator wrote the ID file; no create resource yet
+    _ws_state(prod).unlink()  # an operator wrote the ID file; no create resource yet
     api = FakeGenie({"prod-1": {"version": 1}})
     manifest = _manifest(tmp_path, prod, api)
     assert json.loads(manifest.read_text())["agents"]["agents"]["Sales"]["binding"] == "adopt"

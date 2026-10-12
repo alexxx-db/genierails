@@ -318,13 +318,14 @@ def _lock_owner(env_dir: Path) -> str | None:
 
 
 def _state_resources(env_dir: Path) -> list[dict]:
-    path = Path(env_dir) / "terraform.tfstate"
-    if not path.is_file():
-        return []
+    """The workspace state's resources, read through scripts/state_layout.py (fails closed)."""
+    from scripts.state_layout import state_json
+
+    env_dir = Path(env_dir)
     try:
-        return json.loads(path.read_text()).get("resources") or []
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AgentError(f"{path}: unreadable Terraform state ({exc})") from exc
+        return (state_json(env_dir, env_dir.name, "workspace") or {}).get("resources") or []
+    except RuntimeError as exc:
+        raise AgentError(str(exc)) from exc
 
 
 def _instances(env_dir: Path, mode: str, type_: str, name: str) -> dict[str, dict]:
@@ -939,7 +940,7 @@ def guard_removals(env_dir: Path) -> None:
     cfg = agent_files._load_hcl(env_dir / "env.auto.tfvars")
     if cfg.get("governance_mode", "legacy") != "deterministic" and not agent_files.names(env_dir):
         return  # legacy envs keep their remove-means-destroy behaviour
-    held = agent_files.state_keys(env_dir / "terraform.tfstate")
+    held = agent_files.state_keys(env_dir)
     configured = configured_keys(env_dir)
     gone = sorted(key for key in held
                   if key not in configured and key.split("--", 1)[0] not in configured)

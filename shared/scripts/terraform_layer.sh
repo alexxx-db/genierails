@@ -78,7 +78,15 @@ mkdir -p "$ENV_DIR"
 # skip -lockfile=readonly so Terraform can generate the lock file.
 export TF_DATA_DIR="$STATE_BASE/.terraform"
 if [ "$USE_STATE_LAYOUT" = 1 ]; then
-  ROOT_DIR="$(python3 "$SCRIPT_DIR/state_layout.py" root --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER" --source "$ROOT_DIR")"
+  # A nested run for the same env and layer (this runner reading its own state
+  # through state_layout.py state-pull) reuses the caller's root: rebuilding
+  # it would delete the directory the caller's command runs in.
+  if [ "${GENIERAILS_PREPARED_ROOT_KEY:-}" = "$STATE_ENV_DIR:$LAYER" ] && [ -d "${GENIERAILS_PREPARED_ROOT:-}" ]; then
+    ROOT_DIR="$GENIERAILS_PREPARED_ROOT"
+  else
+    ROOT_DIR="$(python3 "$SCRIPT_DIR/state_layout.py" root --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER" --source "$ROOT_DIR")"
+    export GENIERAILS_PREPARED_ROOT="$ROOT_DIR" GENIERAILS_PREPARED_ROOT_KEY="$STATE_ENV_DIR:$LAYER"
+  fi
 fi
 cd "$ROOT_DIR"
 

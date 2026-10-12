@@ -586,3 +586,41 @@ def test_scheduled_job_still_in_a_remote_workspace_state_refuses(tmp_path, fake_
     assert "remote workspace state" in capsys.readouterr().err
     fake_terraform["state"].write_text("")
     assert move_scheduled_job.move(env, env / "data_access") == 0
+
+
+def test_a_nested_state_read_reuses_the_callers_remote_root(tmp_path, fake_terraform):
+    # The runner reads the workspace state itself (the scheduled-job move, the
+    # agent files) through a nested state-pull run; rebuilding the root there
+    # would delete the directory the outer command is about to run in.
+    bin_dir = Path(fake_terraform["PATH"].split(os.pathsep)[0])
+    (bin_dir / "terraform").write_text(FAKE_TERRAFORM.replace(
+        'printf \'%s\\n\' "$*"', 'printf \'%s %s\\n\' "$(pwd -P 2>/dev/null || echo DELETED)" "$*"'))
+    dev = _remote("aws", tmp_path / "aws" / "envs" / "dev")
+    proc = _run_layer(tmp_path, fake_terraform, "workspace", "dev", "plan", dev, dev.parent)
+    assert proc.returncode == 0, proc.stderr
+    calls = fake_terraform["log"].read_text().splitlines()
+    assert any(" state pull" in line for line in calls)  # the nested read happened
+    plan = [line for line in calls if " plan " in f"{line} "][-1]
+    assert not plan.startswith("DELETED"), calls
+    assert Path(plan.split(" ", 1)[0]).is_dir()
+
+
+def test_agent_readers_follow_the_state_dir_and_fail_closed(tmp_path, monkeypatch):
+    import agent_files
+    from scripts import agent_ownership
+
+    env = tmp_path / "aws" / "envs" / "prod"
+    env.mkdir(parents=True)
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    state = {"resources": [{"module": "module.workspace", "mode": "managed", "type": "terraform_data",
+                            "name": "genie_space", "instances": [{"index_key": "sales", "attributes": {"id": "t"}}]}]}
+    layer = tmp_path / "state" / "aws" / "prod" / "layers" / "workspace"
+    layer.mkdir(parents=True)
+    (layer / "terraform.tfstate").write_text(json.dumps(state))
+    assert agent_ownership.create_instance(env, "sales") == {"id": "t"}
+    (layer / "terraform.tfstate").unlink()
+    (env / "terraform.tfstate").write_text(json.dumps(state))  # left in the checkout: a split
+    with pytest.raises(agent_files.AgentFileError, match="migrate-state-dir"):
+        agent_files.state_keys(env)
+    with pytest.raises(agent_ownership.AgentError, match="migrate-state-dir"):
+        agent_ownership.create_instance(env, "sales")
