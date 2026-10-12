@@ -77,6 +77,11 @@ output "genie_spaces_created" {
   value       = keys(terraform_data.genie_space)
 }
 
+output "genie_space_id_records" {
+  description = "Per create-path agent key, the ID file whose agent ID the state records (deterministic envs)."
+  value       = { for key, record in data.external.genie_space_id : key => record.query.id_file }
+}
+
 output "genie_existing_space_warehouse_intent" {
   description = "Per attached agent, the raw per-space warehouse trigger and whether it is explicit."
   value = {

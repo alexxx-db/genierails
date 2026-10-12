@@ -23,7 +23,7 @@ SHARED_ROOT = Path(__file__).resolve().parent.parent
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
-from scripts.footprint import FootprintError, load_discovered_footprint, load_hcl  # noqa: E402
+from scripts.footprint import FootprintError, load_discovered_footprint, load_env_config, load_hcl  # noqa: E402
 
 DISCOVERED = Path("data_access") / "discovered_uc_tables.auto.tfvars"
 
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     env_dir = Path(argv[0]).resolve()
     try:
-        config = load_hcl(env_dir / "env.auto.tfvars")
+        config = load_env_config(env_dir)
         if not config.get("enable_classification", False):
             return 0
         agents = id_only_agents(config)

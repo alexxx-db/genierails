@@ -191,6 +191,29 @@ for tfvars in auth.auto.tfvars env.auto.tfvars abac.auto.tfvars classification.a
   fi
 done
 
+# Per-agent files (envs/<env>/agents/*.auto.tfvars) merged into genie_spaces,
+# after env.auto.tfvars so the merge wins. Written to a temp file for this run
+# only (agent_files.py); a saved plan carries the values it was made with.
+AGENTS_TMP_DIR=""
+case "$LAYER:$COMMAND" in
+  workspace:plan|workspace:apply|workspace:destroy|workspace:import|workspace:console|data_access:plan|data_access:apply|data_access:destroy|data_access:import|data_access:console)
+    workspace_env_dir="$ENV_DIR"
+    if [ "$LAYER" = "data_access" ]; then workspace_env_dir="$(dirname "$ENV_DIR")"; fi
+    if [ -d "$workspace_env_dir/agents" ]; then
+      AGENTS_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/genierails-agents.XXXXXX")"
+      trap 'rm -rf "$AGENTS_TMP_DIR"' EXIT
+      agents_rc=0
+      python3 "$PROJECT_ROOT/agent_files.py" tfvars --env-dir "$workspace_env_dir" --layer "$LAYER" \
+        --var-file "$AGENTS_TMP_DIR/agents.tfvars.json" || agents_rc=$?
+      if [ "$agents_rc" -eq 0 ]; then
+        VAR_ARGS+=(-var-file="$AGENTS_TMP_DIR/agents.tfvars.json")
+      elif [ "$agents_rc" -ne 3 ]; then
+        exit "$agents_rc"
+      fi
+    fi
+    ;;
+esac
+
 if [ "$LAYER" != "account" ]; then
   VAR_ARGS+=(-var="env_dir=$ENV_DIR")
 fi
@@ -242,7 +265,7 @@ if [ "$LAYER" = "data_access" ] && { [ "$COMMAND" = "plan" ] || [ "$COMMAND" = "
   # explain a plan whose only destroys replace terraform_data.masking_functions.
   OUTPUT_COPY="$(mktemp)"
   STATUS_FILE="$(mktemp)"
-  trap 'rm -f "$OUTPUT_COPY" "$STATUS_FILE"' EXIT
+  trap 'rm -f "$OUTPUT_COPY" "$STATUS_FILE"; [ -z "$AGENTS_TMP_DIR" ] || rm -rf "$AGENTS_TMP_DIR"' EXIT
   set +e
   # On Ctrl-C (or TERM/HUP) Terraform shuts down gracefully and keeps writing
   # (saving state) through the pipe, so tee ignores those signals. This shell
