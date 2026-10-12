@@ -174,7 +174,7 @@ def merged_config(env_dir: Path, cfg: dict | None = None) -> dict:
         if agent["delete"]:
             continue
         spaces.append(entry)
-    if spaces or "genie_spaces" in cfg:
+    if spaces or "genie_spaces" in cfg or names(env_dir):
         cfg["genie_spaces"] = spaces
     return cfg
 
