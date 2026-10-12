@@ -108,6 +108,34 @@ def test_damaged_markers_and_bad_values_refuse_without_writing(tmp_path, capsys)
     assert "use customer, auto (the default) or off" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("pattern", [
+    "auth.auto.tfvars", "*.tfstate", "*.tfstate.backup", "*.tfplan", ".terraform/", "__pycache__/",
+    # every dot-file under envs/: Genie ID and adoption markers, locks,
+    # generated/.runtime/, live snapshots, apply records, gate records
+    "/envs/**/.*",
+    "/envs/**/classification.auto.tfvars", "/envs/**/discovered_uc_tables.auto.tfvars",
+    "/envs/**/ddl/_fetched.sql", "/envs/*/data_access/env.auto.tfvars", "/.genierails-state/",
+])
+def test_block_holds_every_secret_state_and_runtime_pattern(pattern, tmp_path):
+    lines = cg.block(tmp_path).splitlines()
+    assert pattern in lines
+    # Ignores come after the re-includes, so no re-include can undo one.
+    assert lines.index(pattern) > lines.index("!/envs/**/masking_functions.sql")
+
+
+def test_block_lists_deterministic_layer_files_per_env(tmp_path):
+    for env, mode in (("dev", "legacy"), ("prod", "deterministic")):
+        (tmp_path / "envs" / env).mkdir(parents=True)
+        (tmp_path / "envs" / env / "env.auto.tfvars").write_text(f'governance_mode = "{mode}"\n')
+    lines = cg.block(tmp_path).splitlines()
+    assert {"/envs/prod/abac.auto.tfvars", "/envs/prod/data_access/",
+            "/envs/prod/generated/genie_space_derived_acl_groups.auto.tfvars"} <= set(lines)
+    assert not any(line.startswith("/envs/dev/") for line in lines)
+    assert "/envs/account/abac.auto.tfvars" not in lines  # legacy dev still commits it
+    (tmp_path / "envs/dev/env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    assert "/envs/account/abac.auto.tfvars" in cg.block(tmp_path).splitlines()
+
+
 # ── git status --ignored over a real sample env ──────────────────────────────
 
 COMMITTED_ANY = [
@@ -160,12 +188,19 @@ def _covered(path: str, ignored: set[str]) -> bool:
 
 @pytest.mark.parametrize("cloud", CLOUDS)
 @pytest.mark.parametrize("dev_mode", ["legacy", "deterministic"])
-def test_git_status_ignores_every_runtime_file_and_tracks_every_committed_one(cloud, dev_mode, tmp_path):
+@pytest.mark.parametrize("root_gitignore", ["none", "upstream"])
+def test_git_status_ignores_every_runtime_file_and_tracks_every_committed_one(
+        cloud, dev_mode, root_gitignore, tmp_path):
     repo = tmp_path / "repo"
     cloud_root = repo / cloud
     cloud_root.mkdir(parents=True)
-    # The customer repo starts as a copy of GenieRails: its real .gitignore files.
-    (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text())
+    # "none": no repo-root .gitignore, so the generated cloud .gitignore alone
+    # must ignore every runtime file (upstream's root already ignores some of
+    # them, e.g. auth.auto.tfvars, and would hide a gap in the block).
+    # "upstream": the customer repo started as a copy of GenieRails, whose root
+    # ignores envs/ and generated/; the block must re-include them.
+    if root_gitignore == "upstream":
+        (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text())
     (cloud_root / ".gitignore").write_text((ROOT / cloud / ".gitignore").read_text())
     _git(repo, "init", "-q")
     envs = {"dev": dev_mode, "prod": "deterministic"}
