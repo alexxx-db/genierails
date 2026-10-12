@@ -186,3 +186,185 @@ def test_apply_model_output_is_what_desired_generation_reads(tmp_path):
     assert [p["name"] for p in gen["fgac_policies"]] == [p["name"] for p in apply_model(cfg, build_model(
         {"cat.sch.t.email": ["ip_address"]}, {"cat.sch.t.email": "STRING"}, {"access_tier_groups": TIERS},
     )).get("fgac_policies")]
+
+
+# -- step 6: the stages the staged controller drives ------------------------------------------
+def _coverage(policies, value, who):
+    return sorted(p["name"] for p in policies if pg.policy_value(p) == value and pg._covers(p, who))
+
+
+def test_create_keeps_the_active_generations_principals_over_a_retained_older_one(tmp_path):
+    # G1 (old tiers) waits to retire; G2 moved tiers in place (same names); G3 changes a treatment.
+    retire = _generation(tmp_path)
+    old = _generation(tmp_path, tiers=["raw", "analysts", "masked"])
+    new = _generation(tmp_path, tiers=["raw", "analysts", "masked"], versions={"ip_address": {"partial": "redacted"}})
+    create = {p["name"]: p for p in pg.render_stage("create", new, old, retire)["fgac_policies"]}
+    for policy in old["fgac_policies"]:
+        # Re-applying G1's principals here would be an unstaged tier move back.
+        assert create[policy["name"]]["to_principals"] == policy["to_principals"]
+        assert create[policy["name"]]["except_principals"] == policy["except_principals"]
+
+
+@pytest.mark.parametrize("before, after", [
+    (["raw", "regional", "masked"], ["raw", "analysts", "masked"]),
+    (["raw", "masked"], ["raw", "regional", "masked"]),
+    (["raw", "regional", "masked"], ["raw", "masked"]),
+    (["raw", "regional", "masked"], ["regional", "raw", "masked"]),
+])
+def test_tighten_never_uncovers_anyone_the_old_or_new_generation_masks(tmp_path, before, after):
+    old = _generation(tmp_path, tiers=before)
+    new = _generation(tmp_path, tiers=after)
+    assert pg.has_tier_move(new, old, None)
+    universe = pg._universe(old, new)
+    stages = {s: pg.plan_stage(s, new, old, None) for s in ("create", "tighten", "switch")}
+    for stage, planned in stages.items():
+        assert planned["problems"] == [], (stage, planned["problems"])
+    for value in set(new["tags"].values()):
+        for who in universe:
+            tight = _coverage(stages["tighten"]["rendered"]["fgac_policies"], value, who)
+            if _coverage(old["fgac_policies"], value, who) or _coverage(new["fgac_policies"], value, who):
+                assert tight, (who, value)
+            # create changes nobody's mask; switch gives everyone exactly the new one.
+            assert _coverage(stages["create"]["rendered"]["fgac_policies"], value, who) == \
+                _coverage(old["fgac_policies"], value, who)
+            assert _coverage(stages["switch"]["rendered"]["fgac_policies"], value, who) == \
+                _coverage(new["fgac_policies"], value, who)
+
+
+def test_a_new_policy_on_a_value_columns_carry_waits_for_tighten(tmp_path):
+    old = _generation(tmp_path, tiers=["raw", "masked"])
+    new = _generation(tmp_path, tiers=["raw", "regional", "masked"])
+    partial = next(p["name"] for p in new["fgac_policies"] if p["name"].endswith("_partial"))
+    assert partial not in {p["name"] for p in pg.render_stage("create", new, old, None)["fgac_policies"]}
+    assert partial in {p["name"] for p in pg.render_stage("tighten", new, old, None)["fgac_policies"]}
+    # A restore after tighten removes it again (allowed), and nothing else.
+    assert pg.plan_stage("restore", new, old, None)["allowed_policy_deletes"] == [partial]
+
+
+def test_switch_drops_a_policy_the_new_generation_no_longer_has_on_a_value_in_use(tmp_path):
+    old = _generation(tmp_path, tiers=["raw", "regional", "masked"])
+    new = _generation(tmp_path, tiers=["raw", "masked"])
+    partial = next(p["name"] for p in old["fgac_policies"] if p["name"].endswith("_partial"))
+    switch = pg.plan_stage("switch", new, old, None)
+    assert partial not in {p["name"] for p in switch["rendered"]["fgac_policies"]}
+    assert switch["allowed_policy_deletes"] == [partial] and switch["problems"] == []
+
+
+def test_switch_keeps_obsolete_values_policies_for_a_later_retire(tmp_path):
+    old = _generation(tmp_path)
+    new = _generation(tmp_path, versions={"ip_address": {"partial": "redacted"}})
+    switch = pg.plan_stage("switch", new, old, None)
+    assert switch["allowed_policy_deletes"] == []
+    assert {p["name"] for p in old["fgac_policies"]} <= {p["name"] for p in switch["rendered"]["fgac_policies"]}
+    retire = pg.plan_stage("retire", new, None, old)
+    assert set(retire["allowed_policy_deletes"]) == {p["name"] for p in old["fgac_policies"]}
+
+
+def test_only_switch_untags_a_column_that_left_governance(tmp_path):
+    old = _generation(tmp_path, columns=("email", "ip"))
+    new = _generation(tmp_path, columns=("email",))
+    key = "columns|cat.sch.t.ip|gr_treatment"
+    assert pg.plan_stage("switch", new, old, None)["allowed_tag_deletes"] == [key]
+    for stage in ("create", "tighten"):
+        assert pg.plan_stage(stage, new, old, None)["allowed_tag_deletes"] == []
+        assert "cat.sch.t.ip" in pg.render_stage(stage, new, old, None)["tags"]
+
+
+def test_render_check_refuses_an_unmasked_value_and_a_double_mask(tmp_path):
+    old = _generation(tmp_path)
+    broken = dict(old, fgac_policies=[p for p in old["fgac_policies"] if p["name"].endswith("_partial")])
+    assert any("which no policy masks" in p or "unmask" in p or "masks on" in p
+               for p in pg.stage_problems("switch", {**old, "fgac_policies": []}, old, None))
+    doubled = [dict(p, to_principals=["account users"], except_principals=[]) for p in old["fgac_policies"]]
+    problems = pg.stage_problems("switch", {**old, "fgac_policies": doubled}, old, old)
+    assert any("would get 2 masks" in p for p in problems)
+    assert pg.stage_problems("create", pg.render_stage("create", old, broken, None), old, broken) == []
+
+
+def test_hook_refuses_an_unsafe_render_before_planning(tmp_path, monkeypatch):
+    env_dir = tmp_path / "dev"
+    gen = _generation(env_dir)
+    monkeypatch.setattr(pg, "RUNNER", _stub_runner(tmp_path, {"resource_changes": []}))
+    monkeypatch.setattr(pg, "stage_problems", lambda *a: ["x would get 2 masks"])
+    assert pg.run_hook("switch", _environ(env_dir, gen["fingerprint"])) == 1
+    assert not (tmp_path / "runner.log").exists()
+
+
+def test_hook_passes_its_stage_to_terraform_and_records_it(tmp_path, monkeypatch):
+    env_dir = tmp_path / "dev"
+    gen = _generation(env_dir)
+    monkeypatch.setattr(pg, "RUNNER", _stub_runner(tmp_path, {"resource_changes": []}))
+    assert pg.run_hook("tighten", _environ(env_dir, gen["fingerprint"])) == 0
+    assert "-var=policy_stage=tighten" in (tmp_path / "runner.log").read_text().splitlines()[0]
+    record = pg.load_stage_record(env_dir)
+    assert record["stage"] == "tighten" and record["desired"] == gen["fingerprint"]
+
+
+def test_plan_check_allows_only_the_stage_own_deletes_and_no_grant_before_the_switch():
+    plan = {"resource_changes": [
+        _change("databricks_policy_info", "gone", "delete"),
+        _change("databricks_entity_tag_assignment", "columns|c.s.t.x|gr_treatment", "delete"),
+        dict(_change("databricks_grant", "c.s.t|g", "create"), name="table_access"),
+        dict(_change("databricks_grant", "cat", "update"), name="terraform_sp_manage_catalog"),
+    ]}
+    assert len(pg.plan_violations(plan, "create")) == 3
+    switch = pg.plan_violations(plan, "switch", {"gone"}, {"columns|c.s.t.x|gr_treatment"})
+    assert switch == []
+    assert len(pg.plan_violations(plan, "restore", {"gone"}, {"columns|c.s.t.x|gr_treatment"})) == 1
+
+
+def test_abandon_removes_only_the_replacement_and_keeps_old_tags(tmp_path):
+    old = _generation(tmp_path)
+    failed = _generation(tmp_path, versions={"ip_address": {"partial": "redacted"}})
+    planned = pg.plan_stage("abandon", failed, old, None)
+    assert planned["rendered"]["tags"] == old["tags"]
+    assert {p["name"] for p in planned["rendered"]["fgac_policies"]} == {p["name"] for p in old["fgac_policies"]}
+    assert set(planned["allowed_policy_deletes"]) == {p["name"] for p in failed["fgac_policies"]}
+
+
+def test_drop_functions_drops_only_functions_no_kept_generation_defines(tmp_path):
+    env_dir = tmp_path / "dev"
+    retired = _generation(env_dir, versions={"ip_address": {"partial": "redacted"}})
+    pg.save_snapshot(env_dir, retired)
+    gen = _generation(env_dir)
+    pg.save_snapshot(env_dir, gen)
+    calls = []
+
+    def run(argv, check=False):
+        calls.append(Path(argv[argv.index("--sql-file") + 1]).read_text())
+        return type("R", (), {"returncode": 0})()
+
+    environ = _environ(env_dir, gen["fingerprint"]) | {"GENIERAILS_RETIRE_FINGERPRINT": retired["fingerprint"],
+                                                       "GENIERAILS_WAREHOUSE_ID": "wh"}
+    assert pg.drop_functions(env_dir, environ, live_users=lambda *a: set(), run=run) == 0
+    dropped = {p["function_name"] for p in retired["fgac_policies"]} - {p["function_name"] for p in gen["fgac_policies"]}
+    assert dropped and all(f in calls[0] for f in dropped)
+    assert not any(p["function_name"] in calls[0] for p in gen["fgac_policies"])
+    # A live policy still calling one stops the drop.
+    calls.clear()
+    assert pg.drop_functions(env_dir, environ, live_users=lambda *a: {next(iter(dropped))}, run=run) == 1
+    assert calls == []
+
+
+def test_grant_plan_may_change_access_only():
+    plan = {"resource_changes": [
+        dict(_change("databricks_grant", "c.s.t|g", "create"), name="table_access"),
+        dict(_change("databricks_grant", "c.s.t|h", "delete"), name="table_access"),
+        _change("databricks_policy_info", "p", "no-op"),
+    ]}
+    assert pg.plan_violations(plan, "grant") == []
+    for rtype, key in (("databricks_policy_info", "p"), ("databricks_entity_tag_assignment", "columns|c.s.t.x|gr_treatment")):
+        for action in ("update", "create", "delete"):
+            assert pg.plan_violations({"resource_changes": [_change(rtype, key, action)]}, "grant"), (rtype, action)
+
+
+def test_grant_hook_reapplies_the_last_render_with_new_access_allowed(tmp_path, monkeypatch):
+    env_dir = tmp_path / "dev"
+    gen = _generation(env_dir)
+    monkeypatch.setattr(pg, "RUNNER", _stub_runner(tmp_path, {"resource_changes": []}))
+    with pytest.raises(pg.StageError, match="last applied stage"):
+        pg.run_hook("grant", _environ(env_dir, gen["fingerprint"]))
+    assert pg.run_hook("switch", _environ(env_dir, gen["fingerprint"])) == 0
+    assert pg.run_hook("grant", _environ(env_dir, gen["fingerprint"])) == 0
+    plans = [line for line in (tmp_path / "runner.log").read_text().splitlines() if " plan " in f" {line} "]
+    assert "-var=policy_stage=grant" in plans[-1]

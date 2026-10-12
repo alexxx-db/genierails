@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -587,6 +587,22 @@ _ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --command-name
 _GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 _GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
+# The governance mode of an env.auto.tfvars (legacy when unset).
+_GOVERNANCE_MODE_OF = python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))'
+
+# A deterministic env's data_access layer is applied only through the staged
+# policy controller (create, verify, tighten, switch, verify, retire; see
+# docs/deterministic-policies.md), never in one Terraform apply. Each verify
+# runs verify-access on the stage's render, with the tier settings of the
+# generation its columns carry. rehearse and release pass _STAGED_CONFIRM=0 to
+# apply and confirm themselves once their own verification passed: only a
+# confirmed change lets a later run retire the generation it replaced.
+_STAGED_POLICY = python3 "$(SHARED_ROOT)/scripts/staged_policy_apply.py"
+_STAGED_CONFIRM ?= 1
+_STAGED_VERIFY_ACCESS = $(MAKE) --no-print-directory verify-access ENV="$(TARGET_ENV_NAME)" ENV_DIR="$$GENIERAILS_ENV_DIR" TARGET_ENV= VERIFY_REQUIRE_MASKS=1 \
+	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
+_STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
+
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
 	if [ "$$mode" = deterministic ]; then \
@@ -626,10 +642,11 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 	$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
-		$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 && \
+		$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0 && \
 		$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 		$(_SAVE_VERIFY_KEY) && \
-		$(_GROUP_MAP_RECORD)
+		$(_GROUP_MAP_RECORD) && \
+		$(_STAGED_CONFIRM_RUN)
 
 # A failed $(MAKE) exits 2 whatever its recipe returned, so release and
 # maintain have audit-rulebook write its script's own exit code (1 = drift,
@@ -716,7 +733,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		fi; \
 		exit $$audit_rc; \
 	fi; \
-	if ! $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1; then \
+	if ! $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0; then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "apply failed"; \
 		exit 1; \
 	fi; \
@@ -726,6 +743,10 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	fi; \
 	$(_SAVE_VERIFY_KEY); \
 	$(_GROUP_MAP_RECORD); \
+	if ! $(_STAGED_CONFIRM_RUN); then \
+		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the staged policy journal could not be confirmed"; \
+		exit 1; \
+	fi; \
 	echo ""; \
 	echo "=== Release complete ($(ENV)) ==="; \
 	if [ "$$mode" = deterministic ]; then \
@@ -945,8 +966,15 @@ _plan-layer:
 		fi; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)"; \
 	fi; \
+	stage_flag=""; \
+	if [ "$$layer" = "data_access" ] && [ -f "$$(dirname "$$env_dir")/env.auto.tfvars" ] \
+		&& [ "$$($(_GOVERNANCE_MODE_OF) "$$(dirname "$$env_dir")/env.auto.tfvars")" = deterministic ]; then \
+		$(_STAGED_POLICY) describe --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env"; \
+		echo "  (The plan below is the end state; apply reaches it in those phases.)"; \
+		stage_flag="-var=policy_stage=preview"; \
+	fi; \
 	echo "=== Terraform Plan ($$layer:$$target_env) ==="; \
-	LAYER_ENV_DIR="$(LAYER_ENV_DIR)" "$(ROOT_RUNNER)" "$$layer" "$$target_env" plan
+	LAYER_ENV_DIR="$(LAYER_ENV_DIR)" "$(ROOT_RUNNER)" "$$layer" "$$target_env" plan $$stage_flag
 
 plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspace env
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
@@ -990,6 +1018,15 @@ _apply-layer: _guard-not-ci-apply
 		echo "=== Skipping workspace layer ($$target_env): governance-only (deterministic, no agents); GenieRails creates and grants nothing there ==="; \
 		exit 0; \
 	fi; \
+	staged=0; \
+	if [ "$$layer" = "data_access" ] && [ -f "$$(dirname "$$env_dir")/env.auto.tfvars" ]; then \
+		mode="$$($(_GOVERNANCE_MODE_OF) "$$(dirname "$$env_dir")/env.auto.tfvars")"; \
+		if [ "$$mode" = deterministic ]; then staged=1; fi; \
+	fi; \
+	if [ "$$staged" = 1 ] && [ -n "$$apply_flags" ]; then \
+		echo "ERROR: APPLY_FLAGS ($$apply_flags) can't be used when a deterministic env's data_access layer is applied; policy changes run in staged phases." >&2; \
+		exit 1; \
+	fi; \
 	if [ "$$layer" = "workspace" ] && [ "$$($(_IS_DETERMINISTIC) "$$env_dir/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
 		$(_AGENT_COVERAGE) run --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags" || true; \
 	fi; \
@@ -1014,7 +1051,7 @@ _apply-layer: _guard-not-ci-apply
 	skip_key=""; \
 	if [ "$$layer" = "data_access" ] || [ "$$layer" = "workspace" ]; then skip_key="$$($(_COVERAGE_GATE) skip-key --layer "$$layer" --layer-dir "$$env_dir")"; fi; \
 	current_fingerprint="$$( { printf '%s\n' "$$skip_key"; for file in $$files; do [ -f "$$file" ] && shasum "$$file"; done; find "$(SHARED_ROOT)/roots/$$layer" "$(SHARED_ROOT)/modules/$$layer" -type f -name '*.tf' ! -path '*/tests/*' ! -path '*/.terraform/*' 2>/dev/null | LC_ALL=C sort | while IFS= read -r code_file; do shasum "$$code_file"; done; if [ "$$layer" = "workspace" ]; then shasum "$(SHARED_ROOT)/scripts/genie_space.sh"; elif [ "$$layer" = "data_access" ]; then shasum "$(SHARED_ROOT)/deploy_masking_functions.py" "$(SHARED_ROOT)/masking_sql_blocks.py" "$(SHARED_ROOT)/modules/data_access/normalize_masking_sql.py" "$(SHARED_ROOT)/sql_tokenizer.py"; fi; [ -z "$$apply_flags" ] || printf '%s\n' "$$apply_flags"; } | shasum | awk '{print $$1}')"; \
-	if [ "$(FORCE_APPLY)" != "1" ] && [ "$$skip_key" != "noskip" ] && [ -f "$$fingerprint_file" ] && [ "$$(cat "$$fingerprint_file")" = "$$current_fingerprint" ]; then \
+	if [ "$$staged" != 1 ] && [ "$(FORCE_APPLY)" != "1" ] && [ "$$skip_key" != "noskip" ] && [ -f "$$fingerprint_file" ] && [ "$$(cat "$$fingerprint_file")" = "$$current_fingerprint" ]; then \
 		echo "=== Skipping terraform apply ($$layer:$$target_env): inputs unchanged ==="; \
 		exit 0; \
 	fi; \
@@ -1052,6 +1089,9 @@ _apply-layer: _guard-not-ci-apply
 				fi; \
 			fi; \
 		done; \
+	elif [ "$$staged" = 1 ]; then \
+		GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" \
+			--verify-access-cmd '$(_STAGED_VERIFY_ACCESS)'; \
 	else \
 		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" "$$layer" "$$target_env" apply -parallelism=1 -auto-approve $$apply_flags; \
 	fi; \
@@ -1095,6 +1135,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		withheld_rc=0; \
 		$(_COVERAGE_GATE) withheld --layer data_access --layer-dir "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" --env-name "$(ENV)" || withheld_rc=1; \
 		$(_COVERAGE_GATE) withheld --layer workspace --layer-dir "$(ENV_DIR)" --env-name "$(ENV)" || withheld_rc=1; \
+		if [ $$withheld_rc -eq 0 ] && [ "$(_STAGED_CONFIRM)" != 0 ]; then $(_STAGED_CONFIRM_RUN) || withheld_rc=1; fi; \
 		exit $$withheld_rc; \
 	fi
 
@@ -1113,7 +1154,19 @@ apply-governance: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target
 	$(MAKE) --no-print-directory wait-tag-policies REQUIRED_VALUES_TFVARS="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars"; \
 	echo "=== Waiting 30s for account-level groups to propagate before data_access apply ==="; \
 	sleep 30; \
-	$(MAKE) --no-print-directory _apply-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"
+	$(MAKE) --no-print-directory _apply-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
+	if [ "$(_STAGED_CONFIRM)" != 0 ]; then $(_STAGED_CONFIRM_RUN); fi
+
+# Read-only: the policy journal of a deterministic env (live generation, the
+# one waiting to retire, and any unfinished staged change).
+policy-status: _guard-workspace-target ## Show the staged policy journal (deterministic envs)
+	@$(_GUARD_WORKSPACE_ENV); $(_STAGED_POLICY) status --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
+
+# Drops an unfinished staged policy change that never retagged a column or
+# moved a principal (its new policies match no column), so a corrected config
+# can start a new one. Takes the env lock.
+policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched (deterministic envs)
+	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
 
 genie-adopt-preflight: _guard-workspace-target ## Read-only: check every legacy Genie agent can be adopted (ID file, host, GET 200) before migrating
 	@python3 "$(SHARED_ROOT)/scripts/genie_adopt_preflight.py" "$(ENV_DIR)"
@@ -1208,7 +1261,7 @@ migrate-state: _guard-not-ci-apply _bootstrap ## Migrate legacy state into accou
 _destroy-layer: _guard-not-ci-apply
 	@layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	echo "=== Terraform Destroy ($$layer:$$target_env) ==="; \
-	LAYER_ENV_DIR="$(LAYER_ENV_DIR)" "$(ROOT_RUNNER)" "$$layer" "$$target_env" destroy -auto-approve $(DESTROY_FLAGS)
+	LAYER_ENV_DIR="$(LAYER_ENV_DIR)" "$(ROOT_RUNNER)" "$$layer" "$$target_env" destroy -auto-approve $$([ "$$layer" = data_access ] && echo "-var=policy_stage=destroy") $(DESTROY_FLAGS)
 
 destroy: _guard-not-ci-apply _bootstrap ## Destroy the selected layer or workspace environment
 	@$(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
@@ -1234,7 +1287,7 @@ clean: ## Remove generated files and Terraform state for the selected environmen
 	@echo "=== Clean ($(ENV)) ==="
 	@rm -rf "$(ENV_DIR)/generated/abac.auto.tfvars" "$(ENV_DIR)/generated/masking_functions.sql" "$(ENV_DIR)/generated/generated_response.md" "$(ENV_DIR)/generated/genie_space_derived_acl_groups.auto.tfvars"
 	@rm -rf "$(ENV_DIR)/.terraform" "$(ENV_DIR)"/*.tfstate "$(ENV_DIR)"/*.tfstate.backup "$(ENV_DIR)"/.terraform.lock.hcl "$(ENV_DIR)"/.*.apply.sha
-	@rm -rf "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/.terraform" "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/*.tfstate "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/*.tfstate.backup "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.terraform.lock.hcl "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.*.apply.sha "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.coverage_gate.json
+	@rm -rf "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/.terraform" "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/*.tfstate "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/*.tfstate.backup "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.terraform.lock.hcl "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.*.apply.sha "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.coverage_gate.json "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"/.policy_generations
 	@echo "Cleaned generated files and Terraform state in $(ENV_DIR)."
 	@echo "NOTE: auth.auto.tfvars, env.auto.tfvars, abac.auto.tfvars, $(DATA_ACCESS_SUBDIR)/abac.auto.tfvars, $(DATA_ACCESS_SUBDIR)/masking_functions.sql, and .genie_space_id were NOT removed."
 
@@ -1295,11 +1348,15 @@ test-unit: ## Run fast unit tests (no Databricks/LLM/Terraform required) — use
 #   VERIFY_REQUIRE_MASKS=1 fail when a masked table has no provable key (make release sets it)
 VERIFY_KEY_COLUMN ?=
 VERIFY_SPEC ?=
-_VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
+# VERIFY_FROM_TFVARS / VERIFY_ENV_FILE: the staged policy controller verifies
+# one stage's render, with the tier settings of the generation it checks.
+VERIFY_FROM_TFVARS ?=
+VERIFY_ENV_FILE ?=
+_VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
 _VERIFY_KEEP_FLAG = $(if $(KEEP_PRINCIPALS),--keep-principals,)
 # The global key (explicit VERIFY_KEY_COLUMN, else the saved verify_key_column)
 # and the env's per-table verify_key_columns.
-_VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(ENV_DIR)/env.auto.tfvars"
+_VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)"
 # make release sets VERIFY_REQUIRE_MASKS=1: a mask check whose table has no
 # provable row-pairing key fails instead of letting the release report success.
 _VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)

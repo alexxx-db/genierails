@@ -291,7 +291,7 @@ locals {
   ]
   # Kept grants that need a pass: the plan fails without one.
   table_grants_blocking = [for key in local.table_grants_needing_gate : key if contains(var.applied_table_grants, key)]
-  table_grants_withheld = local.coverage_gate_status == "pass" ? [] : local.table_grants_new
+  table_grants_withheld = local.coverage_gate_status == "pass" && !var.withhold_new_table_grants ? [] : local.table_grants_new
 }
 
 # Shared with the workspace layer's CAN_RUN check; no resources.
@@ -428,7 +428,7 @@ resource "databricks_grant" "table_access" {
   for_each = {
     for pair in local.table_access_pairs :
     "${pair.table}|${pair.principal}" => { table = pair.table, group = pair.principal }
-    if local.coverage_gate_status == "pass" || contains(var.applied_table_grants, "${pair.table}|${pair.principal}")
+    if(local.coverage_gate_status == "pass" && !var.withhold_new_table_grants) || contains(var.applied_table_grants, "${pair.table}|${pair.principal}")
   }
 
   provider   = databricks.workspace

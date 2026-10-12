@@ -151,6 +151,32 @@ run "select_only_from_table_readers" {
   }
 }
 
+# Staged policy phases (step 6) withhold new SELECT even with a pass, and keep
+# every grant already applied: withholding never revokes.
+run "staged_phase_withholds_new_select_and_keeps_applied" {
+  command = plan
+  providers = {
+    databricks.account   = databricks.account
+    databricks.workspace = databricks.workspace
+    time                 = time
+  }
+  expect_failures = []
+  variables {
+    withhold_new_table_grants = true
+    applied_table_grants      = ["cat.sch.orders|raw"]
+  }
+  assert {
+    condition     = toset(keys(databricks_grant.table_access)) == toset(["cat.sch.orders|raw"])
+    error_message = "a staged phase plans only the SELECT already applied"
+  }
+  assert {
+    condition = toset(output.withheld_table_grants.grants) == toset([
+      "cat.sch.customers|partial", "cat.sch.customers|raw", "cat.sch.orders|etl", "cat.sch.payments|raw",
+    ])
+    error_message = "every new table_readers grant is withheld until the grant phase"
+  }
+}
+
 run "reader_outside_the_tiers_is_refused" {
   command = plan
   providers = {

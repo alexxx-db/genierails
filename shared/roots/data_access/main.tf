@@ -123,6 +123,67 @@ locals {
   applied_protection             = local._state_is_for_us ? try(local._applied_record.protection, null) : null
 }
 
+# Deterministic policy changes run only through scripts/staged_policy_apply.py,
+# which sets policy_stage per phase. Any other plan (a raw terraform apply, or
+# an older make) may not remove, re-principal or swap the function of a live
+# deterministic mask policy, nor retag or untag a governed column: in one
+# apply Terraform could drop the old mask before the column moves to the new
+# one. create keeps everything live as it is; tighten may only add coverage.
+locals {
+  _applied_mask_policies = merge({}, [
+    for resource in try(local._own_state.resources, []) : {
+      for instance in try(resource.instances, []) : tostring(instance.index_key) => {
+        to       = sort(try(instance.attributes.to_principals, []))
+        except   = sort(coalesce(try(instance.attributes.except_principals, null), []))
+        function = lower(try(instance.attributes.column_mask.function_name, ""))
+      }
+      if try(instance.deposed, "") == "" && startswith(tostring(try(instance.index_key, "")), "gr_mask_")
+    }
+    if try(resource.module, "") == "module.data_access" && try(resource.mode, "") == "managed"
+    && try(resource.type, "") == "databricks_policy_info" && try(resource.name, "") == "policies"
+  ]...)
+  _applied_treatment_tags = merge({}, [
+    for resource in try(local._own_state.resources, []) : {
+      for instance in try(resource.instances, []) : tostring(instance.index_key) => tostring(try(instance.attributes.tag_value, ""))
+      if try(instance.deposed, "") == "" && try(instance.index_key, null) != null
+    }
+    if try(resource.module, "") == "module.data_access" && try(resource.mode, "") == "managed"
+    && try(resource.type, "") == "databricks_entity_tag_assignment" && try(resource.name, "") == "treatment"
+  ]...)
+  _config_mask_policies = {
+    for p in var.fgac_policies : p.name => {
+      to       = sort(p.to_principals)
+      except   = sort(coalesce(p.except_principals, []))
+      function = lower("${p.function_catalog}.${p.function_schema}.${p.function_name}")
+    } if p.policy_type == "POLICY_TYPE_COLUMN_MASK" && startswith(p.name, "gr_mask_")
+  }
+  _config_treatment_tags = {
+    for ta in var.tag_assignments : "${ta.entity_type}|${ta.entity_name}|${ta.tag_key}" => ta.tag_value
+    if ta.entity_type == "columns" && ta.tag_key == "gr_treatment"
+  }
+  _policy_stage_guarded = var.governance_mode == "deterministic" && contains(["", "create", "tighten", "grant"], var.policy_stage)
+  # New SELECT opens only in the grant phase, after every staged phase is
+  # applied and verified (scripts/staged_policy_apply.py).
+  withhold_new_table_grants = var.governance_mode == "deterministic" && contains(["create", "tighten", "switch", "restore", "retire", "abandon"], var.policy_stage)
+  staged_policy_violations = local._policy_stage_guarded ? concat(
+    [for name, live in local._applied_mask_policies : "${name} removed" if !contains(keys(local._config_mask_policies), name)],
+    [for name, live in local._applied_mask_policies : "${name} changes its function" if contains(keys(local._config_mask_policies), name) && try(local._config_mask_policies[name].function, "") != live.function],
+    [for name, live in local._applied_mask_policies : "${name} changes its principals" if contains(keys(local._config_mask_policies), name) && var.policy_stage != "tighten" && (try(local._config_mask_policies[name].to, []) != live.to || try(local._config_mask_policies[name].except, []) != live.except)],
+    [for name, live in local._applied_mask_policies : "${name} loses coverage while tightening" if contains(keys(local._config_mask_policies), name) && var.policy_stage == "tighten" && (length(setsubtract(live.to, try(local._config_mask_policies[name].to, []))) > 0 || length(setsubtract(try(local._config_mask_policies[name].except, []), live.except)) > 0)],
+    [for key, value in local._applied_treatment_tags : "${split("|", key)[1]} moves from ${value} to ${lookup(local._config_treatment_tags, key, "no treatment")}" if lookup(local._config_treatment_tags, key, "") != value],
+  ) : []
+}
+
+variable "policy_stage" {
+  type        = string
+  default     = ""
+  description = "Set only by scripts/policy_generations.py (one value per staged phase), preview by make plan and destroy by make destroy."
+  validation {
+    condition     = contains(["", "preview", "destroy", "create", "tighten", "switch", "restore", "retire", "abandon", "grant"], var.policy_stage)
+    error_message = "policy_stage must be empty or one of preview, destroy, create, tighten, switch, restore, retire, abandon, grant."
+  }
+}
+
 variable "env_dir" {
   type = string
 }
@@ -507,6 +568,7 @@ module "data_access" {
   tag_assignments                          = var.tag_assignments
   governance_mode                          = var.governance_mode
   table_readers                            = local.full_table_readers
+  withhold_new_table_grants                = local.withhold_new_table_grants
   access_tier_groups                       = var.access_tier_groups
   raw_exempt_principals                    = var.raw_exempt_principals
   governed_tables                          = local.governed_tables
@@ -524,6 +586,16 @@ check "business_select_withheld" {
   assert {
     condition     = length(module.data_access.withheld_table_grants.grants) == 0
     error_message = "Coverage check ${module.data_access.withheld_table_grants.status}: ${module.data_access.withheld_table_grants.problem}. New business SELECT withheld: ${join(", ", module.data_access.withheld_table_grants.grants)}. Removals and existing grants still apply. Run this layer through make (make apply ENV=${basename(dirname(var.env_dir))}), which refreshes live tags and DDL and runs the coverage check."
+  }
+}
+
+# Evaluated on every plan; it has no value, so it never shows as a change.
+output "staged_policy_guard" {
+  description = "Fails a plan that would change a live deterministic mask outside the staged policy controller."
+  value       = null
+  precondition {
+    condition     = length(local.staged_policy_violations) == 0
+    error_message = "Deterministic policy changes run in staged phases (create, verify, retag, verify, retire), never in one apply. This ${var.policy_stage == "" ? "plan" : "${var.policy_stage} plan"} would: ${join("; ", local.staged_policy_violations)}. Run make apply, apply-governance, rehearse or release ENV=${basename(dirname(var.env_dir))}, which stage the change through scripts/staged_policy_apply.py."
   }
 }
 
