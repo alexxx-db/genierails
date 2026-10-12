@@ -1,6 +1,8 @@
 # Deterministic-governance E2E driver
 
-The driver encodes the champion flow, plan scenarios S1–S16, cross-cutting
+The driver encodes the champion flow from
+`shared/docs/design/deterministic-governance.md` sections 9, 12, 13 and 17,
+plan scenarios S1–S16, cross-cutting
 manifest/concurrency checks, and the migration operation. Lifecycle mutations
 are issued only as public `make` targets. Read-only snapshots cover UC grants,
 column tags, effective ABAC policies, mask functions, Genie exports and ACLs,
@@ -23,10 +25,49 @@ python3 shared/scripts/e2e/driver.py --cloud aws \
   --scenarios champion --confirm-live
 ```
 
-The checkout is switched with `git checkout --force --detach <commit>` and is
-required to be clean. Missing public targets are reported as `requires step N`
-and automatically become runnable when those targets land. Human classification
-and curation gates pause with an explicit prompt. Each scenario writes JSON and
-Markdown reports plus sanitized command logs. Never put report/state output in
-the repository.
+Live runs require an explicit 40-hex commit and persistent checkout. Before
+each scenario and each step the driver verifies HEAD is the pinned commit
+(`git checkout --force --detach <commit>` at scenario start). Applying targets
+(`rehearse`, `release-plan`, `release`, `maintain`, operations) run only on a
+clean tree; authoring targets (`setup`, `generate`, `promote-to`, `ungovern`)
+may change `envs/`, and the scenario's next step commits that on a
+`genierails-e2e/<scenario>-*` branch and merges it with `--no-ff` into the
+driver's own main. That main lives in a bare repo under `<reports>/e2e-remote.git`
+(git remote `genierails-e2e`), and every `make` runs with
+`RELEASE_REMOTE=genierails-e2e`, so release-plan's "merged on main" rule holds
+without pushing to `origin`.
 
+Everything a scenario needs is checked before it touches anything. A missing
+target (for example `capture`, `detach-agent` or the step-10 migration targets)
+or a human gate without a TTY makes the whole scenario `NOT RUN`. An
+unsupplied `--value` makes it `ERROR`. Either way no snapshot, git switch or
+`make` runs. Placeholder text (`<...>`, `{...}`) and empty `KEY=` arguments
+never reach `make`. A refusal step passes only with a non-zero exit, the exact
+diagnostic the target prints, and identical before/after snapshots. Any other
+failure is `ERROR`. S13 runs every command with `CI=true` and without
+`GENIERAILS_ALLOW_CI_APPLY`.
+
+Scenario values: `agent_a`, `wrong_agent`, `table` (covered), `uncovered_table`,
+`treatment`, `ack_entry` (an exact `prod:<kind>:...` line), `manifest`,
+`tampered_manifest`, and the 40-hex commits `u`, `o`, `r`, `r_plus_1`, `x`, `y`.
+
+Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
+(`databricks_workspace_host`, `databricks_client_id`,
+`databricks_client_secret`) and connect with OAuth M2M while `DATABRICKS_*`,
+`ARM_*` and `AZURE_*` are hidden from the SDK. A client that resolves any other
+host is refused. A failed query, an unreadable catalog, or an unreadable state
+file is an error, never empty evidence.
+
+Human gates need an interactive TTY and the typed scenario ID. A closed or
+piped stdin aborts the run, and the scenario is `NOT RUN`. A wrong token is
+`ERROR`. Ctrl-C, SIGTERM and SIGHUP stop the run as `interrupted`. In every
+case the scenario's `finally` restores and writes a partial report. The restore
+first resets the checkout to the commit. After any applying step it then
+releases the commit's tree again as a forward fix on the driver's main
+(`rehearse`, `release-plan`, `release MANIFEST=`, `maintain`). The driver then
+re-snapshots dev and prod. A column that lost a tag, a removed mask or policy, a
+newly exempted or uncovered principal, or a new grant compared with the
+scenario's baseline is `RESTORE FAILED`. `<reports>/final-protection.json`
+repeats that check against the run's first baseline. Logs and reports redact
+secret-named keys, every value in the cloud's auth files, `Authorization`,
+`Bearer` and `*_TOKEN=` values. Reports and state must be outside the checkout.
