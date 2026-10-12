@@ -234,7 +234,10 @@ resource "null_resource" "genie_space_config_existing" {
   }
 
   provisioner "local-exec" {
-    command = "${var.genie_script_path} update-config"
+    # Existing agents are never configured through Terraform. Dev is UI-owned;
+    # prod is authoritatively updated from the captured JSON after apply. Keep
+    # this resource/address during migration so upgrades do not plan a destroy.
+    command = "true"
 
     environment = {
       DATABRICKS_HOST          = var.databricks_workspace_host

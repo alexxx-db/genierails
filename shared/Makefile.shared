@@ -4,6 +4,8 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release maintain test-champion _derive-before-exposure _refresh-live-ddl promote-to
 
 # ── Variables expected from the including Makefile ──────────────
+.PHONY: capture detach-agent
+
 # SHARED_ROOT  — absolute path to shared/
 # CLOUD_ROOT   — absolute path to aws/ or azure/
 # CLOUD        — "aws" or "azure"
@@ -211,6 +213,7 @@ _guarded-bootstrap:
 	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(MAKE) --no-print-directory _guard-root ENV="$(ENV)" ENV_ORIGIN="$(ENV_ORIGIN)"
 	@$(MAKE) --no-print-directory _prepare-env ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
+	@python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" assemble --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _guard-workspace-target:
 	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -385,6 +388,17 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	else \
 		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/generate_abac.py" $(GENERATE_ARGS) $(if $(MODE),--mode $(MODE),) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
 	fi
+
+capture: _guarded-bootstrap _guard-workspace-target ## Export one dev Genie agent to agents/<name>.space.json (read-only)
+	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
+	@$(_DRY_RUN_GUARD); python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" capture \
+		--env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)"
+
+detach-agent: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Revoke CAN_RUN and detach one agent without deleting it
+	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
+	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,detach-agent); \
+	python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" detach --env-dir "$(ENV_DIR)" \
+		--env "$(ENV)" --space "$(SPACE)" --runner "$(ROOT_RUNNER)"
 
 scaffold-treatments: _guarded-bootstrap _guard-workspace-target ## Add fail-safe treatment stubs for unmapped native class.* tags
 	@python3 "$(SHARED_ROOT)/scripts/scaffold_treatments.py" \
@@ -749,10 +763,13 @@ _prepare-classification:
 _plan-layer:
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
-	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK) --warn; fi; \
 	if [ ! -f "$$env_dir/abac.auto.tfvars" ]; then \
 		echo "=== Skipping terraform plan ($$layer:$$target_env): no $$env_dir/abac.auto.tfvars ==="; \
 		exit 0; \
+	fi; \
+	if [ "$$layer" = "workspace" ]; then \
+		python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" guard-removals --env-dir "$$env_dir" --env "$$target_env" --runner "$(ROOT_RUNNER)"; \
+		$(_GENIE_ID_FILE_CHECK) --warn; \
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$$target_env" CLASSIFICATION_ENV_DIR="$$(dirname "$(LAYER_ENV_DIR)")"; \
@@ -790,11 +807,14 @@ _apply-layer: _guard-not-ci-apply
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
 	apply_flags="$(if $(filter data_access workspace,$(LAYER)),$(APPLY_FLAGS),)"; \
-	if [ "$$layer" = "workspace" ]; then $(_GENIE_ID_FILE_CHECK); fi; \
 	if [ "$$layer" = "data_access" ]; then $(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$$target_env" CLASSIFICATION_ENV_DIR="$$(dirname "$$env_dir")" IMPORT_CLASSIFICATION=1; fi; \
 	if [ ! -f "$$env_dir/abac.auto.tfvars" ]; then \
 		echo "=== Skipping terraform apply ($$layer:$$target_env): no $$env_dir/abac.auto.tfvars ==="; \
 		exit 0; \
+	fi; \
+	if [ "$$layer" = "workspace" ]; then \
+		python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" guard-removals --env-dir "$$env_dir" --env "$$target_env" --runner "$(ROOT_RUNNER)"; \
+		$(_GENIE_ID_FILE_CHECK); \
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		$(_COVERAGE_GATE) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags" $(if $(filter 1,$(VERBOSE)),--verbose,); \
@@ -882,6 +902,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		echo "=== Waiting 30s for data_access resources to propagate before workspace apply ==="; \
 		sleep 30; \
 		$(MAKE) --no-print-directory _apply-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)" DEFER_WITHHELD=1; \
+		python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" sync-prod --env-dir "$(ENV_DIR)" --env "$(ENV)"; \
 		withheld_rc=0; \
 		$(_COVERAGE_GATE) withheld --layer data_access --layer-dir "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" --env-name "$(ENV)" || withheld_rc=1; \
 		$(_COVERAGE_GATE) withheld --layer workspace --layer-dir "$(ENV_DIR)" --env-name "$(ENV)" || withheld_rc=1; \
@@ -935,7 +956,8 @@ apply-genie: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## [
 	fi; \
 	$(_COVERAGE_GATE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" --apply-flags="$(APPLY_FLAGS)" $(if $(filter 1,$(VERBOSE)),--verbose,) \
 		|| echo "WARNING: the coverage check did not pass; only CAN_RUN changes that keep, shrink or clear what is applied can proceed." >&2; \
-	$(MAKE) --no-print-directory _apply-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"
+	$(MAKE) --no-print-directory _apply-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
+	python3 "$(SHARED_ROOT)/scripts/agent_ownership.py" sync-prod --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 destroy-governance: _guard-not-ci-apply _bootstrap _guard-workspace-target ## [Governance team] Destroy data_access layer for the selected env (leaves workspace/Genie untouched)
 	@$(MAKE) --no-print-directory _destroy-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"

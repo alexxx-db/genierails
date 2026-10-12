@@ -255,6 +255,7 @@ def test_plan_real_target_runs_configured_workspace_layers(tmp_path):
         f"{data_access_dir}|data_access dev console",
         f"{data_access_dir}|data_access dev console",
         f"{data_access_dir}|data_access dev plan",
+        f"{env_dir}|workspace dev state-list",
         f"{env_dir}|workspace dev console",
         f"{env_dir}|workspace dev plan",
     ]
