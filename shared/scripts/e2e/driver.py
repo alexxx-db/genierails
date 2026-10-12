@@ -8,6 +8,7 @@ not load authentication, run git, invoke make, or contact Databricks.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -17,12 +18,32 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+import signal
+import time
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 
-PLAN_SOURCE = "/tmp/genierails-e2e-plan.md"
 DESIGN_SOURCE = "shared/docs/design/deterministic-governance.md"
 SECRET_KEYS = re.compile(r"(?i)(secret|token|password|private[_-]?key)")
+TOKEN_VALUE = re.compile(r"(?i)\b(?:dapi|dkea|dose|ghp_|gho_|github_pat_)[A-Za-z0-9_-]{8,}\b")
+PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+# The driver owns this remote and its main branch: local merges are pushed here
+# and every make call uses it as RELEASE_REMOTE, so release-plan's "merged on
+# main" provenance rule holds without touching origin.
+E2E_REMOTE = "genierails-e2e"
+E2E_BRANCH_PREFIX = "genierails-e2e/"
+GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genierails-e2e@localhost",
+                "GIT_COMMITTER_NAME": "genierails-e2e", "GIT_COMMITTER_EMAIL": "genierails-e2e@localhost"}
+# Targets that apply to a workspace/account: the checkout must be clean and
+# pinned before them, and running one means the scenario must be restored.
+APPLYING = frozenset({"rehearse", "release-plan", "release", "maintain", "detach-agent",
+                      "apply-account", "migration-apply"})
+# Targets that author files under envs/ (committed later by a local merge) and,
+# for ungovern in a rehearse env, also apply.
+AUTHORING = frozenset({"setup", "generate", "promote-to", "capture", "ungovern", "scaffold-treatments"})
+# Scenarios whose purpose is to remove or loosen protection mid-scenario. The
+# post-restore check still applies to them.
+WEAKENING_EXPECTED = frozenset({"s8", "s9", "migration"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,6 +55,10 @@ class Step:
     requires_step: int | None = None
     human_prompt: str | None = None
     expect_failure: bool = False
+    refusal: str | None = None
+    extra_env: tuple[tuple[str, str | None], ...] = ()
+    action: str | None = None
+    value: str | None = None
     assertions: tuple[str, ...] = ()
 
 
@@ -49,16 +74,41 @@ class Scenario:
 
 
 def mk(name: str, target: str, env: str | None = None, *, step: int | None = None,
-       args: Sequence[str] = (), fail: bool = False, assertions: Sequence[str] = ()) -> Step:
+       args: Sequence[str] = (), fail: bool = False, refusal: str | None = None,
+       extra_env: Mapping[str, str | None] | None = None,
+       assertions: Sequence[str] = ()) -> Step:
     command = ("make", target) + ((f"ENV={env}",) if env else ()) + tuple(args)
-    return Step(name, command, env, target, step, expect_failure=fail,
+    return Step(name, command, env, target, step, expect_failure=fail, refusal=refusal,
+                extra_env=tuple((extra_env or {}).items()),
                 assertions=tuple(assertions))
 
 
+def action(name: str, kind: str, value: str | None = None) -> Step:
+    return Step(name=name, action=kind, value=value)
+
+
+# Each refusal pattern is the diagnostic the implementing target prints, so an
+# unrelated non-zero exit (a typo, a crash, a timeout) is never a passing refusal.
+REFUSALS = {
+    "covered": r"refusing to ungovern \S+: a configured agent still uses it",
+    "plan_provenance": r"release-plan refused:",
+    "release_provenance": r"(make release refused|is not a release manifest|is a manifest for \S+, not)",
+    "maintain_provenance": r"make maintain refused",
+    "ci": r"applying targets cannot run in CI",
+    "weakening": r"(refused by the reader or weakening check|unacknowledged (weakening|reader) )",
+    "detach": r"detach-agent(:| refused)",
+    "tamper": r"(make release refused: \S+ no longer matches|is not a release manifest|is a manifest for \S+, not)",
+    "stale": r"committed files differ from what the commit regenerates",
+}
+CI_ENV = {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": None}
+
+
+AUTHOR_MERGE = action("Commit and merge authored changes on the driver's local main", "local_merge")
 DAY2 = (
     mk("PR check (dev)", "check", "dev", step=12),
     mk("Dev rehearsal", "rehearse", "dev"),
     mk("Promote deterministic output", "promote-to", "prod"),
+    action("Commit and merge promotion on the driver's local main", "local_merge"),
     mk("PR check (prod)", "check", "prod", step=12),
     mk("Promotion determinism", "promote-to", "prod", args=("CHECK=1",)),
     mk("Rehearse promotion merge", "rehearse", "dev"),
@@ -79,98 +129,130 @@ SCENARIOS: tuple[Scenario, ...] = (
         "Catalog mapping, tier groups, acl_groups and external state directory are reviewed.",
     ), (
         mk("Scaffold dev environment", "setup", "dev"),
-        Step("Review dev classification", human_prompt="In dev Catalog Explorer review classification, exclude false positives, enable auto-tagging, then press Enter."),
+        Step("Review dev classification", human_prompt="In dev Catalog Explorer review classification, exclude false positives and enable auto-tagging."),
         mk("Generate reviewed dev configuration", "generate", "dev"),
+        AUTHOR_MERGE,
     ) + DAY2[:3] + (
-        Step("Review prod classification", human_prompt="In prod Catalog Explorer review classification and confirm expected_classification.json, then press Enter."),
+        Step("Review prod classification", human_prompt="In prod Catalog Explorer review classification and confirm expected_classification.json."),
     ) + DAY2[3:], (
         "Prod grants, masks, tags, agent export/ACL and receipts match committed governance.",
         "Second release-plan and maintain are idempotent; agent ID and conversations are stable.",
     ), ("Release delete=true for disposable agents; remove governed fixtures through reviewed lifecycle changes.",)),
     _scenario("s1", "Promote A while B has unfinished dev edits", (
         "A and B have released captured baselines; make an unmistakable UI-only edit to dev B.",
-    ), (Step("Curate only A", human_prompt="Curate dev A, leave B unfinished, then press Enter."),
-        mk("Capture A only", "capture", "dev", step=11, args=("SPACE=A",))) + DAY2, (
+    ), (Step("Curate only A", human_prompt="Curate dev A and leave B unfinished."),
+        mk("Capture A only", "capture", "dev", step=11, args=("SPACE={agent_a}",)), AUTHOR_MERGE) + DAY2, (
         "Only A changes; dev B remains UI-edited and prod B stays byte-identical with stable conversations.",
     ), ("Revert/capture A through lifecycle; manually discard or separately capture B edit.",)),
-    _scenario("s2", "Mask-only change while B is mid-curation", ("Begin an uncaptured edit to dev B; review a mask version/override change."),
-        (Step("Leave B mid-curation", human_prompt="Leave B's UI edit uncaptured, apply the reviewed config edit, then press Enter."),
-         mk("Regenerate governance", "generate", "dev")) + DAY2,
+    _scenario("s2", "Mask-only change while B is mid-curation", ("Begin an uncaptured edit to dev B; review a mask version/override change.",),
+        (Step("Leave B mid-curation", human_prompt="Leave B's UI edit uncaptured and apply the reviewed config edit."),
+         mk("Regenerate governance", "generate", "dev"), AUTHOR_MERGE) + DAY2,
         ("Only governance changes; B config, ID and conversations do not change; staged replacement never exposes raw data.",),
         ("Revert governance change through the same lifecycle.",), ("Staged policy operation may require step 6 operation targets.",)),
-    _scenario("s3", "Agent adds a new table", ("Create uniquely prefixed, classified dev/prod test table pair."),
-        (Step("Add table to A", human_prompt="Add the dev table to A in the UI and review classification, then press Enter."),
-         mk("Capture A", "capture", "dev", step=11, args=("SPACE=A",)), mk("Generate governance", "generate", "dev")) + DAY2,
+    _scenario("s3", "Agent adds a new table", ("Create uniquely prefixed, classified dev/prod test table pair.",),
+        (Step("Add table to A", human_prompt="Add the dev table to A in the UI and review classification."),
+         mk("Capture A", "capture", "dev", step=11, args=("SPACE={agent_a}",)), mk("Generate governance", "generate", "dev"),
+         AUTHOR_MERGE) + DAY2,
         ("Unreadable table is refused; once readers are reviewed, prod is masked before access and identifiers are remapped.",),
         ("Remove table from A, capture/release, ungovern, then drop disposable fixtures.",)),
-    _scenario("s4", "New sensitive column appears in prod", ("Add a known-class prefixed column via an approved external fixture migration."),
+    _scenario("s4", "New sensitive column appears in prod", ("Add a known-class prefixed column via an approved external fixture migration.",),
         (mk("Maintain released commit", "maintain", "prod"), mk("Prove idempotence", "maintain", "prod")),
         ("Known class is masked in one run for every tier; no Genie update occurs.",),
         ("Remove disposable column through its owning migration.",)),
-    _scenario("s5", "Unmapped class fail-safe", ("Add prefixed unknown_secret with an unmapped class tag; no acknowledgement."),
+    _scenario("s5", "Unmapped class fail-safe", ("Add prefixed unknown_secret with an unmapped class tag; no acknowledgement.",),
         (mk("Plan protected release", "release-plan", "prod", step=9), mk("Maintain fail-safe", "maintain", "prod"),
          mk("Scaffold reviewed treatment", "scaffold-treatments", "dev", args=("TREATMENT={treatment}",))),
         ("Gap is reported and every principal sees never-raw redaction; new access is blocked.",),
         ("Promote a reviewed mapping or remove the fixture tag/column; prove no stale fail-safe policy.",)),
-    _scenario("s6", "table_readers widening requires acknowledgement", ("Prepare a prod-owned reader widening with stale coverage and no matching ack."),
-        (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", step=9, fail=True),) + DAY2,
+    _scenario("s6", "table_readers widening requires acknowledgement", ("Prepare a prod-owned reader widening with stale coverage and no matching ack.",),
+        (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", step=9, fail=True, refusal=REFUSALS["weakening"]),
+         action("Write exact reviewed acknowledgement", "add_ack", "ack_entry"),
+         action("Commit and merge acknowledgement on the driver's local main", "local_merge")) + DAY2,
         ("Negative plan creates no applicable manifest; exact reviewed ack permits only the named grant.",),
         ("Revert reader and acknowledgement through lifecycle; verify only GenieRails-owned SELECT is revoked.",)),
-    _scenario("s7", "Detach agent", ("A is released, detached=true and acl_groups=[] have been released."),
-        (mk("Refuse wrong commit/agent", "detach-agent", "prod", step=11, args=("SPACE=wrong",), fail=True),
-         mk("Detach A state only", "detach-agent", "prod", step=11, args=("SPACE=A",))) + DAY2[:2],
+    _scenario("s7", "Detach agent", ("A is released, detached=true and acl_groups=[] have been released.",),
+        (mk("Refuse wrong commit/agent", "detach-agent", "prod", step=11, args=("SPACE={wrong_agent}",), fail=True, refusal=REFUSALS["detach"]),
+         mk("Detach A state only", "detach-agent", "prod", step=11, args=("SPACE={agent_a}",))) + DAY2[:2],
         ("Only A resource addresses leave state; live space, conversations, grants and masks remain.",),
         ("Use documented adoption/reattachment; otherwise retain disposable agent for explicit cleanup.",)),
-    _scenario("s8", "Stop governing a table", ("Disposable table is in governed list; prepare each covering-source negative case."),
-        (mk("Refuse while covered", "ungovern", "dev", step=4, args=("TABLE={table}",), fail=True),
-         mk("Edit governed list", "ungovern", "dev", step=4, args=("TABLE={table}",))) + DAY2,
+    _scenario("s8", "Stop governing a table", ("Disposable table is in governed list; prepare each covering-source negative case.",),
+        (mk("Refuse while covered", "ungovern", "dev", step=4, args=("TABLE={table}", "YES=1"), fail=True, refusal=REFUSALS["covered"]),
+         mk("Edit governed list", "ungovern", "dev", step=4, args=("TABLE={uncovered_table}", "YES=1")), AUTHOR_MERGE) + DAY2,
         ("Every coverage source is named/refused; only reviewed lifecycle removes policies/tags.",),
         ("Re-add via uc_tables/agent/readers and lifecycle, or drop disposable table.",)),
-    _scenario("s9", "Rollback", ("R1 and visible-change R2 are released; exact prod rollback ack is reviewed."), DAY2,
+    _scenario("s9", "Rollback", ("R1 and visible-change R2 are released; exact prod rollback ack is reviewed.",), DAY2,
         ("Bad/missing ack refuses before mutation; exact ack restores R1 behavior without agent recreation/raw exposure.",),
         ("Forward-fix through lifecycle and remove obsolete acknowledgement.",)),
-    _scenario("s10", "Stale promotion PR refusal", ("Create promotion at M1, advance main to M2 and leave promotion stale."),
-        (mk("Refuse stale generated output", "promote-to", "prod", args=("CHECK=1",), fail=True),
-         mk("Refuse stale prod check", "check", "prod", step=12, fail=True)),
+    _scenario("s10", "Stale promotion PR refusal", ("Create promotion at M1, advance main to M2 and leave promotion stale.",),
+        (mk("Refuse stale generated output", "promote-to", "prod", args=("CHECK=1",), fail=True, refusal=REFUSALS["stale"]),
+         mk("Refuse stale prod check", "check", "prod", step=12, fail=True, refusal=REFUSALS["stale"])),
         ("Scratch regeneration differs and checks fail without workspace mutation.",), ("Delete simulator branches/worktrees.",)),
-    _scenario("s11", "Release refuses unrehearsed or older commit", ("Fixture receipts model U, N and ancestor O around last release R."),
-        (mk("Refuse candidate provenance", "release-plan", "prod", step=9, fail=True),
-         mk("Refuse foreign manifest", "release", "prod", step=9, args=("MANIFEST={manifest}",), fail=True)),
+    _scenario("s11", "Release refuses unrehearsed or older commit", ("Fixture receipts model U, N and ancestor O around last release R.",),
+        (action("Checkout unrehearsed U", "checkout_value", "u"),
+         mk("Refuse candidate provenance", "release-plan", "prod", step=9, fail=True, refusal=REFUSALS["plan_provenance"]),
+         action("Checkout older O", "checkout_value", "o"),
+         mk("Refuse foreign manifest", "release", "prod", step=9, args=("MANIFEST={manifest}",), fail=True, refusal=REFUSALS["release_provenance"])),
         ("Unrehearsed, dirty, off-main, older and mismatched-manifest cases refuse with no mutation.",), ("Remove negative-case branches only.",)),
-    _scenario("s12", "Maintain refuses off released commit", ("Release receipt points to R while main is R+1."),
-        (mk("Refuse R+1", "maintain", "prod", fail=True), mk("Maintain exact R", "maintain", "prod")),
+    _scenario("s12", "Maintain refuses off released commit", ("Release receipt points to R while main is R+1.",),
+        (action("Checkout R+1", "checkout_value", "r_plus_1"),
+         mk("Refuse R+1", "maintain", "prod", fail=True, refusal=REFUSALS["maintain_provenance"]),
+         action("Checkout exact release R", "checkout_value", "r"), mk("Maintain exact R", "maintain", "prod")),
         ("Off-receipt/dirty/digest mismatch refuse before mutation; exact R is governance-only.",), ("Return persistent checkout to requested commit.",)),
-    _scenario("s13", "CI apply guard", ("No authorized pipeline provenance; CI=true is set by the scenario fixture."),
+    _scenario("s13", "CI apply guard", ("No authorized pipeline provenance; CI=true is set by the scenario fixture.",),
         tuple(mk(f"Refuse CI {t}", t, "dev" if t == "rehearse" else "prod", step=11 if t == "detach-agent" else None,
-                 args=(("SPACE=A",) if t == "detach-agent" else ()), fail=True)
-              for t in ("rehearse", "release-plan", "release", "maintain", "detach-agent")) +
-        (mk("Refuse CI account apply", "apply-account", "account", step=9, fail=True),),
+                 args=(("SPACE={agent_a}",) if t == "detach-agent" else ()), fail=True, refusal=REFUSALS["ci"],
+                 extra_env=CI_ENV)
+              for t in ("rehearse", "release-plan", "maintain", "detach-agent")) +
+        # The guard refuses before MANIFEST is read; the path is a fixed, real
+        # value so no placeholder ever reaches make.
+        (mk("Refuse CI release", "release", "prod", step=9, args=("MANIFEST=/tmp/genierails-ci-guard-fixture.json",),
+            fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),) +
+        (mk("Refuse CI account apply", "apply-account", step=9, fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),),
         ("Every unauthorized apply fails with zero API calls and unchanged state/locks; authoring/check remain usable.",), ("Unset CI markers.",)),
-    _scenario("s14", "Governance-only environment", ("Test env has prefixed uc_tables, no agent files/IDs, initially no table_readers."),
-        (mk("Setup", "setup", "dev"), mk("Generate governance only", "generate", "dev")) + DAY2,
+    _scenario("s14", "Governance-only environment", ("Test env has prefixed uc_tables, no agent files/IDs, initially no table_readers.",),
+        (mk("Setup", "setup", "dev"), mk("Generate governance only", "generate", "dev"), AUTHOR_MERGE) + DAY2,
         ("No Genie resource/CAN_RUN is created; first run grants no SELECT, reviewed second run grants only table_readers.",),
         ("Remove readers, ungovern, then remove disposable tables.",)),
-    _scenario("s15", "Two PRs merged then one promotion", ("X changes A; Y changes governance/B; ordered merge commits are available."),
-        (mk("Rehearse X", "rehearse", "dev"), mk("Rehearse Y", "rehearse", "dev")) + DAY2[2:],
+    _scenario("s15", "Two PRs merged then one promotion", ("X changes A; Y changes governance/B; ordered merge commits are available.",),
+        (action("Checkout merge X", "checkout_value", "x"), mk("Rehearse X", "rehearse", "dev"),
+         action("Checkout merge Y", "checkout_value", "y"), mk("Rehearse Y", "rehearse", "dev")) + DAY2[2:],
         ("Append-only receipts exist for X/Y/promotion; one cumulative prod release has no missing/duplicate change.",),
         ("Cumulative revert or ordered reverts followed by one promotion.",)),
-    _scenario("s16", "Prod UI drift overwritten; conversations retained", ("Released prod A has a conversation and a recorded unsupported UI edit."),
-        (Step("Make prod drift", human_prompt="Record A export/conversation IDs, make a recognizable prod UI edit, then press Enter."),) + DAY2,
+    _scenario("s16", "Prod UI drift overwritten; conversations retained", ("Released prod A has a conversation and a recorded unsupported UI edit.",),
+        (Step("Make prod drift", human_prompt="Record A export/conversation IDs and make a recognizable prod UI edit."),) + DAY2,
         ("Overwrite report names drift; config equals Git after remap; ID/conversations remain; no recreation.",),
         ("Restore desired content via dev UI, capture and lifecycle.",)),
-    _scenario("manifest", "Manifest tamper and concurrency refusals", ("Disposable fixtures and an approved manifest exist."),
-        (mk("Refuse tampered manifest", "release", "prod", step=9, args=("MANIFEST={tampered_manifest}",), fail=True),),
+    _scenario("manifest", "Manifest tamper and concurrency refusals", ("Disposable fixtures and an approved manifest exist.",),
+        (mk("Refuse tampered manifest", "release", "prod", step=9, args=("MANIFEST={tampered_manifest}",), fail=True, refusal=REFUSALS["tamper"]),),
         ("Commit, plan bytes, serial, live snapshot and kept-name changes each invalidate the old manifest; locks serialize applies.",),
         ("Remove each external grant/mask through its owning fixture immediately.",)),
-    _scenario("migration", "Legacy migration operations", ("Reviewed report-only legacy fixture and revocation report exist."),
-        (mk("Migration report", "migration-report", "prod", step=9), mk("Migration cutover", "migration-apply", "prod", step=9)),
+    _scenario("migration", "Legacy migration operations", ("Reviewed report-only legacy fixture and revocation report exist.",),
+        (mk("Migration report", "migration-report", "prod", step=10), mk("Migration cutover", "migration-apply", "prod", step=10)),
         ("Every column/reader consequence is reviewed; phases tighten before loosen; verification is fresh.",),
-        ("Rollback both source and promotion using exact rollback acknowledgement.",), ("Target names are supplied by rollout step 9 implementation.",)),
+        ("Rollback both source and promotion using exact rollback acknowledgement.",), ("Target names are supplied by rollout step 10 implementation.",)),
 )
+
+# Explicit top-level snapshot components each scenario is allowed to change.
+# Any component not named here is an assertion failure, not just report prose.
+_ALL_COMPONENTS = frozenset({"uc", "agents", "state_serials", "receipts"})
+ALLOWED_CHANGES: Mapping[str, frozenset[str]] = {
+    "champion": _ALL_COMPONENTS, "s1": _ALL_COMPONENTS, "s2": frozenset({"uc", "state_serials", "receipts"}),
+    "s3": _ALL_COMPONENTS, "s4": frozenset({"uc", "state_serials", "receipts"}),
+    "s5": frozenset({"uc", "state_serials", "receipts"}), "s6": _ALL_COMPONENTS,
+    "s7": _ALL_COMPONENTS, "s8": frozenset({"uc", "state_serials", "receipts"}), "s9": _ALL_COMPONENTS,
+    "s10": frozenset(), "s11": frozenset(), "s12": frozenset({"uc", "state_serials", "receipts"}),
+    "s13": frozenset(), "s14": frozenset({"uc", "state_serials", "receipts"}), "s15": _ALL_COMPONENTS,
+    "s16": _ALL_COMPONENTS, "manifest": frozenset(),
+    "migration": frozenset({"uc", "state_serials", "receipts"}),
+}
 
 
 class SnapshotProvider(Protocol):
     def capture(self, env: str) -> Mapping[str, Any]: ...
+
+
+class HumanAbort(Exception):
+    """stdin closed at a human gate: the scenario is NOT RUN, never skipped past."""
 
 
 def canonical(value: Any) -> Any:
@@ -190,62 +272,134 @@ def snapshot_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[s
             for key in keys if left.get(key) != right.get(key)}
 
 
-def redact(value: Any) -> Any:
+def redact(value: Any, secrets: Iterable[str] = ()) -> Any:
+    secrets = tuple(secrets)
     if isinstance(value, Mapping):
-        return {str(k): "<redacted>" if SECRET_KEYS.search(str(k)) else redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [redact(v) for v in value]
+        return {str(k): "<redacted>" if SECRET_KEYS.search(str(k)) else redact(v, secrets) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(v, secrets) for v in value]
+    if isinstance(value, str):
+        return redact_text(value, secrets)
     return value
 
 
+def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
+    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
+        text = text.replace(secret, "<redacted>")
+    text = re.sub(r'(?i)("[^"]*(?:token|secret|password|authorization)[^"]*"\s*:\s*)"[^"]*"', r'\1"<redacted>"', text)
+    text = re.sub(r"(?i)(Authorization\s*[:=]\s*)\S+(?:\s+\S+)?", r"\1<redacted>", text)
+    text = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", r"\1 <redacted>", text)
+    text = re.sub(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*[=:]\s*)\"?[^\s\"]+\"?", r"\1<redacted>", text)
+    return TOKEN_VALUE.sub("<redacted>", text)
+
+
 class CommandRunner:
-    def __init__(self, cwd: Path, log_dir: Path, extra_env: Mapping[str, str] | None = None):
+    def __init__(self, cwd: Path, log_dir: Path, extra_env: Mapping[str, str] | None = None,
+                 secrets: Iterable[str] = (), timeout: int = 1800):
         self.cwd, self.log_dir = cwd, log_dir
         self.env = {**os.environ, **(extra_env or {})}
+        self.secrets, self.timeout = tuple(secrets), timeout
+        self.count = 0
 
-    def run(self, argv: Sequence[str], label: str) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(list(argv), cwd=self.cwd, env=self.env, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-        safe = re.sub(r"(?i)(secret|token|password)(\s*[=:]\s*)\S+", r"\1\2<redacted>", result.stdout)
-        (self.log_dir / f"{slug(label)}.log").write_text(safe, encoding="utf-8")
-        return result
+    def run(self, argv: Sequence[str], label: str,
+            extra_env: Mapping[str, str | None] | None = None) -> subprocess.CompletedProcess[str]:
+        env = dict(self.env)
+        for key, value in (extra_env or {}).items():
+            if value is None: env.pop(key, None)
+            else: env[key] = value
+        self.count += 1
+        print(f"  -> {redact_text(label, self.secrets)}", flush=True)
+        try:
+            # stdin is never the operator's terminal: a target that prompts
+            # reads EOF and refuses instead of silently waiting or proceeding.
+            result = subprocess.run(list(argv), cwd=self.cwd, env=env, text=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+                                    timeout=self.timeout)
+        except subprocess.TimeoutExpired as exc:
+            partial = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            result = subprocess.CompletedProcess(list(argv), 124, partial + f"\nERROR: timed out after {self.timeout}s\n")
+        safe = redact_text(result.stdout or "", self.secrets)
+        header = redact_text("$ " + " ".join(argv), self.secrets)
+        (self.log_dir / f"{self.count:04d}-{slug(label)[:80]}.log").write_text(header + "\n" + safe, encoding="utf-8")
+        return subprocess.CompletedProcess(result.args, result.returncode, safe, result.stderr)
+
+
+def read_tfvars(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        raise RuntimeError(f"missing authentication file: {path}")
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = re.match(r'^\s*([A-Za-z_][\w]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$', line)
+        if m:
+            values[m.group(1)] = bytes(m.group(2), "utf-8").decode("unicode_escape")
+    return values
+
+
+def collect_secrets(cloud_root: Path) -> set[str]:
+    """Every secret value in this cloud's auth files, so logs and reports can scrub it."""
+    found: set[str] = set()
+    paths = [cloud_root / "auth.auto.tfvars", *cloud_root.glob("envs/*/auth.auto.tfvars"),
+             *cloud_root.glob("envs/*/*/auth.auto.tfvars")]
+    for path in paths:
+        if path.is_file():
+            found.update(v for k, v in read_tfvars(path).items() if SECRET_KEYS.search(k) and v)
+    return found
+
+
+@contextlib.contextmanager
+def _without_ambient_auth() -> Iterator[None]:
+    """Hide shell auth (DATABRICKS_*, ARM_*, AZURE_*) while a client is configured."""
+    hidden = {k: os.environ.pop(k) for k in list(os.environ)
+              if k.startswith(("DATABRICKS_", "ARM_", "AZURE_"))}
+    try:
+        yield
+    finally:
+        os.environ.update(hidden)
 
 
 class LiveSnapshotProvider:
-    """Read-only SDK/SQL snapshot using env auth.auto.tfvars (values never logged)."""
+    """Read-only SDK/SQL snapshot pinned to <cloud>/envs/<env>/auth.auto.tfvars (values never logged)."""
     def __init__(self, cloud_root: Path, state_dir: Path):
         self.cloud_root, self.state_dir = cloud_root, state_dir
+        self.secret_values: set[str] = set()
 
-    @staticmethod
-    def _tfvars(path: Path) -> dict[str, str]:
-        if not path.is_file():
-            raise RuntimeError(f"missing authentication file: {path}")
-        values: dict[str, str] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            m = re.match(r'^\s*([A-Za-z_][\w]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$', line)
-            if m:
-                values[m.group(1)] = bytes(m.group(2), "utf-8").decode("unicode_escape")
-        return values
+    _tfvars = staticmethod(read_tfvars)
 
-    def capture(self, env: str) -> Mapping[str, Any]:
+    def client(self, env: str) -> Any:
         try:
             from databricks.sdk import WorkspaceClient  # type: ignore
         except ImportError as exc:
             raise RuntimeError("live snapshots require databricks-sdk") from exc
+        auth = read_tfvars(self.cloud_root / "envs" / env / "auth.auto.tfvars")
+        self.secret_values.update(v for k, v in auth.items() if SECRET_KEYS.search(k) and v)
+        host = (auth.get("databricks_workspace_host") or "").strip()
+        if not host:
+            raise RuntimeError(f"{env}: auth.auto.tfvars has no databricks_workspace_host")
+        if not auth.get("databricks_client_id") or not auth.get("databricks_client_secret"):
+            raise RuntimeError(f"{env}: auth.auto.tfvars needs databricks_client_id and databricks_client_secret")
+        # Explicit OAuth M2M with ambient auth hidden: never a profile, token or
+        # host from the shell, so the snapshot reads exactly this env's workspace.
+        with _without_ambient_auth():
+            client = WorkspaceClient(host=host, client_id=auth["databricks_client_id"],
+                                     client_secret=auth["databricks_client_secret"], auth_type="oauth-m2m",
+                                     product="genierails-e2e", product_version="1")
+        connected = str(getattr(getattr(client, "config", None), "host", "") or "")
+        if _norm_host(connected) != _norm_host(host):
+            raise RuntimeError(f"{env}: client resolved host {connected!r}, not the env's {host!r}")
+        return client
+
+    def capture(self, env: str) -> Mapping[str, Any]:
         env_dir = self.cloud_root / "envs" / env
-        auth = self._tfvars(env_dir / "auth.auto.tfvars")
-        kwargs = {k: v for k, v in {
-            "profile": auth.get("databricks_profile") or auth.get("profile"),
-            "host": auth.get("databricks_host") or auth.get("host"),
-            "client_id": auth.get("databricks_client_id") or auth.get("client_id"),
-            "client_secret": auth.get("databricks_client_secret") or auth.get("client_secret"),
-            "azure_tenant_id": auth.get("azure_tenant_id"),
-        }.items() if v}
-        client = WorkspaceClient(**kwargs)
-        catalog = _read_catalog(env_dir / "env.auto.tfvars")
-        warehouse = auth.get("databricks_warehouse_id") or auth.get("warehouse_id")
-        sql = _sql_snapshots(client, warehouse, catalog) if warehouse and catalog else {}
-        spaces = _agent_ids(env_dir)
+        client = self.client(env)
+        config = _load_hcl(env_dir / "env.auto.tfvars")
+        catalogs = _read_catalogs(env_dir, config)
+        warehouse = config.get("sql_warehouse_id") or next((space.get("sql_warehouse_id")
+            for space in config.get("genie_spaces") or []
+            if isinstance(space, Mapping) and space.get("sql_warehouse_id")), None)
+        if not warehouse: raise RuntimeError(f"{env}: env.auto.tfvars has no sql_warehouse_id")
+        if not catalogs: raise RuntimeError(f"{env}: no governed catalogs could be resolved")
+        sql = {catalog: _sql_snapshots(client, str(warehouse), catalog) for catalog in catalogs}
+        spaces = _agent_ids(env_dir, config, self.state_dir / env, self.cloud_root)
         agents: list[dict[str, Any]] = []
         for name, space_id in spaces:
             exported = client.genie.get_space(space_id).as_dict()
@@ -256,7 +410,12 @@ class LiveSnapshotProvider:
             "agents": agents,
             "state_serials": _state_serials(self.state_dir / env),
             "receipts": _receipt_inventory(self.state_dir / env),
-        })
+        }, self.secret_values)
+
+
+def _norm_host(host: str) -> str:
+    host = host.strip().rstrip("/").lower()
+    return host if host.startswith("https://") else "https://" + host.removeprefix("http://")
 
 
 def _sql_snapshots(client: Any, warehouse: str, catalog: str) -> Mapping[str, Any]:
@@ -265,24 +424,35 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str) -> Mapping[str, An
         "schema_grants": f"SELECT * FROM system.information_schema.schema_privileges WHERE catalog_name = '{_sql_lit(catalog)}'",
         "table_grants": f"SELECT * FROM system.information_schema.table_privileges WHERE table_catalog = '{_sql_lit(catalog)}'",
         "governed_tags": f"SELECT * FROM system.information_schema.column_tags WHERE catalog_name = '{_sql_lit(catalog)}'",
-        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND routine_name LIKE 'gr\\_%' ESCAPE '\\'",
-        "tables": f"SELECT table_catalog,table_schema,table_name FROM system.information_schema.tables WHERE table_catalog = '{_sql_lit(catalog)}'",
+        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND routine_name LIKE 'mask\\_%' ESCAPE '\\'",
+        "tables": f"SELECT table_catalog,table_schema,table_name FROM system.information_schema.tables WHERE table_catalog = '{_sql_lit(catalog)}' AND table_schema <> 'information_schema'",
     }
     out: dict[str, Any] = {}
     for name, statement in queries.items():
         response = client.statement_execution.execute_statement(warehouse_id=warehouse, statement=statement, wait_timeout="50s")
+        _require_succeeded(response, name)
         columns = [c.name for c in (response.manifest.schema.columns or [])]
-        rows = response.result.data_array or []
+        rows = list(response.result.data_array or [])
+        next_index = getattr(response.result, "next_chunk_index", None)
+        while next_index is not None:
+            chunk = client.statement_execution.get_statement_result_chunk_n(response.statement_id, next_index)
+            rows.extend(chunk.data_array or [])
+            next_index = getattr(chunk, "next_chunk_index", None)
         out[name] = [dict(zip(columns, row)) for row in rows]
+    # information_schema shows only what the principal can see: a governed
+    # catalog with no visible tables is an unreadable catalog, not "no data".
+    if not out["tables"]:
+        raise RuntimeError(f"{catalog}: no visible tables; the snapshot principal cannot read this governed catalog")
     # Effective-policy evidence is per table. Inability to read it is a failed
     # snapshot, never evidence that no policy exists.
     policies: list[Mapping[str, Any]] = []
     for table in out.pop("tables"):
-        qualified = ".".join(f"`{str(table[k]).replace('`', '``')}`" for k in
-                             ("table_catalog", "table_schema", "table_name"))
-        response = client.statement_execution.execute_statement(warehouse_id=warehouse,
-            statement=f"SHOW EFFECTIVE POLICIES ON TABLE {qualified}", wait_timeout="50s")
-        policies.append({"table": qualified, "response": response.as_dict()})
+        qualified = ".".join(str(table[k]) for k in ("table_catalog", "table_schema", "table_name"))
+        try:
+            listed = client.policies.list_policies("TABLE", qualified, include_inherited=True)
+            policies.append({"table": qualified, "policies": [p.as_dict() for p in listed]})
+        except Exception as exc:
+            raise RuntimeError(f"policy inventory failed for {qualified}: {type(exc).__name__}") from exc
     out["abac_policies"] = policies
     return out
 
@@ -291,29 +461,75 @@ def _sql_lit(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _read_catalog(path: Path) -> str | None:
-    if not path.exists(): return None
-    match = re.search(r'^\s*(?:catalog_name|catalog)\s*=\s*"([^"]+)"', path.read_text(), re.M)
-    return match.group(1) if match else None
+def _require_succeeded(response: Any, label: str) -> None:
+    state = getattr(getattr(response, "status", None), "state", None)
+    if str(getattr(state, "value", state)).upper() != "SUCCEEDED":
+        raise RuntimeError(f"{label} snapshot query did not succeed (state={state})")
+    if getattr(response, "result", None) is None or getattr(response, "manifest", None) is None:
+        raise RuntimeError(f"{label} snapshot query returned no result")
 
 
-def _agent_ids(env_dir: Path) -> list[tuple[str, str]]:
+def _load_hcl(path: Path) -> dict[str, Any]:
+    if not path.is_file(): raise RuntimeError(f"missing config: {path}")
+    try:
+        import hcl2  # type: ignore
+        with path.open(encoding="utf-8") as handle: return hcl2.load(handle)
+    except Exception as exc:
+        raise RuntimeError(f"could not parse {path.name}: {type(exc).__name__}") from exc
+
+
+def _read_catalogs(env_dir: Path, config: Mapping[str, Any]) -> list[str]:
+    catalogs: set[str] = set()
+    for table in config.get("uc_tables") or []:
+        if isinstance(table, str) and "." in table: catalogs.add(table.split(".", 1)[0])
+    for space in config.get("genie_spaces") or []:
+        if isinstance(space, Mapping):
+            for table in space.get("uc_tables") or []:
+                if isinstance(table, str) and "." in table: catalogs.add(table.split(".", 1)[0])
+    mapping = config.get("catalog_map") or {}
+    if isinstance(mapping, Mapping): catalogs.update(str(v) for v in mapping.values())
+    governed = env_dir / "generated" / "governed_tables.json"
+    if governed.is_file():
+        try:
+            data = json.loads(governed.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"could not read {governed}: {type(exc).__name__}") from exc
+        values = data if isinstance(data, list) else data.get("tables", [])
+        catalogs.update(str(t).split(".", 1)[0] for t in values if isinstance(t, str) and "." in t)
+    return sorted(catalogs)
+
+
+def _agent_ids(env_dir: Path, config: Mapping[str, Any], state_root: Path, cloud_root: Path) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
+    for index, space in enumerate(config.get("genie_spaces") or []):
+        if isinstance(space, Mapping) and space.get("genie_space_id"):
+            found.append((str(space.get("name") or f"space-{index}"), str(space["genie_space_id"])))
     for path in sorted(env_dir.glob("agents/*")):
         if not path.is_file(): continue
         text = path.read_text(encoding="utf-8")
         match = re.search(r'^\s*(?:genie_space_id|space_id)\s*=\s*"([^"]+)"', text, re.M)
         if match: found.append((path.stem, match.group(1)))
-    legacy = env_dir / ".genie_space_id"
-    if legacy.is_file() and legacy.read_text().strip(): found.append(("legacy", legacy.read_text().strip()))
-    return found
+    for legacy in (env_dir / ".genie_space_id", cloud_root / ".genie_space_id"):
+        if legacy.is_file() and legacy.read_text().strip(): found.append(("legacy", legacy.read_text().strip()))
+    for path in sorted(state_root.rglob("*.tfstate")) if state_root.exists() else []:
+        try:
+            for resource in json.loads(path.read_text()).get("resources", []):
+                if "genie" not in str(resource.get("type", "")).lower(): continue
+                for inst in resource.get("instances", []):
+                    attrs = inst.get("attributes") or {}
+                    sid = attrs.get("space_id") or attrs.get("id")
+                    if sid: found.append((str(resource.get("name", "state")), str(sid)))
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError(f"could not read agent IDs from {path}") from exc
+    return sorted(set(found))
 
 
 def _state_serials(root: Path) -> Mapping[str, int]:
     result: dict[str, int] = {}
     for path in sorted(root.rglob("*.tfstate")) if root.exists() else []:
-        try: result[str(path.relative_to(root))] = int(json.loads(path.read_text()).get("serial", -1))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError): result[str(path.relative_to(root))] = -1
+        try: result[str(path.relative_to(root))] = int(json.loads(path.read_text())["serial"])
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError(f"could not read the Terraform serial of {path}") from exc
     return result
 
 
@@ -326,11 +542,16 @@ def _receipt_inventory(root: Path) -> list[Mapping[str, Any]]:
     return result
 
 
-def make_targets(cloud_root: Path) -> set[str]:
-    result = subprocess.run(["make", "-qp"], cwd=cloud_root, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, check=False)
-    return {m.group(1) for line in result.stdout.splitlines()
-            if (m := re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*):(?:\s|$)", line)) and "%" not in m.group(1)}
+def make_targets(cloud_root: Path, timeout: int = 60) -> set[str]:
+    print("  -> inventory public Make targets", flush=True)
+    result = subprocess.run(["make", "-qp"], cwd=cloud_root, text=True, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, check=False, timeout=timeout)
+    found = {m.group(1) for line in result.stdout.splitlines()
+             if (m := re.match(r"^([A-Za-z0-9][A-Za-z0-9_.-]*):(?:\s|$)", line)) and "%" not in m.group(1)}
+    # An unreadable Makefile is an error, not "every target is missing".
+    if "help" not in found:
+        raise RuntimeError(f"could not inventory Make targets in {cloud_root}")
+    return found
 
 
 def slug(text: str) -> str:
@@ -338,7 +559,42 @@ def slug(text: str) -> str:
 
 
 def render(value: str, values: Mapping[str, str]) -> str:
-    return re.sub(r"\{([a-z_]+)\}", lambda m: values.get(m.group(1), f"<{m.group(1)}>") , value)
+    missing = [name for name in PLACEHOLDER.findall(value) if not values.get(name)]
+    if missing: raise ValueError(f"unresolved placeholder(s): {', '.join(sorted(set(missing)))}")
+    rendered = PLACEHOLDER.sub(lambda m: values[m.group(1)], value)
+    check_argument(rendered)
+    return rendered
+
+
+def check_argument(arg: str) -> None:
+    """No placeholder text, and no empty KEY=, ever reaches make."""
+    if re.fullmatch(r"[A-Z_][A-Z0-9_]*=", arg) or re.search(r"[<>{}]", arg):
+        raise ValueError(f"unresolved placeholder in argument {arg!r}")
+
+
+def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str]:
+    """Every value a scenario needs that is neither supplied nor produced by an earlier step."""
+    produced: set[str] = set()
+    missing: list[str] = []
+    for step in scenario.steps:
+        if step.action in ("checkout_value", "add_ack") and not values.get(step.value or ""):
+            missing.append(step.value or "")
+        for name in (n for part in step.command for n in PLACEHOLDER.findall(part)):
+            if not values.get(name) and name not in produced: missing.append(name)
+        if step.target == "release-plan" and not step.expect_failure: produced.add("manifest")
+    for step in scenario.steps:
+        if step.action == "checkout_value" and values.get(step.value or "") and not re.fullmatch(r"[0-9a-fA-F]{40}", values[step.value or ""]):
+            missing.append(f"{step.value} (must be a 40-hex commit)")
+    return sorted(set(missing))
+
+
+def parse_manifest(output: str) -> str:
+    matches = re.findall(r"(?m)Manifest \(immutable\):\s*(\S+)", output) or re.findall(r"MANIFEST=(\S+)", output)
+    if not matches: raise RuntimeError("release-plan succeeded but printed no manifest path")
+    manifest = matches[-1].strip("'\"")
+    check_argument(manifest)
+    if not os.path.isabs(manifest): raise RuntimeError(f"release-plan printed a non-absolute manifest path {manifest!r}")
+    return manifest
 
 
 def scenario_plan(scenario: Scenario, targets: set[str]) -> list[dict[str, Any]]:
@@ -347,21 +603,24 @@ def scenario_plan(scenario: Scenario, targets: set[str]) -> list[dict[str, Any]]
         missing = bool(step.target and step.target not in targets)
         marker = f"requires step {step.requires_step}" if step.requires_step else "target not implemented"
         planned.append({"name": step.name, "command": " ".join(step.command), "human_prompt": step.human_prompt,
-                        "expect_failure": step.expect_failure, "status": "skip" if missing else "planned",
+                        "expect_failure": step.expect_failure, "refusal": step.refusal,
+                        "action": step.action, "status": "skip" if missing else "planned",
                         "skip_reason": marker if missing else None, "assertions": list(step.assertions)})
     return planned
 
 
-def write_report(out: Path, scenario: Scenario, payload: Mapping[str, Any]) -> None:
+def write_report(out: Path, scenario: Scenario, payload: Mapping[str, Any], secrets: Iterable[str] = ()) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    clean = redact(payload)
+    clean = redact(payload, secrets)
     (out / f"{scenario.key}.json").write_text(json.dumps(clean, indent=2, sort_keys=True, default=str) + "\n")
-    lines = [f"# {scenario.key}: {scenario.title}", "", f"Status: **{clean['status']}**", "", "## Preconditions", ""]
-    lines += [f"- {x}" for x in scenario.preconditions]
+    lines = [f"# {scenario.key}: {scenario.title}", "", f"Status: **{clean['status']}**", ""]
+    if clean.get("error"): lines += [f"Error: {clean['error']}", ""]
+    if clean.get("blocked_by"): lines += ["Not run because: " + "; ".join(map(str, clean["blocked_by"])), ""]
+    lines += ["## Preconditions", ""] + [f"- {x}" for x in scenario.preconditions]
     lines += ["", "## Steps", ""]
     for item in clean["steps"]:
         detail = item.get("skip_reason") or (f"exit {item['exit_code']}" if "exit_code" in item else item["status"])
-        lines.append(f"- `{item['status']}` {item['name']}: {item.get('command') or 'human gate'} ({detail})")
+        lines.append(f"- `{item['status']}` {item['name']}: {item.get('command') or item.get('action') or 'human gate'} ({detail})")
     lines += ["", "## Pass criteria", ""] + [f"- {x}" for x in scenario.pass_criteria]
     lines += ["", "## Restore", ""] + [f"- {x}" for x in scenario.restore]
     diff = clean.get("snapshot_diff", {})
@@ -369,28 +628,209 @@ def write_report(out: Path, scenario: Scenario, payload: Mapping[str, Any]) -> N
     (out / f"{scenario.key}.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def checkout(runner: CommandRunner, commit: str) -> None:
-    result = runner.run(("git", "checkout", "--force", "--detach", commit), "checkout")
-    if result.returncode: raise RuntimeError("detached checkout failed; see checkout.log")
-    status = runner.run(("git", "status", "--porcelain"), "checkout-status")
-    if status.returncode or status.stdout.strip(): raise RuntimeError("persistent checkout is not clean")
+class Checkout:
+    """The persistent checkout: pinned HEAD, clean tree, and the driver's own local main."""
+
+    def __init__(self, runner: CommandRunner, baseline: str, remote_dir: Path):
+        self.runner, self.baseline, self.remote_dir = runner, baseline, remote_dir
+        self.head = baseline
+        self.main_tip = baseline
+
+    def git(self, *argv: str, label: str) -> str:
+        result = self.runner.run(("git", *argv), label)
+        if result.returncode: raise RuntimeError(f"git {argv[0]} failed ({label}); see its log")
+        return result.stdout.strip()
+
+    def switch(self, commit: str, label: str = "checkout") -> str:
+        self.git("checkout", "--force", "--detach", commit, label=label)
+        resolved = self.git("rev-parse", "--verify", f"{commit}^{{commit}}", label=f"{label}-resolved")
+        self.head = resolved
+        self.verify(label)
+        self.require_clean(label)
+        return resolved
+
+    def verify(self, label: str) -> None:
+        head = self.git("rev-parse", "HEAD", label=f"{label}-head")
+        if head != self.head:
+            raise RuntimeError(f"checkout HEAD {head[:12] or '?'} is not the pinned {self.head[:12]} ({label})")
+
+    def require_clean(self, label: str) -> None:
+        status = self.runner.run(("git", "status", "--porcelain", "--untracked-files=all"), f"clean-{label}")
+        if status.returncode or status.stdout.strip(): raise RuntimeError(f"checkout is not clean at {label}")
+
+    def init_remote(self) -> None:
+        """Create (or reuse) the driver-owned bare remote and point its main at the baseline."""
+        if not (self.remote_dir / "HEAD").is_file():
+            self.git("init", "--bare", "--quiet", str(self.remote_dir), label="e2e-remote-init")
+        url = self.runner.run(("git", "remote", "get-url", E2E_REMOTE), "e2e-remote-url")
+        if url.returncode:
+            self.git("remote", "add", E2E_REMOTE, str(self.remote_dir), label="e2e-remote-add")
+        elif Path(url.stdout.strip()).resolve() != self.remote_dir.resolve():
+            raise RuntimeError(f"git remote {E2E_REMOTE} exists and points elsewhere; refusing to reuse it")
+        self.publish(self.baseline)
+
+    def publish(self, commit: str) -> None:
+        self.git("branch", "--force", f"{E2E_BRANCH_PREFIX}main", commit, label="e2e-main-branch")
+        self.git("push", "--quiet", "--force", E2E_REMOTE, f"{commit}:refs/heads/main", label="e2e-main-push")
+        self.main_tip = commit
+
+    def local_merge(self, key: str) -> str:
+        """Commit authored envs/ changes on a driver branch and merge it into the driver's main."""
+        stamp = time.time_ns()
+        self.git("switch", "--quiet", "-c", f"{E2E_BRANCH_PREFIX}{key}-{stamp}", label=f"{key}-author-branch")
+        self.git("add", "-A", "--", "envs", label=f"{key}-author-add")
+        self.git("commit", "--quiet", "--allow-empty", "-m", f"e2e {key}: authored changes", label=f"{key}-author-commit")
+        author = self.git("rev-parse", "HEAD", label=f"{key}-author-head")
+        self.git("checkout", "--quiet", "--detach", self.main_tip, label=f"{key}-merge-base")
+        self.git("merge", "--quiet", "--no-ff", "--no-edit", "-m", f"e2e {key}: merge", author, label=f"{key}-merge")
+        merged = self.git("rev-parse", "HEAD", label=f"{key}-merge-head")
+        self.publish(merged)
+        return self.switch(merged, f"{key}-merged")
+
+    def reset(self) -> None:
+        """Back to the requested commit; drop anything the scenario authored under envs/."""
+        self.git("checkout", "--force", "--detach", self.baseline, label="reset-checkout")
+        self.git("clean", "-fdq", "--", "envs", label="reset-clean")
+        self.head = self.baseline
+
+    def forward_fix(self) -> str:
+        """A commit on the driver's main whose tree is the baseline's: restore is a forward release."""
+        if self.main_tip == self.baseline: return self.switch(self.baseline, "restore-checkout")
+        tree = self.git("rev-parse", f"{self.baseline}^{{tree}}", label="restore-tree")
+        if self.git("rev-parse", f"{self.main_tip}^{{tree}}", label="restore-tip-tree") == tree:
+            return self.switch(self.main_tip, "restore-checkout")
+        fixed = self.git("commit-tree", tree, "-p", self.main_tip, "-m", "e2e: restore the requested commit's tree",
+                         label="restore-commit")
+        self.publish(fixed)
+        return self.switch(fixed, "restore-checkout")
+
+
+def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Per-column and per-principal protection facts, independent of IDs and timestamps."""
+    result: dict[str, Any] = {"columns": set(), "masks": set(), "policies": {}, "grants": set()}
+    uc = snapshot.get("uc", {})
+    for catalog, evidence in uc.items() if isinstance(uc, Mapping) else []:
+        if not isinstance(evidence, Mapping): continue
+        for row in evidence.get("governed_tags") or []:
+            result["columns"].add(".".join(str(row.get(k)) for k in ("catalog_name", "schema_name", "table_name", "column_name"))
+                                  + f" {row.get('tag_name')}={row.get('tag_value')}")
+        for row in evidence.get("mask_functions") or []:
+            result["masks"].add(".".join(str(row.get(k)) for k in ("routine_catalog", "routine_schema", "routine_name")))
+        for entry in evidence.get("abac_policies") or []:
+            for policy in entry.get("policies") or []:
+                mask = policy.get("column_mask") or policy.get("row_filter") or {}
+                key = f"{entry.get('table')} {policy.get('name')}"
+                result["policies"][key] = {"function": mask.get("function_name"),
+                                           "to": set(policy.get("to_principals") or []),
+                                           "except": set(policy.get("except_principals") or [])}
+        for kind in ("catalog_grants", "schema_grants", "table_grants"):
+            for row in evidence.get(kind) or []:
+                securable = ".".join(str(row[k]) for k in ("table_catalog", "table_schema", "table_name",
+                                                           "catalog_name", "schema_name") if row.get(k))
+                result["grants"].add(f"{row.get('grantee')} {row.get('privilege_type')} {securable}")
+    return result
+
+
+def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, include_grants: bool = False) -> dict[str, list[str]]:
+    """What is weaker in ``current``: a column untagged, a mask or policy gone,
+    a principal newly exempted or no longer covered, and (optionally) a grant added."""
+    before, after = _protection(baseline), _protection(current)
+    weaker: dict[str, list[str]] = {}
+    for bucket in ("columns", "masks"):
+        lost = sorted(before[bucket] - after[bucket])
+        if lost: weaker[bucket] = lost
+    policies = []
+    for key, was in sorted(before["policies"].items()):
+        now = after["policies"].get(key)
+        if now is None: policies.append(f"{key}: removed")
+        elif now["function"] != was["function"]: policies.append(f"{key}: function {was['function']} -> {now['function']}")
+        else:
+            policies += [f"{key}: no longer applies to {p}" for p in sorted(was["to"] - now["to"])]
+            policies += [f"{key}: newly exempts {p}" for p in sorted(now["except"] - was["except"])]
+    if policies: weaker["policies"] = policies
+    widened = sorted(after["grants"] - before["grants"])
+    if include_grants and widened: weaker["widened_grants"] = widened
+    return weaker
+
+
+def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+    return {env: weak for env in sorted(baseline) if (weak := protection_diff(baseline[env], current.get(env, {}), **kwargs))}
+
+
+def unexpected_changes(scenario: str, before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, list[str]]:
+    allowed = ALLOWED_CHANGES[scenario]
+    result: dict[str, list[str]] = {}
+    for env in ("dev", "prod"):
+        changed = set(snapshot_diff(before.get(env, {}), after.get(env, {}))) - allowed
+        if changed: result[env] = sorted(changed)
+    return result
+
+
+def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[str, str]) -> None:
+    if step.action == "checkout_value":
+        repo.require_clean(f"{scenario.key}-before-checkout")
+        repo.switch(values[step.value or ""], f"{scenario.key}-checkout-{step.value}")
+        return
+    if step.action == "add_ack":
+        entry = values[step.value or ""]
+        if not re.fullmatch(r"prod:(?:weaken|reader|unclassified|revoke|rollback):[^\s:#][^\n#]*", entry):
+            raise RuntimeError("ack_entry is not an exact typed prod acknowledgement")
+        path = repo.runner.cwd / "envs" / "prod" / "ack.txt"
+        prior = path.read_text(encoding="utf-8") if path.exists() else ""
+        if entry not in prior.splitlines(): path.write_text(prior.rstrip("\n") + ("\n" if prior.strip() else "") + entry + "\n", encoding="utf-8")
+        return
+    if step.action == "local_merge":
+        repo.local_merge(scenario.key)
+        return
+    raise RuntimeError(f"unknown scenario action: {step.action}")
+
+
+def _restore_baseline(runner: CommandRunner, repo: Checkout, targets: set[str], label: str) -> None:
+    """Restore via a forward release of the requested commit's tree; never Terraform or direct APIs."""
+    required = {"rehearse", "release-plan", "release", "maintain"}
+    missing = required - targets
+    if missing: raise RuntimeError(f"restore targets unavailable: {', '.join(sorted(missing))}")
+    repo.reset()
+    repo.forward_fix()
+    for argv, step in ((("make", "rehearse", "ENV=dev"), "rehearse"), (("make", "release-plan", "ENV=prod"), "release-plan")):
+        result = runner.run(argv, f"{label}-restore-{step}")
+        if result.returncode: raise RuntimeError(f"baseline restore {step} failed")
+    manifest = parse_manifest(result.stdout)
+    for argv, step in ((("make", "release", "ENV=prod", f"MANIFEST={manifest}"), "release"), (("make", "maintain", "ENV=prod"), "maintain")):
+        result = runner.run(argv, f"{label}-restore-{step}")
+        if result.returncode: raise RuntimeError(f"baseline restore {step} failed")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cloud", choices=("aws", "azure"), required=True)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
-    parser.add_argument("--checkout", type=Path, help="persistent v1 deployment checkout (defaults to --repo)")
-    parser.add_argument("--commit", default="HEAD")
+    parser.add_argument("--checkout", type=Path, help="persistent v1 deployment checkout")
+    parser.add_argument("--commit", help="required 40-hex commit for live runs")
     parser.add_argument("--scenarios", default="all", help="comma-separated keys; use --list-scenarios to inspect")
     parser.add_argument("--reports", type=Path, default=Path("/tmp/genierails-e2e-reports"))
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--non-interactive", action="store_true", help="skip scenarios containing human gates")
+    parser.add_argument("--non-interactive", action="store_true", help="report scenarios with human gates as NOT RUN")
     parser.add_argument("--list-scenarios", action="store_true")
     parser.add_argument("--confirm-live", action="store_true", help="required for non-dry-run execution")
     parser.add_argument("--value", action="append", default=[], metavar="KEY=VALUE", help="safe scenario placeholder")
+    parser.add_argument("--timeout", type=int, default=1800, help="per-command timeout in seconds")
     return parser.parse_args(argv)
+
+
+def _human_gate(scenario: Scenario, step: Step) -> dict[str, str]:
+    if not sys.stdin.isatty(): raise HumanAbort("stdin is not a TTY at a human gate")
+    try:
+        response = input(f"[{scenario.key}] {step.human_prompt} Type {scenario.key} to confirm: ").strip()
+    except EOFError as exc:
+        raise HumanAbort("stdin closed at a human gate") from exc
+    if response != scenario.key: raise RuntimeError(f"human gate requires exact token {scenario.key!r}")
+    return {"step": step.name, "token": response, "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+
+
+def _raise_interrupt(signum: int, _frame: Any) -> None:
+    raise KeyboardInterrupt(signal.Signals(signum).name)
 
 
 def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path, Path], SnapshotProvider] = LiveSnapshotProvider) -> int:
@@ -402,74 +842,182 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
     selected = list(SCENARIOS) if wanted == {"all"} else [s for s in SCENARIOS if s.key in wanted]
     unknown = wanted - {s.key for s in SCENARIOS} - {"all"}
     if unknown: raise SystemExit(f"unknown scenarios: {', '.join(sorted(unknown))}")
-    repo = args.repo.resolve(); checkout_dir = (args.checkout or repo).resolve(); cloud_root = checkout_dir / args.cloud
+    repo_root = args.repo.resolve(); checkout_dir = (args.checkout or repo_root).resolve(); cloud_root = checkout_dir / args.cloud
     reports = args.reports.resolve()
-    # Dry-run is hermetic: target inventory is source parsing, not make execution.
-    target_text = (repo / "shared" / "Makefile.shared").read_text(encoding="utf-8")
-    targets = set(re.findall(r"^([a-zA-Z0-9][\w.-]*):(?:\s|$)", target_text, re.M)) if args.dry_run else make_targets(cloud_root)
-    if not args.dry_run and not args.confirm_live: raise SystemExit("live execution requires --confirm-live")
-    values = dict(item.split("=", 1) for item in args.value)
+    values: dict[str, str] = {}
+    for item in args.value:
+        if "=" not in item or not item.split("=", 1)[0]: raise SystemExit(f"--value must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1); values[key] = value
     if args.dry_run:
+        # Dry-run is hermetic: target inventory is source parsing, not make execution.
+        target_text = (repo_root / "shared" / "Makefile.shared").read_text(encoding="utf-8")
+        targets = set(re.findall(r"^([a-zA-Z0-9][\w.-]*):(?:\s|$)", target_text, re.M))
         for scenario in selected:
             payload = {"scenario": scenario.key, "status": "dry-run", "cloud": args.cloud,
                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                       "steps": scenario_plan(scenario, targets), "snapshot_diff": {}}
+                       "steps": scenario_plan(scenario, targets), "snapshot_diff": {},
+                       "would_not_run": [x["skip_reason"] for x in scenario_plan(scenario, targets) if x["status"] == "skip"]}
             write_report(reports, scenario, payload)
-            print(f"[{scenario.key}] {scenario.title}")
+            print(f"[{scenario.key}] {scenario.title}" + (" — NOT RUN live (missing targets)" if payload["would_not_run"] else ""))
             for item in payload["steps"]:
                 suffix = f" — SKIP ({item['skip_reason']})" if item["status"] == "skip" else ""
-                print(f"  {item['command'] or '[human pause]'}{suffix}")
+                print(f"  {item['command'] or ('[' + item['action'] + ']' if item['action'] else '[human pause]')}{suffix}")
         return 0
+    if not args.confirm_live: raise SystemExit("live execution requires --confirm-live")
+    if not args.checkout: raise SystemExit("live execution requires explicit --checkout")
+    if not args.commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
+        raise SystemExit("live execution requires explicit 40-hex --commit")
     if not args.state_dir: raise SystemExit("live execution requires --state-dir outside the checkout")
     state_dir = args.state_dir.resolve()
     if state_dir == checkout_dir or checkout_dir in state_dir.parents: raise SystemExit("--state-dir must be outside the checkout")
+    if reports == checkout_dir or checkout_dir in reports.parents: raise SystemExit("--reports must be outside the checkout")
     log_root = reports / "logs"; log_root.mkdir(parents=True, exist_ok=True)
-    runner = CommandRunner(cloud_root, log_root, {"GENIERAILS_STATE_DIR": str(state_dir)})
-    checkout(runner, args.commit)
+    secrets = collect_secrets(cloud_root)
+    runner = CommandRunner(cloud_root, log_root, {"GENIERAILS_STATE_DIR": str(state_dir), "RELEASE_REMOTE": E2E_REMOTE,
+                                                  "RELEASE_BRANCH": "main", **GIT_IDENTITY},
+                           secrets=secrets, timeout=args.timeout)
+    repo = Checkout(runner, args.commit.lower(), reports / "e2e-remote.git")
+    repo.switch(args.commit.lower(), "initial-checkout")
+    targets = make_targets(cloud_root, min(args.timeout, 60))
     provider = snapshot_factory(cloud_root, state_dir / args.cloud)
+
+    def capture() -> dict[str, Any]:
+        snaps = {env: provider.capture(env) for env in ("dev", "prod")}
+        runner.secrets = tuple(set(runner.secrets) | set(getattr(provider, "secret_values", ())))
+        return snaps
+
     failed = False
-    for scenario in selected:
-        plan = scenario_plan(scenario, targets)
-        if args.non_interactive and any(s.human_prompt for s in scenario.steps):
-            for item in plan: item["status"] = "skip"; item["skip_reason"] = "requires human UI review"
-            write_report(reports, scenario, {"scenario": scenario.key, "status": "skipped", "steps": plan, "snapshot_diff": {}})
-            continue
-        before = {env: provider.capture(env) for env in ("dev", "prod")}
-        scenario_failed = False
-        refusal_diffs: list[dict[str, Any]] = []
-        manifest = values.get("manifest", "")
-        for index, (step, item) in enumerate(zip(scenario.steps, plan), 1):
-            if item["status"] == "skip": continue
-            if step.human_prompt:
-                input(f"[{scenario.key}] {step.human_prompt} ")
-                item["status"] = "passed"; continue
-            argv2 = [render(part, {**values, "manifest": manifest}) for part in step.command]
-            refusal_before = provider.capture(step.env) if step.expect_failure and step.env in ("dev", "prod") else None
-            result = runner.run(argv2, f"{scenario.key}-{index}-{step.name}")
-            item["exit_code"] = result.returncode
-            ok = (result.returncode != 0) if step.expect_failure else (result.returncode == 0)
-            item["status"] = "passed" if ok else "failed"
-            if refusal_before is not None:
-                refusal_after = provider.capture(step.env)
-                mutation = snapshot_diff(refusal_before, refusal_after)
-                refusal_diffs.append({"step": step.name, "env": step.env, "diff": mutation})
-                if mutation:
-                    item["status"] = "failed"
-                    item["assertion"] = "expected refusal mutated the snapshot"
-                    ok = False
-            if step.target == "release-plan" and ok and not step.expect_failure:
-                matches = re.findall(r"(?m)(?:manifest(?: path)?\s*[:=]\s*|MANIFEST=)(\S+\.json)", result.stdout)
-                if matches: manifest = matches[-1].strip("'\"")
-            if not ok: scenario_failed = failed = True; break
-        after = {env: provider.capture(env) for env in ("dev", "prod")}
-        diff = snapshot_diff(before, after)
-        incomplete = any(item["status"] == "skip" for item in plan)
-        payload = {"scenario": scenario.key,
-                   "status": "failed" if scenario_failed else ("incomplete" if incomplete else "passed"),
-                   "cloud": args.cloud, "commit": args.commit, "steps": plan,
-                   "before": before, "after": after, "snapshot_diff": diff,
-                   "refusal_snapshot_diffs": refusal_diffs}
-        write_report(reports, scenario, payload)
+    remote_ready = False
+    run_baseline: dict[str, Any] = {}
+    old_handlers = {sig: signal.signal(sig, _raise_interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        for scenario in selected:
+            plan = scenario_plan(scenario, targets)
+            # Everything a scenario needs is checked before it touches anything:
+            # one missing target, gate or value and nothing of it runs.
+            blocked = [item["skip_reason"] for item in plan if item["status"] == "skip"]
+            if any(s.human_prompt for s in scenario.steps) and (args.non_interactive or not sys.stdin.isatty()):
+                blocked.append("human UI gate needs an interactive TTY and a typed confirmation")
+            missing_values = unresolved_values(scenario, values)
+            if blocked or missing_values:
+                for item in plan:
+                    if item["status"] == "planned": item["status"] = "NOT RUN"
+                status = "NOT RUN" if blocked else "ERROR"
+                failed |= status == "ERROR"
+                write_report(reports, scenario, {"scenario": scenario.key, "status": status, "cloud": args.cloud,
+                    "commit": args.commit, "blocked_by": blocked,
+                    "error": f"unresolved placeholder(s): {', '.join(missing_values)}" if missing_values and not blocked else None,
+                    "steps": plan, "snapshot_diff": {}}, runner.secrets)
+                continue
+            before: dict[str, Any] = {}
+            after: dict[str, Any] = {}
+            restored: dict[str, Any] = {}
+            scenario_status = "passed"
+            error_message: str | None = None
+            refusal_diffs: list[dict[str, Any]] = []
+            manifest = values.get("manifest", "")
+            mutated = False
+            stop = False
+            confirmations: list[dict[str, str]] = []
+            try:
+                # Pin: every scenario starts at exactly the requested commit.
+                repo.switch(repo.baseline, f"{scenario.key}-pin")
+                if not remote_ready:
+                    repo.init_remote(); remote_ready = True
+                before = capture()
+                if not run_baseline: run_baseline = before
+                for index, (step, item) in enumerate(zip(scenario.steps, plan), 1):
+                    label = f"{scenario.key}-{index}"
+                    repo.verify(label)
+                    item["head"] = repo.head
+                    if step.human_prompt:
+                        confirmations.append(_human_gate(scenario, step))
+                        item["status"] = "passed"; continue
+                    if step.action:
+                        _run_action(step, scenario, repo, values)
+                        item["status"] = "passed"; continue
+                    argv2 = [render(part, {**values, "manifest": manifest}) for part in step.command]
+                    applying = step.target in APPLYING
+                    if applying: repo.require_clean(label)
+                    refusal_before = capture() if step.expect_failure else None
+                    # Assume a mutation from the moment an applying command
+                    # starts (it may be interrupted half-way); a refusal that
+                    # held with an unchanged snapshot takes the assumption back.
+                    prior_mutated = mutated
+                    mutated |= applying or step.target == "ungovern"
+                    result = runner.run(argv2, f"{label}-{step.name}", dict(step.extra_env))
+                    item["exit_code"] = result.returncode
+                    if step.expect_failure:
+                        ok = result.returncode != 0 and bool(step.refusal and re.search(step.refusal, result.stdout))
+                        if not ok: item["assertion"] = "nonzero exit and the expected refusal message are both required"
+                    else: ok = result.returncode == 0
+                    item["status"] = "passed" if ok else "ERROR"
+                    if refusal_before is not None:
+                        refusal_after = capture()
+                        mutation = snapshot_diff(refusal_before, refusal_after)
+                        refusal_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
+                        if mutation: item["status"] = "ERROR"; item["assertion"] = "refusal changed the snapshot"; ok = False
+                    if not ok: raise RuntimeError(f"step did not satisfy its contract: {step.name}")
+                    if step.expect_failure: mutated = prior_mutated
+                    if step.target == "release-plan" and not step.expect_failure:
+                        manifest = parse_manifest(result.stdout)
+                    if applying: repo.require_clean(f"after-{label}")
+                after = capture()
+                if scenario.key not in WEAKENING_EXPECTED:
+                    weak = protection_diff_envs(before, after)
+                    if weak: raise RuntimeError(f"protection became weaker: {weak}")
+                unexpected = unexpected_changes(scenario.key, before, after)
+                if unexpected: raise RuntimeError(f"unexpected snapshot components changed: {unexpected}")
+                if scenario.key == "s4" and canonical(before["prod"].get("agents")) != canonical(after["prod"].get("agents")):
+                    raise RuntimeError("S4 changed Genie agents")
+            except KeyboardInterrupt as exc:
+                scenario_status = "interrupted"; error_message = f"interrupted ({exc or 'SIGINT'})"; failed = True; stop = True
+            except HumanAbort as exc:
+                scenario_status = "NOT RUN"; error_message = str(exc); stop = True
+            except Exception as exc:
+                scenario_status = "ERROR"; error_message = f"{type(exc).__name__}: {exc}"; failed = True
+            finally:
+                try:
+                    if before:
+                        if not after:
+                            after = capture()
+                        if mutated:
+                            _restore_baseline(runner, repo, targets, scenario.key)
+                        elif repo.main_tip != repo.baseline:
+                            # An unreleased local merge must not leak into the
+                            # next scenario's main.
+                            repo.reset(); repo.forward_fix()
+                        repo.reset()
+                        repo.switch(repo.baseline, f"{scenario.key}-restored")
+                        restored = capture()
+                        weak_restore = protection_diff_envs(before, restored, include_grants=True)
+                        if weak_restore:
+                            scenario_status = "RESTORE FAILED"; failed = True
+                            error_message = "; ".join(filter(None, (error_message, f"protection not restored: {weak_restore}")))
+                except BaseException as exc:
+                    scenario_status = "RESTORE FAILED"; failed = True; stop = True
+                    error_message = "; ".join(filter(None, (error_message, f"restore: {type(exc).__name__}: {exc}")))
+                payload = {"scenario": scenario.key, "status": scenario_status, "error": error_message,
+                           "cloud": args.cloud, "commit": args.commit, "steps": plan, "confirmations": confirmations,
+                           "before": before, "after": after, "restored": restored, "restored_lifecycle": mutated,
+                           "snapshot_diff": snapshot_diff(before, after) if before and after else {},
+                           "refusal_snapshot_diffs": refusal_diffs}
+                write_report(reports, scenario, payload, runner.secrets)
+            if stop: break
+    finally:
+        try:
+            if run_baseline:
+                final = capture()
+                weak_final = protection_diff_envs(run_baseline, final, include_grants=True)
+                (reports / "final-protection.json").write_text(json.dumps(redact(
+                    {"status": "ERROR" if weak_final else "passed", "weaker_than_baseline": weak_final},
+                    runner.secrets), indent=2, sort_keys=True) + "\n")
+                failed |= bool(weak_final)
+        except Exception as exc:
+            (reports / "final-protection.json").write_text(json.dumps(
+                {"status": "ERROR", "error": redact_text(f"{type(exc).__name__}: {exc}", runner.secrets)}, indent=2) + "\n")
+            failed = True
+        for sig, handler in old_handlers.items(): signal.signal(sig, handler)
     return 1 if failed else 0
 
 
