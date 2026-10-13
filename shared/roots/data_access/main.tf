@@ -91,7 +91,7 @@ locals {
   governed_tables       = fileexists(local._governed_tables_file) ? try([for t in jsondecode(file(local._governed_tables_file)).tables : tostring(t)], []) : []
 
   # What the last apply of this layer left in place, read from its own state
-  # (the layer runner's local backend), so keeping or revoking SELECT never
+  # (data_access_state_file), so keeping or revoking SELECT never
   # needs a current coverage check (see modules/data_access). Only current,
   # successfully applied objects count: tainted instances and deposed ones
   # (left by a failed or partial replacement) don't. The record must also be
@@ -102,7 +102,8 @@ locals {
     workspace_host = lower(trimsuffix(trimspace(var.databricks_workspace_host), "/"))
     workspace_id   = trimspace(var.databricks_workspace_id)
   }))
-  _own_state = fileexists("${var.env_dir}/terraform.tfstate") ? try(jsondecode(file("${var.env_dir}/terraform.tfstate")), null) : null
+  _own_state_file = var.data_access_state_file != "" ? var.data_access_state_file : "${var.env_dir}/terraform.tfstate"
+  _own_state      = fileexists(local._own_state_file) ? try(jsondecode(file(local._own_state_file)), null) : null
   retain_auto_warehouse = anytrue([
     for resource in try(local._own_state.resources, []) :
     try(resource.module, "") == "module.data_access" &&
@@ -186,6 +187,16 @@ variable "policy_stage" {
 
 variable "env_dir" {
   type = string
+}
+
+# A snapshot of this layer's own state, which the locals above read. Empty (the
+# default) means the in-checkout state file in env_dir. With
+# GENIERAILS_STATE_DIR or remote state, terraform_layer.sh writes it through
+# scripts/state_layout.py and refuses to run when the state can't be read. A
+# missing snapshot file means no state yet.
+variable "data_access_state_file" {
+  type    = string
+  default = ""
 }
 
 variable "databricks_account_host" {

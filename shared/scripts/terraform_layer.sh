@@ -280,6 +280,33 @@ if [ "$LAYER" != "account" ]; then
   VAR_ARGS+=(-var="env_dir=$ENV_DIR")
 fi
 
+# The roots read state with file(): the workspace root its own and the
+# data_access state (the CAN_RUN on record, the applied coverage check and
+# grants), the data_access root its own (the SELECT and masks applied, which
+# its guards protect). With a state dir or remote state those files aren't
+# next to env_dir, so they get snapshots read through scripts/state_layout.py,
+# in this layer's runtime dir. A state that can't be read stops here: planning
+# from "nothing applied" could withhold, and so remove, access already
+# granted. (In-checkout state: no change.)
+if [ "$LAYER" != "account" ] && [ "$USE_STATE_LAYOUT" = 1 ]; then
+  STATE_INPUT_LAYERS="data_access"
+  [ "$LAYER" = "workspace" ] && STATE_INPUT_LAYERS="workspace data_access"
+  case "$COMMAND" in
+    plan|apply|destroy|import|console)
+      STATE_INPUTS_DIR="$STATE_BASE/inputs"
+      for input_layer in $STATE_INPUT_LAYERS; do
+        if ! python3 "$SCRIPT_DIR/state_layout.py" state-file --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" \
+          --layer "$input_layer" --out "$STATE_INPUTS_DIR/$input_layer.tfstate.json"; then
+          echo "ERROR: refusing terraform $COMMAND: the $input_layer state can't be read, so the Genie CAN_RUN on record is unknown." >&2
+          exit 2
+        fi
+      done
+      [ "$LAYER" = "workspace" ] && VAR_ARGS+=(-var="workspace_state_file=$STATE_INPUTS_DIR/workspace.tfstate.json")
+      VAR_ARGS+=(-var="data_access_state_file=$STATE_INPUTS_DIR/data_access.tfstate.json")
+      ;;
+  esac
+fi
+
 case "$COMMAND" in
   plan|apply|destroy|import|console)
     CMD=(terraform "$COMMAND" "${VAR_ARGS[@]}" "$@")

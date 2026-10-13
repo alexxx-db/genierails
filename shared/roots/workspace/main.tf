@@ -162,15 +162,16 @@ locals {
   # governance config moved on and hasn't been applied) and rests on a live
   # refresh no older than the max age that apply recorded. The result is
   # judged by modules/coverage_gate_check, the same check data_access uses.
-  # Read from the local state the layer runner writes; anything missing or
-  # unreadable blocks.
-  data_access_dir        = "${var.env_dir}/data_access"
-  _data_access_state     = fileexists("${local.data_access_dir}/terraform.tfstate") ? try(jsondecode(file("${local.data_access_dir}/terraform.tfstate")), null) : null
-  _applied_coverage_gate = try(local._data_access_state.outputs.coverage_gate.value, null)
+  # Read from the data_access state (data_access_state_file); anything missing
+  # or unreadable blocks.
+  data_access_dir         = "${var.env_dir}/data_access"
+  _data_access_state_file = var.data_access_state_file != "" ? var.data_access_state_file : "${local.data_access_dir}/terraform.tfstate"
+  _data_access_state      = fileexists(local._data_access_state_file) ? try(jsondecode(file(local._data_access_state_file)), null) : null
+  _applied_coverage_gate  = try(local._data_access_state.outputs.coverage_gate.value, null)
   # The blocker minus the gate's refresh-time checks, which need the plan time
   # (unknown under terraform console); can-run-check applies those itself.
   genie_exposure_static_blocker = local.deterministic ? local.agent_gate_static_blocker : (
-    local._data_access_state == null ? "the data_access layer has no readable state (${local.data_access_dir}/terraform.tfstate)" :
+    local._data_access_state == null ? "the data_access layer has no readable state (${local._data_access_state_file})" :
     local._applied_coverage_gate == null ? "the data_access state predates the coverage check; re-apply the data_access layer" :
     # Legacy state from before business_access_enabled was retired: an apply
     # made with it false granted nothing. Current state no longer records it.
@@ -234,13 +235,14 @@ locals {
   }
 
   # What CAN_RUN the last apply left in place, per space, from this layer's
-  # own state (the layer runner's local backend): the groups recorded in the
+  # own state (workspace_state_file): the groups recorded in the
   # ACL resource's triggers, for the same Genie agent (same space ID, or the
   # same created agent on the same host). The blocker and grant checks only
   # bite for groups beyond that, so keeping, shrinking or clearing an ACL
   # always plans, and an unchanged ACL never errors once the gate expires.
   # Unreadable state means nothing is on record (fail closed).
-  _own_state = fileexists("${var.env_dir}/terraform.tfstate") ? try(jsondecode(file("${var.env_dir}/terraform.tfstate")), null) : null
+  _own_state_file = var.workspace_state_file != "" ? var.workspace_state_file : "${var.env_dir}/terraform.tfstate"
+  _own_state      = fileexists(local._own_state_file) ? try(jsondecode(file(local._own_state_file)), null) : null
   retain_auto_warehouse = anytrue([
     for resource in try(local._own_state.resources, []) :
     try(resource.module, "") == "module.workspace" &&
@@ -349,6 +351,22 @@ locals {
 
 variable "env_dir" {
   type = string
+}
+
+# Snapshots of this env's workspace and data_access state, which the locals
+# above read. Empty (the default) means the in-checkout state files next to
+# env_dir. With GENIERAILS_STATE_DIR or remote state, terraform_layer.sh
+# writes the snapshots through scripts/state_layout.py, and it refuses to run
+# when a state can't be read. A missing snapshot file means that layer has no
+# state yet.
+variable "workspace_state_file" {
+  type    = string
+  default = ""
+}
+
+variable "data_access_state_file" {
+  type    = string
+  default = ""
 }
 
 variable "databricks_account_host" {

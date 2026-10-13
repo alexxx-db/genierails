@@ -112,7 +112,12 @@ inputs stay in the checkout, and nothing is written under `envs/<env>/`.
 Every GenieRails reader of Terraform state (the release manifest's state
 serials, sticky governance, staged policies, the coverage check, the Genie
 preflight, promote) goes through `scripts/state_layout.py`, so they follow it;
-a state that should exist but can't be read refuses.
+a state that should exist but can't be read refuses. The Terraform roots
+read state too (the workspace root: the Genie CAN_RUN on record and the
+applied coverage check and grants; the data_access root: the SELECT and
+masks it applied): the runner hands them snapshots read the same way, and
+stops before Terraform when one can't be read, so nothing is planned from
+"nothing applied".
 
 Migrate existing local state once:
 

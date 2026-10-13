@@ -365,12 +365,27 @@ ALLOWED_STATE_MENTIONS = {
     "shared/scripts/terraform_layer.sh": (r'-backend-config="path=\$STATE_BASE/terraform\.tfstate"',),
     "shared/scripts/sticky_governance.py": (r'^STATE = Path\("data_access/terraform\.tfstate"\)$',),  # messages
     "shared/scripts/remap_generated_config.py": (r'help="Destination data_access terraform\.tfstate\."',),
+    # The roots read state with file() only from the snapshot terraform_layer.sh
+    # passes (workspace_state_file, data_access_state_file); these are the
+    # in-checkout defaults when it passes none.
+    "shared/roots/workspace/main.tf": (
+        r'^_data_access_state_file = var\.data_access_state_file != "" \? var\.data_access_state_file : '
+        r'"\$\{local\.data_access_dir\}/terraform\.tfstate"$',
+        r'^_own_state_file = var\.workspace_state_file != "" \? var\.workspace_state_file : '
+        r'"\$\{var\.env_dir\}/terraform\.tfstate"$',
+    ),
+    "shared/roots/data_access/main.tf": (
+        r'^_own_state_file = var\.data_access_state_file != "" \? var\.data_access_state_file : '
+        r'"\$\{var\.env_dir\}/terraform\.tfstate"$',
+    ),
 }
 
 
 def test_no_state_file_is_read_outside_state_layout():
     offenders = []
-    for path in sorted([*SHARED.rglob("*.py"), *SHARED.rglob("*.sh"), SHARED / "Makefile.shared"]):
+    terraform = [p for p in [*(SHARED / "roots").rglob("*.tf"), *(SHARED / "modules").rglob("*.tf")]
+                 if "tests" not in p.parts]  # module test fixtures write state on purpose
+    for path in sorted([*SHARED.rglob("*.py"), *SHARED.rglob("*.sh"), SHARED / "Makefile.shared", *terraform]):
         rel = path.relative_to(ROOT).as_posix()
         if (rel.startswith(("shared/tests/", "shared/examples/")) or path.name in {
                 "state_layout.py", "run_integration_tests.py"}):  # the helper; the live e2e harness

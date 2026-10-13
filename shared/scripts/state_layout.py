@@ -293,6 +293,31 @@ def state_json(env_dir: Path, env: str, layer: str) -> dict | None:
         raise StateError(f"cannot read the {env} {layer} Terraform state (terraform.tfstate): {exc}") from exc
 
 
+def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
+    """Snapshot a layer's state (read through state_json) to ``out`` for a Terraform root to read.
+
+    The workspace root reads its own and the data_access state with file()
+    (CAN_RUN on record, the applied coverage check and grants); with a state
+    dir or remote state, terraform_layer.sh passes it these snapshots. No
+    state removes ``out`` (the root then sees none, as with no local file);
+    an unreadable state raises, so the runner refuses rather than plan from
+    nothing on record. Owner-only: state can hold secrets.
+    """
+    out = Path(out)
+    state = state_json(env_dir, env, layer)
+    if state is None:
+        out.unlink(missing_ok=True)
+        return False
+    out.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(out.parent, 0o700)
+    tmp = out.with_name(f".{out.name}.{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(state, handle)
+    tmp.replace(out)
+    return True
+
+
 def root_state_paths(env_dir: Path) -> dict[str, Path]:
     """Each root's local state file (for tests and messages; a remote root has none)."""
     env_dir = Path(env_dir).resolve()
@@ -456,15 +481,17 @@ def ci_allowed(env_dir: Path, env: str, expected_cloud_dir: Path, cloud_root: Pa
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json"):
+    for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file"):
         command = commands.add_parser(name)
         command.add_argument("--env-dir", type=Path, required=True)
         command.add_argument("--env", required=True)
         if name == "ci-allowed":
             command.add_argument("--cloud-dir", type=Path, required=True)
             command.add_argument("--cloud-root", type=Path)
-        if name in ("backend-args", "root", "layer-dir", "state-json"):
+        if name in ("backend-args", "root", "layer-dir", "state-json", "state-file"):
             command.add_argument("--layer", required=True)
+        if name == "state-file":
+            command.add_argument("--out", type=Path, required=True)
         if name == "root":
             command.add_argument("--source", type=Path, required=True)
     args = parser.parse_args()
@@ -481,6 +508,8 @@ def main() -> int:
             print(layer_base(args.env_dir, args.env, args.layer) or "")
         elif args.command == "state-json":
             print(json.dumps(state_json(args.env_dir, args.env, args.layer)))
+        elif args.command == "state-file":
+            write_state_file(args.env_dir, args.env, args.layer, args.out)
         else:
             migrate(args.env_dir, args.env)
         return 0
