@@ -20,7 +20,7 @@ import argparse
 from pathlib import Path
 
 from tag_vocabulary import REGISTRY
-from governance_policies import parse_treatment_value
+from governance_policies import parse_treatment_value, principal_sets_are_disjoint
 from treatment_derivation import load_treatment_config
 
 try:
@@ -298,6 +298,28 @@ def column_mask_matches(cfg: dict) -> dict[str, list[str]]:
     return matches
 
 
+def _deterministic_mask_pair_is_disjoint(policies: list[dict], cfg: dict) -> bool:
+    """Whether exactly two policies for one deterministic value cannot hit one principal."""
+    if cfg.get("governance_mode") != "deterministic" or len(policies) != 2:
+        return False
+    treatment_refs = []
+    for policy in policies:
+        refs = {
+            value for key, value in _extract_tag_refs(policy.get("match_condition", ""))[0]
+            if key == "gr_treatment" and parse_treatment_value(value)
+        }
+        if len(refs) != 1:
+            return False
+        treatment_refs.append(refs)
+    if treatment_refs[0] != treatment_refs[1]:
+        return False
+    return principal_sets_are_disjoint(
+        policies[0].get("to_principals") or [], policies[0].get("except_principals") or [],
+        policies[1].get("to_principals") or [], policies[1].get("except_principals") or [],
+        cfg.get("group_members") or {},
+    )
+
+
 def validate_policy_overlaps(cfg: dict, result: ValidationResult):
     """Fail when multiple FGAC policies resolve for one securable object."""
     assignments = cfg.get("tag_assignments", [])
@@ -312,7 +334,12 @@ def validate_policy_overlaps(cfg: dict, result: ValidationResult):
         entity_name = spelling[(entity_type, entity_key)]
         if entity_type == "columns":
             matches = mask_matches.get(entity_name, [])
-            if len(set(matches)) > 1:
+            matching_policies = [
+                policy for policy in policies
+                if isinstance(policy, dict) and policy.get("name", "<unnamed>") in set(matches)
+            ]
+            if len(set(matches)) > 1 and not _deterministic_mask_pair_is_disjoint(
+                    matching_policies, cfg):
                 result.error(
                     f"Column '{entity_name}' matches multiple column-mask policies: "
                     f"{sorted(set(matches))}. Unity Catalog allows only one mask to "
@@ -841,7 +868,10 @@ def validate_tag_policies(cfg: dict, result: ValidationResult) -> dict[str, set[
                     f"tag_policies[{i}] (key='{key}'): value '{value}' is non-canonical — "
                     f"use '{canonical_value}'"
                 )
-            elif REGISTRY.is_allowed_value(canonical_key, value) is False:
+            elif (REGISTRY.is_allowed_value(canonical_key, value) is False
+                  and not (cfg.get("governance_mode") == "deterministic"
+                           and canonical_key == "gr_treatment"
+                           and parse_treatment_value(value))):
                 result.error(
                     f"tag_policies[{i}] (key='{key}'): value '{value}' is not in the "
                     f"canonical registry {sorted(REGISTRY.canonical_values_for_key(canonical_key) or [])}"
@@ -889,7 +919,10 @@ def validate_tag_assignments(cfg: dict, tag_map: dict[str, set[str]], result: Va
                 f"{prefix}: tag_value '{tval}' is non-canonical for tag_key '{tkey}' — "
                 f"use '{canonical_value}'"
             )
-        elif REGISTRY.is_allowed_value(canonical_key, tval) is False:
+        elif (REGISTRY.is_allowed_value(canonical_key, tval) is False
+              and not (cfg.get("governance_mode") == "deterministic"
+                       and canonical_key == "gr_treatment"
+                       and parse_treatment_value(tval))):
             result.error(
                 f"{prefix}: tag_value '{tval}' is not in the canonical registry for "
                 f"tag_key '{canonical_key}' — allowed: "
@@ -935,6 +968,11 @@ def validate_fgac_policies(
         return
     seen_names: set[str] = set()
     referenced_functions: set[str] = set()
+    deterministic_exempt_principals = set()
+    if cfg.get("governance_mode") == "deterministic":
+        deterministic_exempt_principals.update(cfg.get("raw_exempt_principals") or [])
+        if cfg.get("databricks_client_id"):
+            deterministic_exempt_principals.add(cfg["databricks_client_id"])
 
     for i, p in enumerate(policies):
         name = p.get("name", "")
@@ -969,7 +1007,8 @@ def validate_fgac_policies(
                     f"{prefix}: to_principals group '{principal}' not defined in 'groups'"
                 )
         for principal in p.get("except_principals", []) or []:
-            if principal.lower() not in BUILTIN_PRINCIPALS and principal not in group_names:
+            if (principal.lower() not in BUILTIN_PRINCIPALS and principal not in group_names
+                    and principal not in deterministic_exempt_principals):
                 result.error(
                     f"{prefix}: except_principals group '{principal}' not defined in 'groups'"
                 )
@@ -996,7 +1035,10 @@ def validate_fgac_policies(
                     f"{prefix}: condition uses non-canonical tag_value '{ref_val}' for "
                     f"tag_key '{ref_key}' — use '{canonical_value}'"
                 )
-            elif REGISTRY.is_allowed_value(canonical_key, ref_val) is False:
+            elif (REGISTRY.is_allowed_value(canonical_key, ref_val) is False
+                  and not (cfg.get("governance_mode") == "deterministic"
+                           and canonical_key == "gr_treatment"
+                           and parse_treatment_value(ref_val))):
                 result.error(
                     f"{prefix}: condition references canonical tag_value '{ref_val}' "
                     f"outside the registry for '{canonical_key}' — allowed: "

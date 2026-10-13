@@ -56,11 +56,14 @@ def external_masks(
     governed = {column.lower() for column in governed_columns}
     problems: set[str] = set()
     for row in direct_rows:
-        if len(row) < 5:
-            continue
+        if len(row) != 5 or any(not isinstance(value, str) or not value for value in row):
+            raise ValueError(
+                "unexpected information_schema.column_masks row; expected five non-empty "
+                "strings: table_catalog, table_schema, table_name, column_name, mask_name"
+            )
         column = ".".join(str(value) for value in row[:4])
         if column.lower() in governed:
-            mask = ".".join(str(value) for value in row[4:7] if value)
+            mask = row[4]
             problems.add(f"{column}: table-attached mask {mask}")
     for table, policies in sorted(policies_by_table.items()):
         for policy in policies:
@@ -119,7 +122,7 @@ def inventory(env_dir: Path) -> list[str]:
         quoted = ",".join("'" + value.lower().replace("'", "''") + "'" for value in sorted(columns))
         direct = _run_sql(
             w, warehouse,
-            "SELECT table_catalog, table_schema, table_name, column_name, mask_catalog, mask_schema, mask_name "
+            "SELECT table_catalog, table_schema, table_name, column_name, mask_name "
             "FROM system.information_schema.column_masks WHERE lower(concat_ws('.', table_catalog, "
             f"table_schema, table_name, column_name)) IN ({quoted})",
         )

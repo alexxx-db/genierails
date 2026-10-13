@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts import external_mask_inventory as inv
 from scripts.sync_tag_policies import retained_deterministic_values
 
@@ -27,8 +29,8 @@ def test_own_policies_of_any_generation_are_recognised():
 
 def test_external_masks_on_governed_columns_and_tables_are_reported():
     governed = {"cat.sch.t.email"}
-    direct = [["cat", "sch", "t", "email", "sec", "fn", "legacy_mask"],
-              ["cat", "sch", "t", "other", "sec", "fn", "unrelated"]]
+    direct = [["cat", "sch", "t", "email", "sec.fn.legacy_mask"],
+              ["cat", "sch", "t", "other", "sec.fn.unrelated"]]
     policies = {"cat.sch.t": [
         _policy(f"cat_gr_mask_cat_{VALUE}_full", f"cat.sch.gr_mask_{VALUE}_full"),
         _policy("team_mask", "cat.sec.mask_it", where="cat.sch"),
@@ -40,6 +42,16 @@ def test_external_masks_on_governed_columns_and_tables_are_reported():
         "cat.sch.t: column-mask policy 'team_mask' on cat.sch (function cat.sec.mask_it)",
     ]
     assert inv.external_masks(governed, [], {"cat.sch.t": policies["cat.sch.t"][:1]}) == []
+
+
+@pytest.mark.parametrize("row", [
+    ["cat", "sch", "t", "email"],
+    ["cat", "sch", "t", "email", "sec.fn.mask", "extra"],
+    ["cat", "sch", "t", "email", None],
+])
+def test_column_mask_rows_fail_closed_on_unexpected_shapes(row):
+    with pytest.raises(ValueError, match="expected five non-empty strings"):
+        inv.external_masks({"cat.sch.t.email"}, [row], {})
 
 
 class _Policies:
@@ -70,6 +82,8 @@ def test_inventory_reads_inherited_policies_and_column_masks(tmp_path, monkeypat
     assert inv.inventory(tmp_path) == ["cat.sch.t: column-mask policy 'ext' on cat (function cat.sch.ext)"]
     assert client.policies.calls == [("TABLE", "cat.sch.t", True)]
     assert "system.information_schema.column_masks" in sql[0] and "'cat.sch.t.email'" in sql[0]
+    assert "mask_name" in sql[0]
+    assert "mask_catalog" not in sql[0] and "mask_schema" not in sql[0]
     assert inv.main(["--env-dir", str(tmp_path)]) == 1
 
 

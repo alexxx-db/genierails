@@ -3,6 +3,7 @@
 Tests exercise the individual validate_* functions with synthetic config dicts
 so no file I/O, Databricks, or LLM access is needed.
 """
+import subprocess
 import sys
 from pathlib import Path
 
@@ -32,6 +33,77 @@ from validate_abac import (  # noqa: E402
 
 def _result() -> ValidationResult:
     return ValidationResult()
+
+
+class _GeneratedClassification:
+    def classes_by_column(self, columns=None):
+        classes = {"cat.sch.customers.email": ["class.email_address"]}
+        return classes if columns is None else {name: classes[name] for name in columns}
+
+
+def _real_deterministic_output(tmp_path):
+    """Produce the files through the same deterministic generator code as `make generate`."""
+    import hcl2
+    from generate_abac import deterministic_model_for, write_deterministic_model
+
+    tfvars = tmp_path / "abac.auto.tfvars"
+    sql = tmp_path / "masking_functions.sql"
+    tfvars.write_text('''
+governance_mode = "deterministic"
+databricks_client_id = "deployer-sp"
+access_tier_groups = ["raw", "regional", "masked"]
+raw_exempt_principals = ["break-glass"]
+groups = {
+  raw = { description = "Raw" }
+  regional = { description = "Regional" }
+  masked = { description = "Masked" }
+}
+tag_policies = []
+tag_assignments = []
+fgac_policies = []
+''')
+    model = deterministic_model_for(
+        hcl2.loads(tfvars.read_text()), _GeneratedClassification(),
+        "CREATE TABLE cat.sch.customers (email STRING);",
+    )
+    write_deterministic_model(tfvars, sql, model)
+    return tfvars, sql, hcl2.loads(tfvars.read_text())
+
+
+def test_validator_accepts_real_deterministic_generator_output(tmp_path):
+    tfvars, sql, _ = _real_deterministic_output(tmp_path)
+    run = subprocess.run(
+        [sys.executable, str(Path(__file__).parent.parent / "validate_abac.py"), str(tfvars), str(sql)],
+        text=True, capture_output=True, check=False,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
+def test_deterministic_validator_still_refuses_overlapping_double_mask(tmp_path):
+    _, _, cfg = _real_deterministic_output(tmp_path)
+    for policy in cfg["fgac_policies"]:
+        policy["to_principals"] = ["account users"]
+        policy["except_principals"] = []
+    result = _result()
+    validate_policy_overlaps(cfg, result)
+    assert any("MULTIPLE_MASKS" in error for error in result.errors)
+
+
+def test_deterministic_validator_still_refuses_unknown_treatment(tmp_path):
+    _, _, cfg = _real_deterministic_output(tmp_path)
+    cfg["tag_policies"][0]["values"] = ["unknown_treatment"]
+    result = _result()
+    validate_tag_policies(cfg, result)
+    assert any("not in the canonical registry" in error for error in result.errors)
+
+
+def test_deterministic_validator_still_refuses_undefined_except_group(tmp_path):
+    _, _, cfg = _real_deterministic_output(tmp_path)
+    cfg["fgac_policies"][0]["except_principals"].append("undefined-group")
+    result = _result()
+    tag_map = validate_tag_policies(cfg, result)
+    validate_fgac_policies(cfg, set(cfg["groups"]), tag_map, None, result)
+    assert any("except_principals group 'undefined-group' not defined" in error for error in result.errors)
 
 
 def test_validation_refuses_ambiguous_fallback_duplicate_functions(tmp_path):
