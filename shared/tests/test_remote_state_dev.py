@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -36,11 +37,23 @@ def _remote(cloud: str, env_dir: Path, text: str | None = None) -> Path:
     return env_dir
 
 
+def _python_path(tmp_path: Path) -> str:
+    """PATH with python3 (and python) first resolving to this interpreter, so subprocesses
+    use the same Python and python-hcl2 as the test. Only those two names: the
+    interpreter's own bin dir may also hold a make that would shadow GNU Make."""
+    bin_dir = tmp_path / "pybin"
+    if not bin_dir.is_dir():
+        bin_dir.mkdir()
+        for name in ("python3", "python"):
+            (bin_dir / name).symlink_to(sys.executable)
+    return f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+
+
 def _hermetic_env(tmp_path: Path, **extra) -> dict:
     """PATH and a throwaway HOME only: no cloud, Databricks or CI variables leak in."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    return {"PATH": os.environ["PATH"], "HOME": str(home), "LANG": "C"} | extra
+    return {"PATH": _python_path(tmp_path), "HOME": str(home), "LANG": "C"} | extra
 
 
 @pytest.fixture
@@ -52,7 +65,7 @@ def fake_terraform(tmp_path):
     log, state = tmp_path / "tf.log", tmp_path / "pulled.json"
     log.touch()
     state.write_text("")
-    return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "FAKE_TF_LOG": str(log),
+    return {"PATH": f"{bin_dir}{os.pathsep}{_python_path(tmp_path)}", "FAKE_TF_LOG": str(log),
             "FAKE_TF_STATE": str(state), "log": log, "state": state}
 
 
