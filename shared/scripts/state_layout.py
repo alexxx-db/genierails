@@ -318,6 +318,69 @@ def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
     return True
 
 
+# Variables only terraform_layer.sh sets: where the roots read their state.
+RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file")
+
+
+def _assigned_names(args: list[str], source: str) -> list[tuple[str, str]]:
+    """(name, where) for every -var assignment and every -var-file in Terraform ``args``."""
+    found, files = [], []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        flag, eq, value = arg.lstrip("-").partition("=")
+        if arg.startswith("-") and flag in ("var", "var-file"):
+            if not eq:  # the split form: -var name=value / -var-file path
+                i += 1
+                value = args[i] if i < len(args) else ""
+            if flag == "var":
+                found.append((value.split("=", 1)[0].strip(), f"{source}: {arg}{'' if eq else ' ' + value}"))
+            else:
+                files.append(value)
+        i += 1
+    for path in files:
+        found += _file_names(Path(path), f"{source}: -var-file={path}")
+    return found
+
+
+def _file_names(path: Path, where: str) -> list[tuple[str, str]]:
+    try:
+        text = path.read_text()
+        if path.suffix == ".json":
+            data = json.loads(text)
+        else:
+            import hcl2
+
+            data = hcl2.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except Exception as exc:  # unreadable: can't tell what it sets, so it can't pass
+        return [("<unreadable>", f"{where} ({type(exc).__name__}: {exc})")]
+    return [(str(name), where) for name in data]
+
+
+def runner_var_overrides(args: list[str], command: str, var_files: list[Path] = (),
+                         environ: dict | None = None) -> list[str]:
+    """Where a caller tries to set a variable only the runner may set (RUNNER_VARS).
+
+    Covers -var name=value in both forms, -var-file contents (the caller's and
+    the env's own tfvars), and TF_CLI_ARGS / TF_CLI_ARGS_<command>, which
+    Terraform appends after every other argument. Names are case-sensitive,
+    as in Terraform. A var file that can't be read counts as an override.
+    """
+    import shlex
+
+    environ = os.environ if environ is None else environ
+    found = _assigned_names(list(args), "arguments")
+    for path in var_files:
+        found += _file_names(Path(path), f"var file {path}")
+    for name in ("TF_CLI_ARGS", f"TF_CLI_ARGS_{command}"):
+        if environ.get(name, "").strip():
+            found += _assigned_names(shlex.split(environ[name]), name)
+    return [f"{where} sets {name}" if name != "<unreadable>" else f"{where} can't be read"
+            for name, where in found if name in RUNNER_VARS or name == "<unreadable>"]
+
+
 def root_state_paths(env_dir: Path) -> dict[str, Path]:
     """Each root's local state file (for tests and messages; a remote root has none)."""
     env_dir = Path(env_dir).resolve()
@@ -481,6 +544,10 @@ def ci_allowed(env_dir: Path, env: str, expected_cloud_dir: Path, cloud_root: Pa
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
+    check = commands.add_parser("check-runner-vars")
+    check.add_argument("--tf-command", required=True)
+    check.add_argument("--var-file", type=Path, action="append", default=[])
+    check.add_argument("args", nargs=argparse.REMAINDER)
     for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file"):
         command = commands.add_parser(name)
         command.add_argument("--env-dir", type=Path, required=True)
@@ -496,6 +563,12 @@ def main() -> int:
             command.add_argument("--source", type=Path, required=True)
     args = parser.parse_args()
     try:
+        if args.command == "check-runner-vars":
+            caller = args.args[1:] if args.args[:1] == ["--"] else args.args
+            overrides = runner_var_overrides(caller, args.tf_command, args.var_file)
+            for line in overrides:
+                print(f"  {line}", file=sys.stderr)
+            return 2 if overrides else 0
         if args.command == "ci-allowed":
             return 0 if ci_allowed(args.env_dir, args.env, args.cloud_dir, args.cloud_root) else 1
         if args.command == "backend-args":

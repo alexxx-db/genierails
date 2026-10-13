@@ -117,7 +117,9 @@ read state too (the workspace root: the Genie CAN_RUN on record and the
 applied coverage check and grants; the data_access root: the SELECT and
 masks it applied): the runner hands them snapshots read the same way, and
 stops before Terraform when one can't be read, so nothing is planned from
-"nothing applied".
+"nothing applied". Only the runner sets those snapshot paths and `env_dir`, after
+every caller argument; setting one yourself (`-var`, a var file, the env's
+tfvars, `TF_CLI_ARGS`) refuses.
 
 Migrate existing local state once:
 

@@ -767,3 +767,80 @@ def test_state_readers_import_the_helper_without_help_from_other_modules(tmp_pat
     proc = subprocess.run([sys.executable, "-I", "-c", code], text=True, capture_output=True,
                           env=_hermetic_env(tmp_path))
     assert proc.returncode == 0, proc.stderr
+
+
+# -- the runner's own variables can't be overridden --------------------------
+
+RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file")
+OVERRIDE_FORMS = ("-var=NAME=", "-var NAME=", "--var=NAME=", "-var-file=FILE", "-var-file FILE",
+                  "env tfvars", "TF_CLI_ARGS", "TF_CLI_ARGS_plan")
+
+
+@pytest.mark.parametrize("layer", ["workspace", "data_access"])
+@pytest.mark.parametrize("name", RUNNER_VARS)
+@pytest.mark.parametrize("form", OVERRIDE_FORMS)
+def test_a_caller_cannot_set_the_runners_state_variables(tmp_path, fake_terraform, layer, name, form):
+    # A later -var wins in Terraform, so a caller (APPLY_FLAGS, direct args,
+    # a var file, TF_CLI_ARGS) could point a root at a forged snapshot or at
+    # another env's state. The runner refuses before any Terraform command.
+    dev = tmp_path / "aws" / "envs" / "dev"
+    (dev / "data_access").mkdir(parents=True)
+    layer_dir = dev / "data_access" if layer == "data_access" else dev
+    forged = tmp_path / "forged.json"
+    forged.write_text("{}")
+    args, extra = ["plan"], {}
+    var_file = tmp_path / "caller.tfvars"
+    var_file.write_text(f'{name} = "{forged}"\n')
+    if form.startswith(("-var=", "--var=")):
+        args.append(form.replace("NAME", name) + str(forged))
+    elif form == "-var NAME=":
+        args += ["-var", f"{name}={forged}"]
+    elif form == "-var-file=FILE":
+        args.append(f"-var-file={var_file}")
+    elif form == "-var-file FILE":
+        args += ["-var-file", str(var_file)]
+    elif form == "env tfvars":
+        (layer_dir / "abac.auto.tfvars").write_text(f'{name} = "{forged}"\n')
+    else:
+        extra[form] = f"-var={name}={forged}"
+    env = _hermetic_env(tmp_path, PATH=fake_terraform["PATH"], FAKE_TF_LOG=fake_terraform["FAKE_TF_LOG"],
+                        FAKE_TF_STATE=fake_terraform["FAKE_TF_STATE"], LAYER_ENV_DIR=str(layer_dir),
+                        ENVS_DIR=str(dev.parent), GENIERAILS_STATE_DIR=str(tmp_path / "state"), **extra)
+    proc = subprocess.run([str(RUNNER), layer, "dev", *args], env=env, text=True, capture_output=True)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert f"sets {name}" in proc.stderr and "set only by" in proc.stderr
+    assert fake_terraform["log"].read_text() == ""  # refused before terraform init
+
+
+def test_an_unreadable_caller_var_file_refuses(tmp_path, fake_terraform):
+    dev = tmp_path / "aws" / "envs" / "dev"
+    dev.mkdir(parents=True)
+    proc = _run_layer(tmp_path, fake_terraform, "workspace", "dev", "plan", dev, dev.parent)
+    assert proc.returncode == 0, proc.stderr
+    bad = tmp_path / "bad.tfvars"
+    bad.write_text("this is { not hcl")
+    env = _hermetic_env(tmp_path, PATH=fake_terraform["PATH"], FAKE_TF_LOG=fake_terraform["FAKE_TF_LOG"],
+                        FAKE_TF_STATE=fake_terraform["FAKE_TF_STATE"], LAYER_ENV_DIR=str(dev), ENVS_DIR=str(dev.parent))
+    proc = subprocess.run([str(RUNNER), "workspace", "dev", "plan", f"-var-file={bad}"], env=env, text=True,
+                          capture_output=True)
+    assert proc.returncode == 2 and "can't be read" in proc.stderr
+
+
+@pytest.mark.parametrize("layout", ["in-checkout", "state dir"])
+def test_the_runners_variables_come_after_every_caller_argument(tmp_path, fake_terraform, layout):
+    dev = tmp_path / "aws" / "envs" / "dev"
+    (dev / "data_access").mkdir(parents=True)
+    extra = {"GENIERAILS_STATE_DIR": str(tmp_path / "state")} if layout == "state dir" else {}
+    env = _hermetic_env(tmp_path, PATH=fake_terraform["PATH"], FAKE_TF_LOG=fake_terraform["FAKE_TF_LOG"],
+                        FAKE_TF_STATE=fake_terraform["FAKE_TF_STATE"], LAYER_ENV_DIR=str(dev),
+                        ENVS_DIR=str(dev.parent), **extra)
+    proc = subprocess.run([str(RUNNER), "workspace", "dev", "plan", "-var=policy_stage=switch", "-no-color"],
+                          env=env, text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr  # ordinary caller variables still pass
+    plan = [c for c in fake_terraform["log"].read_text().splitlines() if c.startswith("plan ")][-1].split()
+    runner_vars = [i for i, a in enumerate(plan) if a.split("=", 2)[1:2] and a.startswith("-var=")
+                   and a.split("=", 2)[1] in RUNNER_VARS]
+    caller = [plan.index("-var=policy_stage=switch"), plan.index("-no-color")]
+    assert runner_vars and min(runner_vars) > max(caller), plan
+    expected = 3 if layout == "state dir" else 1
+    assert len(runner_vars) == expected, plan

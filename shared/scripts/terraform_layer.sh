@@ -90,6 +90,23 @@ if [ "$USE_STATE_LAYOUT" = 1 ]; then
 fi
 cd "$ROOT_DIR"
 
+# env_dir and the state snapshots (workspace_state_file, data_access_state_file)
+# say where the roots read Terraform state; only this runner sets them, after
+# every caller argument. A caller assignment to one (-var in either form, a
+# -var-file, the env's tfvars, TF_CLI_ARGS*) refuses here, before Terraform.
+case "$COMMAND" in
+  plan|apply|destroy|import|console|print-cmd)
+    RUNNER_VAR_FILES=()
+    for tfvars in auth.auto.tfvars env.auto.tfvars abac.auto.tfvars classification.auto.tfvars discovered_uc_tables.auto.tfvars; do
+      if [ -f "$ENV_DIR/$tfvars" ]; then RUNNER_VAR_FILES+=(--var-file "$ENV_DIR/$tfvars"); fi
+    done
+    if ! python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@"; then
+      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state)." >&2
+      exit 2
+    fi
+    ;;
+esac
+
 INIT_CMD=(
   terraform
   init
@@ -276,8 +293,9 @@ case "$LAYER:$COMMAND" in
     ;;
 esac
 
+RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
-  VAR_ARGS+=(-var="env_dir=$ENV_DIR")
+  RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
 fi
 
 # The roots read state with file(): the workspace root its own and the
@@ -301,15 +319,18 @@ if [ "$LAYER" != "account" ] && [ "$USE_STATE_LAYOUT" = 1 ]; then
           exit 2
         fi
       done
-      [ "$LAYER" = "workspace" ] && VAR_ARGS+=(-var="workspace_state_file=$STATE_INPUTS_DIR/workspace.tfstate.json")
-      VAR_ARGS+=(-var="data_access_state_file=$STATE_INPUTS_DIR/data_access.tfstate.json")
+      if [ "$LAYER" = "workspace" ]; then
+        RUNNER_VARS+=(-var="workspace_state_file=$STATE_INPUTS_DIR/workspace.tfstate.json")
+      fi
+      RUNNER_VARS+=(-var="data_access_state_file=$STATE_INPUTS_DIR/data_access.tfstate.json")
       ;;
   esac
 fi
 
 case "$COMMAND" in
   plan|apply|destroy|import|console)
-    CMD=(terraform "$COMMAND" "${VAR_ARGS[@]}" "$@")
+    # The runner's own variables last, so no earlier value can win.
+    CMD=(terraform "$COMMAND" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} "$@" ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"})
     ;;
   show)
     CMD=(terraform show "$@")
@@ -341,7 +362,7 @@ case "$COMMAND" in
   print-cmd)
     printf 'terraform %s (in %s, TF_DATA_DIR=%s)' "$1" "$ROOT_DIR" "$TF_DATA_DIR"
     shift || true
-    for arg in "${VAR_ARGS[@]}" "$@"; do
+    for arg in ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} "$@" ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"}; do
       printf ' %q' "$arg"
     done
     printf '\n'
