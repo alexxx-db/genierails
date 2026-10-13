@@ -1331,7 +1331,22 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
         except Exception as e:
             result.warn(f"Could not parse {env_path}: {e}")
 
-    for key in ("governance_mode", "access_tier_groups", "raw_exempt_principals"):
+    if env_path is not None:
+        env_governance_mode = env_cfg.get("governance_mode", "legacy")
+        generated_governance_mode = cfg.get("governance_mode")
+        if (
+            is_generated
+            and generated_governance_mode is not None
+            and generated_governance_mode != env_governance_mode
+        ):
+            result.error(
+                "generated governance_mode "
+                f"'{generated_governance_mode}' conflicts with env.auto.tfvars "
+                f"governance_mode '{env_governance_mode}'; env.auto.tfvars is authoritative"
+            )
+        merged["governance_mode"] = env_governance_mode
+
+    for key in ("access_tier_groups", "raw_exempt_principals"):
         if key not in merged and key in env_cfg:
             merged[key] = env_cfg[key]
     if "databricks_client_id" not in merged and env_cfg.get("databricks_client_id"):
