@@ -21,6 +21,7 @@ from pathlib import Path
 
 import hcl2
 import pytest
+import generate_abac
 
 from scripts import migration
 from scripts import policy_generations as pg
@@ -28,6 +29,7 @@ from scripts import release_gate as rg
 from scripts import staged_policy_apply as spa
 from scripts.external_mask_inventory import external_masks
 from ack_file import AckFileError, parse_line
+from governance_policies import build_model
 from tests.test_staged_policy_apply import Harness, _covers, _value_of, live_policies, live_state, write_env
 
 SHARED = Path(__file__).resolve().parents[1]
@@ -309,6 +311,73 @@ def test_a_legacy_redaction_turned_partial_is_a_weakening(env_dir):
     (env_dir / "data_access" / "terraform.tfstate").write_text(json.dumps(state))
     opt_in(env_dir)
     assert f"dev:weaken:{COLUMN}:regional: redacted (redact) -> partial" in _refusal(env_dir)
+
+
+def test_a_redacting_partial_variant_is_not_a_weakening(env_dir):
+    """A tier-2 policy can use its partial slot while still fully redacting."""
+    redact = legacy_policy(value="redact") | {"to_principals": ["regional", "masked"]}
+    state = json.loads((env_dir / "data_access" / "terraform.tfstate").read_text())
+    state["resources"][0]["instances"] = [{"index_key": "gr_mask_cat_redact", "attributes": redact}]
+    state["resources"][1]["instances"] = [{
+        "index_key": f"columns|{COLUMN}|gr_treatment|redact",
+        "attributes": {"entity_name": COLUMN, "tag_value": "redact"},
+    }]
+    (env_dir / "data_access" / "terraform.tfstate").write_text(json.dumps(state))
+
+    settings = {"access_tier_groups": ["raw", "regional", "masked"],
+                "column_overrides": {COLUMN: {"treatment": "redact"}}}
+    write_env(env_dir)
+    model = build_model({COLUMN: ["email_address"]}, {COLUMN: "STRING"}, settings)
+    generate_abac.write_deterministic_model(env_dir / "generated" / "abac.auto.tfvars",
+                                            env_dir / "generated" / "masking_functions.sql", model)
+    with (env_dir / "env.auto.tfvars").open("a") as f:
+        f.write(f'column_overrides = {{ "{COLUMN}" = {{ treatment = "redact" }} }}\n')
+        f.write('table_readers = { "cat.sch.t" = ["regional", "masked"] }\n')
+        f.write('genie_spaces = [{ name = "Sales", genie_space_id = "s1", uc_tables = ["cat.sch.t"], '
+                'acl_groups = ["regional"] }]\n')
+
+    result = migration.analyze(env_dir, ENV, migration.legacy_generation(migration.deployment(env_dir)))
+    assert f"dev:weaken:{COLUMN}:regional" not in {w.ack_key for w in result["weakening"].all_weakenings}
+
+
+def test_promoted_empty_assignments_are_live_derived_for_migrate_plan(env_dir, monkeypatch, tmp_path):
+    """Promotion omits assignments; migrate-plan must compare the live-derived destination."""
+    opt_in(env_dir)
+    derived = (env_dir / "generated" / "abac.auto.tfvars").read_text()
+    (env_dir / "generated" / "abac.auto.tfvars").write_text(
+        re.sub(r"tag_assignments\s*=\s*\[.*?\n\]", "tag_assignments = [\n]", derived, flags=re.DOTALL)
+    )
+
+    def fake_derive(_env_dir, out_dir):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "abac.auto.tfvars"
+        path.write_text(derived)
+        return path
+
+    monkeypatch.setattr(migration, "_derive_live_desired", fake_derive)
+    _, data = migration.report(env_dir, ENV)
+    assert data["columns"][COLUMN]["regional"]["after"] == f"partial ({LEGACY_VALUE})"
+    assert not any(w["after"] == "raw" for w in data["weakenings"])
+
+
+def test_promoted_live_derivation_still_reports_a_real_weakening(env_dir, monkeypatch):
+    opt_in(env_dir)
+    derived = (env_dir / "generated" / "abac.auto.tfvars").read_text()
+    # The derived destination really grants tier 1 raw, so this acknowledgement remains mandatory.
+    write_legacy_state(env_dir, policies={LEGACY_POLICY: legacy_policy(to=["account users"])})
+    (env_dir / "generated" / "abac.auto.tfvars").write_text(
+        re.sub(r"tag_assignments\s*=\s*\[.*?\n\]", "tag_assignments = [\n]", derived, flags=re.DOTALL)
+    )
+
+    def fake_derive(_env_dir, out_dir):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "abac.auto.tfvars"
+        path.write_text(derived)
+        return path
+
+    monkeypatch.setattr(migration, "_derive_live_desired", fake_derive)
+    _, data = migration.report(env_dir, ENV)
+    assert f"dev:weaken:{COLUMN}:raw" in {w["key"] for w in data["weakenings"]}
 
 
 def test_a_new_reader_is_widening(env_dir):
