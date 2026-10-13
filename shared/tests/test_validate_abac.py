@@ -87,6 +87,24 @@ def test_validator_accepts_real_deterministic_generator_output(tmp_path):
     assert run.returncode == 0, run.stdout + run.stderr
 
 
+def test_generated_governance_mode_cannot_override_environment(tmp_path):
+    tfvars, sql, _ = _real_deterministic_output(tmp_path)
+    env_file = tfvars.parent.parent / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace('"deterministic"', '"legacy"'))
+    tfvars.write_text('governance_mode = "deterministic"\n' + tfvars.read_text())
+
+    run = subprocess.run(
+        [sys.executable, str(Path(__file__).parent.parent / "validate_abac.py"), str(tfvars), str(sql)],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert run.returncode == 1
+    assert (
+        "generated governance_mode 'deterministic' conflicts with env.auto.tfvars "
+        "governance_mode 'legacy'; env.auto.tfvars is authoritative"
+    ) in run.stdout
+
+
 def test_deterministic_validator_still_refuses_overlapping_double_mask(tmp_path):
     _, _, cfg = _real_deterministic_output(tmp_path)
     for policy in cfg["fgac_policies"]:

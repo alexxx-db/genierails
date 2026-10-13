@@ -1732,6 +1732,7 @@ TFVARS_STRIP_KEYS = {
     "databricks_client_secret",
     "databricks_workspace_id",
     "databricks_workspace_host",
+    "governance_mode",
     "uc_catalog_name",
     "uc_schema_name",
     "uc_tables",
@@ -2317,7 +2318,7 @@ def _fetch_live_classification_source(
         return None
     try:
         from databricks.sdk import WorkspaceClient
-        from databricks.sdk.service.sql import StatementState
+        from scripts.audit_schema_drift import _run_sql
 
         configure_databricks_env(auth_cfg)
         w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
@@ -2335,22 +2336,9 @@ def _fetch_live_classification_source(
             print(f"  [SENSITIVITY] {message}; using DDL inference only")
             return None
 
-        def _run_sql(sql: str) -> list:
-            r = w.statement_execution.execute_statement(
-                statement=sql, warehouse_id=warehouse_id, wait_timeout="50s",
-            )
-            while r.status and r.status.state in (StatementState.PENDING, StatementState.RUNNING):
-                time.sleep(2)
-                r = w.statement_execution.get_statement(r.statement_id)
-            if r.status and r.status.state == StatementState.FAILED:
-                err = getattr(r.status, "error", None)
-                msg = getattr(err, "message", str(err)) if err else "unknown"
-                raise RuntimeError(msg)
-            if r.result and r.result.data_array:
-                return r.result.data_array
-            return []
-
-        source = ClassificationSource.from_run_sql(_run_sql, table_fqns)
+        source = ClassificationSource.from_run_sql(
+            lambda sql: _run_sql(w, warehouse_id, sql), table_fqns,
+        )
         if not source.has_native_data():
             message = (
                 "Native classification read succeeded but returned 0 class.* "

@@ -2151,6 +2151,74 @@ def test_required_native_classification_fails_on_successful_empty_scan(monkeypat
     assert "wait until the class.* tags appear" in str(exc_info.value)
 
 
+@pytest.mark.parametrize("state_name", ["FAILED", "CANCELED", "CLOSED"])
+def test_generate_native_classification_fails_closed_on_bad_sql_state(monkeypatch, state_name):
+    import databricks.sdk
+    from databricks.sdk.service.sql import StatementState
+
+    response = SimpleNamespace(
+        status=SimpleNamespace(state=getattr(StatementState, state_name), error=None),
+        statement_id="statement-1", result=None, manifest=None,
+    )
+    client = SimpleNamespace(
+        statement_execution=SimpleNamespace(execute_statement=lambda **_: response),
+    )
+    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: client)
+
+    with pytest.raises(
+        generate_abac.NativeClassificationRequiredError,
+        match=rf"SQL failed \(StatementState\.{state_name}\)",
+    ):
+        generate_abac._fetch_live_classification_source(
+            ["cat.sch.tbl"], {"sql_warehouse_id": "warehouse"}, require_native=True,
+        )
+
+
+def test_generate_native_classification_reads_all_sql_chunks(monkeypatch):
+    import databricks.sdk
+    from databricks.sdk.service.sql import StatementState
+
+    response = SimpleNamespace(
+        status=SimpleNamespace(state=StatementState.SUCCEEDED), statement_id="statement-1",
+        result=SimpleNamespace(
+            data_array=[["cat", "sch", "tbl", "first", "class.email_address"]],
+            next_chunk_index=1,
+        ),
+        manifest=None,
+    )
+    chunks = {
+        1: SimpleNamespace(
+            data_array=[["cat", "sch", "tbl", "second", "class.phone_number"]],
+            next_chunk_index=None,
+        ),
+    }
+    execution = SimpleNamespace(
+        execute_statement=lambda **_: response,
+        get_statement_result_chunk_n=lambda statement_id, index: chunks[index],
+    )
+    client = SimpleNamespace(statement_execution=execution)
+    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: client)
+
+    source = generate_abac._fetch_live_classification_source(
+        ["cat.sch.tbl"], {"sql_warehouse_id": "warehouse"}, require_native=True,
+    )
+
+    assert source.classified_columns() == {
+        "cat.sch.tbl.first", "cat.sch.tbl.second",
+    }
+
+
+def test_generated_tfvars_strip_governance_mode():
+    output = generate_abac.sanitize_tfvars_hcl(
+        'governance_mode = "deterministic"\ngroups = {}\n'
+    )
+
+    assert "governance_mode" not in output
+    assert "groups = {}" in output
+
+
 def test_auto_install_pins_python_hcl2_below_8():
     import generate_abac
 
