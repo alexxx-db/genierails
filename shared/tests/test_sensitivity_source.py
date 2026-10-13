@@ -206,6 +206,20 @@ class TestClassificationSourceFromRunSql:
         assert "like 'class.%'" in tags_sql.lower()
         assert "'cat.sch.tbl'" in tags_sql
 
+    def test_required_read_tolerates_missing_results_table(self):
+        def fake_run_sql(sql):
+            if "data_classification.results" in sql:
+                raise RuntimeError(
+                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view "
+                    "system.data_classification.results cannot be found"
+                )
+            return [["cat", "sch", "tbl", "email", "class.email", ""]]
+
+        source = ClassificationSource.from_run_sql(
+            fake_run_sql, ["cat.sch.tbl"], require_native=True,
+        )
+        assert source.classified_columns() == {"cat.sch.tbl.email"}
+
     def test_results_table_projection_uses_class_tag(self):
         # Regression: the results read must project `class_tag` (not the
         # non-existent `class_name`), and those rows must produce findings.
@@ -225,6 +239,27 @@ class TestClassificationSourceFromRunSql:
         assert [(f.tag_key, f.tag_value, f.source) for f in findings] == [
             ("pii_level", "masked_ssn", CLASSIFICATION)
         ]
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "SQL failed (StatementState.FAILED)",
+            "SQL failed (StatementState.CANCELED)",
+            "SQL failed (StatementState.CLOSED)",
+            "SQL statement timed out",
+        ],
+    )
+    def test_required_results_read_fails_closed(self, message):
+        def fake_run_sql(sql):
+            if "data_classification.results" in sql:
+                raise RuntimeError(message)
+            return [["cat", "sch", "tbl", "email", "class.email", ""]]
+
+        expected = message.replace("(", r"\(").replace(")", r"\)")
+        with pytest.raises(RuntimeError, match=expected):
+            ClassificationSource.from_run_sql(
+                fake_run_sql, ["cat.sch.tbl"], require_native=True,
+            )
 
     def test_schema_wildcard_refs_query_schema_scope(self):
         calls = []

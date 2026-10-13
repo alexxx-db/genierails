@@ -2280,6 +2280,7 @@ def _fetch_live_classification_source(
 
         source = ClassificationSource.from_run_sql(
             lambda sql: _run_sql(w, warehouse_id, sql), table_fqns,
+            require_native=require_native,
         )
         if not source.has_native_data():
             message = (
