@@ -42,17 +42,22 @@ class _GeneratedClassification:
 
 
 def _real_deterministic_output(tmp_path):
-    """Produce the files through the same deterministic generator code as `make generate`."""
+    """Produce files in the real env/generated layout used by `make validate-generated`."""
     import hcl2
     from generate_abac import deterministic_model_for, write_deterministic_model
 
-    tfvars = tmp_path / "abac.auto.tfvars"
-    sql = tmp_path / "masking_functions.sql"
-    tfvars.write_text('''
+    env_dir = tmp_path / "envs" / "dev"
+    generated = env_dir / "generated"
+    generated.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text('''
 governance_mode = "deterministic"
-databricks_client_id = "deployer-sp"
 access_tier_groups = ["raw", "regional", "masked"]
 raw_exempt_principals = ["break-glass"]
+''')
+    (env_dir / "auth.auto.tfvars").write_text('databricks_client_id = "deployer-sp"\n')
+    tfvars = generated / "abac.auto.tfvars"
+    sql = generated / "masking_functions.sql"
+    tfvars.write_text('''
 groups = {
   raw = { description = "Raw" }
   regional = { description = "Regional" }
@@ -62,12 +67,15 @@ tag_policies = []
 tag_assignments = []
 fgac_policies = []
 ''')
+    runtime = hcl2.loads((env_dir / "env.auto.tfvars").read_text())
+    runtime["databricks_client_id"] = "deployer-sp"
     model = deterministic_model_for(
-        hcl2.loads(tfvars.read_text()), _GeneratedClassification(),
+        runtime, _GeneratedClassification(),
         "CREATE TABLE cat.sch.customers (email STRING);",
     )
     write_deterministic_model(tfvars, sql, model)
-    return tfvars, sql, hcl2.loads(tfvars.read_text())
+    cfg = hcl2.loads(tfvars.read_text()) | runtime
+    return tfvars, sql, cfg
 
 
 def test_validator_accepts_real_deterministic_generator_output(tmp_path):
@@ -89,9 +97,61 @@ def test_deterministic_validator_still_refuses_overlapping_double_mask(tmp_path)
     assert any("MULTIPLE_MASKS" in error for error in result.errors)
 
 
+@pytest.mark.parametrize("counterexample", [
+    "full_without_exceptions",
+    "overlapping_named_groups",
+    "dropped_partial_tier_exception",
+    "swapped_functions",
+    "undeclared_nested_group",
+    "declared_nested_group",
+    "account_users_title_case",
+    "account_users_upper_case",
+    "exempt_principal_in_partial_tier",
+])
+def test_deterministic_overlap_proof_refuses_reviewer_counterexamples(tmp_path, counterexample):
+    _, _, cfg = _real_deterministic_output(tmp_path)
+    partial = next(p for p in cfg["fgac_policies"] if p["function_name"].endswith("_partial"))
+    full = next(p for p in cfg["fgac_policies"] if p["function_name"].endswith("_full"))
+    if counterexample == "full_without_exceptions":
+        partial["except_principals"] = []
+        full["except_principals"] = []
+    elif counterexample == "overlapping_named_groups":
+        full["to_principals"] = ["masked"]
+        full["except_principals"] = ["raw", "break-glass", "deployer-sp"]
+    elif counterexample == "dropped_partial_tier_exception":
+        full["except_principals"].remove("regional")
+    elif counterexample == "swapped_functions":
+        partial["function_name"], full["function_name"] = full["function_name"], partial["function_name"]
+    elif counterexample in {"undeclared_nested_group", "declared_nested_group"}:
+        cfg["groups"]["outer"] = {"description": "Outer"}
+        partial["to_principals"] = ["outer"]
+        if counterexample == "declared_nested_group":
+            cfg["group_members"] = {"outer": ["regional"]}
+    elif counterexample in {"account_users_title_case", "account_users_upper_case"}:
+        principal = "Account Users" if counterexample.endswith("title_case") else "ACCOUNT USERS"
+        partial["to_principals"] = [principal]
+        full["except_principals"].append(principal)
+    elif counterexample == "exempt_principal_in_partial_tier":
+        cfg["raw_exempt_principals"].append("svc-etl")
+        cfg["groups"]["svc-etl"] = {"description": "Service"}
+        partial["to_principals"] = ["svc-etl"]
+        full["except_principals"] = [p for p in full["except_principals"] if p != "svc-etl"]
+    result = _result()
+    validate_policy_overlaps(cfg, result)
+    assert any("MULTIPLE_MASKS" in error for error in result.errors)
+
+
 def test_deterministic_validator_still_refuses_unknown_treatment(tmp_path):
     _, _, cfg = _real_deterministic_output(tmp_path)
     cfg["tag_policies"][0]["values"] = ["unknown_treatment"]
+    result = _result()
+    validate_tag_policies(cfg, result)
+    assert any("not in the canonical registry" in error for error in result.errors)
+
+
+def test_deterministic_validator_refuses_well_formed_unknown_treatment(tmp_path):
+    _, _, cfg = _real_deterministic_output(tmp_path)
+    cfg["tag_policies"][0]["values"] = ["bogus__string__deadbeef"]
     result = _result()
     validate_tag_policies(cfg, result)
     assert any("not in the canonical registry" in error for error in result.errors)
@@ -104,6 +164,34 @@ def test_deterministic_validator_still_refuses_undefined_except_group(tmp_path):
     tag_map = validate_tag_policies(cfg, result)
     validate_fgac_policies(cfg, set(cfg["groups"]), tag_map, None, result)
     assert any("except_principals group 'undefined-group' not defined" in error for error in result.errors)
+
+
+def test_never_raw_deterministic_policy_refuses_deployer_and_raw_exempt_exceptions():
+    from governance_policies import build_model
+
+    settings = {
+        "governance_mode": "deterministic",
+        "access_tier_groups": ["raw", "regional", "masked"],
+        "raw_exempt_principals": ["break-glass"],
+        "databricks_client_id": "deployer-sp",
+    }
+    model = build_model(
+        {"cat.sch.payments.cvv": ["card_security_code"]},
+        {"cat.sch.payments.cvv": "STRING"}, settings,
+        deployer_principal="deployer-sp",
+    )
+    policy = model.fgac_policies[0]
+    policy["except_principals"] = ["deployer-sp", "break-glass"]
+    cfg = settings | {
+        "groups": {name: {} for name in ("raw", "regional", "masked")},
+        "tag_policies": [{"key": "gr_treatment", "values": model.tag_values}],
+        "tag_assignments": model.tag_assignments,
+        "fgac_policies": model.fgac_policies,
+    }
+    result = _result()
+    tag_map = validate_tag_policies(cfg, result)
+    validate_fgac_policies(cfg, set(cfg["groups"]), tag_map, None, result)
+    assert any("never-raw deterministic treatments" in error for error in result.errors)
 
 
 def test_validation_refuses_ambiguous_fallback_duplicate_functions(tmp_path):

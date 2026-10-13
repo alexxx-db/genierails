@@ -62,6 +62,11 @@ def external_masks(
                 "strings: table_catalog, table_schema, table_name, column_name, mask_name"
             )
         column = ".".join(str(value) for value in row[:4])
+        if len(row[4].split(".")) != 3 or any(not part for part in row[4].split(".")):
+            raise ValueError(
+                "unexpected information_schema.column_masks mask_name; expected "
+                "a fully qualified catalog.schema.function name"
+            )
         if column.lower() in governed:
             mask = row[4]
             problems.add(f"{column}: table-attached mask {mask}")

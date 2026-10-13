@@ -54,6 +54,49 @@ def test_column_mask_rows_fail_closed_on_unexpected_shapes(row):
         inv.external_masks({"cat.sch.t.email"}, [row], {})
 
 
+@pytest.mark.parametrize("mask_name", ["mask", "schema.mask", "cat..mask", "cat.schema.mask.extra"])
+def test_column_mask_rows_require_fully_qualified_mask_name(mask_name):
+    with pytest.raises(ValueError, match="fully qualified catalog.schema.function"):
+        inv.external_masks({"cat.sch.t.email"}, [["cat", "sch", "t", "email", mask_name]], {})
+
+
+def test_inventory_sql_reader_fails_closed_on_unsuccessful_statements():
+    from databricks.sdk.service.sql import StatementState
+    from scripts.audit_schema_drift import _run_sql
+
+    for state_name in ("FAILED", "CANCELED", "CLOSED"):
+        response = SimpleNamespace(
+            status=SimpleNamespace(state=getattr(StatementState, state_name), error=None),
+            statement_id="statement-1", result=None, manifest=None,
+        )
+        client = SimpleNamespace(statement_execution=SimpleNamespace(
+            execute_statement=lambda **kwargs: response,
+        ))
+        with pytest.raises(RuntimeError, match=state_name):
+            _run_sql(client, "warehouse", "SELECT 1")
+
+
+def test_inventory_sql_reader_reads_every_result_chunk():
+    from databricks.sdk.service.sql import StatementState
+    from scripts.audit_schema_drift import _run_sql
+
+    response = SimpleNamespace(
+        status=SimpleNamespace(state=StatementState.SUCCEEDED), statement_id="statement-1",
+        result=SimpleNamespace(data_array=[["first"]], next_chunk_index=1), manifest=None,
+    )
+    chunks = {
+        1: SimpleNamespace(data_array=[["second"]], next_chunk_index=2),
+        2: SimpleNamespace(data_array=[["third"]], next_chunk_index=None),
+    }
+    execution = SimpleNamespace(
+        execute_statement=lambda **kwargs: response,
+        get_statement_result_chunk_n=lambda statement_id, index: chunks[index],
+    )
+    assert _run_sql(SimpleNamespace(statement_execution=execution), "warehouse", "SELECT 1") == [
+        ["first"], ["second"], ["third"],
+    ]
+
+
 class _Policies:
     def __init__(self, rows):
         self.rows, self.calls = rows, []

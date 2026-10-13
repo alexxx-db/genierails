@@ -206,13 +206,28 @@ def _run_sql(w, warehouse_id: str, sql: str) -> list[list[str]]:
     while r.status and r.status.state in (StatementState.PENDING, StatementState.RUNNING):
         time.sleep(2)
         r = w.statement_execution.get_statement(r.statement_id)
-    if r.status and r.status.state == StatementState.FAILED:
+    state = getattr(r.status, "state", None) if r.status else None
+    if state != StatementState.SUCCEEDED:
         err = getattr(r.status, "error", None)
         msg = getattr(err, "message", str(err)) if err else "unknown"
-        raise RuntimeError(f"SQL failed: {msg}")
-    if r.result and r.result.data_array:
-        return r.result.data_array
-    return []
+        raise RuntimeError(f"SQL failed ({state or 'UNKNOWN'}): {msg}")
+    rows = list(getattr(r.result, "data_array", None) or [])
+    next_chunk = getattr(r.result, "next_chunk_index", None) if r.result else None
+    if next_chunk is not None:
+        seen = set()
+        while next_chunk is not None:
+            if next_chunk in seen:
+                raise RuntimeError(f"SQL result paging repeated chunk {next_chunk}")
+            seen.add(next_chunk)
+            chunk = w.statement_execution.get_statement_result_chunk_n(r.statement_id, next_chunk)
+            rows.extend(getattr(chunk, "data_array", None) or [])
+            next_chunk = getattr(chunk, "next_chunk_index", None)
+    else:
+        chunk_count = int(getattr(getattr(r, "manifest", None), "total_chunk_count", 1) or 1)
+        for chunk_index in range(1, chunk_count):
+            chunk = w.statement_execution.get_statement_result_chunk_n(r.statement_id, chunk_index)
+            rows.extend(getattr(chunk, "data_array", None) or [])
+    return rows
 
 
 def detect_forward_drift(
