@@ -482,21 +482,13 @@ def _quote_list(values: Sequence[str]) -> str:
 
 
 def _is_missing_table_or_view_error(exc: Exception) -> bool:
-    """Return true only for an explicit table/view-not-found failure."""
+    """True only for Spark/DBSQL TABLE_OR_VIEW_NOT_FOUND (SQLSTATE 42P01)."""
     current: BaseException | None = exc
     while current is not None:
         message = str(current).lower()
-        if (
-            "table_or_view_not_found" in message
-            or "table or view not found" in message
-            or "table/view does not exist" in message
-            or (
-                ("table" in message or "view" in message)
-                and ("does not exist" in message or "cannot be found" in message)
-            )
-        ):
+        if "[table_or_view_not_found]" in message or "sqlstate: 42p01" in message:
             return True
-        current = current.__cause__ or current.__context__
+        current = current.__cause__
     return False
 
 

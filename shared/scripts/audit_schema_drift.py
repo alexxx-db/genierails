@@ -210,7 +210,9 @@ def _run_sql(w, warehouse_id: str, sql: str) -> list[list[str]]:
     if state != StatementState.SUCCEEDED:
         err = getattr(r.status, "error", None)
         msg = getattr(err, "message", str(err)) if err else "unknown"
-        raise RuntimeError(f"SQL failed ({state or 'UNKNOWN'}): {msg}")
+        code = getattr(err, "error_code", None) if err else None
+        code_suffix = f" [{code}]" if code else ""
+        raise RuntimeError(f"SQL failed ({state or 'UNKNOWN'}){code_suffix}: {msg}")
     rows = list(getattr(r.result, "data_array", None) or [])
     next_chunk = getattr(r.result, "next_chunk_index", None) if r.result else None
     if next_chunk is not None:
