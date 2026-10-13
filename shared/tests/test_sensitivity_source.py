@@ -261,6 +261,62 @@ class TestClassificationSourceFromRunSql:
                 fake_run_sql, ["cat.sch.tbl"], require_native=True,
             )
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            (
+                "PERMISSION_DENIED: Table 'system.data_classification.results' "
+                "does not exist or you do not have permission"
+            ),
+            "[INSUFFICIENT_PERMISSIONS] User does not have SELECT on Table results",
+            "[CATALOG_NOT_FOUND] The catalog `system` cannot be found",
+            "SQL failed (FAILED): Catalog 'system' does not exist. Please review settings",
+            "SQL failed (FAILED): Warehouse abc does not exist; check the timetable",
+            "SQL failed (FAILED): Metastore does not exist; see the view settings",
+            "SQL failed (FAILED): [INTERNAL_ERROR] Query table scan cannot be found in plan cache",
+        ],
+    )
+    def test_required_results_read_rejects_non_table_missing_errors(self, message):
+        def fake_run_sql(sql):
+            if "data_classification.results" in sql:
+                raise RuntimeError(message)
+            return [["cat", "sch", "tbl", "email", "class.email", ""]]
+
+        with pytest.raises(RuntimeError, match=".*"):
+            ClassificationSource.from_run_sql(
+                fake_run_sql, ["cat.sch.tbl"], require_native=True,
+            )
+
+    def test_required_results_read_ignores_not_found_exception_context(self):
+        try:
+            raise RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] earlier handled failure")
+        except RuntimeError:
+            try:
+                raise RuntimeError("SQL failed (StatementState.CANCELED)")
+            except RuntimeError as exc:
+                canceled = exc
+
+        def fake_run_sql(sql):
+            if "data_classification.results" in sql:
+                raise canceled
+            return [["cat", "sch", "tbl", "email", "class.email", ""]]
+
+        with pytest.raises(RuntimeError, match="CANCELED"):
+            ClassificationSource.from_run_sql(
+                fake_run_sql, ["cat.sch.tbl"], require_native=True,
+            )
+
+    def test_optional_results_read_keeps_failed_read_fallback(self):
+        def fake_run_sql(sql):
+            if "data_classification.results" in sql:
+                raise RuntimeError("SQL failed (StatementState.FAILED)")
+            return [["cat", "sch", "tbl", "email", "class.email", ""]]
+
+        source = ClassificationSource.from_run_sql(fake_run_sql, ["cat.sch.tbl"])
+
+        assert source._classification_rows == []
+        assert source.classified_columns() == {"cat.sch.tbl.email"}
+
     def test_schema_wildcard_refs_query_schema_scope(self):
         calls = []
 
