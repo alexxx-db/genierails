@@ -711,26 +711,51 @@ class Checkout:
 
 
 def customer_checkout_problems(checkout_dir: Path, cloud: str, commit: str) -> list[str]:
-    """Why ``commit`` can't carry authored envs/ changes; read-only git only."""
+    """Why ``commit`` can't carry authored envs/ changes; read-only git only.
+
+    The checkout must already be clean at ``commit``, so git's own ignore
+    rules (every .gitignore, .git/info/exclude, core.excludesFile) are
+    evaluated against exactly that tree without switching anything.
+    """
     def git(*argv: str) -> subprocess.CompletedProcess:
-        return subprocess.run(("git", *argv), cwd=checkout_dir, capture_output=True, text=True)
+        return subprocess.run(("git", "--no-optional-locks", *argv), cwd=checkout_dir,
+                              capture_output=True, text=True)
 
     if git("cat-file", "-e", f"{commit}^{{commit}}").returncode:
         return [f"commit {commit[:12]} is not in {checkout_dir}"]
+    head = git("rev-parse", "HEAD")
+    if head.returncode or head.stdout.strip() != commit:
+        return [f"{checkout_dir} is at {head.stdout.strip()[:12] or '?'}, not {commit[:12]}; "
+                f"check out the requested commit first (git checkout --detach {commit[:12]})"]
+    status = git("status", "--porcelain", "--untracked-files=all")
+    if status.returncode or status.stdout.strip():
+        return [f"{checkout_dir} is not clean at {commit[:12]}"]
     problems = []
     gitignore = git("show", f"{commit}:{cloud}/.gitignore")
     if gitignore.returncode or CUSTOMER_GITIGNORE_MARKER not in gitignore.stdout:
         problems.append(f"{cloud}/.gitignore at {commit[:12]} has no GenieRails customer block, so the "
                         "upstream .gitignore ignores envs/ and `git add -A -- envs` fails")
     for env in CUSTOMER_ENVS:
-        if git("cat-file", "-e", f"{commit}:{cloud}/envs/{env}/env.auto.tfvars").returncode:
-            problems.append(f"{cloud}/envs/{env}/env.auto.tfvars is not committed at {commit[:12]}")
-    # The working tree's ignore rules are the commit's only when it is checked out.
-    head = git("rev-parse", "HEAD")
-    if not problems and head.returncode == 0 and head.stdout.strip() == commit:
-        probe = f"{cloud}/envs/{CUSTOMER_ENVS[0]}/env.auto.tfvars"
-        if git("check-ignore", "-q", "--no-index", probe).returncode == 0:
-            problems.append(f"{probe} is git-ignored, so authored env changes can't be committed")
+        path = f"{cloud}/envs/{env}/env.auto.tfvars"
+        parts = path.split("/")
+        # Each component must be a real directory and the file a regular blob, not a symlink.
+        modes = {}
+        for i in range(1, len(parts) + 1):
+            name = "/".join(parts[:i])
+            listed = git("ls-tree", "-z", commit, "--", name)
+            entry = listed.stdout.split("\0")[0] if listed.returncode == 0 else ""
+            if "\t" in entry and entry.split("\t", 1)[1] == name:
+                modes[name] = entry.split()[0]
+            else:
+                break
+        bad = [f"{name} ({mode})" for name, mode in modes.items()
+               if mode not in (("100644", "100755") if name == path else ("040000",))]
+        if not bad and path not in modes:
+            problems.append(f"{path} is not committed at {commit[:12]}")
+        elif bad:
+            problems.append(f"{path} must be a regular committed file in real directories; not: {', '.join(bad)}")
+        elif git("check-ignore", "-q", "--no-index", path).returncode == 0:
+            problems.append(f"{path} is git-ignored, so authored env changes can't be committed")
     return problems
 
 
@@ -907,7 +932,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             f"live execution requires a customer-shaped checkout that commits envs/; {checkout_dir} at "
             f"{args.commit[:12]} does not:\n" + "".join(f"  - {p}\n" for p in problems)
             + f"  Fix: cd {args.cloud} && make setup ENV=dev GITIGNORE=customer, commit {args.cloud}/.gitignore "
-            f"and {args.cloud}/envs/, then pass that commit as --commit. Nothing was run.")
+            f"and {args.cloud}/envs/, check that commit out and pass it as --commit. Nothing was run.")
     log_root = reports / "logs"; log_root.mkdir(parents=True, exist_ok=True)
     secrets = collect_secrets(cloud_root)
     runner = CommandRunner(cloud_root, log_root, {"GENIERAILS_STATE_DIR": str(state_dir), "RELEASE_REMOTE": E2E_REMOTE,
