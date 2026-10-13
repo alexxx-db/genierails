@@ -7834,6 +7834,20 @@ def main():
 
     # ── Delta mode: incremental schema-drift classification ─────────────
     if args.delta:
+        # Decision 5: the delta path drafts with a model, so a deterministic
+        # env refuses it before any SDK call, model call or write.
+        from scripts.sticky_governance import GovernedTablesError, deterministic
+        try:
+            delta_deterministic = deterministic(Path(args.auth_file).parent)
+        except GovernedTablesError as exc:
+            print(f"ERROR: generate --delta: {exc}", file=sys.stderr)
+            sys.exit(2)
+        if delta_deterministic:
+            print("ERROR: generate --delta (make generate-delta) drafts tag assignments with a model, "
+                  "and a deterministic env never calls one (governance_mode = \"deterministic\"). "
+                  "Run make generate, which recomputes the whole governed set from class.* tags, or "
+                  "make derive-assignments to refresh only the tags.", file=sys.stderr)
+            sys.exit(2)
         try:
             _run_delta_mode(Path(args.auth_file))
         except Exception as exc:

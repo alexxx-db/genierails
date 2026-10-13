@@ -312,3 +312,34 @@ def test_migration_doc_runs_rebuild_before_the_first_deterministic_generate():
     assert steps.index("make rebuild-governed-tables ENV=prod") < steps.index("make promote-to ENV=prod")
     assert steps.index("make promote-to ENV=prod") < steps.rindex("make migrate-plan ENV=prod")
     assert "rebuild it with: make rebuild-governed-tables ENV=dev" in doc
+
+
+@pytest.mark.parametrize("env_text", [ENV, "governance_mode = \"deterministic\"\n"])
+def test_delta_refuses_before_any_sdk_model_or_write(env_dir, monkeypatch, capfd, env_text):
+    (env_dir / "env.auto.tfvars").write_text(env_text)
+    generated = _reviewed_draft(env_dir)
+    before = {p: p.read_bytes() for p in env_dir.rglob("*") if p.is_file()}
+    monkeypatch.setattr(generate_abac, "_run_delta_mode",
+                        lambda *a, **k: pytest.fail("the delta path must not start"))
+    import scripts.audit_schema_drift as drift
+    for name in ("_get_sdk_client", "_get_warehouse_id", "detect_forward_drift", "detect_reverse_drift"):
+        monkeypatch.setattr(drift, name, lambda *a, **k: pytest.fail("no SDK call"), raising=False)
+    for name in ("write_text", "write_bytes", "unlink", "mkdir"):
+        monkeypatch.setattr(Path, name, lambda *a, **k: pytest.fail("no write"))
+    with pytest.raises(SystemExit) as exc:
+        _generate(env_dir, monkeypatch, "--delta")
+    assert exc.value.code == 2
+    err = capfd.readouterr().err
+    assert "a deterministic env never calls one" in err
+    assert "make generate" in err and "make derive-assignments" in err
+    monkeypatch.undo()
+    assert {p: p.read_bytes() for p in env_dir.rglob("*") if p.is_file()} == before
+    assert generated.is_dir()
+
+
+def test_legacy_delta_still_dispatches(env_dir, monkeypatch):
+    (env_dir / "env.auto.tfvars").write_text(ENV.replace('governance_mode = "deterministic"\n', ""))
+    calls = []
+    monkeypatch.setattr(generate_abac, "_run_delta_mode", lambda auth_file: calls.append(auth_file))
+    _generate(env_dir, monkeypatch, "--delta")
+    assert calls == [env_dir / "auth.auto.tfvars"]
