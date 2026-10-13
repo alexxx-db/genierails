@@ -50,7 +50,7 @@ def _load_auth():
     except ImportError:
         import subprocess
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", "python-hcl2"],
+            [sys.executable, "-m", "pip", "install", "--quiet", "python-hcl2>=7.3.1,<8"],
         )
         import hcl2
 

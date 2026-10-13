@@ -45,8 +45,9 @@ RESERVED_ENVS = ("account", "data_access")
 # Runtime files never enter the scratch copy: credentials, state, Terraform
 # data dirs and the dot-records commands leave next to them (coverage and
 # CAN_RUN results, live refresh, locks, certifications). Agent ID files are
-# inputs, so they stay.
-RUNTIME_NAMES = {"auth.auto.tfvars"}
+# inputs, so they stay. remote_state.hcl stays out too: the scratch plan is
+# structural and never reads (or locks) an env's remote state.
+RUNTIME_NAMES = {"auth.auto.tfvars", "remote_state.hcl"}
 RUNTIME_SUFFIXES = (".tfstate", ".tfstate.backup")
 KEPT_DOT_PREFIX = ".genie_space_id"
 # Layer files promote splits out of generated/; applying commands re-split,
@@ -64,6 +65,7 @@ LEAKED_VARS = (
     "CLOUD_ROOT", "SHARED_ROOT", "GENIERAILS_CLOUD_DIR", "SOURCE_ENV", "SOURCE_ENV_DIR",
     "DEST_ENV", "DEST_ENV_DIR", "DEST_CATALOG_MAP", "ACCOUNT_ENV_DIR", "FROM", "CATALOG_MAP",
     "CHECK", "APPLY_FLAGS", "GENIERAILS_APPLY_FLAGS", "TARGET_ENV", "SPACE", "MODE",
+    "GENIERAILS_STATE_DIR",
 )
 
 

@@ -62,6 +62,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -75,6 +76,8 @@ SHARED = Path(__file__).resolve().parents[1]
 for _path in (SHARED, SHARED / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+
+from state_layout import root_state_paths, state_json  # noqa: E402
 
 STATE_DIR_ENV = "GENIERAILS_STATE_DIR"
 DEFAULT_STATE = ".genierails-state"
@@ -141,6 +144,36 @@ def state_root(cloud_dir: Path) -> Path:
 
 def env_state(cloud_dir: Path, env: str) -> Path:
     return state_root(cloud_dir) / env
+
+
+def store_id(cloud_dir: Path, env: str) -> str:
+    """This receipt store's random id (created once); every receipt it writes records it.
+
+    Only receipts carrying it count, so a receipt copied in from elsewhere
+    (a CI artifact, another machine's store) never satisfies release-plan or
+    lets rehearse skip. Like the env lock nonce this stops mistakes and
+    unauthenticated artifacts, not someone who can write the store itself.
+    TODO(rollout step 12, prod in CI): accept a CI receipt only with a verified
+    origin (GitHub artifact attestation via gh attestation verify
+    --signer-workflow .../dev-rehearse.yml, or the ADO producing run checked
+    through the pipeline resource) binding run id, workflow and commit.
+    """
+    path = env_state(cloud_dir, env) / ".store-id"
+    try:
+        value = path.read_text().strip()
+    except FileNotFoundError:
+        value = ""
+    if value:
+        return value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path.read_text().strip()
+    value = secrets.token_hex(16)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(value + "\n")
+    return value
 
 
 def _write_once(path: Path, payload: Mapping) -> Path:
@@ -326,8 +359,11 @@ def rehearse_dir(cloud_dir: Path, env: str) -> Path:
     return env_state(cloud_dir, env) / "receipts" / "rehearse"
 
 
-def rehearse_receipts(cloud_dir: Path, env: str) -> list[dict]:
-    return [r for r in _receipts(rehearse_dir(cloud_dir, env)) if r.get("kind") == "rehearse"]
+def rehearse_receipts(cloud_dir: Path, env: str, *, any_store: bool = False) -> list[dict]:
+    """The rehearse receipts this store wrote (``any_store``: also ones copied in, for messages)."""
+    store = store_id(cloud_dir, env)
+    return [r for r in _receipts(rehearse_dir(cloud_dir, env))
+            if r.get("kind") == "rehearse" and (any_store or r.get("store") == store)]
 
 
 def passing_receipt(cloud_dir: Path, env: str, commit: str) -> dict | None:
@@ -387,7 +423,7 @@ def rehearse_start(env_dir: Path, env: str, makefile: Path, make: str) -> str:
         "kind": "rehearse", "version": VERSION, "env": env, "cloud": cloud_dir.name,
         "commit": status["commit"], "clean_tree": status["clean_tree"], "dirty": status["dirty"],
         "fingerprint": fp["fingerprint"], "fingerprint_parts": fp, "result": "passed",
-        "reused_from": earlier["commit"], "applied": False,
+        "reused_from": earlier["commit"], "applied": False, "store": store_id(cloud_dir, env),
         "targets": _target_digests(cloud_dir, env, makefile, make),
         "host": socket.gethostname(), "created_at": _now(),
     }
@@ -415,7 +451,7 @@ def rehearse_finish(env_dir: Path, env: str, result: str, makefile: Path, make: 
         "kind": "rehearse", "version": VERSION, "env": env, "cloud": cloud_dir.name,
         "commit": status["commit"], "clean_tree": status["clean_tree"], "dirty": status["dirty"],
         "fingerprint": fp["fingerprint"], "fingerprint_parts": fp, "result": result,
-        "reused_from": None, "applied": True,
+        "reused_from": None, "applied": True, "store": store_id(cloud_dir, env),
         "targets": _target_digests(cloud_dir, env, makefile, make) if result == "passed" else {},
         "host": socket.gethostname(), "created_at": _now(),
     } | ({"reason": reason} if reason else {})
@@ -497,8 +533,12 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
     fp = inputs_fingerprint(repo, cloud_dir, source)
     committed = generated_digest(env_dir / "generated")
     if receipt is None:
+        foreign = [r for r in rehearse_receipts(cloud_dir, source, any_store=True)
+                   if r.get("commit") == commit and r.get("store") != store_id(cloud_dir, source)]
         problems.append(f"no passing rehearsal of {commit[:12]} (a clean checkout): run make rehearse "
-                        f"ENV={source} on this commit first (receipts: {rehearse_dir(cloud_dir, source)})")
+                        f"ENV={source} on this commit first (receipts: {rehearse_dir(cloud_dir, source)})"
+                        + (f"; {len(foreign)} receipt(s) for it were written by another store (a downloaded "
+                           "CI artifact or a copy) and are informational only" if foreign else ""))
     else:
         if receipt.get("fingerprint") != fp["fingerprint"]:
             changed = [k for k in ("code", "env", "account")
@@ -558,21 +598,14 @@ def rollback_consequences(env_dir: Path, env: str, entries) -> dict[str, str]:
 
 # -- terraform state ----------------------------------------------------------
 
-def root_state_paths(env_dir: Path) -> dict[str, Path]:
-    env_dir = Path(env_dir)
-    return {
-        "account": env_dir.parent / "account" / "terraform.tfstate",
-        "data_access": env_dir / "data_access" / "terraform.tfstate",
-        "workspace": env_dir / "terraform.tfstate",
-    }
-
-
 def state_serials(env_dir: Path) -> dict[str, dict | None]:
     serials = {}
-    for root, path in root_state_paths(env_dir).items():
-        state = _read_json(path) if path.is_file() else None
-        if path.is_file() and state is None:
-            raise Refused(f"the {root} state {path} is unreadable")
+    env = Path(env_dir).name
+    for root in ROOTS:
+        try:
+            state = state_json(env_dir, env, root)
+        except RuntimeError as exc:
+            raise Refused(str(exc)) from exc
         serials[root] = None if state is None else {"serial": state.get("serial"), "lineage": state.get("lineage")}
     return serials
 

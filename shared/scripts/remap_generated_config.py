@@ -96,7 +96,7 @@ def remap_policy_name(name: str, src: str, dest: str) -> str:
     return re.sub(rf"(?<![A-Za-z0-9]){re.escape(src)}(?![A-Za-z0-9])", dest, name)
 
 
-def read_state_policy_keys(path: Path | None) -> set[tuple[str, str]] | None:
+def read_state_policy_keys(path: Path | None = None, *, state: dict | None = None) -> set[tuple[str, str]] | None:
     """Return (catalog, key) of the data_access policies in a Terraform state.
 
     Only ``module.data_access.databricks_policy_info.policies`` counts. The
@@ -106,12 +106,13 @@ def read_state_policy_keys(path: Path | None) -> set[tuple[str, str]] | None:
     """
     import json
 
-    if path is None or not path.is_file():
-        return None
-    try:
-        state = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
+    if state is None:
+        if path is None or not path.is_file():
+            return None
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
     if not isinstance(state, dict) or "resources" not in state:
         return None
     keys: set[tuple[str, str]] = set()
@@ -329,6 +330,13 @@ def parse_args() -> argparse.Namespace:
         help="Destination data_access terraform.tfstate.",
     )
     parser.add_argument(
+        "--state-env-dir",
+        metavar="PATH",
+        type=Path,
+        help="Destination env dir; its data_access state is read through scripts/state_layout.py "
+             "(GENIERAILS_STATE_DIR or remote state).",
+    )
+    parser.add_argument(
         "--auth",
         metavar="PATH",
         type=Path,
@@ -501,6 +509,15 @@ def remap_sql(text: str, pairs: list[tuple[str, str]]) -> str:
     return text
 
 
+def _destination_policy_keys(args) -> set[tuple[str, str]] | None:
+    if args.state_env_dir is None:
+        return read_state_policy_keys(args.state)
+    from scripts.state_layout import state_json
+
+    env_dir = args.state_env_dir
+    return read_state_policy_keys(state=state_json(env_dir, env_dir.name, "data_access") or {})
+
+
 def main() -> None:
     args = parse_args()
 
@@ -523,7 +540,7 @@ def main() -> None:
             args.source_abac.read_text(),
             remap_hcl(args.source_abac.read_text(), pairs),
             pairs,
-            None if args.pure else read_state_policy_keys(args.state),
+            None if args.pure else _destination_policy_keys(args),
             None if args.pure else live_policy_lister(args.auth),
             pure=args.pure,
         )

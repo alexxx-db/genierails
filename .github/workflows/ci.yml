@@ -31,7 +31,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Install dependencies
-        run: pip install pytest python-hcl2
+        run: pip install pytest 'python-hcl2>=7.3.1,<8'
 
       - name: Run unit tests
         env:
@@ -49,7 +49,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install python-hcl2
+        run: pip install 'python-hcl2>=7.3.1,<8'
 
       - name: Run validation tests
         run: cd shared && bash test.sh --skip-tf
@@ -69,7 +69,7 @@ jobs:
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
 
       - name: Install dependencies
-        run: pip install python-hcl2 databricks-sdk requests
+        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk requests
 
       - name: Provision test environment
         env:
@@ -125,7 +125,7 @@ jobs:
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
 
       - name: Install dependencies
-        run: pip install python-hcl2 databricks-sdk requests
+        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk requests
 
       - name: Provision test environment
         env:

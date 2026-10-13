@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
 .PHONY: capture detach-agent
 
@@ -250,11 +250,16 @@ _guard-not-ci-apply:
 	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); is_ci=; \
 	case "$$ci_value" in true|1|yes) is_ci=1 ;; esac; \
 	if [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; then is_ci=1; fi; \
-	if [ "$$is_ci" = "1" ] && [ "$$GENIERAILS_ALLOW_CI_APPLY" != "1" ]; then \
-		echo "ERROR: applying targets cannot run in CI. GenieRails v1 runs Terraform applies on the deployment machine; CI may run tests, validation, coverage, audits, and plans only." >&2; \
+	allow_dev_rehearse=; \
+	if GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" python3 "$(SHARED_ROOT)/scripts/state_layout.py" ci-allowed --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)" >/dev/null 2>&1; then allow_dev_rehearse=1; fi; \
+	if [ "$$is_ci" = "1" ] && [ "$$GENIERAILS_ALLOW_CI_APPLY" != "1" ] && [ "$$allow_dev_rehearse" != "1" ]; then \
+		echo "ERROR: applying targets cannot run in CI (except make rehearse ENV=dev with configured remote state and locking). Prod and account applies stay on the deployment machine." >&2; \
 		echo "Only isolated integration-test workflows may opt out with GENIERAILS_ALLOW_CI_APPLY=1." >&2; \
 		exit 1; \
 	fi
+
+migrate-state-dir: _guard-not-ci-apply ## Move local state and records to GENIERAILS_STATE_DIR (env lock held, never overwrites)
+	@$(_DRY_RUN_GUARD); python3 "$(SHARED_ROOT)/scripts/state_layout.py" migrate --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 # business_access_enabled is deprecated and ignored (business access is granted
 # whenever the coverage check passes). One warning line per run, whether it
@@ -627,8 +632,8 @@ _GOVERNANCE_ONLY = python3 -c 'import glob,hcl2,os,sys; c=hcl2.load(open(sys.arg
 # 1 when the env is deterministic: CAN_RUN rests on the live agent coverage check.
 _IS_DETERMINISTIC = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic"))'
 # 1 when the env configures an agent or its workspace state still holds one
-# (envs/<env>/terraform.tfstate next to env.auto.tfvars; unreadable counts).
-_HAS_AGENTS = { python3 -c 'import glob,hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); st=os.path.join(os.path.dirname(sys.argv[1]),"terraform.tfstate"); r=json.load(open(st)).get("resources",[]) if os.path.exists(st) else []; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars")) or any(str(x.get("name","")).startswith("genie_space") for x in r))))' "$(1)" 2>/dev/null || echo 1; }
+# (read through scripts/state_layout.py, wherever it lives; unreadable counts).
+_HAS_AGENTS = { python3 "$(SHARED_ROOT)/scripts/state_layout.py" state-json --env-dir "$$(dirname "$(1)")" --env "$$(basename "$$(dirname "$(1)")")" --layer workspace | python3 -c 'import glob,hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); s=json.load(sys.stdin) or {}; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars")) or any(str(x.get("name","")).startswith("genie_space") for x in s.get("resources",[])))))' "$(1)" 2>/dev/null || echo 1; }
 # Live "agent tables covered" check (scripts/agent_coverage.py): run before
 # every deterministic workspace plan/apply; the workspace root reads its result.
 _AGENT_COVERAGE = python3 "$(SHARED_ROOT)/scripts/agent_coverage.py"
@@ -702,8 +707,16 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 		python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"; \
 	fi
 
+# In CI the runner's state is throwaway, so the account plan must read the
+# real account state: envs/account/remote_state.hcl (read-only here; only
+# make apply-account, on the deployment machine, applies it).
 _guard-account-plan-empty:
-	@set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
+	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
+	if { [ "$$ci_value" = true ] || [ "$$ci_value" = 1 ] || [ "$$ci_value" = yes ] || [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; } \
+		&& [ "$$GENIERAILS_ALLOW_CI_APPLY" != 1 ] && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
+		echo "ERROR: in CI the account plan needs $(ACCOUNT_ENV_DIR)/remote_state.hcl, so it plans against the real account state (not the runner's empty state)." >&2; exit 1; \
+	fi; \
+	set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
 	if [ $$status -eq 2 ]; then \
 		echo "ERROR: account plan is non-empty; rehearse/release may only add allowed treatment-tag values." >&2; \
 		echo "Run 'make apply-account' in the approved operations stage." >&2; exit 1; \
@@ -761,6 +774,11 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		fi; \
 		$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result failed --reason "a rehearse step failed (above)" $(_RELEASE_GATE_MAKE); \
 		exit 1; \
+	fi; \
+	ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
+	if { [ "$$ci_value" = true ] || [ "$$ci_value" = 1 ] || [ "$$ci_value" = yes ] || [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; } \
+		&& [ "$$GENIERAILS_ALLOW_CI_APPLY" != 1 ]; then \
+		echo "rehearse: ENV=$(ENV) uses legacy governance, which the CI dev pipeline doesn't run (its applies take no env lock); set governance_mode = \"deterministic\" in envs/$(ENV)/env.auto.tfvars, or rehearse on the deployment machine." >&2; exit 1; \
 	fi; \
 	$(_LEGACY_GUARD) rehearse || exit 1; \
 	$(_ACCESS_CHECK) "make rehearse" || exit 1; \
@@ -1160,7 +1178,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		python3 "$(SHARED_ROOT)/scripts/remap_env_config.py" "$(SOURCE_ENV_DIR)" "$$dest_env_dir" "$(DEST_CATALOG_MAP)" || exit 1; \
 		mkdir -p "$$dest_env_dir/generated"; \
 		map_flags=$$(python3 -c 'pairs = [p.strip() for p in "$(DEST_CATALOG_MAP)".split(",") if "=" in p]; print(" ".join("--map " + p for p in pairs))'); \
-		name_flags=(--state "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/terraform.tfstate" --auth "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/auth.auto.tfvars"); \
+		name_flags=(--state-env-dir "$$dest_env_dir" --auth "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/auth.auto.tfvars"); \
 		if [ "$$($(_IS_DETERMINISTIC) "$(SOURCE_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then name_flags=(--pure); fi; \
 		python3 "$(SHARED_ROOT)/scripts/remap_generated_config.py" \
 			"$(SOURCE_ENV_DIR)/generated/abac.auto.tfvars" \
@@ -1584,7 +1602,10 @@ import: _guard-not-ci-apply _guarded-bootstrap ## Import existing resources into
 
 migrate-state: _guard-not-ci-apply _bootstrap ## Migrate legacy state into account/data_access/workspace ownership
 	@echo "=== Migrate Terraform State ($(ENV)) ==="
-	@$(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
+	@$(_DRY_RUN_GUARD); if [ -n "$$GENIERAILS_STATE_DIR" ] || [ -f "$(ENV_DIR)/remote_state.hcl" ] || [ -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
+		echo "migrate-state upgrades the pre-layer in-checkout layout only; run it with GENIERAILS_STATE_DIR unset and no remote_state.hcl, before make migrate-state-dir." >&2; exit 1; \
+	fi; \
+	if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		if [ ! -f "$(ACCOUNT_ENV_DIR)/terraform.tfstate" ]; then echo "No Terraform state found in $(ACCOUNT_ENV_DIR)."; exit 0; fi; \
 		"$(ROOT_RUNNER)" account $(ACCOUNT_ENV) state-list 2>/dev/null | python3 -c 'import re,sys; [print(line.strip()) for line in sys.stdin if re.match(r"^databricks_group\\.groups\\[", line.strip())]' | while read addr; do suffix="$${addr#databricks_group.groups}"; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) state-mv "$$addr" "module.account.databricks_group.groups$$suffix"; done; \
 		"$(ROOT_RUNNER)" account $(ACCOUNT_ENV) state-list 2>/dev/null | python3 -c 'import re,sys; [print(line.strip()) for line in sys.stdin if re.match(r"^databricks_group_member\\.members\\[", line.strip())]' | while read addr; do suffix="$${addr#databricks_group_member.members}"; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) state-mv "$$addr" "module.account.databricks_group_member.members$$suffix"; done; \

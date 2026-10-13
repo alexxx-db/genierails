@@ -382,7 +382,7 @@ def _plan_dir(repo: Repo, *, final=True) -> Path:
 
 @pytest.fixture
 def manifest(repo):
-    state = repo.prod / "data_access" / "terraform.tfstate"
+    state = rg.root_state_paths(repo.prod)["data_access"]
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({"version": 4, "serial": 7, "lineage": "L", "resources": []}))
     ro.begin(repo.prod)

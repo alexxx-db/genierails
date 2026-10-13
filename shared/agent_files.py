@@ -206,14 +206,20 @@ def _space_entry(agent: dict) -> dict:
     return entry
 
 
-def state_keys(state_file: Path) -> set[str]:
-    """Agent keys the workspace state holds a module.workspace Genie resource for."""
-    if not state_file.is_file():
-        return set()
+def state_keys(env_dir: Path) -> set[str]:
+    """Agent keys the env's workspace state holds a module.workspace Genie resource for.
+
+    Read through scripts/state_layout.py (in the checkout, GENIERAILS_STATE_DIR
+    or remote state); a state that should exist but can't be read refuses.
+    """
+    from scripts.state_layout import state_json
+
+    env_dir = Path(env_dir)
     try:
-        resources = json.loads(state_file.read_text()).get("resources") or []
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AgentFileError(f"{state_file}: unreadable Terraform state ({exc})") from exc
+        state = state_json(env_dir, env_dir.name, "workspace") or {}
+    except RuntimeError as exc:
+        raise AgentFileError(str(exc)) from exc
+    resources = state.get("resources") or []
     keys = set()
     for resource in resources:
         if resource.get("module") != "module.workspace" or resource.get("name") not in STATE_RESOURCES:
@@ -247,7 +253,7 @@ def terraform_spaces(env_dir: Path, layer: str) -> list[dict] | None:
     if not names(env_dir):
         return None
     cfg = merged_config(env_dir)
-    in_state = state_keys(env_dir / "terraform.tfstate") if layer == "workspace" else set()
+    in_state = state_keys(env_dir) if layer == "workspace" else set()
     spaces = []
     from_files = set(names(env_dir))
     for space in cfg.get("genie_spaces") or []:

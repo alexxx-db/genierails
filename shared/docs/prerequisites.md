@@ -42,7 +42,7 @@ GenieRails auto-installs its Python packages (first `make generate` / `make appl
 
 | Package | Purpose |
 |---------|---------|
-| `python-hcl2` | Parse Terraform HCL configurations |
+| `python-hcl2` 7.x (`>=7.3.1,<8`; 8 changed its parse output) | Parse Terraform HCL configurations |
 | `databricks-sdk` | Databricks Python SDK |
 | `pyyaml` | Parse YAML overlay / config files |
 
@@ -56,7 +56,7 @@ For integration testing (`make test-ci`), cloud-specific packages are also auto-
 | `azure-mgmt-authorization` | Azure | RBAC role assignments |
 | `azure-mgmt-databricks` | Azure | Workspace management |
 
-> **`make test-ci`** also needs **`pytest`** (and `python-hcl2`) present — these are *not* auto-installed. Run `pip install pytest python-hcl2` first.
+> **`make test-ci`** also needs **`pytest`** (and `'python-hcl2>=7.3.1,<8'`) present — these are *not* auto-installed. Run `pip install pytest 'python-hcl2>=7.3.1,<8'` first.
 >
 > Contributors: a few unit tests exercise GNU Make 4+ options (`-Oline`, `--output-sync`). Apple's `make` is 3.81, so on macOS they run with `gmake` if present (`brew install make`) and are skipped otherwise. GenieRails itself works with either.
 

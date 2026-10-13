@@ -574,7 +574,7 @@ def _ensure_catalog(
 
 def _ensure_packages():
     import subprocess
-    for pkg in ("python-hcl2", "databricks-sdk"):
+    for pkg in ("python-hcl2>=7.3.1,<8", "databricks-sdk"):
         try:
             __import__(pkg.replace("-", ".").split(".")[0])
         except ImportError:
@@ -586,7 +586,7 @@ def _load_auth(auth_file: Path) -> dict:
         import hcl2
     except ImportError:
         import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "python-hcl2"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "python-hcl2>=7.3.1,<8"])
         import hcl2
 
     if not auth_file.exists():

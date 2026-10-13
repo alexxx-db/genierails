@@ -403,7 +403,7 @@ def test_promote_passes_destination_state_and_auth_only():
     body = makefile[makefile.index("remap_generated_config.py\" \\"):]
     body = body[: body.index("derive_genie_acls.py")]
     # Legacy sources; a deterministic source promotes purely (--pure, no state or auth).
-    assert ('name_flags=(--state "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/terraform.tfstate" '
+    assert ('name_flags=(--state-env-dir "$$dest_env_dir" '
             '--auth "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/auth.auto.tfvars")') in makefile
     assert '"$${name_flags[@]}"' in body
     assert "--deployed" not in body

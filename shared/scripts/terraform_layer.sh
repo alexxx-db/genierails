@@ -41,6 +41,30 @@ case "$LAYER" in
     ;;
 esac
 
+# The env dir that owns this layer's state and remote_state.hcl: the dir the
+# layer runs in (envs/<env>, or envs/account), never one rebuilt from
+# ENVS_DIR, so the CI guard (state_layout.py ci-allowed) and this runner read
+# the same remote_state.hcl.
+STATE_ENV_DIR="$ENV_DIR"
+if [ "$LAYER" = "data_access" ] && [ "$(dirname "$ENV_DIR")" != "$ENVS_DIR" ]; then
+  STATE_ENV_DIR="$(dirname "$ENV_DIR")"
+fi
+# state-pull prints only the state on stdout (state_layout.py state_json reads it).
+if [ "$COMMAND" = "state-pull" ]; then
+  exec 3>&1 1>&2
+fi
+STATE_BASE="$ENV_DIR"
+USE_STATE_LAYOUT=0
+if [ -n "${GENIERAILS_STATE_DIR:-}" ] || [ -f "$STATE_ENV_DIR/remote_state.hcl" ]; then
+  USE_STATE_LAYOUT=1
+fi
+# Refuses a moved-state marker without GENIERAILS_STATE_DIR, and a state dir
+# that lacks a state the checkout still holds (a split, not an empty env).
+if [ "$USE_STATE_LAYOUT" = 1 ] || [ -f "$STATE_ENV_DIR/.state-moved" ]; then
+  STATE_BASE="$(python3 "$SCRIPT_DIR/state_layout.py" layer-dir --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")" || exit 2
+fi
+mkdir -p "$STATE_BASE"
+
 if [ ! -d "$ROOT_DIR" ]; then
   echo "Missing Terraform root: $ROOT_DIR" >&2
   exit 1
@@ -52,16 +76,70 @@ mkdir -p "$ENV_DIR"
 # file is always in the working directory — use -lockfile=readonly during init
 # to prevent concurrent writes from corrupting it. On first run (no lock file),
 # skip -lockfile=readonly so Terraform can generate the lock file.
-export TF_DATA_DIR="$ENV_DIR/.terraform"
+export TF_DATA_DIR="$STATE_BASE/.terraform"
+if [ "$USE_STATE_LAYOUT" = 1 ]; then
+  # A nested run for the same env and layer (this runner reading its own state
+  # through state_layout.py state-pull) reuses the caller's root: rebuilding
+  # it would delete the directory the caller's command runs in.
+  if [ "${GENIERAILS_PREPARED_ROOT_KEY:-}" = "$STATE_ENV_DIR:$LAYER" ] && [ -d "${GENIERAILS_PREPARED_ROOT:-}" ]; then
+    ROOT_DIR="$GENIERAILS_PREPARED_ROOT"
+  else
+    ROOT_DIR="$(python3 "$SCRIPT_DIR/state_layout.py" root --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER" --source "$ROOT_DIR")"
+    export GENIERAILS_PREPARED_ROOT="$ROOT_DIR" GENIERAILS_PREPARED_ROOT_KEY="$STATE_ENV_DIR:$LAYER"
+  fi
+fi
 cd "$ROOT_DIR"
+
+# env_dir and the state snapshots (workspace_state_file, data_access_state_file)
+# say where the roots read Terraform state; only this runner sets them, after
+# every caller argument. A caller assignment to one (-var in either form, a
+# -var-file, the env's tfvars, TF_CLI_ARGS*) refuses here, before Terraform.
+case "$COMMAND" in
+  plan|apply|destroy|import|console|print-cmd)
+    RUNNER_VAR_FILES=()
+    for tfvars in auth.auto.tfvars env.auto.tfvars abac.auto.tfvars classification.auto.tfvars discovered_uc_tables.auto.tfvars; do
+      if [ -f "$ENV_DIR/$tfvars" ]; then RUNNER_VAR_FILES+=(--var-file "$ENV_DIR/$tfvars"); fi
+    done
+    if ! python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@"; then
+      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state)." >&2
+      exit 2
+    fi
+    ;;
+esac
 
 INIT_CMD=(
   terraform
   init
   -input=false
   -reconfigure
-  -backend-config="path=$ENV_DIR/terraform.tfstate"
 )
+REMOTE_BACKEND_ARGS=()
+if [ "$USE_STATE_LAYOUT" = 1 ]; then
+  # An invalid remote_state.hcl fails here; it never falls back to local state.
+  backend_lines="$(python3 "$SCRIPT_DIR/state_layout.py" backend-args --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")" || exit 2
+  while IFS= read -r arg; do
+    if [ -n "$arg" ]; then REMOTE_BACKEND_ARGS+=("$arg"); fi
+  done <<< "$backend_lines"
+fi
+if [ "${#REMOTE_BACKEND_ARGS[@]}" -gt 0 ]; then
+  INIT_CMD+=("${REMOTE_BACKEND_ARGS[@]}")
+else
+  ci_value="$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')"
+  is_ci=
+  case "$ci_value" in true|1|yes) is_ci=1 ;; esac
+  [ -n "${TF_BUILD:-}${JENKINS_URL:-}${GITLAB_CI:-}${BUILDKITE:-}${CIRCLECI:-}" ] && is_ci=1
+  # Second line behind the make guard: in CI a write to a local backend would
+  # land in the runner's throwaway state.
+  case "$COMMAND" in
+    apply|apply-plan|destroy|import|state-rm|state-mv)
+      if [ "$is_ci" = 1 ] && [ "${GENIERAILS_ALLOW_CI_APPLY:-}" != 1 ]; then
+        echo "ERROR: refusing terraform $COMMAND in CI: $STATE_ENV_DIR has no remote_state.hcl, so the backend is local." >&2
+        exit 2
+      fi
+      ;;
+  esac
+  INIT_CMD+=(-backend-config="path=$STATE_BASE/terraform.tfstate")
+fi
 WRITABLE_INIT_CMD=("${INIT_CMD[@]}")
 if [ -f .terraform.lock.hcl ]; then
   INIT_CMD+=(-lockfile=readonly)
@@ -172,8 +250,9 @@ trap - EXIT INT TERM
 # The scheduled governance job moved from the workspace root to data_access:
 # before any command on either root, move it between the env's state files
 # (a no-op unless the workspace state still holds it), so neither root ever
-# plans to destroy or recreate it.
-if [ "$COMMAND" != "print-cmd" ]; then
+# plans to destroy or recreate it. Not for state-pull: that is how
+# move_scheduled_job.py reads a remote state.
+if [ "$COMMAND" != "print-cmd" ] && [ "$COMMAND" != "state-pull" ]; then
   case "$LAYER" in
     workspace) JOB_WS_DIR="$ENV_DIR"; JOB_DA_DIR="$ENV_DIR/data_access" ;;
     data_access) JOB_WS_DIR="$(dirname "$ENV_DIR")"; JOB_DA_DIR="$ENV_DIR" ;;
@@ -214,13 +293,44 @@ case "$LAYER:$COMMAND" in
     ;;
 esac
 
+RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
-  VAR_ARGS+=(-var="env_dir=$ENV_DIR")
+  RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
+fi
+
+# The roots read state with file(): the workspace root its own and the
+# data_access state (the CAN_RUN on record, the applied coverage check and
+# grants), the data_access root its own (the SELECT and masks applied, which
+# its guards protect). With a state dir or remote state those files aren't
+# next to env_dir, so they get snapshots read through scripts/state_layout.py,
+# in this layer's runtime dir. A state that can't be read stops here: planning
+# from "nothing applied" could withhold, and so remove, access already
+# granted. (In-checkout state: no change.)
+if [ "$LAYER" != "account" ] && [ "$USE_STATE_LAYOUT" = 1 ]; then
+  STATE_INPUT_LAYERS="data_access"
+  [ "$LAYER" = "workspace" ] && STATE_INPUT_LAYERS="workspace data_access"
+  case "$COMMAND" in
+    plan|apply|destroy|import|console)
+      STATE_INPUTS_DIR="$STATE_BASE/inputs"
+      for input_layer in $STATE_INPUT_LAYERS; do
+        if ! python3 "$SCRIPT_DIR/state_layout.py" state-file --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" \
+          --layer "$input_layer" --out "$STATE_INPUTS_DIR/$input_layer.tfstate.json"; then
+          echo "ERROR: refusing terraform $COMMAND: the $input_layer state can't be read, so the Genie CAN_RUN on record is unknown." >&2
+          exit 2
+        fi
+      done
+      if [ "$LAYER" = "workspace" ]; then
+        RUNNER_VARS+=(-var="workspace_state_file=$STATE_INPUTS_DIR/workspace.tfstate.json")
+      fi
+      RUNNER_VARS+=(-var="data_access_state_file=$STATE_INPUTS_DIR/data_access.tfstate.json")
+      ;;
+  esac
 fi
 
 case "$COMMAND" in
   plan|apply|destroy|import|console)
-    CMD=(terraform "$COMMAND" "${VAR_ARGS[@]}" "$@")
+    # The runner's own variables last, so no earlier value can win.
+    CMD=(terraform "$COMMAND" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} "$@" ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"})
     ;;
   show)
     CMD=(terraform show "$@")
@@ -235,6 +345,11 @@ case "$COMMAND" in
   state-show)
     CMD=(terraform state show "$@")
     ;;
+  state-pull)
+    echo "+ terraform state pull"
+    terraform state pull >&3
+    exit $?
+    ;;
   state-rm)
     CMD=(terraform state rm "$@")
     ;;
@@ -247,7 +362,7 @@ case "$COMMAND" in
   print-cmd)
     printf 'terraform %s (in %s, TF_DATA_DIR=%s)' "$1" "$ROOT_DIR" "$TF_DATA_DIR"
     shift || true
-    for arg in "${VAR_ARGS[@]}" "$@"; do
+    for arg in ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} "$@" ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"}; do
       printf ' %q' "$arg"
     done
     printf '\n'

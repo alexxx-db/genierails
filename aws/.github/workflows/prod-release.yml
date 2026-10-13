@@ -18,8 +18,8 @@ name: GenieRails prod release (aws)
 # `git fetch && git checkout --force --detach <sha>` (--force drops earlier
 # runs' edits to tracked generated/ and layer files and leaves the ignored
 # state alone), confirm `git status --porcelain` prints nothing, and never
-# run `git clean -x` or re-clone. (State outside the checkout, in
-# GENIERAILS_STATE_DIR, is the target.)
+# run `git clean -x` or re-clone. (Or keep state outside the checkout:
+# set GENIERAILS_STATE_DIR and run make migrate-state-dir once per env.)
 # The CI guard refuses every applying target here. Do not set
 # GENIERAILS_ALLOW_CI_APPLY: it exists only for the throwaway
 # integration-test workspace. In v1 the plan job re-runs the
@@ -72,7 +72,8 @@ jobs:
 
       - id: diff
         run: |
-          if git diff --name-only HEAD^ HEAD -- envs/prod ../shared | grep -q .; then
+          changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?
+          if [ -n "$changed" ]; then
             echo "prod=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -83,6 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
       id-token: write
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
@@ -96,7 +98,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install python-hcl2 databricks-sdk pytest
+        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
 
       - uses: hashicorp/setup-terraform@v3
         with:

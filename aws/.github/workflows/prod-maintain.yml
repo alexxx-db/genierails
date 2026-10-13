@@ -65,7 +65,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install python-hcl2 databricks-sdk
+        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk
 
       - name: Write OIDC auth file (IDs only, no secrets)
         env:

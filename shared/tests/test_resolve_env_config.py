@@ -108,12 +108,13 @@ def test_resolver_never_executes_the_terraform_runner(tmp_path):
     assert not marker.exists()
 
 
-def test_repository_uses_only_per_environment_local_state_backends():
+def test_repository_defaults_to_per_environment_local_state_backends():
     for root in ("workspace", "data_access", "account"):
         text = (SHARED / "roots" / root / "main.tf").read_text()
         assert 'backend "local"' in text
     runner = (SHARED / "scripts" / "terraform_layer.sh").read_text()
-    assert '-backend-config="path=$ENV_DIR/terraform.tfstate"' in runner
+    assert '-backend-config="path=$STATE_BASE/terraform.tfstate"' in runner
+    assert 'state_layout.py" backend-args' in runner
 
 
 def test_invalid_warehouse_id_is_rejected(tmp_path):

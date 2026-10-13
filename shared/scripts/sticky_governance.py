@@ -28,6 +28,7 @@ if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
 
 from scripts.footprint import FootprintError, load_env_config, resolve_footprint  # noqa: E402
+from scripts.state_layout import state_json  # noqa: E402
 
 MANIFEST = Path("generated/governed_tables.json")
 STATE = Path("data_access/terraform.tfstate")
@@ -71,13 +72,12 @@ def _table_of(column: str) -> str | None:
 
 def _state_tags(env_dir: Path, tag_key: str) -> list[tuple[str, object, str]]:
     """(resource name, index key, column) of every deployed treatment tag."""
-    path = Path(env_dir) / STATE
-    if not path.is_file():
-        return []
     try:
-        state = json.loads(path.read_text())
-    except (OSError, ValueError) as exc:
-        raise GovernedTablesError(f"cannot read Terraform state {path}: {exc}") from exc
+        state = state_json(env_dir, Path(env_dir).name, "data_access")
+    except RuntimeError as exc:
+        raise GovernedTablesError(str(exc)) from exc
+    if state is None:
+        return []
     tags = []
     for resource in state.get("resources") or []:
         if resource.get("type") != "databricks_entity_tag_assignment" or resource.get("mode") == "data":

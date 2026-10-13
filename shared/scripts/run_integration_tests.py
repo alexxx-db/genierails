@@ -3044,7 +3044,7 @@ def _ensure_packages() -> None:
         from databricks.sdk import WorkspaceClient  # noqa: F401
     except ImportError:
         _run([sys.executable, "-m", "pip", "install", "-q",
-              "databricks-sdk", "python-hcl2"])
+              "databricks-sdk", "python-hcl2>=7.3.1,<8"])
 
 
 def _load_auth_cfg(auth_file: Path) -> dict:

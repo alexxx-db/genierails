@@ -168,8 +168,10 @@ def _applied(env_dir: Path) -> dict[str, str] | None:
 
 
 def _ever_applied(env_dir: Path) -> bool:
-    return (Path(env_dir) / "data_access" / "terraform.tfstate").is_file() or (
-        Path(env_dir) / "terraform.tfstate").is_file()
+    from scripts.state_layout import state_json
+    env_dir = Path(env_dir)
+    return any(state_json(env_dir, env_dir.name, layer) is not None
+               for layer in ("data_access", "workspace"))
 
 
 def required_acks(env_dir: Path, env: str, cfg: Mapping) -> dict[str, str]:
