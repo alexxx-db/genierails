@@ -36,14 +36,19 @@ def holds_job(state: dict | None) -> bool:
 
 
 def _state(env_dir: Path, layer: str) -> dict | None:
-    try:
-        return state_layout.state_json(env_dir, env_dir.name, layer)
-    except RuntimeError:
-        return None  # unreadable here: the layer command itself reports it
+    return state_layout.state_json(env_dir, env_dir.name, layer)
 
 
 def move(workspace_dir: Path, data_access_dir: Path) -> int:
-    workspace_dir = Path(workspace_dir)
+    """0 when nothing needs moving or the job moved; 1 otherwise, including any unreadable state."""
+    try:
+        return _move(Path(workspace_dir))
+    except RuntimeError as exc:  # never "no job": a state that can't be read stops the command
+        print(f"ERROR: cannot check {ADDRESS} before running Terraform: {exc}", file=sys.stderr)
+        return 1
+
+
+def _move(workspace_dir: Path) -> int:
     if state_layout.remote_configured(workspace_dir):
         if not holds_job(_state(workspace_dir, "workspace")):
             return 0

@@ -624,3 +624,24 @@ def test_agent_readers_follow_the_state_dir_and_fail_closed(tmp_path, monkeypatc
         agent_files.state_keys(env)
     with pytest.raises(agent_ownership.AgentError, match="migrate-state-dir"):
         agent_ownership.create_instance(env, "sales")
+
+
+# A remote env reads only its workspace state (it never moves the job itself).
+@pytest.mark.parametrize("remote, failing", [(False, "workspace"), (False, "data_access"), (True, "workspace")])
+def test_scheduled_job_move_fails_closed_on_unreadable_state(tmp_path, fake_terraform, monkeypatch, remote, failing):
+    from scripts import move_scheduled_job
+
+    env = _remote("aws", tmp_path / "aws" / "envs" / "dev") if remote else tmp_path / "aws" / "envs" / "dev"
+    (env / "data_access").mkdir(parents=True, exist_ok=True)
+    job = {"resources": [{"mode": "managed", "type": "databricks_job", "name": "scheduled_governance",
+                          "instances": [{}]}]}
+
+    def state_json(env_dir, env_name, layer):
+        if layer == failing:
+            raise state_layout.StateError(f"cannot read the {layer} state")
+        return job if layer == "workspace" else None
+
+    monkeypatch.setattr(move_scheduled_job.state_layout, "state_json", state_json)
+    _use_fake(monkeypatch, fake_terraform)
+    assert move_scheduled_job.move(env, env / "data_access") != 0
+    assert fake_terraform["log"].read_text() == ""  # no Terraform command ran
