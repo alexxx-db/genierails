@@ -389,10 +389,14 @@ def migrate(env_dir: Path, env: str) -> int:
             raise StateError("refusing to overwrite existing " + ", ".join(conflicts))
         target.mkdir(parents=True, exist_ok=True)
         os.chmod(target, 0o700)
-        # The marker goes first: from here on a run without the variable refuses.
-        (env_dir / MOVED_MARKER).write_text(
-            f"Terraform state and records moved to {target}.\n"
-            f"Set {STATE_DIR_ENV}={root.parent} before running make for this env.\n")
+        # The marker goes first, durably (file and directory entry fsynced), so
+        # from before any source is removed a run without the variable refuses.
+        with (env_dir / MOVED_MARKER).open("w") as handle:
+            handle.write(f"Terraform state and records moved to {target}.\n"
+                         f"Set {STATE_DIR_ENV}={root.parent} before running make for this env.\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_dir(env_dir)
         for source, destination in operations:
             print(f"{_move_file(source, destination)}: {source} -> {destination}")
         for cache in (env_dir / ".terraform", env_dir / "data_access" / ".terraform"):

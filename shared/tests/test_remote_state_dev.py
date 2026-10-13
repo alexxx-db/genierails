@@ -645,3 +645,44 @@ def test_scheduled_job_move_fails_closed_on_unreadable_state(tmp_path, fake_terr
     _use_fake(monkeypatch, fake_terraform)
     assert move_scheduled_job.move(env, env / "data_access") != 0
     assert fake_terraform["log"].read_text() == ""  # no Terraform command ran
+
+
+def _fd_path(fd: int) -> str:
+    try:
+        import fcntl
+
+        return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0"))  # macOS
+    except (AttributeError, OSError):
+        return os.readlink(f"/proc/self/fd/{fd}")  # Linux
+
+
+def test_migration_makes_the_marker_durable_before_removing_any_source(tmp_path, monkeypatch):
+    env = _legacy_env(tmp_path)
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    events = []
+    real_fsync, real_fsync_dir, real_unlink = os.fsync, state_layout._fsync_dir, Path.unlink
+
+    def fsync(fd):
+        events.append(("fsync", Path(_fd_path(fd)).resolve()))
+        real_fsync(fd)
+
+    def fsync_dir(path):
+        events.append(("fsync-dir", Path(path).resolve()))
+        real_fsync_dir(path)
+
+    def unlink(self, *args, **kwargs):
+        if self.resolve() in {(env / "terraform.tfstate").resolve(), (env / "data_access/terraform.tfstate").resolve()}:
+            events.append(("unlink-source", self.resolve()))
+            raise OSError("power lost")  # the crash: nothing after this point happens
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(state_layout.os, "fsync", fsync)
+    monkeypatch.setattr(state_layout, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(OSError, match="power lost"):
+        state_layout.migrate(env, "dev")
+    marker = (env / ".state-moved").resolve()
+    first_unlink = next(i for i, e in enumerate(events) if e[0] == "unlink-source")
+    assert ("fsync", marker) in events[:first_unlink], events
+    assert events.index(("fsync", marker)) < events.index(("fsync-dir", env.resolve())) < first_unlink, events
+    assert marker.is_file()
