@@ -1324,14 +1324,16 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
         env_name = parent_name
 
     env_cfg = {}
+    env_parse_failed = False
     env_path = _find_tfvars_file(tfvars_path, "env.auto.tfvars")
     if env_path:
         try:
             env_cfg = parse_tfvars(env_path)
         except Exception as e:
-            result.warn(f"Could not parse {env_path}: {e}")
+            env_parse_failed = True
+            result.error(f"Could not parse {env_path}: {e}")
 
-    if env_path is not None:
+    if env_path is not None and not env_parse_failed:
         env_governance_mode = env_cfg.get("governance_mode", "legacy")
         generated_governance_mode = cfg.get("governance_mode")
         if (

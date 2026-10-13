@@ -2175,6 +2175,28 @@ def test_generate_native_classification_fails_closed_on_bad_sql_state(monkeypatc
         )
 
 
+def test_shared_sql_reader_includes_sdk_error_code():
+    from databricks.sdk.service.sql import StatementState
+    from scripts.audit_schema_drift import _run_sql
+
+    response = SimpleNamespace(
+        status=SimpleNamespace(
+            state=StatementState.FAILED,
+            error=SimpleNamespace(
+                error_code="TABLE_OR_VIEW_NOT_FOUND",
+                message="The table cannot be found",
+            ),
+        ),
+        statement_id="statement-1",
+    )
+    client = SimpleNamespace(
+        statement_execution=SimpleNamespace(execute_statement=lambda **_: response),
+    )
+
+    with pytest.raises(RuntimeError, match=r"\[TABLE_OR_VIEW_NOT_FOUND\]"):
+        _run_sql(client, "warehouse", "SELECT 1")
+
+
 def test_generate_native_classification_reads_all_sql_chunks(monkeypatch):
     import databricks.sdk
     from databricks.sdk.service.sql import StatementState
@@ -2208,6 +2230,37 @@ def test_generate_native_classification_reads_all_sql_chunks(monkeypatch):
     assert source.classified_columns() == {
         "cat.sch.tbl.first", "cat.sch.tbl.second",
     }
+
+
+def test_generate_native_classification_plumbs_required_read_mode(monkeypatch):
+    import databricks.sdk
+    from scripts import audit_schema_drift
+
+    class FakeClient:
+        pass
+
+    def fake_run_sql(_client, _warehouse_id, sql):
+        if "data_classification.results" in sql:
+            raise RuntimeError("SQL failed (StatementState.CANCELED): x")
+        return [["cat", "sch", "tbl", "email", "class.email", ""]]
+
+    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: FakeClient())
+    monkeypatch.setattr(audit_schema_drift, "_run_sql", fake_run_sql)
+    cfg = {"sql_warehouse_id": "warehouse"}
+
+    with pytest.raises(
+        generate_abac.NativeClassificationRequiredError,
+        match="StatementState.CANCELED",
+    ):
+        generate_abac._fetch_live_classification_source(
+            ["cat.sch.tbl"], cfg, require_native=True,
+        )
+
+    source = generate_abac._fetch_live_classification_source(
+        ["cat.sch.tbl"], cfg, require_native=False,
+    )
+    assert source.classified_columns() == {"cat.sch.tbl.email"}
 
 
 def test_generated_tfvars_strip_governance_mode():

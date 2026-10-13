@@ -292,18 +292,23 @@ class ClassificationSource(SensitivitySource):
         run_sql: Callable[[str], list],
         table_refs: Sequence[str],
         mapping: dict[str, tuple[str, str]] | None = None,
+        *,
+        require_native: bool = False,
     ) -> "ClassificationSource":
         """Build by querying the system tables via an injected ``run_sql``.
 
         ``run_sql(sql) -> rows`` mirrors ``audit_schema_drift._run_sql`` (returns
-        a list of row lists).  Reads are best-effort: the column_tags read is
-        required, but a missing ``system.data_classification.results`` table is
-        tolerated so this works on workspaces without that surface.
+        a list of row lists).  The column_tags read is required, but a missing
+        ``system.data_classification.results`` table is tolerated so this works
+        on workspaces without that surface.  Other results-table read failures
+        are tolerated only for legacy best-effort reads.
         """
         tag_rows = _read_class_column_tags(run_sql, table_refs)
         try:
             classification_rows = _read_data_classification_results(run_sql, table_refs)
-        except Exception:
+        except Exception as exc:
+            if require_native and not _is_missing_table_or_view_error(exc):
+                raise
             classification_rows = []
         return cls(tag_rows=tag_rows, classification_rows=classification_rows, mapping=mapping)
 
@@ -474,6 +479,17 @@ def select_findings(
 # ---------------------------------------------------------------------------
 def _quote_list(values: Sequence[str]) -> str:
     return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+
+
+def _is_missing_table_or_view_error(exc: Exception) -> bool:
+    """True only for Spark/DBSQL TABLE_OR_VIEW_NOT_FOUND (SQLSTATE 42P01)."""
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).lower()
+        if "[table_or_view_not_found]" in message or "sqlstate: 42p01" in message:
+            return True
+        current = current.__cause__
+    return False
 
 
 def _table_fqns_from_refs(table_refs: Sequence[str]) -> list[str]:
