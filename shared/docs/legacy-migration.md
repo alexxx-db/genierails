@@ -7,13 +7,32 @@ show no change. Design: [deterministic-governance.md, section 8](design/determin
 
 ```bash
 make migrate-plan ENV=prod        # 1. read-only dry run on the live env; proposes table_readers
-# 2. set governance_mode = "deterministic", access_tier_groups, table_readers, acl_groups;
-#    make generate (dev) or make promote-to ENV=prod; add the reviewed ack.txt lines
+                                  #    (before step 2 it exits 1 and prints these next steps)
+# 2. in envs/<env>/env.auto.tfvars set governance_mode = "deterministic",
+#    access_tier_groups, table_readers, acl_groups; then, for each env:
+make rebuild-governed-tables ENV=dev   # 2a. writes generated/governed_tables.json (commit it)
+make generate ENV=dev                  # 2b. dev: the deterministic draft (no model is called)
+make rebuild-governed-tables ENV=prod  #     prod: the same record, then
+make promote-to ENV=prod               #     prod's draft from dev's; add the reviewed ack.txt lines
 make migrate-plan ENV=prod        # 3. repeat until "the cutover may proceed"; PR, review, merge
 make rehearse ENV=dev             # 4. dev migrates here (and writes the receipt prod needs)
 make release-plan ENV=prod        # 5. one manifest per phase: approve, then
 make release ENV=prod MANIFEST=<manifest>   #    repeat 5 until "Release complete"
 ```
+
+Step 2a is required. A legacy env already has treatment tags deployed but no
+`generated/governed_tables.json` (the deterministic record of governed tables),
+so the first deterministic `generate`, and `migrate-plan`, `rehearse` and
+`release-plan` in prod, refuse with:
+
+```
+ERROR: <path>/envs/dev/generated/governed_tables.json is missing but this env has recorded governance (treatment tags are deployed (data_access/terraform.tfstate); its generated or promoted config has treatment tags); rebuild it with: make rebuild-governed-tables ENV=dev
+```
+
+`make rebuild-governed-tables ENV=<env>` writes the record from the deployed
+treatment tags and the generated or promoted config. It is local and changes
+nothing in Databricks. Run it once per env after opting in, then commit the
+record with the rest of the opt-in.
 
 ## The dry run
 
@@ -32,7 +51,8 @@ It reports:
 It writes a proposed `table_readers` that reproduces every `SELECT` GenieRails
 grants today to `<state dir>/<env>/migration/table_readers.proposed.hcl` (and
 `report.json`). Run it before opting in for the proposal; after, for the full
-comparison. Exit code 0 means the cutover may proceed.
+comparison. Exit code 0 means the cutover may proceed. Before opting in it
+always exits 1, after writing the proposal and printing the opt-in steps.
 
 ## Refusals
 

@@ -141,11 +141,22 @@ def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False,
 
     def run(argv, **kwargs):
         argv = list(argv); calls.append((argv, kwargs.get("env", {})))
+        if argv[1:2] == ["--no-optional-locks"]:
+            argv = argv[:1] + argv[2:]
+        if argv[:2] == ["git", "ls-tree"]:
+            paths = argv[argv.index("--") + 1:]
+            return subprocess.CompletedProcess(argv, 0, "".join(
+                f"{'100644 blob' if p.endswith('.tfvars') else '040000 tree'} {'0' * 40}\t{p}\0" for p in paths), "")
         if argv[:2] == ["git", "rev-parse"]:
             head = OTHER if drift_after_make and state["makes"] and argv[2:] == ["HEAD"] else COMMIT
             return subprocess.CompletedProcess(argv, 0, head + "\n", "")
         if argv[:3] == ["git", "remote", "get-url"]:
             return subprocess.CompletedProcess(argv, 2, "error: No such remote\n", "")
+        # A customer-shaped checkout: the managed block is committed, envs/ is not ignored.
+        if argv[:2] == ["git", "show"] and argv[2].endswith("/.gitignore"):
+            return subprocess.CompletedProcess(argv, 0, driver.CUSTOMER_GITIGNORE_MARKER + ") >>>\n", "")
+        if argv[:2] == ["git", "check-ignore"]:
+            return subprocess.CompletedProcess(argv, 1, "", "")
         if argv and argv[0] == "git":
             return subprocess.CompletedProcess(argv, 0, "", "")
         text, rc = "ok\n", 0
@@ -512,16 +523,8 @@ def sim(tmp_path, monkeypatch):
     (tmp_path / "gitconfig").write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    checkout = tmp_path / "checkout"; cloud = checkout / "aws"
-    for env in ("dev", "prod"):
-        (cloud / "envs" / env / "generated").mkdir(parents=True)
-        (cloud / "envs" / env / "generated" / "abac.auto.tfvars").write_text("# baseline\n")
-    (cloud / "Makefile").write_text("include ../shared/Makefile.shared\n")
-    git_env = {**os.environ, **driver.GIT_IDENTITY}
-    subprocess.run(["git", "init", "-q", "-b", "main", str(checkout)], check=True, env=git_env)
-    subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=True, env=git_env)
-    subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "baseline"], check=True, env=git_env)
-    baseline = _git(checkout, "rev-parse", "HEAD")
+    checkout = tmp_path / "checkout"
+    baseline = _genierails_checkout(checkout, customer=True)
     bin_dir = tmp_path / "bin"; bin_dir.mkdir()
     (bin_dir / "make").write_text(FAKE_MAKE.format(python=sys.executable)); (bin_dir / "make").chmod(0o755)
     state = tmp_path / "state"; state.mkdir()
@@ -541,6 +544,35 @@ def sim(tmp_path, monkeypatch):
 
 def _git(repo, *argv):
     return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True, check=True).stdout.strip()
+
+
+UPSTREAM_GITIGNORE = Path(__file__).parents[2] / ".gitignore"
+IDENTITY = ("-c", "user.name=genierails-e2e", "-c", "user.email=genierails-e2e@localhost")
+
+
+def _genierails_checkout(checkout, *, customer, commit_envs=True):
+    """A GenieRails checkout with the upstream root .gitignore (which ignores envs/).
+
+    customer: the cloud dir has the block `make setup GITIGNORE=customer` writes.
+    """
+    from scripts import customer_gitignore
+    cloud = checkout / "aws"
+    for env in ("dev", "prod"):
+        (cloud / "envs" / env / "generated").mkdir(parents=True)
+        (cloud / "envs" / env / "env.auto.tfvars").write_text('uc_catalog = "cat"\n')
+        (cloud / "envs" / env / "generated" / "abac.auto.tfvars").write_text("# baseline\n")
+    (cloud / "Makefile").write_text("include ../shared/Makefile.shared\n")
+    (checkout / ".gitignore").write_text(UPSTREAM_GITIGNORE.read_text())
+    if customer:
+        (cloud / ".gitignore").write_text(customer_gitignore.block(cloud))
+    git_env = {**os.environ, **driver.GIT_IDENTITY}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(checkout)], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=True, env=git_env)
+    if commit_envs and not customer:
+        # Even force-added env files leave new authored files ignored.
+        subprocess.run(["git", "-C", str(checkout), "add", "-f", "aws/envs"], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "baseline"], check=True, env=git_env)
+    return _git(checkout, "rev-parse", "HEAD")
 
 
 def test_simulated_live_s6_merges_ack_on_driver_branch_and_restores(sim):
@@ -585,3 +617,149 @@ def test_simulated_live_champion_commits_generate_then_promotion(sim, monkeypatc
     assert any(e["argv"][:2] == ["maintain", "ENV=prod"] and e["head"] == sim.baseline for e in log)
     assert json.loads((sim.reports / "s4.json").read_text())["status"] == "passed"
     assert _git(sim.checkout, "rev-parse", "HEAD") == sim.baseline
+
+
+def test_customer_marker_matches_the_block_make_setup_writes():
+    from scripts import customer_gitignore
+    assert customer_gitignore.BEGIN.startswith(driver.CUSTOMER_GITIGNORE_MARKER)
+
+
+@pytest.mark.parametrize("commit_envs", [False, True])
+def test_upstream_checkout_is_refused_before_anything_runs(sim, tmp_path, commit_envs):
+    checkout = tmp_path / "upstream"
+    baseline = _genierails_checkout(checkout, customer=False, commit_envs=commit_envs)
+    # The failure the refusal prevents: an authored env file can't be staged.
+    (checkout / "aws/envs/prod/ack.txt").write_text("prod:reader:cat.s.t:g\n")
+    staged = subprocess.run(["git", "-C", str(checkout), "add", "-A", "--", "aws/envs"],
+                            capture_output=True, text=True)
+    assert staged.returncode == 1 and "ignored" in staged.stderr
+    (checkout / "aws/envs/prod/ack.txt").unlink()
+    reports = tmp_path / "upstream-reports"
+    args = [a.replace(str(sim.checkout), str(checkout)).replace(sim.baseline, baseline)
+            for a in sim.args]
+    args[args.index("--reports") + 1] = str(reports)
+
+    with pytest.raises(SystemExit) as exc:
+        driver.main([*args, "--scenarios", "s6"], snapshot_factory=FakeSnapshots)
+
+    message = str(exc.value)
+    assert "customer-shaped checkout that commits envs/" in message
+    assert "aws/.gitignore at" in message and "has no GenieRails customer block" in message
+    assert "make setup ENV=dev GITIGNORE=customer" in message and "Nothing was run." in message
+    if not commit_envs:
+        assert "aws/envs/dev/env.auto.tfvars is not committed" in message
+    assert sim.log() == [] and not reports.exists()
+    assert "genierails-e2e" not in _git(checkout, "remote").split()
+    assert _git(checkout, "rev-parse", "HEAD") == baseline and _git(checkout, "status", "--porcelain") == ""
+
+
+def test_customer_block_without_committed_envs_is_refused(sim, tmp_path):
+    checkout = tmp_path / "half"
+    baseline = _genierails_checkout(checkout, customer=True)
+    _git(checkout, "rm", "-q", "aws/envs/prod/env.auto.tfvars")
+    _git(checkout, *IDENTITY, "commit", "-qm", "untrack prod")
+    head = _git(checkout, "rev-parse", "HEAD")
+    assert head != baseline
+    problems = driver.customer_checkout_problems(checkout, "aws", head)
+    assert problems == [f"aws/envs/prod/env.auto.tfvars is not committed at {head[:12]}"]
+
+
+def test_customer_checkout_passes_and_unknown_commit_is_refused(sim, tmp_path):
+    assert driver.customer_checkout_problems(sim.checkout, "aws", sim.baseline) == []
+    missing = "f" * 40
+    assert driver.customer_checkout_problems(sim.checkout, "aws", missing) == [
+        f"commit {missing[:12]} is not in {sim.checkout}"]
+
+
+def test_ignored_env_file_in_the_checked_out_tree_is_refused(sim):
+    # A hand-edited block that still ignores envs/ (here: an extra rule after it).
+    gitignore = sim.checkout / "aws/.gitignore"
+    gitignore.write_text(gitignore.read_text() + "/envs/dev/\n")
+    _git(sim.checkout, *IDENTITY, "commit", "-qam", "ignore dev")
+    head = _git(sim.checkout, "rev-parse", "HEAD")
+    assert driver.customer_checkout_problems(sim.checkout, "aws", head) == [
+        "aws/envs/dev/env.auto.tfvars is git-ignored, so authored env changes can't be committed"]
+
+
+def _assert_nothing_ran(sim, reports, checkout, head):
+    assert sim.log() == [] and not reports.exists() and not (reports / "logs").exists()
+    assert "genierails-e2e" not in _git(checkout, "remote").split()
+    assert _git(checkout, "rev-parse", "HEAD") == head and _git(checkout, "status", "--porcelain") == ""
+
+
+def _live_args(sim, checkout, commit, reports):
+    args = [a.replace(str(sim.checkout), str(checkout)).replace(sim.baseline, commit) for a in sim.args]
+    args[args.index("--reports") + 1] = str(reports)
+    return [*args, "--scenarios", "s6"]
+
+
+class _NoSnapshots:
+    def __init__(self, *_):
+        raise AssertionError("no snapshot provider before the preflight passes")
+
+
+def test_non_head_commit_with_a_post_marker_ignore_rule_is_refused(sim, tmp_path):
+    # The bad commit (marker, then /envs/dev/ ignored) is not checked out: HEAD is the good baseline.
+    gitignore = sim.checkout / "aws/.gitignore"
+    gitignore.write_text(gitignore.read_text() + "/envs/dev/\n")
+    _git(sim.checkout, *IDENTITY, "commit", "-qam", "ignore dev")
+    bad = _git(sim.checkout, "rev-parse", "HEAD")
+    _git(sim.checkout, "checkout", "-q", "--detach", sim.baseline)
+    reports = tmp_path / "non-head-reports"
+    with pytest.raises(SystemExit) as exc:
+        driver.main(_live_args(sim, sim.checkout, bad, reports), snapshot_factory=_NoSnapshots)
+    assert f"is at {sim.baseline[:12]}, not {bad[:12]}" in str(exc.value)
+    _assert_nothing_ran(sim, reports, sim.checkout, sim.baseline)
+    # Checked out, the same commit is refused on its ignore rule, for dev only.
+    _git(sim.checkout, "checkout", "-q", "--detach", bad)
+    assert driver.customer_checkout_problems(sim.checkout, "aws", bad) == [
+        "aws/envs/dev/env.auto.tfvars is git-ignored, so authored env changes can't be committed"]
+
+
+def test_prod_ignore_rule_is_refused_too(sim):
+    gitignore = sim.checkout / "aws/.gitignore"
+    gitignore.write_text(gitignore.read_text() + "/envs/prod/\n")
+    _git(sim.checkout, *IDENTITY, "commit", "-qam", "ignore prod")
+    head = _git(sim.checkout, "rev-parse", "HEAD")
+    assert driver.customer_checkout_problems(sim.checkout, "aws", head) == [
+        "aws/envs/prod/env.auto.tfvars is git-ignored, so authored env changes can't be committed"]
+
+
+@pytest.mark.parametrize("link", ["file", "env_dir", "envs_dir"])
+def test_committed_symlinked_env_files_are_refused(sim, tmp_path, link):
+    checkout = tmp_path / f"links-{link}"
+    _genierails_checkout(checkout, customer=True)
+    elsewhere = checkout / "elsewhere"
+    if link == "file":
+        (elsewhere / "dev").mkdir(parents=True)
+        target = checkout / "aws/envs/dev/env.auto.tfvars"
+        (elsewhere / "dev/env.auto.tfvars").write_text(target.read_text())
+        target.unlink(); target.symlink_to("../../../elsewhere/dev/env.auto.tfvars")
+        bad = "aws/envs/dev/env.auto.tfvars (120000)"
+    elif link == "env_dir":
+        (checkout / "aws/envs/dev").rename(elsewhere)
+        (checkout / "aws/envs/dev").symlink_to("../../elsewhere")
+        bad = "aws/envs/dev (120000)"
+    else:
+        (checkout / "aws/envs").rename(elsewhere)
+        (checkout / "aws/envs").symlink_to("../elsewhere")
+        bad = "aws/envs (120000)"
+    _git(checkout, "add", "-A")
+    _git(checkout, *IDENTITY, "commit", "-qm", "symlinked envs")
+    head = _git(checkout, "rev-parse", "HEAD")
+    reports = tmp_path / f"links-{link}-reports"
+    with pytest.raises(SystemExit) as exc:
+        driver.main(_live_args(sim, checkout, head, reports), snapshot_factory=_NoSnapshots)
+    assert "must be a regular committed file in real directories" in str(exc.value)
+    assert bad in str(exc.value)
+    _assert_nothing_ran(sim, reports, checkout, head)
+
+
+def test_dirty_checkout_is_refused_before_anything_runs(sim, tmp_path):
+    (sim.checkout / "aws/.gitignore").write_text("# local edit\n")
+    reports = tmp_path / "dirty-reports"
+    with pytest.raises(SystemExit) as exc:
+        driver.main(_live_args(sim, sim.checkout, sim.baseline, reports), snapshot_factory=_NoSnapshots)
+    assert "is not clean at" in str(exc.value)
+    assert sim.log() == [] and not reports.exists()
+    _git(sim.checkout, "checkout", "-q", "--", "aws/.gitignore")

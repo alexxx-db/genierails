@@ -210,6 +210,9 @@ def test_the_dry_run_before_opting_in_proposes_table_readers_from_todays_grants(
     text = "\n".join(lines)
     assert '"cat.sch.t" = ["bi-sp", "masked", "regional"]' in text
     assert "can't be readers: bi-sp, masked" in text and 'set governance_mode = "deterministic"' in text
+    # The first deterministic generate refuses until the governed-table record exists.
+    rebuild = text.index(f"make rebuild-governed-tables ENV={ENV}")
+    assert rebuild < text.index("then make generate")
     assert not data["ok"]
 
 

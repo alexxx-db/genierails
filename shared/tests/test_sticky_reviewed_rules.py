@@ -730,6 +730,8 @@ def test_delta_mode_never_reads_or_merges_reviewed_rules(monkeypatch, tmp_path):
     monkeypatch.setattr(merge_space_configs, "load_reviewed_rules", must_not_run)
     monkeypatch.setattr(merge_space_configs, "keep_reviewed_rules", must_not_run)
     ran = []
+    # Legacy delta runs only after a real legacy env file is read (fail closed).
+    (tmp_path / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
     monkeypatch.setattr(generate_abac, "_run_delta_mode", lambda auth: ran.append(auth))
     monkeypatch.setattr(sys, "argv", [
         "generate_abac.py", "--delta", "--auth-file", str(tmp_path / "auth.auto.tfvars"),

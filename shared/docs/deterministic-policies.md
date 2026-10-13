@@ -3,7 +3,12 @@
 With `governance_mode = "deterministic"`, governance is computed only from
 `class.*` tags, column types and reviewed config (`access_tier_groups`,
 `raw_exempt_principals`, `treatment_versions`, `column_overrides`). No model
-output shapes a mask. Legacy envs are unchanged: none of this runs for them.
+output shapes a mask. `make generate` builds no prompt and calls no model, so
+it needs no model endpoint (design decision 5): the column masks and
+`gr_treatment` tags come from the tags and the mask library, the Genie config
+from the Genie API import, and the rest (groups, row filters, table tags) from
+the reviewed draft in `generated/`. Legacy envs are unchanged: none of this
+runs for them.
 
 Code: `governance_policies.py` (pure), `generate_abac.write_deterministic_model`,
 `scripts/derive_assignments.py`, `scripts/external_mask_inventory.py`,

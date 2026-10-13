@@ -556,7 +556,8 @@ def report(env_dir: Path, env: str) -> tuple[list[str], dict]:
                      "acknowledge its revocation.")
     if not deterministic(env_dir):
         lines += ["", f"Next: set governance_mode = \"deterministic\" and access_tier_groups in envs/{env}/env.auto.tfvars,",
-                  "  add the table_readers above, run make generate (the promotion, for a promoted env), then re-run",
+                  f"  add the table_readers above, run make rebuild-governed-tables ENV={env} (the first deterministic",
+                  "  generate refuses without it), then make generate (the promotion, for a promoted env), then re-run",
                   f"  make migrate-plan ENV={env} for the column-by-column comparison and the refusals."]
         return lines, data | {"ok": False, "ready": False}
 
