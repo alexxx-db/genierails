@@ -51,8 +51,13 @@ def _load_hcl(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def deterministic(env_dir: Path) -> bool:
-    return _load_hcl(Path(env_dir) / "env.auto.tfvars").get("governance_mode", "legacy") == "deterministic"
+def deterministic(env_dir: Path, *, require_env: bool = False) -> bool:
+    """Whether the env opted in. ``require_env`` fails closed: the env file must
+    be a readable, parseable regular file (not missing, a directory or a symlink)."""
+    path = Path(env_dir) / "env.auto.tfvars"
+    if require_env and (path.is_symlink() or not path.is_file()):
+        raise GovernedTablesError(f"{path} is missing or not a regular file; cannot tell legacy from deterministic")
+    return _load_hcl(path).get("governance_mode", "legacy") == "deterministic"
 
 
 def _tag_key() -> str:

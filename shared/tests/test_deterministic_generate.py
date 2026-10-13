@@ -314,9 +314,27 @@ def test_migration_doc_runs_rebuild_before_the_first_deterministic_generate():
     assert "rebuild it with: make rebuild-governed-tables ENV=dev" in doc
 
 
-@pytest.mark.parametrize("env_text", [ENV, "governance_mode = \"deterministic\"\n"])
-def test_delta_refuses_before_any_sdk_model_or_write(env_dir, monkeypatch, capfd, env_text):
-    (env_dir / "env.auto.tfvars").write_text(env_text)
+def _env_file_as(env_dir, case):
+    env = env_dir / "env.auto.tfvars"
+    if case in ("full", "minimal"):
+        env.write_text(ENV if case == "full" else 'governance_mode = "deterministic"\n')
+        return "a deterministic env never calls one"
+    env.unlink()
+    if case == "directory":
+        env.mkdir()
+    elif case == "symlink":
+        (env_dir / "real.tfvars").write_text('governance_mode = "legacy"\n')
+        env.symlink_to("real.tfvars")
+    elif case == "unparsable":
+        env.write_text("governance_mode = = {\n")
+        return "cannot parse"
+    return "is missing or not a regular file"
+
+
+# Missing, non-file and unparsable env files fail closed: never into legacy delta.
+@pytest.mark.parametrize("case", ["full", "minimal", "missing", "directory", "symlink", "unparsable"])
+def test_delta_refuses_before_any_sdk_model_or_write(env_dir, monkeypatch, capfd, case):
+    message = _env_file_as(env_dir, case)
     generated = _reviewed_draft(env_dir)
     before = {p: p.read_bytes() for p in env_dir.rglob("*") if p.is_file()}
     monkeypatch.setattr(generate_abac, "_run_delta_mode",
@@ -330,8 +348,9 @@ def test_delta_refuses_before_any_sdk_model_or_write(env_dir, monkeypatch, capfd
         _generate(env_dir, monkeypatch, "--delta")
     assert exc.value.code == 2
     err = capfd.readouterr().err
-    assert "a deterministic env never calls one" in err
-    assert "make generate" in err and "make derive-assignments" in err
+    assert message in err
+    if case in ("full", "minimal"):
+        assert "make generate" in err and "make derive-assignments" in err
     monkeypatch.undo()
     assert {p: p.read_bytes() for p in env_dir.rglob("*") if p.is_file()} == before
     assert generated.is_dir()

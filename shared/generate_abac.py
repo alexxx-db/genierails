@@ -7838,7 +7838,7 @@ def main():
         # env refuses it before any SDK call, model call or write.
         from scripts.sticky_governance import GovernedTablesError, deterministic
         try:
-            delta_deterministic = deterministic(Path(args.auth_file).parent)
+            delta_deterministic = deterministic(Path(args.auth_file).parent, require_env=True)
         except GovernedTablesError as exc:
             print(f"ERROR: generate --delta: {exc}", file=sys.stderr)
             sys.exit(2)
