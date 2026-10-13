@@ -309,7 +309,9 @@ def _is_for_this_deployment(state: dict, layer_dir: Path) -> bool:
 
 
 def _layer_state(layer_dir: Path, layer: str | None = None) -> dict | None:
-    from state_layout import state_json
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from scripts.state_layout import state_json
     layer_dir = Path(layer_dir)
     resolved_layer = layer or ("data_access" if layer_dir.name == DATA_ACCESS_SUBDIR else "workspace")
     env_dir = layer_dir.parent if resolved_layer == "data_access" else layer_dir

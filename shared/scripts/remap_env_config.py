@@ -103,7 +103,7 @@ def _space_key(name: str) -> str:
 
 def _deployed_space_keys(dest_env_dir: str) -> dict[str, list[str]]:
     """Map each Genie space key in the destination workspace state to its resource addresses (without the key)."""
-    from state_layout import state_json
+    from scripts.state_layout import state_json
     env_dir = Path(dest_env_dir)
     try:
         state = state_json(env_dir, env_dir.name, "workspace")

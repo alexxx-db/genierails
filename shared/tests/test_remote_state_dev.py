@@ -743,3 +743,27 @@ def test_every_sample_and_installer_pins_python_hcl2_below_8():
             if "pip install" in line and "python-hcl2" in line and f"'{HCL2_PIN}'" not in line:
                 unpinned.append(f"{path.relative_to(ROOT)}:{number}: unquoted in a shell (> redirects): {line.strip()}")
     assert unpinned == [], "\n".join(unpinned)
+
+
+# Each module that reads state lazily, and a call that reaches that read.
+LAZY_STATE_READERS = {
+    "scripts.coverage_gate": "m._layer_state(env / 'data_access')",
+    "scripts.staged_policy_apply": "m._read_state(env)",
+    "scripts.remap_env_config": "m._deployed_space_keys(str(env))",
+    "scripts.runtime_overlay": "__import__('state_layout').state_json(env, 'dev', 'workspace')",
+    "scripts.migration": "m._read_state(env, 'workspace')",
+}
+
+
+@pytest.mark.parametrize("module", sorted(LAZY_STATE_READERS))
+def test_state_readers_import_the_helper_without_help_from_other_modules(tmp_path, module):
+    # Each reader in a fresh interpreter with only shared/ on its path, as
+    # pytest or another module imports it: no earlier import may have put
+    # scripts/ on sys.path for it.
+    env = tmp_path / "aws" / "envs" / "dev"
+    (env / "data_access").mkdir(parents=True)
+    code = (f"import importlib, sys; from pathlib import Path; sys.path[:0] = [{str(SHARED)!r}]; "
+            f"m = importlib.import_module({module!r}); env = Path({str(env)!r}); {LAZY_STATE_READERS[module]}")
+    proc = subprocess.run([sys.executable, "-I", "-c", code], text=True, capture_output=True,
+                          env=_hermetic_env(tmp_path))
+    assert proc.returncode == 0, proc.stderr

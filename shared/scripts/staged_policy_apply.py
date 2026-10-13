@@ -180,7 +180,7 @@ def state_problems(live: dict, active: dict | None, pending: list[dict]) -> list
 
 
 def _read_state(env_dir: Path) -> dict | None:
-    from state_layout import state_json
+    from scripts.state_layout import state_json
     try:
         return state_json(env_dir, env_dir.name, "data_access")
     except RuntimeError as exc:
