@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ def test_dry_run_is_offline_and_writes_reports(tmp_path, monkeypatch):
     assert any(item["command"] == "make setup ENV=dev" for item in champion["steps"])
     assert not any("terraform" in item["command"].split()[:1] for item in champion["steps"])
     assert (tmp_path / "s1.md").is_file()
-    assert json.loads((tmp_path / "s1.json").read_text())["would_not_run"] == ["requires step 11"]
+    assert json.loads((tmp_path / "s1.json").read_text())["would_not_run"] == []
 
 
 def test_snapshot_diff_is_stable_and_order_insensitive():
@@ -44,10 +45,12 @@ def test_snapshot_diff_is_stable_and_order_insensitive():
 
 def test_missing_target_has_step_marker():
     s1 = next(s for s in driver.SCENARIOS if s.key == "s1")
-    plan = driver.scenario_plan(s1, {"check", "rehearse", "promote-to", "release", "maintain"})
-    capture = next(item for item in plan if item["command"].startswith("make capture"))
-    assert capture["status"] == "skip"
-    assert capture["skip_reason"] == "requires step 11"
+    fake = dataclasses.replace(s1.steps[1], command=("make", "future-target", "ENV=dev"),
+                               target="future-target", requires_step=99)
+    plan = driver.scenario_plan(dataclasses.replace(s1, steps=(s1.steps[0], fake, *s1.steps[2:])), REAL_TARGETS)
+    item = next(item for item in plan if item["command"].startswith("make future-target"))
+    assert item["status"] == "skip"
+    assert item["skip_reason"] == "requires step 99"
 
 
 def test_every_executable_step_uses_public_make_target():
@@ -177,24 +180,31 @@ def live(monkeypatch):
     return setup
 
 
-# Blocker 1: a scenario needing an unbuilt step runs nothing at all.
-def test_missing_step_scenarios_are_not_run_and_issue_no_make(tmp_path, live):
-    calls = live(set(ALL_TARGETS) - {"capture", "detach-agent", "migration-report", "migration-apply"})
-    for key in ("s1", "s3", "s7", "s13", "migration"):
-        assert driver.main(live_args(tmp_path, key), snapshot_factory=FakeSnapshots) == 0
-        report = json.loads((tmp_path / "reports" / f"{key}.json").read_text())
-        assert report["status"] == "NOT RUN"
-        assert all(item["status"] in ("NOT RUN", "skip") for item in report["steps"])
+# Blocker 1: a scenario needing a genuinely unbuilt target runs nothing at all.
+def test_missing_fake_target_scenario_is_not_run_and_issues_no_make(tmp_path, live, monkeypatch):
+    s1 = next(s for s in driver.SCENARIOS if s.key == "s1")
+    fake = dataclasses.replace(s1.steps[1], command=("make", "future-target", "ENV=dev"),
+                               target="future-target", requires_step=99)
+    monkeypatch.setattr(driver, "SCENARIOS", (dataclasses.replace(s1, steps=(s1.steps[0], fake, *s1.steps[2:])),))
+    calls = live(REAL_TARGETS)
+    assert driver.main(live_args(tmp_path, "s1"), snapshot_factory=FakeSnapshots) == 0
+    report = json.loads((tmp_path / "reports" / "s1.json").read_text())
+    assert report["status"] == "NOT RUN"
+    assert all(item["status"] in ("NOT RUN", "skip") for item in report["steps"])
     assert not makes(calls)
 
 
-def test_this_repo_has_no_step_10_11_targets_so_those_scenarios_are_not_run(tmp_path, live):
-    snaps = []
-    class Recording(FakeSnapshots):
-        def capture(self, env): snaps.append(env); return super().capture(env)
-    calls = live(REAL_TARGETS)
-    assert driver.main(live_args(tmp_path, "s1,s3,s7,s13,migration"), snapshot_factory=Recording) == 0
-    assert not makes(calls) and not snaps
+def test_step_10_11_scenarios_are_runnable_in_this_repo_and_dry_run_is_offline(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dry-run must not invoke subprocess or snapshots")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    keys = "s1,s3,s7,s13,migration"
+    assert driver.main(["--cloud", "aws", "--repo", str(ROOT), "--dry-run",
+                        "--scenarios", keys, "--reports", str(tmp_path)]) == 0
+    for key in keys.split(","):
+        report = json.loads((tmp_path / f"{key}.json").read_text())
+        assert report["status"] == "dry-run"
+        assert report["would_not_run"] == []
 
 
 # Blocker 2: refusals, placeholders, CI and unrelated failures.
