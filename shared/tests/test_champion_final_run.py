@@ -772,14 +772,32 @@ def test_no_saved_plan_file_is_written_by_the_product():
     # A saved plan embeds prior state, which may still hold the legacy secret.
     # The one exception is make release-plan (deterministic envs only), whose
     # plans go to its owner-only manifest dir (scripts/release_gate.py).
-    assert not re.search(r"-out[= ]", (SHARED / "scripts/terraform_layer.sh").read_text())
+    tf_out = r"(?<![-\w])-out[= ]\S*"  # Terraform's -out, not a script's --out
+    assert not re.findall(tf_out, (SHARED / "scripts/terraform_layer.sh").read_text())
     makefile = (SHARED / "Makefile.shared").read_text()
     roots = makefile[makefile.index("\n_release-plan-roots:"):]
     roots = roots[:roots.index("\n\n")]
-    tf_out = r"(?<![-\w])-out[= ]\S*"  # Terraform's -out, not a script's --out
     assert re.findall(tf_out, makefile) == re.findall(tf_out, roots)
     assert re.findall(tf_out, roots) == ['-out="$$plan_dir/account.tfplan"',
                                          '-out="$$plan_dir/workspace.tfplan";']
+
+
+@pytest.mark.parametrize("line, saved", [
+    ('terraform plan -out=x\n', True),
+    ('"$TF" plan -input=false -out "$PLAN"\n', True),
+    ('python3 state_layout.py state-file --out "$DIR/x.tfstate.json"\n', False),
+])
+def test_saved_plan_check_flags_terraform_out_but_not_a_script_out(monkeypatch, tmp_path, line, saved):
+    layer = tmp_path / "scripts/terraform_layer.sh"
+    layer.parent.mkdir()
+    layer.write_text((SHARED / "scripts/terraform_layer.sh").read_text() + line)
+    (tmp_path / "Makefile.shared").write_text((SHARED / "Makefile.shared").read_text())
+    monkeypatch.setattr(sys.modules[__name__], "SHARED", tmp_path)
+    if saved:
+        with pytest.raises(AssertionError):
+            test_no_saved_plan_file_is_written_by_the_product()
+    else:
+        test_no_saved_plan_file_is_written_by_the_product()
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
