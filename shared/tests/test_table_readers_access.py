@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1095,7 +1096,8 @@ def _main_tree(tmp_path: Path) -> Path:
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
-@pytest.mark.parametrize("root_name,body", [("data_access", LEGACY_DATA_ACCESS_TEST), ("workspace", LEGACY_WORKSPACE_TEST)])
+@pytest.mark.parametrize("root_name,body", [("data_access", LEGACY_DATA_ACCESS_TEST), ("workspace", LEGACY_WORKSPACE_TEST)],
+                         ids=["data_access", "workspace"])
 def test_legacy_roots_applied_by_main_plan_no_changes(root_name, body, tmp_path, tf_plugin_cache):
     from tests.terraform_helpers import shared_copy, tf, tf_env, tf_init
 
@@ -1122,4 +1124,16 @@ def test_legacy_roots_applied_by_main_plan_no_changes(root_name, body, tmp_path,
     assert result.returncode == 0, result.stdout + result.stderr
     replan = result.stdout[result.stdout.index('run "planned_by_this_branch"'):]
     assert replan.split("\n", 1)[0].endswith("pass"), replan
-    assert "No changes. Your infrastructure matches the configuration." in replan, replan
+    if root_name == "workspace":
+        # Step 11 added this root output. Legacy state has no prior value, so
+        # the first upgrade plan records an empty output without touching any
+        # managed resource. Keep this exact to catch any real or extra drift.
+        assert re.search(
+            r"Changes to Outputs:\n\s+\+ genie_space_id_records\s+= \{}\n\n"
+            r"You can apply this plan to save these new output values to the Terraform\n"
+            r"state, without changing any real infrastructure\.", replan
+        ), replan
+        assert not re.search(r"(?:will be|must be) (?:created|updated|replaced|destroyed)", replan), replan
+        assert replan.count("Changes to Outputs:") == 1, replan
+    else:
+        assert "No changes. Your infrastructure matches the configuration." in replan, replan

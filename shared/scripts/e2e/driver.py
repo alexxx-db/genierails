@@ -37,7 +37,7 @@ GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genier
 # Targets that apply to a workspace/account: the checkout must be clean and
 # pinned before them, and running one means the scenario must be restored.
 APPLYING = frozenset({"rehearse", "release-plan", "release", "maintain", "detach-agent",
-                      "apply-account", "migration-apply"})
+                      "apply-account"})
 # Targets that author files under envs/ (committed later by a local merge) and,
 # for ungovern in a rehearse env, also apply.
 AUTHORING = frozenset({"setup", "generate", "promote-to", "capture", "ungovern", "scaffold-treatments"})
@@ -227,9 +227,9 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Commit, plan bytes, serial, live snapshot and kept-name changes each invalidate the old manifest; locks serialize applies.",),
         ("Remove each external grant/mask through its owning fixture immediately.",)),
     _scenario("migration", "Legacy migration operations", ("Reviewed report-only legacy fixture and revocation report exist.",),
-        (mk("Migration report", "migration-report", "prod", step=10), mk("Migration cutover", "migration-apply", "prod", step=10)),
-        ("Every column/reader consequence is reviewed; phases tighten before loosen; verification is fresh.",),
-        ("Rollback both source and promotion using exact rollback acknowledgement.",), ("Target names are supplied by rollout step 10 implementation.",)),
+        (mk("Migration report", "migrate-plan", "prod", step=10),),
+        ("Every column/reader consequence and proposed table_readers entry is reported without mutation.",),
+        ("Remove the generated proposal if the migration fixture is not proceeding.",)),
 )
 
 # Explicit top-level snapshot components each scenario is allowed to change.
