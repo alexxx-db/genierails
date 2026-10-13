@@ -25,6 +25,29 @@ python3 shared/scripts/e2e/driver.py --cloud aws \
   --scenarios champion --confirm-live
 ```
 
+The checkout must be customer-shaped, that is, it must commit `envs/`. The
+upstream GenieRails `.gitignore` ignores `envs/`, so in a plain clone the
+driver's local merge (`git add -A -- envs`) would fail. Before anything runs
+(no log, git switch, snapshot or `make`), the driver checks the `--commit`
+with read-only git:
+
+- `<cloud>/.gitignore` has the block `make setup GITIGNORE=customer` writes;
+- `<cloud>/envs/dev/env.auto.tfvars` and `<cloud>/envs/prod/env.auto.tfvars`
+  are committed;
+- when that commit is checked out, `git check-ignore` does not ignore
+  `<cloud>/envs/dev/env.auto.tfvars`.
+
+If any check fails it exits non-zero with what is missing and the fix, and
+runs nothing. Prepare the checkout once:
+
+```bash
+cd aws && make setup ENV=dev GITIGNORE=customer
+git add .gitignore envs && git commit -m "Commit envs/ (customer repo)"
+```
+
+Then pass that commit as `--commit`. The upstream root `.gitignore` is left
+as it is: `<cloud>/.gitignore` re-includes `envs/`.
+
 Live runs require an explicit 40-hex commit and persistent checkout. Before
 each scenario and each step the driver verifies HEAD is the pinned commit
 (`git checkout --force --detach <commit>` at scenario start). Applying targets

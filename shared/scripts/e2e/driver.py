@@ -44,6 +44,11 @@ AUTHORING = frozenset({"setup", "generate", "promote-to", "capture", "ungovern",
 # Scenarios whose purpose is to remove or loosen protection mid-scenario. The
 # post-restore check still applies to them.
 WEAKENING_EXPECTED = frozenset({"s8", "s9", "migration"})
+# The upstream .gitignore ignores envs/, so a local merge can only commit
+# authored changes in a checkout whose <cloud>/.gitignore has the block
+# `make setup GITIGNORE=customer` writes (scripts/customer_gitignore.py BEGIN).
+CUSTOMER_GITIGNORE_MARKER = "# >>> GenieRails customer repo (make setup GITIGNORE=customer"
+CUSTOMER_ENVS = ("dev", "prod")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -705,6 +710,30 @@ class Checkout:
         return self.switch(fixed, "restore-checkout")
 
 
+def customer_checkout_problems(checkout_dir: Path, cloud: str, commit: str) -> list[str]:
+    """Why ``commit`` can't carry authored envs/ changes; read-only git only."""
+    def git(*argv: str) -> subprocess.CompletedProcess:
+        return subprocess.run(("git", *argv), cwd=checkout_dir, capture_output=True, text=True)
+
+    if git("cat-file", "-e", f"{commit}^{{commit}}").returncode:
+        return [f"commit {commit[:12]} is not in {checkout_dir}"]
+    problems = []
+    gitignore = git("show", f"{commit}:{cloud}/.gitignore")
+    if gitignore.returncode or CUSTOMER_GITIGNORE_MARKER not in gitignore.stdout:
+        problems.append(f"{cloud}/.gitignore at {commit[:12]} has no GenieRails customer block, so the "
+                        "upstream .gitignore ignores envs/ and `git add -A -- envs` fails")
+    for env in CUSTOMER_ENVS:
+        if git("cat-file", "-e", f"{commit}:{cloud}/envs/{env}/env.auto.tfvars").returncode:
+            problems.append(f"{cloud}/envs/{env}/env.auto.tfvars is not committed at {commit[:12]}")
+    # The working tree's ignore rules are the commit's only when it is checked out.
+    head = git("rev-parse", "HEAD")
+    if not problems and head.returncode == 0 and head.stdout.strip() == commit:
+        probe = f"{cloud}/envs/{CUSTOMER_ENVS[0]}/env.auto.tfvars"
+        if git("check-ignore", "-q", "--no-index", probe).returncode == 0:
+            problems.append(f"{probe} is git-ignored, so authored env changes can't be committed")
+    return problems
+
+
 def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Per-column and per-principal protection facts, independent of IDs and timestamps."""
     result: dict[str, Any] = {"columns": set(), "masks": set(), "policies": {}, "grants": set()}
@@ -871,6 +900,14 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
     state_dir = args.state_dir.resolve()
     if state_dir == checkout_dir or checkout_dir in state_dir.parents: raise SystemExit("--state-dir must be outside the checkout")
     if reports == checkout_dir or checkout_dir in reports.parents: raise SystemExit("--reports must be outside the checkout")
+    # Checked before any log, switch, snapshot or make: nothing runs on a refusal.
+    problems = customer_checkout_problems(checkout_dir, args.cloud, args.commit.lower())
+    if problems:
+        raise SystemExit(
+            f"live execution requires a customer-shaped checkout that commits envs/; {checkout_dir} at "
+            f"{args.commit[:12]} does not:\n" + "".join(f"  - {p}\n" for p in problems)
+            + f"  Fix: cd {args.cloud} && make setup ENV=dev GITIGNORE=customer, commit {args.cloud}/.gitignore "
+            f"and {args.cloud}/envs/, then pass that commit as --commit. Nothing was run.")
     log_root = reports / "logs"; log_root.mkdir(parents=True, exist_ok=True)
     secrets = collect_secrets(cloud_root)
     runner = CommandRunner(cloud_root, log_root, {"GENIERAILS_STATE_DIR": str(state_dir), "RELEASE_REMOTE": E2E_REMOTE,

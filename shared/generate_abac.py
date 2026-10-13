@@ -1019,6 +1019,64 @@ def restore_reviewed_genie_text(existing: str, rendered: str, spaces: list[str])
     return rendered
 
 
+_IMPORTED_GENIE_COMMENT_RE = re.compile(
+    r"^# (?:genie_space_configs parsed verbatim from the existing Genie agent|"
+    r"Edit here to manage space config as code;)[^\n]*\n", re.MULTILINE,
+)
+_ID_TO_NAME_COMMENT_RE = re.compile(
+    r"^# Tool-owned canonical identity for id-only imported spaces[^\n]*\n", re.MULTILINE,
+)
+
+
+def inject_imported_genie_config(
+    hcl_block: str, reviewed_path: Path, api_genie_configs: dict[str, dict],
+    genie_space_id_to_name: dict[str, str],
+) -> str:
+    """Replace genie_space_configs with the config imported from the Genie API.
+
+    For spaces with a genie_space_id the UI config is authoritative, so the
+    block is the verbatim parse of the Genie agent API, with reviewed
+    benchmarks/snippets in ``reviewed_path`` kept. The comments written with
+    the blocks are replaced too, so a re-run over its own output is stable.
+    """
+    if api_genie_configs:
+        hcl_block = _IMPORTED_GENIE_COMMENT_RE.sub("", hcl_block)
+    if genie_space_id_to_name:
+        hcl_block = _ID_TO_NAME_COMMENT_RE.sub("", hcl_block)
+    if api_genie_configs:
+        reviewed_genie_text = reviewed_path.read_text() if reviewed_path.exists() else ""
+        kept_genie_fields = keep_reviewed_genie_content(reviewed_path, api_genie_configs)
+        if kept_genie_fields:
+            print(
+                "  Kept reviewed Genie benchmarks/snippets: "
+                + ", ".join(kept_genie_fields)
+            )
+        hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_configs")
+        injected_hcl = (
+            "\n# genie_space_configs parsed verbatim from the existing Genie agent(s).\n"
+            "# Edit here to manage space config as code; make apply pushes changes back.\n"
+            + format_genie_space_configs_hcl(api_genie_configs)
+        )
+        injected_hcl = restore_reviewed_genie_text(
+            reviewed_genie_text, injected_hcl, list(api_genie_configs)
+        )
+        hcl_block = hcl_block.rstrip() + "\n" + injected_hcl + "\n"
+        print(
+            f"  Injected genie_space_configs from Genie API for: "
+            f"{', '.join(api_genie_configs)}"
+        )
+
+    if genie_space_id_to_name:
+        hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_id_to_name")
+        hcl_block = (
+            hcl_block.rstrip()
+            + "\n\n# Tool-owned canonical identity for id-only imported spaces.\n"
+            + format_string_map_hcl("genie_space_id_to_name", genie_space_id_to_name)
+            + "\n"
+        )
+    return hcl_block
+
+
 def format_string_map_hcl(name: str, values: dict[str, str]) -> str:
     """Render a deterministic tool-owned string map."""
     lines = [f"{name} = {{"]
@@ -3270,6 +3328,97 @@ def write_deterministic_model(tfvars_path: Path, sql_path: Path | None, model) -
             sql_path.write_text(sql_updated)
             changed = True
     return changed
+
+
+DETERMINISTIC_DRAFT_HEADER = (
+    "# ============================================================================\n"
+    "# GENERATED ABAC CONFIG (deterministic governance)\n"
+    "# ============================================================================\n"
+    "# Column masks and gr_treatment tags are computed from native class.* tags and\n"
+    "# the mask library; Genie config is imported from the Genie API. No model is\n"
+    "# called. Review, then: make rehearse ENV=<env>\n"
+    "# ============================================================================\n\n"
+)
+
+
+def write_deterministic_draft(
+    out_dir: Path, auth_cfg: dict, *, mode: str, group_names: list[str],
+    catalog_schemas: list[tuple[str, str]], api_genie_configs: dict[str, dict],
+    genie_space_id_to_name: dict[str, str], bootstrap_spaces: bool,
+) -> tuple[Path, Path]:
+    """Write a deterministic env's draft without a model (design decision 5).
+
+    The reviewed draft in ``out_dir`` is the base, so reviewed group
+    descriptions, row filters and non-column tags are kept. ``groups`` is the
+    consumed tier list and genie_space_configs is the Genie API import; the
+    column masks and treatment facts are then replaced by
+    write_deterministic_model. Returns (abac.auto.tfvars, masking_functions.sql).
+    """
+    import hcl2
+    from scripts.merge_space_configs import _render_value
+
+    tfvars_path = out_dir / "abac.auto.tfvars"
+    sql_path = out_dir / "masking_functions.sql"
+    reviewed = tfvars_path.read_text() if tfvars_path.exists() else ""
+    text = reviewed or DETERMINISTIC_DRAFT_HEADER
+    if mode == "genie":
+        text = strip_abac_for_genie_mode(text)
+    # Tool-owned blocks are re-appended in a fixed order, so a re-run over
+    # this function's own output leaves the file unchanged.
+    owned = ["groups", "genie_space_id_to_name"]
+    if mode == "governance" or api_genie_configs:
+        owned.append("genie_space_configs")
+    for key in owned:
+        text = remove_hcl_top_level_block(text, key)
+    text = _ID_TO_NAME_COMMENT_RE.sub("", _IMPORTED_GENIE_COMMENT_RE.sub("", text)).rstrip() + "\n"
+    if mode != "genie":
+        reviewed_groups = (hcl2.loads(reviewed).get("groups") or {}) if reviewed else {}
+        groups = {
+            name: {"description": str((reviewed_groups.get(name) or {}).get("description") or "")}
+            for name in group_names
+        }
+        text += "\ngroups = " + _render_value(groups) + "\n"
+    if mode != "governance":
+        text = inject_imported_genie_config(
+            text, tfvars_path, api_genie_configs, genie_space_id_to_name,
+        )
+    tfvars_path.write_text(text.rstrip() + "\n")
+
+    if mode != "governance":
+        strip_draft_genie_acl_fields(tfvars_path)
+        autofix_genie_config_fields(tfvars_path)
+        autofix_missing_genie_space_entries(tfvars_path, auth_cfg)
+        if bootstrap_spaces:
+            env_tfvars = tfvars_path.parent.parent / "env.auto.tfvars"
+            try:
+                n_acl = autofix_acl_groups(
+                    tfvars_path,
+                    env_tfvars if env_tfvars.exists() else None,
+                    defer_unmapped=mode == "genie",
+                )
+            except ValueError as exc:
+                # Decision 4: an agent without acl_groups stops the run.
+                if reviewed:
+                    tfvars_path.write_text(reviewed)
+                else:
+                    tfvars_path.unlink()
+                print(f"ERROR: {exc}")
+                sys.exit(1)
+            if n_acl:
+                print(f"  Derived ACL sidecar for {n_acl} Genie agent(s)")
+
+    # Reviewed functions stay (row filters use them; legacy masks are never
+    # dropped); write_deterministic_model replaces only the library block.
+    if mode != "genie" and not sql_path.exists():
+        sql = "-- GENERATED MASKING FUNCTIONS (deterministic governance)\n"
+        if catalog_schemas:
+            sql += f"USE CATALOG {catalog_schemas[0][0]};\nUSE SCHEMA {catalog_schemas[0][1]};\n"
+        sql_path.write_text(sql)
+    print(f"  abac.auto.tfvars written to: {tfvars_path} (deterministic; no model called)")
+
+    if bootstrap_spaces:
+        bootstrap_per_space_dirs(out_dir, auth_cfg, tfvars_path.read_text())
+    return tfvars_path, sql_path
 
 
 def deterministic_model_for(
@@ -7716,6 +7865,19 @@ def main():
         print(f"ERROR: {e}")
         sys.exit(1)
 
+    # Design decision 5: a deterministic env's governance comes from class.*
+    # tags and the mask library, its Genie config from the Genie API import, so
+    # generate never calls a model and needs no model endpoint.
+    deterministic_mode = auth_cfg.get("governance_mode", "legacy") == "deterministic"
+    if deterministic_mode and args.mode != "genie" and (args.space or args.tables):
+        print("ERROR: deterministic governance derives the whole governed set at once; run "
+              "make generate without SPACE or tables, or make derive-assignments")
+        sys.exit(1)
+    if deterministic_mode and args.create_groups:
+        print("ERROR: deterministic governance consumes the existing groups in "
+              f"{ACCESS_TIER_GROUPS_SETTING}; --create-groups needs a model to invent them")
+        sys.exit(1)
+
     # ── Country/region overlay: resolve from CLI --country or env config ─────
     # Priority: CLI --country > env.auto.tfvars country field > empty (global)
     country_raw = args.country or auth_cfg.get("country", "")
@@ -8189,23 +8351,29 @@ def main():
             configured_space_names = names
 
     overlay_detection_comments = ""
-    if industries:
+    if industries and not deterministic_mode:
         _, overlay_detection_comments = build_industry_detection_guidance(
             ddl_text,
             industries,
         )
 
-    prompt = build_prompt(
-        ddl_text,
-        catalog_schemas=catalog_schemas,
-        group_names=group_names,
-        per_space_name=args.space if args.space else None,
-        space_names=configured_space_names,
-        mode=args.mode,
-        countries=countries,
-        industries=industries,
-        create_groups=args.create_groups,
-    )
+    if deterministic_mode:
+        prompt = None
+        if args.dry_run:
+            print("  DRY RUN — deterministic governance builds no prompt and calls no model.")
+            sys.exit(0)
+    else:
+        prompt = build_prompt(
+            ddl_text,
+            catalog_schemas=catalog_schemas,
+            group_names=group_names,
+            per_space_name=args.space if args.space else None,
+            space_names=configured_space_names,
+            mode=args.mode,
+            countries=countries,
+            industries=industries,
+            create_groups=args.create_groups,
+        )
 
     if args.dry_run:
         print("=" * 60)
@@ -8232,6 +8400,20 @@ def main():
                 print(line)
             sys.exit(1)
 
+    # Built before anything is written, so a refusal leaves generated/ as it was.
+    deterministic_model = None
+    if deterministic_mode and args.mode != "genie":
+        from governance_policies import DeterministicGovernanceError
+        if classification_source is None:
+            print("ERROR: deterministic governance is computed from native class.* tags, and none "
+                  "were read; set enable_classification = true and wait for the tags")
+            sys.exit(1)
+        try:
+            deterministic_model = deterministic_model_for(auth_cfg, classification_source, ddl_text)
+        except DeterministicGovernanceError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+
     # ── Reviewed rules from a prior run stick (additive merge after drafting) ──
     # The assembled generated/ draft is the reviewed rule set, also in --space
     # mode. Genie mode drafts no rules, so it has nothing to merge.
@@ -8247,7 +8429,7 @@ def main():
         prior_function_names = extract_function_names(_prior_sql_path.read_text())
     except FileNotFoundError:
         prior_function_names = set()
-    if args.mode != "genie":
+    if args.mode != "genie" and not deterministic_mode:
         try:
             reviewed_rules = load_reviewed_rules(Path(args.out_dir).resolve())
         except ValueError as e:
@@ -8255,32 +8437,46 @@ def main():
                 print(f"ERROR: {e}")
                 sys.exit(1)
 
-    if args.provider == "databricks":
-        configure_databricks_env(auth_cfg)
+    all_cs = catalog_schemas if catalog_schemas else [(catalog, schema)] if catalog and schema else []
 
-    provider_cfg = PROVIDERS[args.provider]
-    model = args.model or provider_cfg["default_model"]
-    call_fn = provider_cfg["call"]
+    if deterministic_mode:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tfvars_path, sql_path = write_deterministic_draft(
+            out_dir, auth_cfg, mode=args.mode, group_names=group_names or [],
+            catalog_schemas=all_cs, api_genie_configs=api_genie_configs,
+            genie_space_id_to_name=genie_space_id_to_name,
+            bootstrap_spaces=target_space_cfg is None and not args.space,
+        )
+        hcl_block = tfvars_path.read_text()
+        sql_block = sql_path.read_text() if args.mode != "genie" and sql_path.exists() else None
+        response_path = None
+    else:
+        if args.provider == "databricks":
+            configure_databricks_env(auth_cfg)
 
-    _semantic_retry_count = 0
-    _semantic_max_retries = args.max_retries
+        provider_cfg = PROVIDERS[args.provider]
+        model = args.model or provider_cfg["default_model"]
+        call_fn = provider_cfg["call"]
 
-    response_text = call_with_retries(call_fn, prompt, model, args.max_retries)
+        _semantic_retry_count = 0
+        _semantic_max_retries = args.max_retries
 
-    sql_block, hcl_block = extract_code_blocks(response_text)
+        response_text = call_with_retries(call_fn, prompt, model, args.max_retries)
 
-    if not sql_block:
-        print("\nWARNING: Could not extract SQL code block from the response.")
-        print("  The full response will be saved to generated_response.md for manual extraction.\n")
-    if not hcl_block:
-        print("\nWARNING: Could not extract HCL code block from the response.")
-        print("  The full response will be saved to generated_response.md for manual extraction.\n")
+        sql_block, hcl_block = extract_code_blocks(response_text)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+        if not sql_block:
+            print("\nWARNING: Could not extract SQL code block from the response.")
+            print("  The full response will be saved to generated_response.md for manual extraction.\n")
+        if not hcl_block:
+            print("\nWARNING: Could not extract HCL code block from the response.")
+            print("  The full response will be saved to generated_response.md for manual extraction.\n")
 
-    response_path = out_dir / "generated_response.md"
-    response_path.write_text(response_text)
-    print(f"\n  Full LLM response saved to: {response_path}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        response_path = out_dir / "generated_response.md"
+        response_path.write_text(response_text)
+        print(f"\n  Full LLM response saved to: {response_path}")
 
     tuning_md = f"""# Review & Tune (Before Apply)
 
@@ -8332,18 +8528,17 @@ Before you apply, tune for your business roles, security requirements, and Genie
 
 """
 
-    tuning_path = out_dir / "TUNING.md"
-    tuning_path.write_text(tuning_md)
-    print(f"  Tuning checklist written to: {tuning_path}")
+    if not deterministic_mode:
+        tuning_path = out_dir / "TUNING.md"
+        tuning_path.write_text(tuning_md)
+        print(f"  Tuning checklist written to: {tuning_path}")
 
-    if sql_block and args.mode == "genie":
+    if sql_block and args.mode == "genie" and not deterministic_mode:
         # Genie mode: masking functions are owned by the governance team; discard SQL output.
         print("  [genie mode] Skipping masking_functions.sql (managed by governance team)")
         sql_block = None
 
-    all_cs = catalog_schemas if catalog_schemas else [(catalog, schema)] if catalog and schema else []
-
-    if sql_block:
+    if sql_block and not deterministic_mode:
         targets = ", ".join(f"{c}.{s}" for c, s in all_cs)
         sql_header = (
             "-- ============================================================================\n"
@@ -8368,7 +8563,9 @@ Before you apply, tune for your business roles, security requirements, and Genie
         print(f"  masking_functions.sql written to: {sql_path}")
         print(f"    Target schemas: {targets}")
 
-    if hcl_block:
+    # The model-free deterministic draft is complete: none of the model-output
+    # repairs below apply to it.
+    if hcl_block and not deterministic_mode:
         if args.mode == "genie" and champion_flow:
             hcl_header = (
                 "# ============================================================================\n"
@@ -8485,41 +8682,9 @@ Before you apply, tune for your business roles, security requirements, and Genie
         # genie_space_id the UI config is authoritative. Replace the LLM-generated
         # block with the verbatim parse from the Genie agent API.
         # Skip in governance mode — genie_space_configs is managed by BU teams.
-        if api_genie_configs and args.mode != "governance":
-            reviewed_genie_text = (
-                (out_dir / "abac.auto.tfvars").read_text()
-                if (out_dir / "abac.auto.tfvars").exists() else ""
-            )
-            kept_genie_fields = keep_reviewed_genie_content(
-                out_dir / "abac.auto.tfvars", api_genie_configs
-            )
-            if kept_genie_fields:
-                print(
-                    "  Kept reviewed Genie benchmarks/snippets: "
-                    + ", ".join(kept_genie_fields)
-                )
-            hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_configs")
-            injected_hcl = (
-                "\n# genie_space_configs parsed verbatim from the existing Genie agent(s).\n"
-                "# Edit here to manage space config as code; make apply pushes changes back.\n"
-                + format_genie_space_configs_hcl(api_genie_configs)
-            )
-            injected_hcl = restore_reviewed_genie_text(
-                reviewed_genie_text, injected_hcl, list(api_genie_configs)
-            )
-            hcl_block = hcl_block.rstrip() + "\n" + injected_hcl + "\n"
-            print(
-                f"  Injected genie_space_configs from Genie API for: "
-                f"{', '.join(api_genie_configs)}"
-            )
-
-        if genie_space_id_to_name and args.mode != "governance":
-            hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_id_to_name")
-            hcl_block = (
-                hcl_block.rstrip()
-                + "\n\n# Tool-owned canonical identity for id-only imported spaces.\n"
-                + format_string_map_hcl("genie_space_id_to_name", genie_space_id_to_name)
-                + "\n"
+        if args.mode != "governance":
+            hcl_block = inject_imported_genie_config(
+                hcl_block, out_dir / "abac.auto.tfvars", api_genie_configs, genie_space_id_to_name,
             )
 
         tfvars_path = out_dir / "abac.auto.tfvars"
@@ -9085,7 +9250,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
         for line in policy_autofix_results(rules_abac, reviewed_rules[0]):
             print(line)
 
-    if sql_block and hcl_block and args.mode != "genie":
+    if sql_block and hcl_block and args.mode != "genie" and not deterministic_mode:
         pruned = prune_unused_new_functions(
             validation_dir / "masking_functions.sql", validation_dir / "abac.auto.tfvars",
             prior_function_names,
@@ -9095,24 +9260,9 @@ Before you apply, tune for your business roles, security requirements, and Genie
                   f"{', '.join(pruned)}")
 
     # Deterministic governance is computed only from class.* tags, column types
-    # and reviewed config, last, so no model output or autofix above can shape
-    # a mask: every column mask and treatment fact is replaced.
-    if (hcl_block and args.mode != "genie"
-            and auth_cfg.get("governance_mode", "legacy") == "deterministic"):
-        from governance_policies import DeterministicGovernanceError
-        if args.space or args.tables:
-            print("ERROR: deterministic governance derives the whole governed set at once; run "
-                  "make generate without SPACE or tables, or make derive-assignments")
-            sys.exit(1)
-        if classification_source is None:
-            print("ERROR: deterministic governance is computed from native class.* tags, and none "
-                  "were read; set enable_classification = true and wait for the tags")
-            sys.exit(1)
-        try:
-            model = deterministic_model_for(auth_cfg, classification_source, ddl_text)
-        except DeterministicGovernanceError as exc:
-            print(f"ERROR: {exc}")
-            sys.exit(1)
+    # and reviewed config: every column mask and treatment fact is replaced.
+    if deterministic_model is not None:
+        model = deterministic_model
         write_deterministic_model(
             validation_dir / "abac.auto.tfvars",
             validation_dir / "masking_functions.sql",
@@ -9172,7 +9322,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 print(
                     "\n  Promoted into shared account + env-scoped data_access + workspace configs."
                 )
-    elif not hcl_block or (not sql_block and args.mode == "full"):
+    elif not deterministic_mode and (not hcl_block or (not sql_block and args.mode == "full")):
         print("\n  [ERROR] Could not extract both code blocks from LLM response.")
         print(f"  Review {response_path} and manually extract the files.")
         sys.exit(1)
@@ -9200,15 +9350,20 @@ Before you apply, tune for your business roles, security requirements, and Genie
             for line in generate_next_steps(
                 out_dir.resolve(), args.mode, WORK_DIR.name,
                 has_sql=bool(sql_block), champion_flow=champion_flow,
+                tuning=not deterministic_mode,
             ):
                 print(line)
     print("=" * 60)
 
 
 def generate_next_steps(
-    out_dir: Path, mode: str, env_name: str, *, has_sql: bool, champion_flow: bool
+    out_dir: Path, mode: str, env_name: str, *, has_sql: bool, champion_flow: bool,
+    tuning: bool = True,
 ) -> list[str]:
-    """Next steps printed after a full (non --space, non --promote) generate."""
+    """Next steps printed after a full (non --space, non --promote) generate.
+
+    ``tuning`` is false for a deterministic draft, which has no TUNING.md.
+    """
     if champion_flow and mode == "genie":
         return champion_genie_next_steps(env_name)
     if champion_flow and mode == "full":
@@ -9224,24 +9379,28 @@ def generate_next_steps(
         lines += [f"       {out_dir}/abac.auto.tfvars", f"    2. {next_cmd}"]
         return lines
     env_suffix = f" ENV={env_name}" if env_name != "dev" else ""
-    lines = [
-        "  Next steps:",
-        "    1. Review the tuning checklist:",
-        f"       {out_dir}/TUNING.md",
-        "    2. Review and tune generated files:",
-    ]
+    if tuning:
+        lines = [
+            "  Next steps:",
+            "    1. Review the tuning checklist:",
+            f"       {out_dir}/TUNING.md",
+            "    2. Review and tune generated files:",
+        ]
+    else:
+        lines = ["  Next steps:", "    1. Review generated files:"]
     if has_sql:
         lines.append(f"       {out_dir}/masking_functions.sql")
+    step = 3 if tuning else 2
     lines += [
         f"       {out_dir}/abac.auto.tfvars",
-        f"    3. make validate-generated{env_suffix}   (check your changes anytime)",
+        f"    {step}. make validate-generated{env_suffix}   (check your changes anytime)",
     ]
     if mode == "governance":
-        lines.append(f"    4. make apply-governance{env_suffix}   (applies account + data_access layers only)")
+        lines.append(f"    {step + 1}. make apply-governance{env_suffix}   (applies account + data_access layers only)")
     elif mode == "genie":
-        lines.append(f"    4. make apply-genie{env_suffix}   (applies workspace layer only)")
+        lines.append(f"    {step + 1}. make apply-genie{env_suffix}   (applies workspace layer only)")
     else:
-        lines.append(f"    4. make apply{env_suffix}   (validates, splits shared account/workspace config, runs terraform apply)")
+        lines.append(f"    {step + 1}. make apply{env_suffix}   (validates, splits shared account/workspace config, runs terraform apply)")
     return lines
 
 
