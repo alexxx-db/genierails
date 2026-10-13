@@ -97,7 +97,7 @@ stages:
               versionSpec: '3.11'
 
           - script: |
-              pip install python-hcl2 databricks-sdk pytest
+              pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
               curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
               sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
             displayName: Install dependencies and Terraform

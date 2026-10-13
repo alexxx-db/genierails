@@ -686,3 +686,32 @@ def test_migration_makes_the_marker_durable_before_removing_any_source(tmp_path,
     assert ("fsync", marker) in events[:first_unlink], events
     assert events.index(("fsync", marker)) < events.index(("fsync-dir", env.resolve())) < first_unlink, events
     assert marker.is_file()
+
+
+# python-hcl2 8 changed its parse output (state_layout.config, generate_abac);
+# everything that installs it for GenieRails pins the 7.x line.
+HCL2_PIN = "python-hcl2>=7.3.1,<8"
+HCL2_INSTALLERS = (
+    *sorted(ROOT.glob("*/.github/workflows/*.yml")), *sorted(ROOT.glob("*/azure-pipelines/*.yml")),
+    *sorted((ROOT / ".github" / "workflows").glob("*.yml")),
+    SHARED / "roots/data_access/scheduled_governance.tf", SHARED / "roots/workspace/scheduled_governance.tf",
+    SHARED / "scheduled_governance.auto.tfvars.example", SHARED / "scripts/run_integration_tests.py",
+    SHARED / "scripts/setup_test_data.py", SHARED / "scripts/sync_tag_policies.py",
+    SHARED / "scripts/wait_for_tag_policies.py", SHARED / "docs/prerequisites.md",
+    SHARED / "docs/integration-testing.md",
+)
+
+
+def test_every_sample_and_installer_pins_python_hcl2_below_8():
+    assert len([p for p in HCL2_INSTALLERS if "workflows" in p.parts or "azure-pipelines" in p.parts]) >= 17
+    unpinned = []
+    for path in HCL2_INSTALLERS:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if (path.suffix == ".md" or line.lstrip().startswith("#")) and "pip install" not in line:
+                continue  # prose, tables and comments name the package
+            for match in re.finditer(r"python-hcl2[^\s'\",\]|]*(?:,<\d+)?", line):
+                if match.group(0) != HCL2_PIN:
+                    unpinned.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
+            if "pip install" in line and "python-hcl2" in line and f"'{HCL2_PIN}'" not in line:
+                unpinned.append(f"{path.relative_to(ROOT)}:{number}: unquoted in a shell (> redirects): {line.strip()}")
+    assert unpinned == [], "\n".join(unpinned)

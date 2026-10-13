@@ -81,7 +81,7 @@ The `tests/` directory is the dev-to-prod **regression suite** — ~500+ pytest 
 
 ```bash
 # Install deps once (if not already installed)
-pip install pytest python-hcl2
+pip install pytest 'python-hcl2>=7.3.1,<8'
 
 # Run the full suite (~500+ tests, no Databricks connection needed)
 make test-unit

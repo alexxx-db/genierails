@@ -80,7 +80,7 @@ variable "scheduled_governance_serverless_client" {
 
 variable "scheduled_governance_dependencies" {
   type    = list(string)
-  default = ["python-hcl2", "databricks-sdk", "pyyaml", "requests"]
+  default = ["python-hcl2>=7.3.1,<8", "databricks-sdk", "pyyaml", "requests"]
 }
 
 variable "scheduled_governance_notification_emails" {
