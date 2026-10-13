@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts import external_mask_inventory as inv
 from scripts.sync_tag_policies import retained_deterministic_values
 
@@ -27,8 +29,8 @@ def test_own_policies_of_any_generation_are_recognised():
 
 def test_external_masks_on_governed_columns_and_tables_are_reported():
     governed = {"cat.sch.t.email"}
-    direct = [["cat", "sch", "t", "email", "sec", "fn", "legacy_mask"],
-              ["cat", "sch", "t", "other", "sec", "fn", "unrelated"]]
+    direct = [["cat", "sch", "t", "email", "sec.fn.legacy_mask"],
+              ["cat", "sch", "t", "other", "sec.fn.unrelated"]]
     policies = {"cat.sch.t": [
         _policy(f"cat_gr_mask_cat_{VALUE}_full", f"cat.sch.gr_mask_{VALUE}_full"),
         _policy("team_mask", "cat.sec.mask_it", where="cat.sch"),
@@ -40,6 +42,59 @@ def test_external_masks_on_governed_columns_and_tables_are_reported():
         "cat.sch.t: column-mask policy 'team_mask' on cat.sch (function cat.sec.mask_it)",
     ]
     assert inv.external_masks(governed, [], {"cat.sch.t": policies["cat.sch.t"][:1]}) == []
+
+
+@pytest.mark.parametrize("row", [
+    ["cat", "sch", "t", "email"],
+    ["cat", "sch", "t", "email", "sec.fn.mask", "extra"],
+    ["cat", "sch", "t", "email", None],
+])
+def test_column_mask_rows_fail_closed_on_unexpected_shapes(row):
+    with pytest.raises(ValueError, match="expected five non-empty strings"):
+        inv.external_masks({"cat.sch.t.email"}, [row], {})
+
+
+@pytest.mark.parametrize("mask_name", ["mask", "schema.mask", "cat..mask", "cat.schema.mask.extra"])
+def test_column_mask_rows_require_fully_qualified_mask_name(mask_name):
+    with pytest.raises(ValueError, match="fully qualified catalog.schema.function"):
+        inv.external_masks({"cat.sch.t.email"}, [["cat", "sch", "t", "email", mask_name]], {})
+
+
+def test_inventory_sql_reader_fails_closed_on_unsuccessful_statements():
+    from databricks.sdk.service.sql import StatementState
+    from scripts.audit_schema_drift import _run_sql
+
+    for state_name in ("FAILED", "CANCELED", "CLOSED"):
+        response = SimpleNamespace(
+            status=SimpleNamespace(state=getattr(StatementState, state_name), error=None),
+            statement_id="statement-1", result=None, manifest=None,
+        )
+        client = SimpleNamespace(statement_execution=SimpleNamespace(
+            execute_statement=lambda **kwargs: response,
+        ))
+        with pytest.raises(RuntimeError, match=state_name):
+            _run_sql(client, "warehouse", "SELECT 1")
+
+
+def test_inventory_sql_reader_reads_every_result_chunk():
+    from databricks.sdk.service.sql import StatementState
+    from scripts.audit_schema_drift import _run_sql
+
+    response = SimpleNamespace(
+        status=SimpleNamespace(state=StatementState.SUCCEEDED), statement_id="statement-1",
+        result=SimpleNamespace(data_array=[["first"]], next_chunk_index=1), manifest=None,
+    )
+    chunks = {
+        1: SimpleNamespace(data_array=[["second"]], next_chunk_index=2),
+        2: SimpleNamespace(data_array=[["third"]], next_chunk_index=None),
+    }
+    execution = SimpleNamespace(
+        execute_statement=lambda **kwargs: response,
+        get_statement_result_chunk_n=lambda statement_id, index: chunks[index],
+    )
+    assert _run_sql(SimpleNamespace(statement_execution=execution), "warehouse", "SELECT 1") == [
+        ["first"], ["second"], ["third"],
+    ]
 
 
 class _Policies:
@@ -70,6 +125,8 @@ def test_inventory_reads_inherited_policies_and_column_masks(tmp_path, monkeypat
     assert inv.inventory(tmp_path) == ["cat.sch.t: column-mask policy 'ext' on cat (function cat.sch.ext)"]
     assert client.policies.calls == [("TABLE", "cat.sch.t", True)]
     assert "system.information_schema.column_masks" in sql[0] and "'cat.sch.t.email'" in sql[0]
+    assert "mask_name" in sql[0]
+    assert "mask_catalog" not in sql[0] and "mask_schema" not in sql[0]
     assert inv.main(["--env-dir", str(tmp_path)]) == 1
 
 

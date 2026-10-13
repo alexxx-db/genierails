@@ -20,7 +20,10 @@ import argparse
 from pathlib import Path
 
 from tag_vocabulary import REGISTRY
-from governance_policies import parse_treatment_value
+from governance_policies import (
+    FAILSAFE_TREATMENT, base_treatment, is_never_raw, parse_treatment_value,
+)
+from mask_library import load_library
 from treatment_derivation import load_treatment_config
 
 try:
@@ -39,6 +42,18 @@ INDUSTRIES_DIR = Path(__file__).resolve().parent / "industries"
 
 COLUMN_MASK_REQUIRED = {"name", "policy_type", "catalog", "to_principals", "match_condition", "match_alias", "function_name", "function_catalog", "function_schema"}
 ROW_FILTER_REQUIRED = {"name", "policy_type", "catalog", "to_principals", "function_name", "function_catalog", "function_schema"}
+DETERMINISTIC_TREATMENTS = frozenset(load_library()["treatments"]) | {FAILSAFE_TREATMENT}
+
+
+def _is_known_deterministic_treatment(cfg: dict, tag_key: str, value: str) -> bool:
+    """Whether a deterministic value names a treatment shipped by this checkout."""
+    parsed = parse_treatment_value(value)
+    return bool(
+        cfg.get("governance_mode") == "deterministic"
+        and tag_key == "gr_treatment"
+        and parsed
+        and base_treatment(value) in DETERMINISTIC_TREATMENTS
+    )
 
 
 class ValidationResult:
@@ -298,6 +313,44 @@ def column_mask_matches(cfg: dict) -> dict[str, list[str]]:
     return matches
 
 
+def _deterministic_mask_pair_is_disjoint(policies: list[dict], cfg: dict) -> bool:
+    """Whether two policies have the generator's provably exclusive tier shape."""
+    if cfg.get("governance_mode") != "deterministic" or len(policies) != 2:
+        return False
+    by_suffix = {}
+    for policy in policies:
+        refs = {
+            value for key, value in _extract_tag_refs(policy.get("match_condition", ""))[0]
+            if _is_known_deterministic_treatment(cfg, key, value)
+        }
+        if len(refs) != 1:
+            return False
+        value = next(iter(refs))
+        expected_condition = f"hasTagValue('gr_treatment', '{value}')"
+        if policy.get("match_condition") != expected_condition:
+            return False
+        function = policy.get("function_name")
+        expected = {
+            f"gr_mask_{value}_partial": "partial",
+            f"gr_mask_{value}_full": "full",
+        }
+        suffix = expected.get(function)
+        if not suffix or suffix in by_suffix:
+            return False
+        by_suffix[suffix] = (policy, value)
+    if set(by_suffix) != {"partial", "full"}:
+        return False
+    partial, partial_value = by_suffix["partial"]
+    full, full_value = by_suffix["full"]
+    if (partial_value != full_value or is_never_raw(partial_value)
+            or partial.get("catalog") != full.get("catalog")):
+        return False
+    partial_to = set(partial.get("to_principals") or [])
+    if any(principal.casefold() in BUILTIN_PRINCIPALS for principal in partial_to):
+        return False
+    return bool(partial_to) and partial_to <= set(full.get("except_principals") or [])
+
+
 def validate_policy_overlaps(cfg: dict, result: ValidationResult):
     """Fail when multiple FGAC policies resolve for one securable object."""
     assignments = cfg.get("tag_assignments", [])
@@ -312,7 +365,12 @@ def validate_policy_overlaps(cfg: dict, result: ValidationResult):
         entity_name = spelling[(entity_type, entity_key)]
         if entity_type == "columns":
             matches = mask_matches.get(entity_name, [])
-            if len(set(matches)) > 1:
+            matching_policies = [
+                policy for policy in policies
+                if isinstance(policy, dict) and policy.get("name", "<unnamed>") in set(matches)
+            ]
+            if len(set(matches)) > 1 and not _deterministic_mask_pair_is_disjoint(
+                    matching_policies, cfg):
                 result.error(
                     f"Column '{entity_name}' matches multiple column-mask policies: "
                     f"{sorted(set(matches))}. Unity Catalog allows only one mask to "
@@ -841,7 +899,8 @@ def validate_tag_policies(cfg: dict, result: ValidationResult) -> dict[str, set[
                     f"tag_policies[{i}] (key='{key}'): value '{value}' is non-canonical — "
                     f"use '{canonical_value}'"
                 )
-            elif REGISTRY.is_allowed_value(canonical_key, value) is False:
+            elif (REGISTRY.is_allowed_value(canonical_key, value) is False
+                  and not _is_known_deterministic_treatment(cfg, canonical_key, value)):
                 result.error(
                     f"tag_policies[{i}] (key='{key}'): value '{value}' is not in the "
                     f"canonical registry {sorted(REGISTRY.canonical_values_for_key(canonical_key) or [])}"
@@ -889,7 +948,8 @@ def validate_tag_assignments(cfg: dict, tag_map: dict[str, set[str]], result: Va
                 f"{prefix}: tag_value '{tval}' is non-canonical for tag_key '{tkey}' — "
                 f"use '{canonical_value}'"
             )
-        elif REGISTRY.is_allowed_value(canonical_key, tval) is False:
+        elif (REGISTRY.is_allowed_value(canonical_key, tval) is False
+              and not _is_known_deterministic_treatment(cfg, canonical_key, tval)):
             result.error(
                 f"{prefix}: tag_value '{tval}' is not in the canonical registry for "
                 f"tag_key '{canonical_key}' — allowed: "
@@ -935,6 +995,11 @@ def validate_fgac_policies(
         return
     seen_names: set[str] = set()
     referenced_functions: set[str] = set()
+    deterministic_exempt_principals = set()
+    if cfg.get("governance_mode") == "deterministic":
+        deterministic_exempt_principals.update(cfg.get("raw_exempt_principals") or [])
+        if cfg.get("databricks_client_id"):
+            deterministic_exempt_principals.add(cfg["databricks_client_id"])
 
     for i, p in enumerate(policies):
         name = p.get("name", "")
@@ -969,13 +1034,24 @@ def validate_fgac_policies(
                     f"{prefix}: to_principals group '{principal}' not defined in 'groups'"
                 )
         for principal in p.get("except_principals", []) or []:
-            if principal.lower() not in BUILTIN_PRINCIPALS and principal not in group_names:
+            if (principal.lower() not in BUILTIN_PRINCIPALS and principal not in group_names
+                    and principal not in deterministic_exempt_principals):
                 result.error(
                     f"{prefix}: except_principals group '{principal}' not defined in 'groups'"
                 )
 
         # Validate condition syntax — only hasTagValue() and hasTag() are allowed
         condition = p.get("match_condition") or p.get("when_condition") or ""
+        deterministic_values = {
+            value for key, value in _extract_tag_refs(condition)[0]
+            if _is_known_deterministic_treatment(cfg, key, value)
+        }
+        if (any(is_never_raw(value) for value in deterministic_values)
+                and (p.get("except_principals") or [])):
+            result.error(
+                f"{prefix}: never-raw deterministic treatments must not define "
+                "except_principals"
+            )
         for forbidden in ["columnName()", "tableName()", " IN (", " IN("]:
             if forbidden in condition:
                 result.error(
@@ -996,7 +1072,8 @@ def validate_fgac_policies(
                     f"{prefix}: condition uses non-canonical tag_value '{ref_val}' for "
                     f"tag_key '{ref_key}' — use '{canonical_value}'"
                 )
-            elif REGISTRY.is_allowed_value(canonical_key, ref_val) is False:
+            elif (REGISTRY.is_allowed_value(canonical_key, ref_val) is False
+                  and not _is_known_deterministic_treatment(cfg, canonical_key, ref_val)):
                 result.error(
                     f"{prefix}: condition references canonical tag_value '{ref_val}' "
                     f"outside the registry for '{canonical_key}' — allowed: "
@@ -1253,6 +1330,20 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
             env_cfg = parse_tfvars(env_path)
         except Exception as e:
             result.warn(f"Could not parse {env_path}: {e}")
+
+    for key in ("governance_mode", "access_tier_groups", "raw_exempt_principals"):
+        if key not in merged and key in env_cfg:
+            merged[key] = env_cfg[key]
+    if "databricks_client_id" not in merged and env_cfg.get("databricks_client_id"):
+        merged["databricks_client_id"] = env_cfg["databricks_client_id"]
+    auth_path = _find_tfvars_file(tfvars_path, "auth.auto.tfvars")
+    if "databricks_client_id" not in merged and auth_path:
+        try:
+            auth_cfg = parse_tfvars(auth_path)
+            if auth_cfg.get("databricks_client_id"):
+                merged["databricks_client_id"] = auth_cfg["databricks_client_id"]
+        except Exception as e:
+            result.warn(f"Could not parse {auth_path}: {e}")
 
     if (
         env_path is not None  # Only enforce in real workspace envs that have an env.auto.tfvars
