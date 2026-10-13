@@ -166,7 +166,11 @@ def _old_workspace_file() -> str:
             pytest.fail(message)
         pytest.skip(message)
     assert 'resource "databricks_job" "scheduled_governance"' in shown.stdout
-    return shown.stdout
+    # The dependency pin came later (python-hcl2 8 breaks the scripts); a job
+    # deployed before it gets one in-place update to its dependency list, which
+    # is not the move under test, so the old root gets the same pin.
+    assert '"python-hcl2"' in shown.stdout
+    return shown.stdout.replace('"python-hcl2"', '"python-hcl2>=7.3.1,<8"')
 
 
 def test_existing_job_is_never_destroyed_or_recreated(tmp_path):
