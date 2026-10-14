@@ -974,3 +974,71 @@ class TestValidateAclGroups:
         assert any("Bad_Group" in e for e in r.errors)
         # Finance should pass, only Clinical should fail
         assert not any("Analyst" in e for e in r.errors)
+
+
+# ---------------------------------------------------------------------------
+# The shared account tag policy holds deterministic values (live AWS Phase A, N3)
+# ---------------------------------------------------------------------------
+
+DETERMINISTIC_VALUE = "card_last4__string__951e00ac"
+SHARED_POLICY = [{"key": "gr_treatment", "values": ["account_last4", DETERMINISTIC_VALUE]}]
+
+
+def _envs_with_account_policy(tmp_path, values):
+    envs = tmp_path / "envs"
+    (envs / "account").mkdir(parents=True)
+    (envs / "dev").mkdir()
+    rendered = ", ".join(f'"{v}"' for v in values)
+    (envs / "account" / "abac.auto.tfvars").write_text(
+        f'tag_policies = [{{ key = "gr_treatment", description = "t", values = [{rendered}] }}]\n')
+    (envs / "dev" / "env.auto.tfvars").write_text("")  # legacy
+    (envs / "dev" / "abac.auto.tfvars").write_text("groups = {}\n")
+    return envs
+
+
+def test_account_layer_accepts_deterministic_values_next_to_legacy_ones(tmp_path):
+    envs = _envs_with_account_policy(tmp_path, ["account_last4", DETERMINISTIC_VALUE])
+    result = _result()
+
+    cfg = load_validation_context({"tag_policies": SHARED_POLICY}, result, envs / "account" / "abac.auto.tfvars")
+    validate_tag_policies(cfg, result)
+
+    assert result.errors == []
+
+
+def test_a_legacy_env_accepts_the_shared_account_policy_it_loads(tmp_path):
+    envs = _envs_with_account_policy(tmp_path, ["account_last4", DETERMINISTIC_VALUE])
+    result = _result()
+
+    cfg = load_validation_context({"groups": {}}, result, envs / "dev" / "abac.auto.tfvars")
+    validate_tag_policies(cfg, result)
+
+    assert cfg["tag_policies"][0]["values"] == ["account_last4", DETERMINISTIC_VALUE]
+    assert result.errors == []
+
+
+@pytest.mark.parametrize("value", ["not_a_treatment", "not_a_treatment__string__951e00ac"])
+def test_account_layer_still_refuses_unknown_values(tmp_path, value):
+    envs = _envs_with_account_policy(tmp_path, [value])
+    result = _result()
+
+    cfg = load_validation_context({"tag_policies": [{"key": "gr_treatment", "values": [value]}]},
+                                  result, envs / "account" / "abac.auto.tfvars")
+    validate_tag_policies(cfg, result)
+
+    assert any(f"value '{value}' is not in the canonical registry" in e for e in result.errors)
+
+
+def test_a_legacy_env_still_refuses_deterministic_values_in_its_own_config(tmp_path):
+    envs = _envs_with_account_policy(tmp_path, ["account_last4"])
+    own = {"tag_policies": SHARED_POLICY, "tag_assignments": [
+        {"entity_type": "columns", "entity_name": "c.s.t.card", "tag_key": "gr_treatment",
+         "tag_value": DETERMINISTIC_VALUE}]}
+    result = _result()
+
+    cfg = load_validation_context(own, result, envs / "dev" / "generated" / "abac.auto.tfvars")
+    tag_map = validate_tag_policies(cfg, result)
+    validate_tag_assignments(cfg, tag_map, result)
+
+    assert any(f"value '{DETERMINISTIC_VALUE}' is not in the canonical registry" in e for e in result.errors)
+    assert any(f"tag_value '{DETERMINISTIC_VALUE}' is not in the canonical registry" in e for e in result.errors)

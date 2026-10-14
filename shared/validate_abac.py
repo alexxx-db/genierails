@@ -21,9 +21,8 @@ from pathlib import Path
 
 from tag_vocabulary import REGISTRY
 from governance_policies import (
-    FAILSAFE_TREATMENT, base_treatment, is_never_raw, parse_treatment_value,
+    is_library_treatment_value, is_never_raw, parse_treatment_value,
 )
-from mask_library import load_library
 from treatment_derivation import load_treatment_config
 
 try:
@@ -42,18 +41,16 @@ INDUSTRIES_DIR = Path(__file__).resolve().parent / "industries"
 
 COLUMN_MASK_REQUIRED = {"name", "policy_type", "catalog", "to_principals", "match_condition", "match_alias", "function_name", "function_catalog", "function_schema"}
 ROW_FILTER_REQUIRED = {"name", "policy_type", "catalog", "to_principals", "function_name", "function_catalog", "function_schema"}
-DETERMINISTIC_TREATMENTS = frozenset(load_library()["treatments"]) | {FAILSAFE_TREATMENT}
+
+
+# Set by load_validation_context when tag_policies are the account layer's:
+# every env shares them, so they hold deterministic values next to legacy ones.
+SHARED_TAG_POLICIES = "_shared_account_tag_policies"
 
 
 def _is_known_deterministic_treatment(cfg: dict, tag_key: str, value: str) -> bool:
     """Whether a deterministic value names a treatment shipped by this checkout."""
-    parsed = parse_treatment_value(value)
-    return bool(
-        cfg.get("governance_mode") == "deterministic"
-        and tag_key == "gr_treatment"
-        and parsed
-        and base_treatment(value) in DETERMINISTIC_TREATMENTS
-    )
+    return cfg.get("governance_mode") == "deterministic" and is_library_treatment_value(tag_key, value)
 
 
 class ValidationResult:
@@ -900,7 +897,8 @@ def validate_tag_policies(cfg: dict, result: ValidationResult) -> dict[str, set[
                     f"use '{canonical_value}'"
                 )
             elif (REGISTRY.is_allowed_value(canonical_key, value) is False
-                  and not _is_known_deterministic_treatment(cfg, canonical_key, value)):
+                  and not _is_known_deterministic_treatment(cfg, canonical_key, value)
+                  and not (cfg.get(SHARED_TAG_POLICIES) and is_library_treatment_value(canonical_key, value))):
                 result.error(
                     f"tag_policies[{i}] (key='{key}'): value '{value}' is not in the "
                     f"canonical registry {sorted(REGISTRY.canonical_values_for_key(canonical_key) or [])}"
@@ -1323,6 +1321,8 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
     else:
         env_name = parent_name
 
+    if parent_name == "account":
+        merged[SHARED_TAG_POLICIES] = True
     env_cfg = {}
     env_parse_failed = False
     env_path = _find_tfvars_file(tfvars_path, "env.auto.tfvars")
@@ -1409,6 +1409,7 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
                 account_cfg = parse_tfvars(account_abac)
                 if account_cfg.get("tag_policies"):
                     merged["tag_policies"] = account_cfg["tag_policies"]
+                    merged[SHARED_TAG_POLICIES] = True
                     result.ok(f"tag_policies loaded from {account_abac}")
             except Exception as e:
                 result.warn(f"Could not parse {account_abac}: {e}")

@@ -613,6 +613,13 @@ def main():
         # seeds from the source; later ACL changes are reviewed directly in prod.
         is_repromote = bool(dest_space)
         acl_source = dest_space if is_repromote else space
+        # A legacy destination may omit acl_groups (derived from its policies);
+        # a deterministic one can't (decision 4). The first deterministic
+        # promotion seeds a missing one from the source, like a new agent's.
+        seed_acl = (is_repromote and dest_deterministic and dest_space.get("acl_groups") is None
+                    and isinstance(space.get("acl_groups"), list))
+        if seed_acl:
+            acl_source = space
         if "acl_groups" in acl_source:
             acl_groups = acl_source["acl_groups"]
             if acl_groups is not None and (
@@ -626,11 +633,16 @@ def main():
                 )
                 sys.exit(1)
             if acl_groups is not None:
-                if not is_repromote:
+                if not is_repromote or seed_acl:
                     acl_groups = map_groups(acl_groups)
                 rendered_acl = ", ".join(json.dumps(group) for group in acl_groups)
                 lines.append(f"    acl_groups       = [{rendered_acl}]")
-        if is_repromote:
+        if seed_acl:
+            print(
+                f"  Seeded destination Genie space {name!r} acl_groups={acl_groups!r} from "
+                f"{source_env} (it had none; groups through group_map); from now on the destination keeps its own"
+            )
+        elif is_repromote:
             if "acl_groups" in dest_space:
                 print(
                     f"  Preserved destination Genie space {name!r} "

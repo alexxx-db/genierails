@@ -166,3 +166,47 @@ def test_model_acl_is_ignored_and_missing_sidecar_fails_closed(model_acl):
         build_data_access_config(generated)
     with pytest.raises(ValueError, match="no resolved ACL"):
         build_workspace_config(generated)
+
+
+# ── deterministic gr_treatment values (live AWS Phase A, N3) ────────────────
+
+LEGACY_ACCOUNT = {"tag_policies": [{"key": "gr_treatment", "values": ["account_last4", "redact"]}]}
+DETERMINISTIC = {"tag_policies": [{"key": "gr_treatment", "values": [
+    "card_last4__string__951e00ac", "unmapped_redact__string__0123abcd"]}]}
+
+
+@pytest.mark.parametrize("existing", [None, LEGACY_ACCOUNT, DETERMINISTIC])
+def test_split_merges_deterministic_treatment_values_into_the_account_tag_policy(existing):
+    account = build_account_config(DETERMINISTIC, existing)
+
+    values = account["tag_policies"][0]["values"]
+    legacy = ["account_last4", "redact"] if existing is LEGACY_ACCOUNT else []
+    assert values == legacy + ["card_last4__string__951e00ac", "unmapped_redact__string__0123abcd"]
+
+
+def test_split_keeps_legacy_values_from_an_existing_account_policy_unchanged():
+    account = build_account_config(LEGACY_ACCOUNT, DETERMINISTIC)
+
+    assert account["tag_policies"][0]["values"] == [
+        "card_last4__string__951e00ac", "unmapped_redact__string__0123abcd", "account_last4", "redact"]
+
+
+@pytest.mark.parametrize("value", [
+    "not_a_treatment",                   # legacy-shaped, not in the registry
+    "not_a_treatment__string__951e00ac", # deterministic-shaped, no such library treatment
+    "card_last4__string__951e00a",       # malformed generation
+])
+@pytest.mark.parametrize("side", ["new", "existing"])
+def test_split_still_refuses_an_unknown_treatment_value(value, side):
+    bad = {"tag_policies": [{"key": "gr_treatment", "values": [value]}]}
+    new, existing = (bad, LEGACY_ACCOUNT) if side == "new" else (LEGACY_ACCOUNT, bad)
+
+    with pytest.raises(ValueError, match="unknown canonical value"):
+        build_account_config(new, existing)
+
+
+def test_split_refuses_a_deterministic_shaped_value_on_another_registry_key():
+    bad = {"tag_policies": [{"key": "pii_level", "values": ["card_last4__string__951e00ac"]}]}
+
+    with pytest.raises(ValueError, match="unknown canonical value"):
+        build_account_config(bad, None)

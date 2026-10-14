@@ -53,3 +53,53 @@ def test_promote_into_a_prod_without_a_mode_never_copies_the_source_mode(tmp_pat
 
     assert "governance_mode" not in cfg
     assert "governance_mode" not in out
+
+
+# ── acl_groups for an existing destination agent (live AWS Phase A, N4) ─────
+
+SOURCE_AGENT = ('governance_mode = "deterministic"\n'
+                'genie_spaces = [{ name = "Payments", genie_space_id = "dev1", uc_tables = ["dev_catalog.s.t"], '
+                'acl_groups = ["dev_ops", "dev_viewers"] }]\nuc_tables = ["dev_catalog.s.t"]\n')
+DEST_AGENT = 'genie_spaces = [{ name = "Payments", genie_space_id = "prod1", uc_tables = ["prod_catalog.s.t"]{acl} }]\n'
+
+
+def _promote_agent(tmp_path, dest_text):
+    source = tmp_path / "envs" / "dev"
+    dest = tmp_path / "envs" / "prod"
+    source.mkdir(parents=True)
+    dest.mkdir(parents=True)
+    (source / "env.auto.tfvars").write_text(SOURCE_AGENT)
+    (dest / "env.auto.tfvars").write_text(dest_text)
+    result = subprocess.run([sys.executable, str(SCRIPT), str(source), str(dest), "dev_catalog=prod_catalog"],
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return hcl2.loads((dest / "env.auto.tfvars").read_text()), result.stdout
+
+
+@pytest.mark.parametrize("acl", ["", ", acl_groups = null"])
+def test_first_deterministic_promotion_seeds_a_missing_agent_acl_through_group_map(tmp_path, acl):
+    cfg, out = _promote_agent(tmp_path, 'governance_mode = "deterministic"\n'
+                              'group_map = { dev_ops = "prod_ops" }\n' + DEST_AGENT.replace("{acl}", acl))
+
+    assert cfg["genie_spaces"][0]["acl_groups"] == ["prod_ops", "dev_viewers"]
+    assert cfg["genie_spaces"][0]["genie_space_id"] == "prod1"
+    assert "Seeded destination Genie space 'Payments' acl_groups=['prod_ops', 'dev_viewers'] from dev" in out
+
+
+@pytest.mark.parametrize("acl, kept", [(', acl_groups = []', []), (', acl_groups = ["prod_ops"]', ["prod_ops"])])
+def test_deterministic_promotion_never_overwrites_the_destination_acl(tmp_path, acl, kept):
+    cfg, out = _promote_agent(tmp_path, 'governance_mode = "deterministic"\n'
+                              'group_map = { dev_ops = "prod_ops" }\n' + DEST_AGENT.replace("{acl}", acl))
+
+    assert cfg["genie_spaces"][0]["acl_groups"] == kept
+    assert "Seeded destination Genie space" not in out
+    assert f"Preserved destination Genie space 'Payments' acl_groups={kept!r}" in out
+
+
+@pytest.mark.parametrize("mode", ["", 'governance_mode = "legacy"\n'])
+def test_legacy_destination_keeps_omitting_the_agent_acl(tmp_path, mode):
+    cfg, out = _promote_agent(tmp_path, mode + DEST_AGENT.replace("{acl}", ""))
+
+    assert "acl_groups" not in cfg["genie_spaces"][0]
+    assert "Seeded destination Genie space" not in out
+    assert "omitted acl_groups (destination policy derivation remains authoritative)" in out
