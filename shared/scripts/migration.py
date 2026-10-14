@@ -381,7 +381,7 @@ def analyze(env_dir: Path, env: str, generation: Mapping, *, desired_abac: Path 
 
     env_dir = Path(env_dir)
     cfg = _load_hcl(env_dir / "env.auto.tfvars")
-    desired_cfg = _load_hcl(effective(env_dir, "abac.auto.tfvars"))
+    desired_cfg = _load_hcl(desired_abac or effective(env_dir, "abac.auto.tfvars"))
     try:
         entries = parse_file(env_dir / "ack.txt", env) if (env_dir / "ack.txt").is_file() else ()
     except AckFileError as exc:
@@ -628,7 +628,7 @@ def report(env_dir: Path, env: str, *, desired_abac: Path | None = None) -> tupl
     lines += [f"  {name}" for name in sorted(dep["frozen"])] or ["  none"]
     lines += ["", "Tag state moves (run by the cutover under the env lock; tags are never destroyed):"]
     lines += [f"  terraform state mv '{s}' '{t}'" for s, t in dep["moves"]] or ["  none"]
-    forget = forgotten_tags(dep, _load_hcl(_effective_abac(env_dir)))
+    forget = forgotten_tags(dep, _load_hcl(desired_abac or _effective_abac(env_dir)))
     lines += [f"  terraform state rm '{tag_address(k, 'assignments')}'  (legacy sensitivity tag, left on the column)"
               for k in forget]
     if result["stale"]:

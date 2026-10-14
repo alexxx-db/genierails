@@ -302,27 +302,24 @@ def test_a_weakened_column_is_refused_until_acknowledged(env_dir):
     migration.check(env_dir, ENV, migration.legacy_generation(migration.deployment(env_dir)))
 
 
-def test_a_legacy_redaction_turned_partial_is_a_weakening(env_dir):
+def _legacy_redact(env_dir, *, column=COLUMN):
     redact = legacy_policy(value="redact") | {"to_principals": ["regional", "masked"]}
     state = json.loads((env_dir / "data_access" / "terraform.tfstate").read_text())
     state["resources"][0]["instances"] = [{"index_key": "gr_mask_cat_redact", "attributes": redact}]
-    state["resources"][1]["instances"] = [{"index_key": f"columns|{COLUMN}|gr_treatment|redact",
-                                           "attributes": {"entity_name": COLUMN, "tag_value": "redact"}}]
+    state["resources"][1]["instances"] = [{"index_key": f"columns|{column}|gr_treatment|redact",
+                                           "attributes": {"entity_name": column, "tag_value": "redact"}}]
     (env_dir / "data_access" / "terraform.tfstate").write_text(json.dumps(state))
+
+
+def test_a_legacy_redaction_turned_partial_is_a_weakening(env_dir):
+    _legacy_redact(env_dir)
     opt_in(env_dir)
     assert f"dev:weaken:{COLUMN}:regional: redacted (redact) -> partial" in _refusal(env_dir)
 
 
 def test_a_redacting_partial_variant_is_not_a_weakening(env_dir):
     """A tier-2 policy can use its partial slot while still fully redacting."""
-    redact = legacy_policy(value="redact") | {"to_principals": ["regional", "masked"]}
-    state = json.loads((env_dir / "data_access" / "terraform.tfstate").read_text())
-    state["resources"][0]["instances"] = [{"index_key": "gr_mask_cat_redact", "attributes": redact}]
-    state["resources"][1]["instances"] = [{
-        "index_key": f"columns|{COLUMN}|gr_treatment|redact",
-        "attributes": {"entity_name": COLUMN, "tag_value": "redact"},
-    }]
-    (env_dir / "data_access" / "terraform.tfstate").write_text(json.dumps(state))
+    _legacy_redact(env_dir)
 
     settings = {"access_tier_groups": ["raw", "regional", "masked"],
                 "column_overrides": {COLUMN: {"treatment": "redact"}}}
@@ -338,6 +335,30 @@ def test_a_redacting_partial_variant_is_not_a_weakening(env_dir):
 
     result = migration.analyze(env_dir, ENV, migration.legacy_generation(migration.deployment(env_dir)))
     assert f"dev:weaken:{COLUMN}:regional" not in {w.ack_key for w in result["weakening"].all_weakenings}
+
+
+def test_a_stale_env_override_does_not_hide_a_weakening(env_dir):
+    _legacy_redact(env_dir)
+    opt_in(env_dir)
+    with (env_dir / "env.auto.tfvars").open("a") as f:
+        f.write(f'column_overrides = {{ "{COLUMN}" = {{ partial = "redacted" }} }}\n')
+    assert f"dev:weaken:{COLUMN}:regional" in _refusal(env_dir)
+
+
+def test_ssn_last4_over_legacy_redaction_is_a_weakening(env_dir):
+    _legacy_redact(env_dir)
+    settings = {"access_tier_groups": ["raw", "regional", "masked"],
+                "column_overrides": {COLUMN: {"treatment": "ssn", "partial": "last4"}}}
+    write_env(env_dir)
+    model = build_model({COLUMN: ["email_address"]}, {COLUMN: "STRING"}, settings)
+    generate_abac.write_deterministic_model(env_dir / "generated" / "abac.auto.tfvars",
+                                            env_dir / "generated" / "masking_functions.sql", model)
+    with (env_dir / "env.auto.tfvars").open("a") as f:
+        f.write(f'column_overrides = {{ "{COLUMN}" = {{ treatment = "ssn", partial = "last4" }} }}\n')
+        f.write('table_readers = { "cat.sch.t" = ["regional", "masked"] }\n')
+        f.write('genie_spaces = [{ name = "Sales", genie_space_id = "s1", uc_tables = ["cat.sch.t"], '
+                'acl_groups = ["regional"] }]\n')
+    assert f"dev:weaken:{COLUMN}:regional" in _refusal(env_dir)
 
 
 def test_promoted_empty_assignments_are_live_derived_for_migrate_plan(env_dir, monkeypatch, tmp_path):
@@ -378,6 +399,37 @@ def test_promoted_live_derivation_still_reports_a_real_weakening(env_dir, monkey
     monkeypatch.setattr(migration, "_derive_live_desired", fake_derive)
     _, data = migration.report(env_dir, ENV)
     assert f"dev:weaken:{COLUMN}:raw" in {w["key"] for w in data["weakenings"]}
+
+
+def test_promoted_unreadable_live_tags_refuse_and_write_nothing(env_dir, capsys):
+    opt_in(env_dir)
+    config = env_dir / "generated" / "abac.auto.tfvars"
+    config.write_text(re.sub(r"tag_assignments\s*=\s*\[.*?\n\]", "tag_assignments = [\n]",
+                             config.read_text(), flags=re.DOTALL))
+    before = {path: path.read_bytes() for path in env_dir.rglob("*") if path.is_file()}
+    assert migration.main(["report", "--env-dir", str(env_dir), "--env", ENV]) == 2
+    assert "no raw fallback" in capsys.readouterr().err
+    assert before == {path: path.read_bytes() for path in env_dir.rglob("*") if path.is_file()}
+
+
+def test_promoted_successful_empty_derivation_reports_raw_and_needs_ack(env_dir, monkeypatch):
+    opt_in(env_dir)
+    config = env_dir / "generated" / "abac.auto.tfvars"
+    empty = re.sub(r"tag_assignments\s*=\s*\[.*?\n\]", "tag_assignments = [\n]",
+                   config.read_text(), flags=re.DOTALL)
+    config.write_text(empty)
+
+    def successful_empty_derive(argv, *, cwd, check):
+        out_dir = Path(argv[argv.index("--out-dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "abac.auto.tfvars").write_text(empty)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(migration.subprocess, "run", successful_empty_derive)
+    _, data = migration.report(env_dir, ENV)
+    assert data["columns"][COLUMN]["regional"]["after"] == "raw (no GenieRails mask)"
+    assert f"dev:weaken:{COLUMN}:regional" in {w["key"] for w in data["weakenings"]}
+    assert not data["ok"]
 
 
 def test_a_new_reader_is_widening(env_dir):

@@ -628,35 +628,31 @@ def _policy_value(policy: Mapping, known: Iterable[str] = ()) -> str:
     return max(found, key=len) if found else ""
 
 
-def _resolved_policy_level(column: str, value: str, policy: Mapping, settings: Mapping) -> str:
-    """The output level of a deterministic policy, including redacting partial variants."""
+def _resolved_policy_level(value: str, policy: Mapping) -> str:
+    """The output level pinned by a deterministic value's generation hash."""
     if policy.get("level"):
         return str(policy["level"])
     if policy["name"].endswith("_full"):
         return "redacted"
 
-    from governance_policies import base_treatment, parse_treatment_value
+    from governance_policies import ColumnTreatment, normalize_sql_type, parse_treatment_value
     from mask_library import load_library
 
-    treatment = base_treatment(value)
-    override = dict((settings.get("column_overrides") or {}).get(column) or {})
-    version = override.get("partial")
-    if version is None:
-        version = ((settings.get("treatment_versions") or {}).get(treatment) or {}).get("partial")
-    if version is None:
-        item = load_library()["treatments"].get(treatment) or {}
-        parsed = parse_treatment_value(value)
-        family = (parsed[1].upper() if parsed else "")
-        if family.startswith("DECIMAL_"):
-            family = "DECIMAL"
-        if family in {"TINYINT", "SMALLINT", "INT", "BIGINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"}:
-            family = "NUMERIC"
-        version = (item.get("partial_by_type") or {}).get(family, item.get("partial"))
-    return "redacted" if version in {"redacted", "null"} else "partial"
+    parsed = parse_treatment_value(value)
+    item = load_library()["treatments"].get(parsed[0]) if parsed else None
+    if not parsed or not item:
+        return "partial"  # Unknown values must never be assumed to provide stronger protection.
+    token = parsed[1].upper()
+    sql_type = (f"DECIMAL({token.split('_')[1]},{token.split('_')[2]})"
+                if token.startswith("DECIMAL_") else normalize_sql_type(token))
+    redacting = {
+        ColumnTreatment(parsed[0], sql_type, version, item["full"], False).generation
+        for version in ("redacted", "null")
+    }
+    return "redacted" if parsed[2] in redacting else "partial"
 
 
-def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str],
-            settings: Mapping | None = None) -> dict:
+def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str]) -> dict:
     """column -> principal -> (level, consequence) from the mask policies that match it."""
     from governance_policies import base_treatment
     from scripts.policy_generations import ALL_USERS
@@ -674,7 +670,7 @@ def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str]
         levels = {}
         for who in universe:
             on = [p for p in by_value.get(value, []) if covers(p, who)]
-            if any(_resolved_policy_level(column, value, p, settings or {}) == "redacted" for p in on):
+            if any(_resolved_policy_level(value, p) == "redacted" for p in on):
                 levels[who] = ("redacted", f"redacted ({treatment})")
             elif on:
                 levels[who] = ("partial", f"partial ({treatment})")
@@ -754,7 +750,7 @@ def governance_states(before: Mapping, after: Mapping):
     states = []
     columns = set(before["tags"]) | set(after["tags"])
     for side in (before, after):
-        levels = _levels(side["tags"], side["policies"], universe, side["settings"])
+        levels = _levels(side["tags"], side["policies"], universe)
         for column in columns - set(side["tags"]):
             levels[column] = {who: ("raw", "raw (no GenieRails mask)") for who in universe}
         states.append(GovernanceState(
