@@ -1,11 +1,14 @@
 """Integration-level wiring tests for environment-local Genie ACL sidecars."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import hcl2
 import pytest
+
+from tests import script_stubs
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from generate_abac import (  # noqa: E402
@@ -897,10 +900,10 @@ def test_genie_mode_import_with_deferred_acl_cannot_be_applied(tmp_path, target)
     env, runner, runner_log = _genie_mode_import(tmp_path)
 
     result = subprocess.run(
-        ["make", target, "ENV=dev", f"ROOT_RUNNER={runner}",
-         # ... so the deferred ACL, not the live read, is what stops it.
-         f"DERIVE_ASSIGNMENTS_SCRIPT={_live_refresh_stub(tmp_path)}"],
+        ["make", target, "ENV=dev", f"ROOT_RUNNER={runner}"],
         cwd=tmp_path, text=True, capture_output=True,
+        # ... so the deferred ACL, not the live read, is what stops it (stubbed below make).
+        env={**os.environ, "PATH": f"{script_stubs.install(tmp_path / 'stub-bin', {'derive_assignments.py': script_stubs.python_file(_live_refresh_stub(tmp_path))})}:{os.environ['PATH']}"},
     )
 
     output = result.stdout + result.stderr

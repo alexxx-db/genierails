@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs
+
 SHARED = Path(__file__).resolve().parents[1]
 ROOT = SHARED.parent
 sys.path.insert(0, str(SHARED / "scripts"))
@@ -164,16 +166,21 @@ def _recorders(tmp_path):
     lock.write_text(f"#!/bin/sh\nprintf 'lock %s\\n' \"$1\" >> '{log}'\nexit 0\n")
     helper = tmp_path / "release-helper"
     helper.write_text(f"#!/bin/sh\nprintf 'release-helper %s\\n' \"$1\" >> '{log}'\n"
-                      f"exec python3 '{SHARED / 'scripts' / 'release_helpers.py'}' \"$@\"\n")
+                      f"exec {sys.executable} '{SHARED / 'scripts' / 'release_helpers.py'}' \"$@\"\n")
     for path in (make, lock, helper):
         path.chmod(0o755)
-    return log, [f"MAKE={make}", f"_ENV_LOCK_HELPER={lock}", f"_RELEASE_HELPER={helper}"]
+    # The lock and release helpers are stubbed below make (their helpers can't be overridden).
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", {"environment_lock.py": str(lock),
+                                                           "release_helpers.py": str(helper)})
+    return log, {"args": [f"MAKE={make}"], "path": bin_dir}
 
 
 def _release(env, overrides, *extra):
+    environ = _clean_env()
+    environ["PATH"] = f"{overrides['path']}:{environ['PATH']}"
     return subprocess.run(["make", "--no-print-directory", "release", "ENV=prod", f"ENV_DIR={env}",
-                           *overrides, *extra],
-                          cwd=ROOT / "aws", text=True, capture_output=True, env=_clean_env(), timeout=120)
+                           *overrides["args"], *extra],
+                          cwd=ROOT / "aws", text=True, capture_output=True, env=environ, timeout=120)
 
 
 def _calls(log):

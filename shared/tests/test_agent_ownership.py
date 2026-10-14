@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import os
 import shlex
 import shutil
@@ -680,7 +681,7 @@ def test_release_pushes_agents_after_apply_and_writes_the_receipt_last():
     order = [release.index(s) for s in ("restore-ids", '$(MAKE) apply ENV="$(ENV)"', "$(_AGENT_OWNERSHIP) sync",
                                         "verify-access ENV", "$(_AGENT_OWNERSHIP) receipt", "Release complete")]
     assert order == sorted(order)
-    rehearse = makefile[makefile.index("\nrehearse:"):makefile.index("\n_RUN_AUDIT_RULEBOOK")]
+    rehearse = makefile[makefile.index("\nrehearse:"):makefile.index("\noverride _RUN_AUDIT_RULEBOOK")]
     maintain = makefile[makefile.index("\nmaintain:"):makefile.index("\nvalidate:")]
     for recipe in (rehearse, maintain):
         assert "_AGENT_OWNERSHIP" not in recipe, "only release pushes agent config"
@@ -914,7 +915,7 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     make = Make(tmp_path, repo)
     agents = make._recorder("agents")
     assert make("rehearse", "dev").returncode == 0
-    result = make("release-plan", "prod", f"_AGENT_OWNERSHIP={agents}")
+    result = make("release-plan", "prod", stubs={"agent_ownership.py": str(agents)})
     assert result.returncode == 0, result.stdout + result.stderr
     calls = make.calls()
     agent_calls = [c[1] for c in calls if c[0] == "agents"]
@@ -922,7 +923,7 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
     assert json.loads(manifest.read_text())["agents"] == {"agents": {}}
     make.reset()
-    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={agents}")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs={"agent_ownership.py": str(agents)})
     assert result.returncode == 0, result.stdout + result.stderr
     calls = make.calls()
     flat = [c[0] if c[0] in ("agents", "runner") else next((a for a in c if not a.startswith("-") and "=" not in a), "?")
@@ -940,7 +941,7 @@ def test_make_release_fails_without_a_receipt_when_the_agent_push_fails(tmp_path
 
     repo, make, script, spaces, manifest = _make_release(tmp_path, monkeypatch)
     (spaces.parent / "spaces.json.reject").write_text("benchmarks")  # Genie rejects one field
-    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={script}")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs={"agent_ownership.py": str(script)})
     assert result.returncode != 0 and "Genie agent config was not pushed" in result.stderr
     assert "rejected the captured config" in result.stderr
     assert rg.last_release(repo.cloud, "prod") is None
@@ -1204,7 +1205,7 @@ def _make_release(tmp_path, monkeypatch, *, new_agent=False):
     script = make._write("agents-fake", FAKE_AGENT_SCRIPT.format(
         python=_sys.executable, shared=str(SHARED), spaces=str(spaces), log=str(make.log)))
     assert make("rehearse", "dev").returncode == 0
-    result = make("release-plan", "prod", f"_AGENT_OWNERSHIP={script}")
+    result = make("release-plan", "prod", stubs={"agent_ownership.py": str(script)})
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
     make.reset()
@@ -1223,7 +1224,7 @@ def test_make_release_refuses_agent_drift_before_any_tag_policy_or_saved_plan(tm
         (repo.prod / ".genie_space_id_sales").write_text("other-1\n")  # replaced between plan and release
     else:
         (repo.prod / ".genie_space_id_sales").write_text("pre-created-1\n")  # planned as a new agent
-    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={script}")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs={"agent_ownership.py": str(script)})
     assert result.returncode != 0 and "nothing was applied" in result.stderr, result.stdout + result.stderr
     names = make.names()
     assert not [n for n in names if n in MUTATING], names
@@ -1236,7 +1237,7 @@ def test_make_release_refuses_agent_drift_before_any_tag_policy_or_saved_plan(tm
 
 def test_make_release_pushes_after_the_saved_plans_when_nothing_drifted(tmp_path, monkeypatch):
     repo, make, script, spaces, manifest = _make_release(tmp_path, monkeypatch)
-    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={script}")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs={"agent_ownership.py": str(script)})
     assert result.returncode == 0, result.stdout + result.stderr
     calls = (spaces.parent / "spaces.json.calls").read_text()
     assert '["PATCH", "/api/2.0/genie/spaces/prod-1"]' in calls
@@ -1248,7 +1249,7 @@ def test_make_a_non_final_staged_phase_pushes_no_agent_config(tmp_path, monkeypa
     """A staged policy phase is not a completed release: no agent push, no release receipt."""
     repo, make, script, spaces, manifest = _make_release(tmp_path, monkeypatch)
     make.exit_code("staged", 10)
-    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"_AGENT_OWNERSHIP={script}")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs={"agent_ownership.py": str(script)})
     assert result.returncode == 0 and "Release phase applied" in result.stdout, result.stdout + result.stderr
     agent_calls = [c[1] for c in make.calls() if c[0] == "agents"]
     assert agent_calls == ["preflight"]
@@ -1436,9 +1437,9 @@ def _legacy_release(tmp_path, monkeypatch, *, agent: str, ack: str = ""):
     agents = make._recorder("agents-legacy")
     real = SHARED / "scripts" / "agent_ownership.py"
     # check-deletes runs for real; every other agent command is recorded only.
-    wrapper = make._write("agents-wrapper", f"#!/bin/sh\nif [ \"$1\" = check-deletes ]; then exec python3 {real} \"$@\"; fi\n"
+    wrapper = make._write("agents-wrapper", f"#!/bin/sh\nif [ \"$1\" = check-deletes ]; then exec {sys.executable} {real} \"$@\"; fi\n"
                                             f"exec {agents} \"$@\"\n")
-    return repo, make, make("release", "prod", f"_AGENT_OWNERSHIP={wrapper}")
+    return repo, make, make("release", "prod", stubs={"agent_ownership.py": str(wrapper)})
 
 
 @pytest.mark.parametrize("agent, ack, message", [

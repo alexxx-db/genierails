@@ -752,7 +752,7 @@ def test_make_runs_the_preflight_before_any_layer_is_applied():
     layer = makefile[makefile.index("\n_apply-layer:"):]
     workspace = layer[layer.index('if [ "$$layer" = "workspace" ]; then'):]
     assert workspace.index('"$(GENIE_ADOPT_PREFLIGHT_SCRIPT)"') < workspace.index("apply -parallelism=1")
-    assert "GENIE_ADOPT_PREFLIGHT_SCRIPT ?= $(SHARED_ROOT)/scripts/genie_adopt_preflight.py" in makefile
+    assert "override GENIE_ADOPT_PREFLIGHT_SCRIPT = $(SHARED_ROOT)/scripts/genie_adopt_preflight.py" in makefile
     assert "\ngenie-adopt-preflight: " in makefile
 
 

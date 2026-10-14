@@ -2,11 +2,18 @@
 """All-or-nothing promotion: snapshot the trees a promotion writes, restore them on failure.
 
 make promote (cross-env) and make promote-to write the destination env and
-the shared account layer in several steps. When any step refuses, restore
-puts every file, symlink and directory under those trees back byte for byte
-and removes what the run added, so a refused promotion leaves nothing
-changed. ``.terraform`` directories (providers, never written by a promotion)
-are neither copied nor touched.
+the shared account layer in several steps. When any step refuses (or the run
+gets SIGINT, SIGTERM or SIGHUP), restore puts every file, symlink and
+directory under those trees back byte for byte and removes what the run
+added, so a refused promotion leaves nothing changed. ``.terraform``
+directories (providers, never written by a promotion) are neither copied nor
+touched.
+
+This is not crash-atomic. restore rewrites the live trees in place, and no
+trap runs on SIGKILL or a host crash, so those (or a crash during restore)
+can leave a partial tree. The snapshot directory make prints is then left
+behind: ``promotion_txn.py restore --from <it>`` (or copying files back from
+it) recovers the pre-promotion state.
 
   promotion_txn.py snapshot --to <tmp> <dir> [<dir> ...]
   promotion_txn.py restore --from <tmp>

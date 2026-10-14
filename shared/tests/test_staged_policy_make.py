@@ -10,13 +10,21 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs
+
 from scripts import environment_lock
 
 ROOT = Path(__file__).parents[2]
 
 
-def _env():
-    return {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "APPLY_FLAGS")}
+def _env(staged=None, gate=None, sticky=None):
+    environ = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "APPLY_FLAGS")}
+    if staged:
+        # Stubbed below make: the controller, gate and sticky helpers can't be overridden.
+        bin_dir = script_stubs.install(Path(staged).parent / "stub-bin", {
+            "staged_policy_apply.py": str(staged), "coverage_gate.py": str(gate), "sticky_governance.py": str(sticky)})
+        environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
+    return environ
 
 
 def _stub(path: Path, log: Path, rc: int = 0) -> Path:
@@ -62,9 +70,8 @@ def _run_apply_layer(env_dir, stubs, extra, cloud):
     return subprocess.run(
         ["make", "--no-print-directory", "_apply-layer", "LAYER=data_access", "TARGET_ENV=dev", "ENV=dev",
          f"LAYER_ENV_DIR={env_dir / 'data_access'}", f"ENV_DIR={env_dir}", f"ROOT_RUNNER={stubs['runner']}",
-         f"_STAGED_POLICY={stubs['staged']}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
          f"MAKE={stubs['make']}", "IMPORT_EXISTING_SCRIPT=true", "FORCE_APPLY=1", *extra],
-        cwd=ROOT / cloud, text=True, capture_output=True, env=_env())
+        cwd=ROOT / cloud, text=True, capture_output=True, env=_env(stubs["staged"], stubs["gate"], stubs["sticky"]))
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
@@ -104,9 +111,8 @@ def test_a_failed_staged_apply_fails_the_layer(tmp_path):
         result = subprocess.run(
             ["make", "--no-print-directory", "_apply-layer", "LAYER=data_access", "TARGET_ENV=dev", "ENV=dev",
              f"LAYER_ENV_DIR={env_dir / 'data_access'}", f"ENV_DIR={env_dir}", f"ROOT_RUNNER={stubs['runner']}",
-             f"_STAGED_POLICY={staged}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
              f"MAKE={stubs['make']}", "IMPORT_EXISTING_SCRIPT=true"],
-            cwd=ROOT / "aws", text=True, capture_output=True, env=_env())
+            cwd=ROOT / "aws", text=True, capture_output=True, env=_env(staged, stubs["gate"], stubs["sticky"]))
     assert result.returncode != 0
     assert not (env_dir / "data_access" / ".data_access.apply.sha").exists()
 

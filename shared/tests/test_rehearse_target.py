@@ -23,7 +23,10 @@ def _recording_stub(tmp_path):
     stub = tmp_path / "record-successful-make"
     stub.write_text(
         "#!/bin/sh\n"
-        f"printf '%s\\n' \"$*\" >> \"{log}\"\n"
+        # The one-time token the caller hands a nested apply so it skips its own derive.
+        'args="$*"; if [ -n "$GENIERAILS_EXPOSURE_TOKEN" ] && [ -f "$GENIERAILS_EXPOSURE_TOKEN" ]; then '
+        'args="$args <exposure-token>"; rm -f "$GENIERAILS_EXPOSURE_TOKEN"; fi\n'
+        f"printf '%s\\n' \"$args\" >> \"{log}\"\n"
         "exit 0\n"
     )
     stub.chmod(0o755)
@@ -102,7 +105,7 @@ def test_rehearse_with_key_derives_validates_gates_applies_and_verifies(tmp_path
         ["_derive-before-exposure", "ENV=dev", "APPLY_FLAGS="],
         ["validate-generated", "ENV=dev"],
         ["coverage-gate", "ENV=dev"],
-        ["apply", "ENV=dev", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
+        ["apply", "ENV=dev", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", "<exposure-token>"],
         ["verify-access", "ENV=dev", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate toggle: nothing passes or writes the retired flag.
@@ -129,7 +132,7 @@ def test_rehearse_without_key_runs_key_independent_live_verification(tmp_path):
         ["_derive-before-exposure", "ENV=dev", "APPLY_FLAGS="],
         ["validate-generated", "ENV=dev"],
         ["coverage-gate", "ENV=dev"],
-        ["apply", "ENV=dev", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
+        ["apply", "ENV=dev", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", "<exposure-token>"],
         ["verify-access", "ENV=dev"],
     ]
     assert "skipped verify-access" not in output

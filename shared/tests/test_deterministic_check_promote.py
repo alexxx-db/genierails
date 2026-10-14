@@ -15,6 +15,7 @@ Terraform is a stub on PATH; nothing reaches Databricks.
 """
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -442,6 +443,83 @@ def test_apply_refuses_before_the_lock_when_auth_is_not_the_committed_deployer(r
     assert "databricks_client_id is 0badc0de-0000-0000-0000-000000000000" in out, out
     assert not list(_envs(repo).rglob(".governance.lock")), out
     assert _state(repo) == before
+
+
+# Every Make variable a test harness used to stub a check with, plus the
+# derive-skip flag. None may skip the identity gate, from the command line or
+# the environment (make -e lets the environment beat ordinary assignments).
+FORMER_STUBS = {name: "true" for name in (
+    "_DEPLOYER_CHECK", "_ACCESS_CHECK", "_GROUP_CHECK", "_GROUP_MAP_RECORD", "_TABLE_READERS", "_SAVE_VERIFY_KEY",
+    "_STAGED_POLICY", "_STAGED_CONFIRM_RUN", "_EXTERNAL_MASK_INVENTORY", "_CLASSIFICATION_CHECK", "_LIVE_SNAPSHOT",
+    "_RELEASE_REPORTS", "_RELEASE_GATE", "_COVERAGE_GATE", "_STICKY", "_AGENT_OWNERSHIP", "_AGENT_COVERAGE",
+    "_ENV_LOCK_HELPER", "_RELEASE_HELPER", "_REQUIRE_MASK_PROOF", "_LEGACY_GUARD", "_APPLY_GUARD",
+    "_PROMOTION_TXN_BEGIN", "_PROMOTION_TXN_COMMIT", "_IS_DETERMINISTIC", "_GOVERNANCE_MODE_OF")} | {
+    "_EXPOSURE_DERIVED": "1", "AUDIT_SCHEMA_SCRIPT": "/dev/null", "DERIVE_ASSIGNMENTS_SCRIPT": "/dev/null",
+    "GENIE_ADOPT_PREFLIGHT_SCRIPT": "/dev/null"}
+ENTRY_POINTS = [("rehearse", "dev", ()), ("release-plan", "prod", ()), ("release", "prod", ("MANIFEST=m.json",)),
+                ("maintain", "prod", ()), ("ungovern", "prod", ("TABLE=ppay.s.t", "YES=1")),
+                ("detach-agent", "prod", ("SPACE=Payments",))]
+
+
+@pytest.mark.parametrize("target, env, extra", ENTRY_POINTS, ids=[t for t, _e, _x in ENTRY_POINTS])
+def test_no_override_skips_the_deployer_gate_at_any_entry_point(repo, tmp_path, target, env, extra):
+    _promote_to_prod(repo, tmp_path, deployer=PROD_DEPLOYER)
+    auth = _envs(repo) / env / "auth.auto.tfvars"
+    cmdline = [f"{name}={value}" for name, value in FORMER_STUBS.items()]
+    for auth_text, how in ((_auth("0badc0de-0000-0000-0000-000000000000", host=""), "cmdline"),
+                           (_auth("0badc0de-0000-0000-0000-000000000000", host=""), "environment"),
+                           (_auth("0badc0de-0000-0000-0000-000000000000", host=""), "make -e"),
+                           (_auth("", host=""), "cmdline")):
+        auth.write_text(auth_text)
+        before = _state(repo)
+        args = [target, f"ENV={env}", *extra]
+        if how == "cmdline":
+            result = _make(repo, tmp_path, *args, *cmdline)
+        else:
+            result = _make(repo, tmp_path, *(["-e"] if how == "make -e" else []), *args, **FORMER_STUBS)
+        out = result.stdout + result.stderr
+        case = f"{target} ENV={env}, overrides via {how}, auth {auth_text.splitlines()[1]}"
+        assert result.returncode != 0, case + "\n" + out
+        assert f"ERROR: make {target} refused before taking the lock:" in out, case + "\n" + out
+        committed = PROD_DEPLOYER if env == "prod" else DEPLOYER
+        assert "databricks_client_id is" in out and committed in out, case
+        assert not list(_envs(repo).rglob(".governance.lock")), case
+        assert _state(repo) == before, case
+
+
+def test_every_check_guard_and_transaction_helper_is_non_overridable():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    loose = [line.split("=")[0].strip() for line in makefile.splitlines()
+             if re.match(r"^_[A-Z][A-Z0-9_]* *[:?]?= ", line)
+             and any(word in line for word in ("python3", "$(MAKE)", "trap", "exit", "$(_"))]
+    assert loose == [], f"overridable helpers: {loose}"
+    for name in ("AUDIT_SCHEMA_SCRIPT", "DERIVE_ASSIGNMENTS_SCRIPT", "GENIE_ADOPT_PREFLIGHT_SCRIPT"):
+        assert re.search(rf"(?m)^override {name} = ", makefile), name
+    assert "_EXPOSURE_DERIVED" not in makefile
+
+
+def test_the_exposure_token_works_once_and_only_for_its_env(tmp_path, monkeypatch):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from exposure_token import consume, mint
+
+    env, other = tmp_path / "prod", tmp_path / "dev"
+    env.mkdir()
+    other.mkdir()
+    token = mint(env)
+    assert oct(token.stat().st_mode & 0o777) == "0o600"
+    assert not consume(other, str(token)) and token.exists()  # another env's token skips nothing
+    assert consume(env, str(token)) and not token.exists()
+    assert not consume(env, str(token))  # once
+    forged = tmp_path / "forged"
+    forged.write_text(f"{env.resolve()}\n")
+    forged.chmod(0o644)
+    assert not consume(env, str(forged))  # not private
+    link = tmp_path / "link"
+    good = mint(env)
+    link.symlink_to(good)
+    assert not consume(env, str(link)) and good.exists()  # never through a link
+    assert not consume(env, None) and not consume(env, "")
+    good.unlink()
 
 
 def test_apply_check_passes_when_auth_matches_and_ignores_legacy(tmp_path):

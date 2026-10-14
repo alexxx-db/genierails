@@ -14,14 +14,29 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs  # noqa: E402
+
 ROOT = Path(__file__).parents[2]
 CLOUD_ROOT = ROOT / "aws"
 sys.path.insert(0, str(ROOT / "shared"))
 from scripts import environment_lock as lock  # noqa: E402
 
 
-def _env():
-    return {k: v for k, v in os.environ.items() if k not in ("VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MAKEFLAGS", "MAKELEVEL")}
+def _env(audit=None):
+    environ = {k: v for k, v in os.environ.items() if k not in ("VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MAKEFLAGS", "MAKELEVEL")}
+    if audit is not None:
+        # The schema audit is stubbed below make (AUDIT_SCHEMA_SCRIPT can't be overridden).
+        bin_dir = script_stubs.install(Path(audit).parent / "stub-bin",
+                                       {"audit_schema_drift.py": script_stubs.python_file(audit)})
+        environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
+    return environ
+
+
+# What a make stub logs after a nested call's arguments when the caller handed
+# it the one-time token that lets it skip its own derive (scripts/exposure_token.py).
+TOKEN = "<exposure-token>"
+_LOG_CALL = ('args="$*"; if [ -n "$GENIERAILS_EXPOSURE_TOKEN" ] && [ -f "$GENIERAILS_EXPOSURE_TOKEN" ]; then '
+             'args="$args <exposure-token>"; rm -f "$GENIERAILS_EXPOSURE_TOKEN"; fi; ')
 
 
 # An already-released prod env still carries the retired flag; release and
@@ -45,7 +60,7 @@ def _same_env_promote(env_dir):
 def _stub(tmp_path, fail=None, sleep=0, on=None):
     log = tmp_path / "calls"
     stub = tmp_path / "make-stub"
-    body = ["#!/bin/sh", f"printf '%s\\n' \"$*\" >> '{log}'"]
+    body = ["#!/bin/sh", _LOG_CALL + f"printf '%s\\n' \"$args\" >> '{log}'"]
     if sleep:
         body.append(f"sleep {sleep}")
     for target, action in (on or {}).items():
@@ -67,9 +82,8 @@ def _stub(tmp_path, fail=None, sleep=0, on=None):
 
 
 def _make(target, env_dir, stub, audit, *extra):
-    return subprocess.run(["make", target, "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}",
-                           f"AUDIT_SCHEMA_SCRIPT={audit}", *extra], cwd=CLOUD_ROOT,
-                          text=True, capture_output=True, env=_env())
+    return subprocess.run(["make", target, "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}", *extra], cwd=CLOUD_ROOT,
+                          text=True, capture_output=True, env=_env(audit))
 
 
 def _calls(log):
@@ -89,7 +103,7 @@ def test_release_runs_unified_pipeline_in_order_and_writes_no_receipt(tmp_path):
         _same_env_promote(env_dir),
         ["verify-access-keys", "ENV=prod", "VERIFY_KEY_COLUMN=customer_id"],
         ["audit-rulebook", "ENV=prod"],
-        ["apply", "ENV=prod", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", "_STAGED_CONFIRM=0"],
+        ["apply", "ENV=prod", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", TOKEN],
         ["verify-access", "ENV=prod", "VERIFY_REQUIRE_MASKS=1", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate to open or persist: release neither passes nor writes it. The
@@ -168,9 +182,8 @@ def test_lock_is_exclusive_and_stale_lock_is_reclaimed(tmp_path):
 def test_release_interrupt_cleans_lock(tmp_path):
     env_dir = _env_dir(tmp_path)
     stub, _log, audit = _stub(tmp_path, sleep=10)
-    proc = subprocess.Popen(["make", "release", "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}",
-                             f"AUDIT_SCHEMA_SCRIPT={audit}"], cwd=CLOUD_ROOT, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(), start_new_session=True)
+    proc = subprocess.Popen(["make", "release", "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}"], cwd=CLOUD_ROOT, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(audit), start_new_session=True)
     lock_path = env_dir / "generated/.governance.lock"
     for _ in range(100):
         if lock_path.exists(): break
@@ -225,10 +238,9 @@ def test_release_failed_apply_prints_withdrawal_guidance_and_writes_nothing(tmp_
 def test_release_promote_stays_same_env_when_dest_env_leaks_from_the_shell(tmp_path):
     env_dir = _env_dir(tmp_path)
     stub, log, audit = _stub(tmp_path)
-    leaked = {**_env(), "DEST_ENV": "dev", "SOURCE_ENV": "dev", "DEST_CATALOG_MAP": "a=b",
+    leaked = {**_env(audit), "DEST_ENV": "dev", "SOURCE_ENV": "dev", "DEST_CATALOG_MAP": "a=b",
               "SOURCE_ENV_DIR": str(tmp_path / "dev"), "DEST_ENV_DIR": str(tmp_path / "dev")}
-    result = subprocess.run(["make", "release", "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}",
-                             f"AUDIT_SCHEMA_SCRIPT={audit}"], cwd=CLOUD_ROOT,
+    result = subprocess.run(["make", "release", "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}"], cwd=CLOUD_ROOT,
                             text=True, capture_output=True, env=leaked)
     assert result.returncode == 0, result.stdout + result.stderr
     assert _same_env_promote(env_dir) in _calls(log)
@@ -347,8 +359,8 @@ def test_parallel_make_maintain_release_serialises_on_lock(tmp_path):
     stub, log, audit = _stub(tmp_path, sleep=1)
     result = subprocess.run(
         ["make", "-j2", "maintain", "release", "ENV=prod", f"ENV_DIR={env_dir}",
-         f"MAKE={stub}", f"AUDIT_SCHEMA_SCRIPT={audit}"], cwd=CLOUD_ROOT,
-        text=True, capture_output=True, env=_env(),
+         f"MAKE={stub}"], cwd=CLOUD_ROOT,
+        text=True, capture_output=True, env=_env(audit),
     )
     assert result.returncode != 0
     assert "held by make" in result.stderr
@@ -401,9 +413,8 @@ def test_signal_mid_run_releases_lock(tmp_path, target, sig):
     env_dir = _env_dir(tmp_path)
     stub, log, audit = _stub(tmp_path, on={"derive-assignments": "exec sleep 30"})
     proc = subprocess.Popen(
-        ["make", target, "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}",
-         f"AUDIT_SCHEMA_SCRIPT={audit}"], cwd=CLOUD_ROOT, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(), start_new_session=True,
+        ["make", target, "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}"], cwd=CLOUD_ROOT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=_env(audit), start_new_session=True,
         preexec_fn=_default_signals,
     )
     path = env_dir / lock.LOCK_RELPATH
@@ -451,8 +462,8 @@ def test_maintain_preserves_direct_audit_exit_code_with_real_nested_make(tmp_pat
     audit.write_text(f"raise SystemExit({audit_rc})\n")
     result = subprocess.run(
         ["make", "maintain", "ENV=prod", f"ENV_DIR={env_dir}",
-         f"ACCOUNT_ENV_DIR={tmp_path / 'account'}", f"AUDIT_SCHEMA_SCRIPT={audit}"],
-        cwd=CLOUD_ROOT, text=True, capture_output=True, env=_env(),
+         f"ACCOUNT_ENV_DIR={tmp_path / 'account'}"],
+        cwd=CLOUD_ROOT, text=True, capture_output=True, env=_env(audit),
     )
     assert result.returncode != 0 and expected in result.stderr
 
@@ -484,7 +495,7 @@ def _guarding_stub(tmp_path):
     stub = tmp_path / "guarding-make"
     stub.write_text(
         "#!/bin/sh\n"
-        f"printf '%s\\n' \"$*\" >> '{log}'\n"
+        + _LOG_CALL + f"printf '%s\\n' \"$args\" >> '{log}'\n"
         'case "$1" in apply|apply-governance) shift; '
         f'exec {shutil.which("make")} --no-print-directory _guard-workspace-config "$@" ;; esac\n'
         "exit 0\n"
@@ -501,9 +512,8 @@ def _run_with_flags(tmp_path, target, env_name, apply_flags, env_file='sql_wareh
     (env_dir / "env.auto.tfvars").write_text(env_file)
     stub, log, audit = _guarding_stub(tmp_path)
     result = subprocess.run(
-        ["make", target, f"ENV={env_name}", f"ENV_DIR={env_dir}", f"MAKE={stub}",
-         f"AUDIT_SCHEMA_SCRIPT={audit}", f"APPLY_FLAGS={apply_flags}"],
-        cwd=CLOUD_ROOT, text=True, capture_output=True, env=_env(),
+        ["make", target, f"ENV={env_name}", f"ENV_DIR={env_dir}", f"MAKE={stub}", f"APPLY_FLAGS={apply_flags}"],
+        cwd=CLOUD_ROOT, text=True, capture_output=True, env=_env(audit),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     warnings = [line for line in (result.stdout + result.stderr).splitlines()
@@ -527,7 +537,7 @@ def test_retired_flag_in_caller_apply_flags_warns_once_though_nested_apply_clear
     nested_calls = [call for call in calls if call[0] == nested]
     # rehearse and release confirm the staged policy journal themselves, after their verification.
     confirm = ["_STAGED_CONFIRM=0"] if nested == "apply" else []
-    assert nested_calls == [[nested, f"ENV={env_name}", "APPLY_FLAGS=", "_EXPOSURE_DERIVED=1", *confirm]]
+    assert nested_calls == [[nested, f"ENV={env_name}", "APPLY_FLAGS=", *confirm, TOKEN]]
     assert not any(f"APPLY_FLAGS={flags}" in call for call in calls)
 
 

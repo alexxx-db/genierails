@@ -16,12 +16,18 @@ export VERBOSE
 
 
 SHELL := /bin/bash
+# Every helper that runs a check, guard, gate, lock or promotion transaction
+# is defined with override: a command-line or environment value (make
+# _DEPLOYER_CHECK=true, make -e) can't replace it. Tests stub the scripts
+# behind them with a fake python3 on PATH (tests/script_stubs.py), never by
+# overriding these. Only variables that pick what runs (MAKE, ROOT_RUNNER,
+# SHARED_ROOT, CLOUD_ROOT, IMPORT_EXISTING_SCRIPT) stay overridable.
 export DATABRICKS_USER_AGENT_EXTRA := genierails/0.1.0
 
 # GNU Make executes an entire recipe line containing $(MAKE), even with -n.
 # Mixed recursive/shell recipes must exit before reaching real side effects.
-_MAKE_DRY_RUN := $(findstring n,$(firstword -$(MAKEFLAGS)))
-_DRY_RUN_GUARD = if [ -n "$(_MAKE_DRY_RUN)" ]; then exit 0; fi
+override _MAKE_DRY_RUN := $(findstring n,$(firstword -$(MAKEFLAGS)))
+override _DRY_RUN_GUARD = if [ -n "$(_MAKE_DRY_RUN)" ]; then exit 0; fi
 
 ACCOUNT_ENV := account
 DATA_ACCESS_SUBDIR := data_access
@@ -45,15 +51,16 @@ SPACE ?=
 # Example: make generate MODE=governance   (central governance team)
 #          make generate MODE=genie        (BU team creating Genie agents)
 MODE ?=
-AUDIT_SCHEMA_SCRIPT ?= $(SHARED_ROOT)/scripts/audit_schema_drift.py
-DERIVE_ASSIGNMENTS_SCRIPT ?= $(SHARED_ROOT)/scripts/derive_assignments.py
-# Live-API steps of _apply-layer; overridable so tests never reach Databricks.
+override AUDIT_SCHEMA_SCRIPT = $(SHARED_ROOT)/scripts/audit_schema_drift.py
+override DERIVE_ASSIGNMENTS_SCRIPT = $(SHARED_ROOT)/scripts/derive_assignments.py
+# Imports existing resources into state (not a check, so it stays overridable;
+# a skipped import fails the apply rather than widening anything).
 IMPORT_EXISTING_SCRIPT ?= $(SHARED_ROOT)/scripts/import_existing.sh
-GENIE_ADOPT_PREFLIGHT_SCRIPT ?= $(SHARED_ROOT)/scripts/genie_adopt_preflight.py
+override GENIE_ADOPT_PREFLIGHT_SCRIPT = $(SHARED_ROOT)/scripts/genie_adopt_preflight.py
 # Every Genie agent GenieRails created must still have its ID file (state has
 # no agent ID). Runs first on the workspace path of _apply-layer (fails) and
 # _plan-layer (--warn), before any early exit. Local unless a file is missing.
-_GENIE_ID_FILE_CHECK = python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$$env_dir" --id-files --env-name "$$target_env" --runner "$(ROOT_RUNNER)"
+override _GENIE_ID_FILE_CHECK = python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$$env_dir" --id-files --env-name "$$target_env" --runner "$(ROOT_RUNNER)"
 # Optional: override the 'country' field in env.auto.tfvars for this invocation.
 # Comma-separated region codes. Normally set once in env.auto.tfvars.
 # Example: make generate COUNTRY=ANZ   (Australia & NZ)
@@ -224,7 +231,7 @@ _guard-workspace-target:
 # or TF_VAR_), where a leftover business_access_enabled otherwise gets only
 # Terraform's generic undeclared-variable warning. plan, apply and
 # apply-governance print the same one-line deprecation; never fails.
-_WARN_ACCOUNT_RETIRED_FLAG = $(_COVERAGE_GATE) warn-retired-flag --file-only \
+override _WARN_ACCOUNT_RETIRED_FLAG = $(_COVERAGE_GATE) warn-retired-flag --file-only \
 	--env-file "$(ACCOUNT_ENV_DIR)/env.auto.tfvars" --label "$(patsubst $(CLOUD_ROOT)/%,%,$(ACCOUNT_ENV_DIR))/env.auto.tfvars" || true
 
 _guard-account-config:
@@ -240,7 +247,7 @@ _guard-data-access-config:
 # Fail fast while env.auto.tfvars still holds the template's <your-genie-space-id>.
 # Promote also checks its source env and, if it already exists, its destination.
 # Missing files pass, so ENV=account and not-yet-created envs are unaffected.
-_GENIE_PLACEHOLDER_GUARD = python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
+override _GENIE_PLACEHOLDER_GUARD = python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
 	"$(SOURCE_ENV_DIR)/env.auto.tfvars" $(if $(DEST_ENV),"$(DEST_ENV_DIR)/env.auto.tfvars",)
 
 _guard-genie-placeholder:
@@ -379,7 +386,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 # explicit GITIGNORE=customer writes the block into $(CLOUD_ROOT)/.gitignore;
 # after that every setup refreshes it (GITIGNORE=off skips). The upstream repo
 # never has the block, so a plain setup there only prints the opt-in line.
-_CUSTOMER_GITIGNORE = python3 "$(SHARED_ROOT)/scripts/customer_gitignore.py" --cloud-dir "$(CLOUD_ROOT)" \
+override _CUSTOMER_GITIGNORE = python3 "$(SHARED_ROOT)/scripts/customer_gitignore.py" --cloud-dir "$(CLOUD_ROOT)" \
 	--mode "$(GITIGNORE)" --account-env "$(ACCOUNT_ENV)" --env "$(ENV)"
 
 init-env: _bootstrap ## Prepare env directories and default config files
@@ -442,7 +449,7 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 # one read-only GET, writes only envs/dev/agents/<agent>.space.json; no
 # governance drafting, no model call, no Terraform state. A plain generate
 # captures only agents with no capture yet (import-new) and never re-captures.
-_AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
+override _AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
 capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/dev/agents/<agent>.space.json: SPACE="<agent>" (read-only)
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
 	@if [ "$(ENV)" != "$(DEFAULT_ENV)" ]; then echo "ERROR: capture runs only with ENV=$(DEFAULT_ENV); promote-to carries agents to $(ENV)." >&2; exit 1; fi
@@ -457,17 +464,18 @@ capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/
 # so the script can't be run around it. Writes no committed file.
 detach-agent: _guard-not-ci-apply _guard-workspace-target ## Forget a released, detached agent from Terraform state (never deletes it): SPACE="<agent>"
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
-	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,detach-agent); \
+	@$(_DRY_RUN_GUARD); $(_DEPLOYER_CHECK) "make detach-agent" || exit 1; $(call _ENV_LOCK,detach-agent); \
 	$(_AGENT_OWNERSHIP) detach --env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)" --runner "$(ROOT_RUNNER)"
 
 # Takes one table out of a deterministic env's governed set, removes its
 # treatment tags and applies governance. Refuses while any agent uses it; the
 # check runs before anything is created, then it asks to confirm (YES=1 skips).
-_STICKY = python3 "$(SHARED_ROOT)/scripts/sticky_governance.py"
+override _STICKY = python3 "$(SHARED_ROOT)/scripts/sticky_governance.py"
 ungovern: _guard-not-ci-apply ## Remove governance (treatment tags, masks) from a table no agent uses: TABLE=cat.sch.tbl [YES=1]
 	@$(_GUARD_WORKSPACE_ENV); \
 	if [ -z "$(TABLE)" ]; then echo "ERROR: TABLE=cat.sch.tbl is required" >&2; exit 1; fi; \
 	$(_DRY_RUN_GUARD); \
+	$(_DEPLOYER_CHECK) "make ungovern" || exit 1; \
 	$(_STICKY) ungovern --env-dir "$(ENV_DIR)" --table "$(TABLE)" || exit 1; \
 	if [ "$(YES)" != 1 ]; then \
 		printf 'Type YES to ungovern $(TABLE) in $(ENV): '; read -r answer || answer=; \
@@ -509,7 +517,7 @@ scaffold-treatments: _guarded-bootstrap _guard-workspace-target ## Map unmapped 
 # The env check (exactly a real envs/<ENV>, not prod or a promotion target)
 # runs before bootstrap, so a redirected ENV_DIR is refused before anything is
 # written there.
-_MATERIALIZE = python3 "$(SHARED_ROOT)/scripts/materialize_treatment.py" \
+override _MATERIALIZE = python3 "$(SHARED_ROOT)/scripts/materialize_treatment.py" \
 	--tfvars "$(ENV_DIR)/generated/abac.auto.tfvars" \
 	--sql "$(ENV_DIR)/generated/masking_functions.sql" \
 	--treatment-config "$(SHARED_ROOT)/treatment_config.json" \
@@ -575,7 +583,7 @@ coverage-gate: _guarded-bootstrap _guard-workspace-target ## Block on any sensit
 # Terraform-enforced gate for the split data_access config (scripts/coverage_gate.py).
 # _apply-layer and _plan-layer run it before every data_access plan/apply; the
 # module withholds new business SELECT unless its recorded result matches the inputs.
-_COVERAGE_GATE = python3 "$(SHARED_ROOT)/scripts/coverage_gate.py"
+override _COVERAGE_GATE = python3 "$(SHARED_ROOT)/scripts/coverage_gate.py"
 
 # Before a plan/apply that opens business access, re-read live UC so the gate
 # judges current tags and DDL: derive-assignments (class.* tags + DDL) in
@@ -583,8 +591,9 @@ _COVERAGE_GATE = python3 "$(SHARED_ROOT)/scripts/coverage_gate.py"
 # generated/.live_refresh.json, which the gate requires. Both first mark the
 # recorded gate result failed, so a failed or interrupted refresh leaves no
 # usable pass for make or raw Terraform. PROMOTE_AFTER=1 re-splits generated/
-# afterwards (plan; apply promotes itself). Callers that already refreshed
-# pass _EXPOSURE_DERIVED=1. With TOLERATE_REFRESH_FAILURE=1 (plan, apply,
+# afterwards (plan; apply promotes itself). A caller that already refreshed
+# hands its nested apply a one-time token (_EXPOSURE_TOKEN, minted only after
+# its own derive passed; scripts/exposure_token.py); no variable skips it. With TOLERATE_REFRESH_FAILURE=1 (plan, apply,
 # apply-governance, apply-genie) a failed refresh doesn't stop the command:
 # the gate then fails closed, and Terraform only lets through changes that
 # keep or revoke SELECT / CAN_RUN, so revocation never waits on Unity Catalog.
@@ -622,43 +631,44 @@ _refresh-live-ddl: _guarded-bootstrap _guard-workspace-target
 # tool saved are dropped, your own are kept; promote carries the map, remapping
 # table names), and an explicit VERIFY_KEY_COLUMN as verify_key_column when
 # passing mask checks were paired by it. A partial run saves nothing.
-_SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
-_VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
-_SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)" \
+override _SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
+override _VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
+override _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)" \
 	$$([ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ] && echo --report-only)
 
 # 1 when any workspace env of this checkout ($(CLOUD_ROOT)/envs/*, not account
 # or data_access) is deterministic. The account layer is shared, so its
 # tag-policy values may only be removed under the account lock then.
-_ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$(CLOUD_ROOT)/envs" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)"
+override _ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$(CLOUD_ROOT)/envs" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)"
 
 # 1 when the env is deterministic and configures no agent: governance only.
 # A genie_space_title alone also creates an agent (the legacy single-space path).
-_GOVERNANCE_ONLY = python3 -c 'import glob,hcl2,os,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id") and not c.get("genie_space_title") and not glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars"))))'
+override _GOVERNANCE_ONLY = python3 -c 'import glob,hcl2,os,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic" and not c.get("genie_spaces") and not c.get("genie_space_id") and not c.get("genie_space_title") and not glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars"))))'
 # 1 when the env is deterministic: CAN_RUN rests on the live agent coverage check.
-_IS_DETERMINISTIC = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic"))'
+override _IS_DETERMINISTIC = python3 -c 'import hcl2,sys; c=hcl2.load(open(sys.argv[1])); print(int(c.get("governance_mode","legacy")=="deterministic"))'
 # 1 when the env configures an agent or its workspace state still holds one
 # (read through scripts/state_layout.py, wherever it lives; unreadable counts).
-_HAS_AGENTS = { python3 "$(SHARED_ROOT)/scripts/state_layout.py" state-json --env-dir "$$(dirname "$(1)")" --env "$$(basename "$$(dirname "$(1)")")" --layer workspace | python3 -c 'import glob,hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); s=json.load(sys.stdin) or {}; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars")) or any(str(x.get("name","")).startswith("genie_space") for x in s.get("resources",[])))))' "$(1)" 2>/dev/null || echo 1; }
+override _HAS_AGENTS = { python3 "$(SHARED_ROOT)/scripts/state_layout.py" state-json --env-dir "$$(dirname "$(1)")" --env "$$(basename "$$(dirname "$(1)")")" --layer workspace | python3 -c 'import glob,hcl2,json,os,sys; c=hcl2.load(open(sys.argv[1])); s=json.load(sys.stdin) or {}; print(int(bool(c.get("genie_spaces") or c.get("genie_space_id") or c.get("genie_space_title") or glob.glob(os.path.join(os.path.dirname(sys.argv[1]),"agents","*.auto.tfvars")) or any(str(x.get("name","")).startswith("genie_space") for x in s.get("resources",[])))))' "$(1)" 2>/dev/null || echo 1; }
 # Live "agent tables covered" check (scripts/agent_coverage.py): run before
 # every deterministic workspace plan/apply; the workspace root reads its result.
-_AGENT_COVERAGE = python3 "$(SHARED_ROOT)/scripts/agent_coverage.py"
+override _AGENT_COVERAGE = python3 "$(SHARED_ROOT)/scripts/agent_coverage.py"
 # table_readers (shared/table_readers.py): show resolved readers, propose
 # entries for newly imported agents, and refuse acl_groups that can't read.
-_TABLE_READERS = python3 "$(SHARED_ROOT)/table_readers.py"
-_ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --command-name
+override _TABLE_READERS = python3 "$(SHARED_ROOT)/table_readers.py"
+override _ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --command-name
 # group_map (shared/group_map.py, decision 8): before rehearse and release,
 # every group the env names (after mapping) must exist live, and a changed
 # group_map needs its <env>:weaken:group_map:<dev>=<target> ack. After a
 # successful run, the applied group_map is recorded (ignored runtime file).
 # Before any lock: a deterministic env applies only with the SP its policies
 # exempt (auth.auto.tfvars databricks_client_id = deployer_principal_id).
-_DEPLOYER_CHECK = python3 "$(SHARED_ROOT)/deployer_identity.py" check --env-dir "$(ENV_DIR)" --command-name
-_GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
-_GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
+override _EXPOSURE_TOKEN = python3 "$(SHARED_ROOT)/scripts/exposure_token.py"
+override _DEPLOYER_CHECK = python3 "$(SHARED_ROOT)/deployer_identity.py" check --env-dir "$(ENV_DIR)" --command-name
+override _GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
+override _GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 # The governance mode of an env.auto.tfvars (legacy when unset).
-_GOVERNANCE_MODE_OF = python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))'
+override _GOVERNANCE_MODE_OF = python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))'
 
 # A deterministic env's data_access layer is applied only through the staged
 # policy controller (create, verify, tighten, switch, verify, retire; see
@@ -667,11 +677,11 @@ _GOVERNANCE_MODE_OF = python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv
 # generation its columns carry. rehearse and release pass _STAGED_CONFIRM=0 to
 # apply and confirm themselves once their own verification passed: only a
 # confirmed change lets a later run retire the generation it replaced.
-_STAGED_POLICY = python3 "$(SHARED_ROOT)/scripts/staged_policy_apply.py"
+override _STAGED_POLICY = python3 "$(SHARED_ROOT)/scripts/staged_policy_apply.py"
 _STAGED_CONFIRM ?= 1
-_STAGED_VERIFY_ACCESS = $(MAKE) --no-print-directory verify-access ENV="$(TARGET_ENV_NAME)" ENV_DIR="$$GENIERAILS_ENV_DIR" TARGET_ENV= VERIFY_REQUIRE_MASKS=1 \
+override _STAGED_VERIFY_ACCESS = $(MAKE) --no-print-directory verify-access ENV="$(TARGET_ENV_NAME)" ENV_DIR="$$GENIERAILS_ENV_DIR" TARGET_ENV= VERIFY_REQUIRE_MASKS=1 \
 	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
-_STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
+override _STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
 
 # Deterministic envs: applying commands never rewrite committed files (design
 # section 9). What they re-derive from live UC (and the same-env split of it)
@@ -679,36 +689,36 @@ _STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
 # (scripts/runtime_overlay.py); _EFFECTIVE_GENERATED sets gen_abac/gen_sql to
 # the files a reader uses (the overlay when current, else the committed ones;
 # always the committed ones in legacy envs).
-_OVERLAY = python3 "$(SHARED_ROOT)/scripts/runtime_overlay.py"
-_EFFECTIVE_GENERATED = gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)" && \
+override _OVERLAY = python3 "$(SHARED_ROOT)/scripts/runtime_overlay.py"
+override _EFFECTIVE_GENERATED = gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)" && \
 	gen_sql="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" masking_functions.sql)" || exit 1
 
 # Release gating (scripts/release_gate.py, rollout step 9): rehearse receipts,
 # release-plan provenance and manifests, release receipts, maintain gating.
 # Receipts and manifests are ignored runtime files under GENIERAILS_STATE_DIR
 # (or <cloud>/.genierails-state). Deterministic envs only.
-_RELEASE_GATE = python3 "$(SHARED_ROOT)/scripts/release_gate.py"
-_RELEASE_GATE_MAKE = --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
+override _RELEASE_GATE = python3 "$(SHARED_ROOT)/scripts/release_gate.py"
+override _RELEASE_GATE_MAKE = --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
 RELEASE_REMOTE ?= origin
 RELEASE_BRANCH ?= main
 # Live UC as release-plan saw it, and again (re-derived) before release applies.
-_LIVE_SNAPSHOT = $(_RELEASE_GATE) live-snapshot --env-dir "$(ENV_DIR)" --env "$(ENV)"
-_RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)"
+override _LIVE_SNAPSHOT = $(_RELEASE_GATE) live-snapshot --env-dir "$(ENV_DIR)" --env "$(ENV)"
+override _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)"
 # No side door (release_gate.py apply-guard): in a deterministic env, apply,
 # apply-governance, apply-genie and _apply-layer (data_access, workspace) run
 # only under the env lock of the command allowed to run them there: rehearse
 # (and ungovern's governance apply) in the rehearse env, maintain's governance
 # apply in a promoted env (promote_from set, or prod), which otherwise changes
 # only through release MANIFEST=. Legacy envs are never gated.
-_APPLY_GUARD = $(_RELEASE_GATE) apply-guard --env-dir "$(1)" --env "$(2)" --target $(3)
+override _APPLY_GUARD = $(_RELEASE_GATE) apply-guard --env-dir "$(1)" --env "$(2)" --target $(3)
 # A legacy env whose state a migration to deterministic already changed refuses
 # every legacy applying command (scripts/migration.py; no way back).
-_LEGACY_GUARD = $(_RELEASE_GATE) legacy-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
+override _LEGACY_GUARD = $(_RELEASE_GATE) legacy-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 # Destroying a promoted deterministic env needs CONFIRM_DESTROY=<env> on the command line.
-_CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)),$(CONFIRM_DESTROY))
+override _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)),$(CONFIRM_DESTROY))
 # Live checks the release targets run (overridable so tests never reach Databricks).
-_EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
-_CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
+override _EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
+override _CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
 
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
@@ -752,10 +762,10 @@ _apply-account-locked:
 # fingerprint of code and dev inputs, result, and each promotion target's
 # promote-to digest. Unchanged inputs since a passing rehearsal write a receipt
 # without re-applying. release-plan releases only a commit with a passing one.
-_REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
+override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 	$(MAKE) validate-generated ENV="$(ENV)" && \
 	$(MAKE) coverage-gate ENV="$(ENV)" && \
-	$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0 && \
+	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
 	$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 	$(_SAVE_VERIFY_KEY) && \
 	$(_GROUP_MAP_RECORD) && \
@@ -796,7 +806,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 	$(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
-		$(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0 && \
+		GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
 		$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 		$(_SAVE_VERIFY_KEY) && \
 		$(_GROUP_MAP_RECORD) && \
@@ -806,29 +816,29 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 # maintain have audit-rulebook write its script's own exit code (1 = drift,
 # 2 = error) to a file they name. They also export GENIERAILS_RERUN_TARGET so a
 # coverage gap's fix message ends with the command that stopped.
-_RUN_AUDIT_RULEBOOK = audit_rc_file="$$(mktemp)"; \
+override _RUN_AUDIT_RULEBOOK = audit_rc_file="$$(mktemp)"; \
 	GENIERAILS_AUDIT_RC_FILE="$$audit_rc_file" $(MAKE) audit-rulebook ENV="$(ENV)"; audit_rc=$$?; \
 	if [ $$audit_rc -ne 0 ] && [ -s "$$audit_rc_file" ]; then audit_rc="$$(cat "$$audit_rc_file")"; fi; \
 	rm -f "$$audit_rc_file"
 
 # release and maintain hold a per-env lock
 # (envs/<env>/generated/.governance.lock) throughout.
-_ENV_LOCK_HELPER = python3 "$(SHARED_ROOT)/scripts/environment_lock.py"
-_RELEASE_HELPER = python3 "$(SHARED_ROOT)/scripts/release_helpers.py"
+override _ENV_LOCK_HELPER = python3 "$(SHARED_ROOT)/scripts/environment_lock.py"
+override _RELEASE_HELPER = python3 "$(SHARED_ROOT)/scripts/release_helpers.py"
 # release refuses, before its lock, to run when verify-access could not check
 # every masked column (no concrete masked group, or a VERIFY_SPEC without checks
 # for them), and re-checks after promoting the live-derived config; then, still
 # before it applies, verify-access-keys proves every masked table's row-pairing
 # key as the admin.
-_REQUIRE_MASK_PROOF = $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" \
+override _REQUIRE_MASK_PROOF = $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" \
 	--spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars"
 # Same-env promote for release, apply, apply-governance and plan. Command-line
 # values beat the environment and MAKEFLAGS, so a SOURCE_ENV/DEST_ENV exported
 # in the shell (or passed to the outer make) can't turn it into a cross-env
 # promote that rewrites another env.
-_SAME_ENV_PROMOTE = $(MAKE) --no-print-directory promote ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" \
+override _SAME_ENV_PROMOTE = $(MAKE) --no-print-directory promote ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" \
 	SOURCE_ENV="$(ENV)" SOURCE_ENV_DIR="$(ENV_DIR)" DEST_ENV= DEST_ENV_DIR= DEST_CATALOG_MAP=
-_GUARD_WORKSPACE_ENV = if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
+override _GUARD_WORKSPACE_ENV = if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 		echo "This command is workspace-driven. Use ENV=<workspace> instead of ENV=$(ENV)." >&2; \
 		exit 1; \
 	fi
@@ -838,11 +848,11 @@ _GUARD_WORKSPACE_ENV = if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DAT
 # trap ignores HUP/INT/TERM first: make re-sends SIGTERM to the recipe shell after
 # the group-wide one, and a second signal must not re-run `exit` (skipping the
 # unlock) or kill the unlock helper.
-_NO_SIGNALS = trap "" HUP INT TERM
+override _NO_SIGNALS = trap "" HUP INT TERM
 # lock prints the lock's nonce; exporting it is what lets the gated targets
 # this recipe runs (release_gate.py apply-guard) tell its lock from a leftover
 # or hand-written file (scripts/environment_lock.py).
-_ENV_LOCK = trap '$(_NO_SIGNALS); $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
+override _ENV_LOCK = trap '$(_NO_SIGNALS); $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	trap '$(_NO_SIGNALS); exit 129' HUP; trap '$(_NO_SIGNALS); exit 130' INT; trap '$(_NO_SIGNALS); exit 143' TERM; \
 	_genierails_lock_nonce="$$($(_ENV_LOCK_HELPER) lock "$(ENV_DIR)" --pid $$$$ --owner $(1) --env "$(ENV)")" || exit 1; \
 	export "GENIERAILS_LOCK_NONCE_$$(printf '%s' "$(notdir $(patsubst %/,%,$(ENV_DIR)))" | tr 'a-z-' 'A-Z_')=$$_genierails_lock_nonce"
@@ -898,7 +908,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		exit $$audit_rc; \
 	fi; \
 	$(_AGENT_OWNERSHIP) restore-ids --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
-	if ! $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0; then \
+	if ! GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0; then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "apply failed"; \
 		exit 1; \
 	fi; \
@@ -1148,7 +1158,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 		fi; \
 		exit $$audit_rc; \
 	fi; \
-	$(MAKE) apply-governance ENV="$(ENV)" APPLY_FLAGS= _EXPOSURE_DERIVED=1
+	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply-governance ENV="$(ENV)" APPLY_FLAGS=
 
 validate: _guarded-bootstrap ## Validate split config in the selected environment
 	@echo "=== Validate ($(ENV)) ==="
@@ -1249,14 +1259,18 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 	fi
 
 # A refused promotion changes nothing: _PROMOTION_TXN_BEGIN snapshots the trees
-# it writes (the destination env and the shared account layer) and, if the
-# recipe exits non-zero, the EXIT trap restores them byte for byte
-# (scripts/promotion_txn.py). _PROMOTION_TXN_COMMIT keeps the result.
-_PROMOTION_TXN_BEGIN = txn_dir="$$(mktemp -d)" || exit 1; \
+# it writes (the destination env and the shared account layer) and, when the
+# recipe exits non-zero or gets SIGINT/SIGTERM/SIGHUP, the EXIT trap restores
+# them byte for byte (scripts/promotion_txn.py). It is not crash-atomic: the
+# restore rewrites the live trees in place, so SIGKILL, a host crash or a crash
+# during the restore can leave a partial tree; the printed snapshot directory
+# is then left behind for manual recovery. _PROMOTION_TXN_COMMIT keeps the result.
+override _PROMOTION_TXN_BEGIN = txn_dir="$$(mktemp -d)" || exit 1; \
 	trap 'rc=$$?; trap "" HUP INT TERM; if [ $$rc -ne 0 ]; then python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" restore --from "$$txn_dir/snapshot" && echo "  Refused: nothing was changed (the destination env and the account layer were restored)." >&2; fi; rm -rf "$$txn_dir"; exit $$rc' EXIT; \
 	trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
-	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" snapshot --to "$$txn_dir/snapshot" $(1) || exit 1
-_PROMOTION_TXN_COMMIT = rm -rf "$$txn_dir"; trap - EXIT HUP INT TERM
+	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" snapshot --to "$$txn_dir/snapshot" $(1) || exit 1; \
+	echo "  (promotion snapshot, removed when this run ends: $$txn_dir/snapshot)" >&2
+override _PROMOTION_TXN_COMMIT = rm -rf "$$txn_dir"; trap - EXIT HUP INT TERM
 
 # make promote-to ENV=<dest> [FROM=<src>] [CATALOG_MAP="a=b,..."] is a thin
 # wrapper over the cross-env promote above (same remap, validation and policy-name
@@ -1296,7 +1310,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 # Read-only PR check (scripts/check_env.py): every step runs in a scratch copy
 # of the cloud dir, so nothing under envs/ is written and no applying target
 # runs; safe under CI=true. ENV_DIR overrides are refused: it checks envs/$(ENV).
-_CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter command line,$(origin ENV_DIR)), --env-dir-override "$(ENV_DIR)",) \
+override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter command line,$(origin ENV_DIR)), --env-dir-override "$(ENV_DIR)",) \
 	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
@@ -1357,7 +1371,7 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		$(MAKE) --no-print-directory _plan-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	else \
 		$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
-		if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" PROMOTE_AFTER=1 TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
+		if ! $(_EXPOSURE_TOKEN) consume --env-dir "$(ENV_DIR)"; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" PROMOTE_AFTER=1 TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 		$(MAKE) --no-print-directory ENV="$(ENV)" TARGET_ENV="$(ENV)" _guard-data-access-config; \
 		$(_TABLE_READERS) show --env-dir "$(ENV_DIR)"; \
 		$(MAKE) --no-print-directory _plan-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
@@ -1497,7 +1511,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		$(call _APPLY_GUARD,$(ENV_DIR),$(ENV),apply); \
 		$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
 		python3 "$(SHARED_ROOT)/scripts/genie_adopt_preflight.py" "$(ENV_DIR)" --arm; \
-		if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
+		if ! $(_EXPOSURE_TOKEN) consume --env-dir "$(ENV_DIR)"; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 		if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
 			$(_SAME_ENV_PROMOTE); \
 		else \
@@ -1524,7 +1538,7 @@ apply-governance: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target
 	@set -e; $(_DRY_RUN_GUARD); \
 	$(call _APPLY_GUARD,$(ENV_DIR),$(ENV),apply-governance); \
 	$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
-	if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
+	if ! $(_EXPOSURE_TOKEN) consume --env-dir "$(ENV_DIR)"; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 	if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
 		$(_SAME_ENV_PROMOTE); \
 	else \
@@ -1588,7 +1602,7 @@ apply-genie: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## [
 	@set -e; $(_DRY_RUN_GUARD); \
 	$(call _APPLY_GUARD,$(ENV_DIR),$(ENV),apply-genie); \
 	$(MAKE) --no-print-directory ENV="$(ENV)" _guard-workspace-config; \
-	if [ -z "$(_EXPOSURE_DERIVED)" ]; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
+	if ! $(_EXPOSURE_TOKEN) consume --env-dir "$(ENV_DIR)"; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 	if [ -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
 		echo "=== Extracting workspace config from genie draft ($(ENV)) ==="; \
 		$(_OVERLAY) ensure --env-dir "$(ENV_DIR)"; \
@@ -1709,7 +1723,7 @@ clean-all: ## Remove all env workspaces under envs/
 	@rm -rf "$(CLOUD_ROOT)/envs"
 	@echo "Removed $(CLOUD_ROOT)/envs"
 
-_ITEST_RUNNER   := CLOUD_PROVIDER=$(CLOUD) python3 "$(SHARED_ROOT)/scripts/run_integration_tests.py"
+override _ITEST_RUNNER   := CLOUD_PROVIDER=$(CLOUD) python3 "$(SHARED_ROOT)/scripts/run_integration_tests.py"
 _ITEST_AUTH     := $(ENV_DIR)/auth.auto.tfvars
 _ITEST_WH_FLAG  := $(if $(WAREHOUSE_ID),--warehouse-id $(WAREHOUSE_ID),)
 _ITEST_KD_FLAG  := $(if $(KEEP_DATA),--keep-data,)
@@ -1724,7 +1738,7 @@ _ITEST_FF_FLAG  := $(if $(filter 0,$(FAIL_FAST)),,--fail-fast)
 _DEFAULT_ACCOUNT_ADMIN_ENV := $(SHARED_ROOT)/scripts/account-admin.$(CLOUD).env
 ACCOUNT_ADMIN_ENV  ?= $(_DEFAULT_ACCOUNT_ADMIN_ENV)
 _CRED_EXAMPLE      := $(SHARED_ROOT)/scripts/account-admin.$(CLOUD).env.example
-_PROVISION       := python3 "$(SHARED_ROOT)/scripts/provision_test_env.py"
+override _PROVISION       := python3 "$(SHARED_ROOT)/scripts/provision_test_env.py"
 
 # Bootstrap the privileged deployment SP using an already-authorized account-admin profile.
 # Required: ACCOUNT_ID, WORKSPACE_ID. Optional: ACCOUNT_PROFILE, WORKSPACE_PROFILE, SP_NAME, MODEL_ENDPOINT, TARGET_CATALOG, PLAN=1, YES=1, ROTATE_SECRET=1.
@@ -1765,14 +1779,14 @@ VERIFY_SPEC ?=
 # one stage's render, with the tier settings of the generation it checks.
 VERIFY_FROM_TFVARS ?=
 VERIFY_ENV_FILE ?=
-_VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
+override _VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
 _VERIFY_KEEP_FLAG = $(if $(KEEP_PRINCIPALS),--keep-principals,)
 # The global key (explicit VERIFY_KEY_COLUMN, else the saved verify_key_column)
 # and the env's per-table verify_key_columns.
-_VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)"
+override _VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)"
 # make release sets VERIFY_REQUIRE_MASKS=1: a mask check whose table has no
 # provable row-pairing key fails instead of letting the release report success.
-_VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)
+override _VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)
 
 verify-access-spec: _guarded-bootstrap _guard-workspace-target ## Print the derived effective-access checks (no workspace/cluster needed)
 	@key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
@@ -1782,7 +1796,7 @@ verify-access-spec: _guarded-bootstrap _guard-workspace-target ## Print the deri
 # Admin-only (no test principals, no grants): pick and prove the row-pairing key
 # of every masked table. With no warehouse configured or applied yet, it reads
 # through a workspace warehouse.
-_VERIFY_KEYS_CHECK = key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
+override _VERIFY_KEYS_CHECK = key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
 	warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --allow-unset)" && \
 	cd "$(SHARED_ROOT)" && GENIERAILS_LIVE_VERIFY=1 python3 verify_effective_access.py \
 		$(_VERIFY_SPEC_FLAG) $(_VERIFY_KEY_FLAGS) --warehouse-id "$$warehouse_id" \

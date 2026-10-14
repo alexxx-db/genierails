@@ -140,6 +140,12 @@ deployer_principal_id = "5a7e0000-0000-0000-0000-00000000beef"   # databricks_cl
   that principal changes; a never-raw policy gets none. A promotion whose
   policies exempt dev's deployer is refused, changing nothing, when prod's
   `deployer_principal_id` is missing or malformed.
+- Any refused promotion leaves `envs/<dest>` and `envs/account` as they were:
+  promote snapshots them first and restores them on an error, SIGINT or
+  SIGTERM. That restore isn't crash-atomic: after a SIGKILL or host crash the
+  tree may be partial, and the snapshot directory the run printed is left
+  for manual recovery (`python3 shared/scripts/promotion_txn.py restore
+  --from <it>`).
 - Before taking the env lock, `rehearse`, `release-plan`, `release` and
   `maintain` refuse unless `databricks_client_id` in the env's
   `auth.auto.tfvars` is this ID. To change the SP, set the new ID here, run

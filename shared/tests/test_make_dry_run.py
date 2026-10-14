@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs
+
 
 ROOT = Path(__file__).parents[2]
 CLOUD_ROOT = ROOT / "aws"
@@ -242,12 +244,11 @@ def test_plan_real_target_runs_configured_workspace_layers(tmp_path):
             f"ENV_DIR={env_dir}",
             f"ACCOUNT_ENV_DIR={tmp_path / 'account'}",
             f"ROOT_RUNNER={runner}",
-            f"DERIVE_ASSIGNMENTS_SCRIPT={derive}",
         ],
         cwd=CLOUD_ROOT,
         text=True,
         capture_output=True,
-        env=_clean_env(),
+        env={**_clean_env(), "PATH": f"{script_stubs.install(tmp_path / 'stub-bin', {'derive_assignments.py': script_stubs.python_file(derive)})}:{_clean_env()['PATH']}"},
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
