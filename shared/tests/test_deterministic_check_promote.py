@@ -1,0 +1,594 @@
+"""make check, make promote and make promote-to on deterministic output (real make).
+
+The live AWS Phase A run found three gaps that only show with real
+deterministic output: the deployer SP in every EXCEPT list, gr_treatment values
+that aren't in the tag registry, and a prod that already has an agent:
+
+- check validates in a scratch copy without credentials, so it refused the
+  deployer SP that plain make validate accepts from auth.auto.tfvars (N2);
+- the split refused deterministic tag values, so promote, promote-to and
+  check ENV=prod crashed (N3);
+- promote-to kept prod's existing agent without acl_groups, which a
+  deterministic env refuses (N4).
+
+Terraform is a stub on PATH; nothing reaches Databricks.
+"""
+
+import json
+import re
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import hcl2
+import pytest
+
+import generate_abac
+from governance_policies import build_model, column_types_from_ddl
+from tests.test_check_target import FAKE_TERRAFORM, GITIGNORE, _env, _git, _snapshot
+
+ROOT = Path(__file__).resolve().parents[2]
+SHARED = ROOT / "shared"
+
+if shutil.which("make") is None or shutil.which("git") is None:
+    pytest.skip("make and git are required", allow_module_level=True)
+
+# One deployer SP for both envs and the same group names, like the live run
+# (the tests at the end give prod its own SP and its own group names).
+DEPLOYER = "82bb9d6d-0000-0000-0000-000000000001"
+TIERS = ["dev_ops", "dev_analysts"]
+SPACE = "Payments"
+DEV_SPACE_ID = "01ef00000000000a"
+DDL = """CREATE TABLE paycat.s.t (
+  id BIGINT,
+  card STRING,
+  email STRING
+);"""
+CLASSES = {"paycat.s.t.card": ["class.credit_card"], "paycat.s.t.email": ["class.email_address"]}
+DEV_ENV = f'''governance_mode = "deterministic"
+deployer_principal_id = "{DEPLOYER}"
+access_tier_groups = {json.dumps(TIERS)}
+table_readers = {{ "paycat.s.t" = {json.dumps(TIERS)} }}
+genie_spaces = [
+  {{ name = "{SPACE}", genie_space_id = "{DEV_SPACE_ID}", uc_tables = ["paycat.s.t"], acl_groups = {json.dumps(TIERS)} }},
+]
+'''
+# What the existing (legacy) account layer already holds in a live env.
+LEGACY_ACCOUNT = '''tag_policies = [
+  { key = "gr_treatment", description = "legacy", values = ["account_last4", "email_partial"] },
+]
+'''
+# Prod opted in by hand; its agent already exists and, from legacy, has no acl_groups.
+# _prod_env adds prod's committed deployer ID.
+PROD_ENV_BASE = '''governance_mode = "deterministic"
+promote_from = "dev"
+catalog_map = { "paycat" = "ppay" }
+genie_spaces = [
+  { name = "Payments", genie_space_id = "", uc_tables = ["ppay.s.t"] },
+]
+'''
+
+
+
+
+def _prod_env(deployer=DEPLOYER, extra=""):
+    line = f'deployer_principal_id = "{deployer}"\n' if deployer is not None else ""
+    return PROD_ENV_BASE + line + extra
+
+
+PROD_ENV = _prod_env()
+
+
+def _auth(client_id, host="https://unreachable.invalid"):
+    # A runtime auth file (gitignored); nothing before the plan step reads it.
+    return (f'databricks_account_id = ""\ndatabricks_client_id = "{client_id}"\n'
+            'databricks_client_secret = ""\ndatabricks_workspace_id = "1"\n'
+            f'databricks_workspace_host = "{host}"\n')
+
+
+def _make(repo, tmp_path, *args, **env):
+    return subprocess.run(["make", "--no-print-directory", "-C", str(repo / "aws"), *args],
+                          text=True, capture_output=True, env=_env(tmp_path, **env), timeout=600)
+
+
+def _envs(repo):
+    return repo / "aws" / "envs"
+
+
+def _commit(repo, message):
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+
+
+def _write_generated(dev):
+    """dev's deterministic generate output, built the way generate builds it."""
+    settings = hcl2.loads(DEV_ENV)
+    model = build_model(CLASSES, column_types_from_ddl(DDL), settings, deployer_principal=DEPLOYER)
+    generated = dev / "generated"
+    generated.mkdir(parents=True)
+    tfvars = generated / "abac.auto.tfvars"
+    groups = "\n".join(f'  "{group}" = {{ description = "tier" }}' for group in TIERS)
+    tfvars.write_text(f'groups = {{\n{groups}\n}}\n'
+                      f'genie_space_configs = {{\n  "{SPACE}" = {{ title = "{SPACE}" }}\n}}\n'
+                      f'genie_space_id_to_name = {{ "{DEV_SPACE_ID}" = "{SPACE}" }}\n')
+    sql = generated / "masking_functions.sql"
+    sql.write_text("USE CATALOG paycat;\nUSE SCHEMA s;\n")
+    generate_abac.write_deterministic_model(tfvars, sql, model)
+    (dev / "ddl").mkdir(exist_ok=True)
+    return model
+
+
+@pytest.fixture
+def repo(tmp_path):
+    repo = tmp_path / "repo"
+    dev = _envs(repo) / "dev"
+    dev.mkdir(parents=True)
+    (_envs(repo) / "account").mkdir()
+    shutil.copy2(ROOT / "aws" / "Makefile", repo / "aws" / "Makefile")
+    (repo / "shared").symlink_to(SHARED)
+    (dev / "env.auto.tfvars").write_text(DEV_ENV)
+    (dev / "auth.auto.tfvars").write_text(_auth(DEPLOYER))
+    (_envs(repo) / "account" / "abac.auto.tfvars").write_text(LEGACY_ACCOUNT)
+    model = _write_generated(dev)
+    assert any(DEPLOYER in (p.get("except_principals") or []) for p in model.fgac_policies)
+    (repo / ".gitignore").write_text(GITIGNORE)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
+    (bin_dir / "terraform").chmod(0o755)
+    result = _make(repo, tmp_path, "promote", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
+                    "--env-dir", str(dev), "--config", str(dev / "generated" / "abac.auto.tfvars")], check=True)
+    _git(repo, "init", "-q")
+    _commit(repo, "dev")
+    return repo
+
+
+def _promote_to_prod(repo, tmp_path, env_text=None, deployer=DEPLOYER):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(env_text if env_text is not None else _prod_env(deployer))
+    # No host: check's plan step (6) reads prod's classification config live
+    # (promote-to turns classification on), which fails fast without one.
+    (prod / "auth.auto.tfvars").write_text(_auth(deployer, host=""))
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
+    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
+                    "--env-dir", str(prod), "--config", str(prod / "generated" / "abac.auto.tfvars")], check=True)
+    _commit(repo, "promote")
+    return repo
+
+
+@pytest.fixture
+def promoted(repo, tmp_path):
+    return _promote_to_prod(repo, tmp_path)
+
+
+def _state(repo):
+    return _snapshot(_envs(repo)), _git(repo, "status", "--porcelain", "--ignored", "--untracked-files=all")
+
+
+# ── N3: the split takes deterministic tag values next to legacy ones ────────
+
+def test_same_env_promote_merges_deterministic_values_into_the_legacy_account_policy(repo):
+    account = hcl2.loads((_envs(repo) / "account" / "abac.auto.tfvars").read_text())
+    values = {p["key"]: p["values"] for p in account["tag_policies"]}["gr_treatment"]
+    generated = hcl2.loads((_envs(repo) / "dev" / "generated" / "abac.auto.tfvars").read_text())
+    deterministic = sorted({a["tag_value"] for a in generated["tag_assignments"]})
+    assert len(deterministic) == 2 and all("__" in value for value in deterministic)
+    assert values[:2] == ["account_last4", "email_partial"]
+    assert sorted(values[2:]) == deterministic
+
+
+# ── N2: check validates the deployer SP the way plain validate does ─────────
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_accepts_the_deployer_sp_without_credentials_and_writes_nothing(repo, tmp_path, ci):
+    assert _make(repo, tmp_path, "validate", "ENV=dev").returncode == 0
+    before = _state(repo)
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "not defined in 'groups'" not in out
+    assert "OK: generated files (envs/dev): committed files match." in out
+    assert "=== make check ENV=dev: passed ===" in out
+    assert _state(repo) == before
+
+
+def test_check_still_refuses_an_unknown_except_principal(repo, tmp_path):
+    for rel in ("generated/abac.auto.tfvars", "data_access/abac.auto.tfvars"):
+        path = _envs(repo) / "dev" / rel
+        path.write_text(path.read_text().replace(DEPLOYER, "stranger-sp"))
+    _commit(repo, "unknown principal")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", CI="true")
+
+    assert result.returncode != 0
+    assert "except_principals group 'stranger-sp' not defined in 'groups'" in result.stdout + result.stderr
+
+
+def test_check_refuses_a_deterministic_env_without_deployer_principal_id(repo, tmp_path):
+    env_file = _envs(repo) / "dev" / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace(f'deployer_principal_id = "{DEPLOYER}"\n', ""))
+    _commit(repo, "no deployer id")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", CI="true")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "deployer_principal_id is required in deterministic mode" in out, out
+
+
+@pytest.mark.parametrize("value", ["account users", "deployer-sp", "users"])
+def test_env_validation_refuses_a_deployer_that_is_not_an_application_id(value):
+    from deterministic_governance import validate_config
+
+    errors = validate_config({"governance_mode": "deterministic", "deployer_principal_id": value})
+
+    assert any("deployer_principal_id must be a service principal application ID" in e for e in errors), errors
+
+
+def test_check_copy_gets_no_auth_file(tmp_path):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from check_env import Scratch
+
+    cloud = tmp_path / "aws"
+    for env in ("dev", "prod", "account"):
+        (cloud / "envs" / env).mkdir(parents=True)
+        (cloud / "envs" / env / "auth.auto.tfvars").write_text(_auth(DEPLOYER).replace(
+            'databricks_client_secret = ""', 'databricks_client_secret = "do-not-copy"'))
+    shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
+    scratch = Scratch(cloud, cloud / "Makefile", "make")
+    try:
+        assert not [p for p in scratch.root.rglob("auth.auto.tfvars") if p.exists() and not p.is_symlink()]
+        assert not any("do-not-copy" in p.read_text() or DEPLOYER in p.read_text()
+                       for p in scratch.root.rglob("*") if p.is_file() and not p.is_symlink())
+    finally:
+        scratch.close()
+
+
+# ── N3 + N4: promote-to into a prod that opted in by hand ───────────────────
+
+def test_promote_to_seeds_the_missing_acl_groups(promoted, tmp_path):
+    prod = hcl2.loads((_envs(promoted) / "prod" / "env.auto.tfvars").read_text())
+
+    assert prod["governance_mode"] == "deterministic"
+    assert prod["genie_spaces"][0]["acl_groups"] == TIERS
+    assert prod["access_tier_groups"] == TIERS
+    assert f"Seeded destination Genie space 'Payments' acl_groups={TIERS!r}" in (tmp_path / "promote.log").read_text()
+
+
+def test_promote_to_keeps_acl_groups_prod_already_has(promoted, tmp_path):
+    env_file = _envs(promoted) / "prod" / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace('acl_groups       = ["dev_ops", "dev_analysts"]',
+                                                     'acl_groups       = ["dev_ops"]'))
+    _commit(promoted, "prod narrows the agent")
+
+    result = _make(promoted, tmp_path, "promote-to", "ENV=prod")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    prod = hcl2.loads(env_file.read_text())
+    assert prod["genie_spaces"][0]["acl_groups"] == ["dev_ops"]
+    assert "Preserved destination Genie space 'Payments' acl_groups=['dev_ops']" in result.stdout
+
+
+def _assert_check_and_promote_check_pass(repo, tmp_path, ci):
+    before = _state(repo)
+    extra = {"CI": ci} if ci else {}
+
+    check = _make(repo, tmp_path, "check", "ENV=prod", **extra)
+    promote_check = _make(repo, tmp_path, "promote-to", "ENV=prod", "CHECK=1", **extra)
+
+    out = check.stdout + check.stderr
+    # Steps 1-5 pass offline; the plan (6) needs prod's live classification config.
+    assert "OK: promote-to ENV=prod CHECK=1: committed files match." in out, out
+    assert "OK: generated files (envs/prod): committed files match." in out, out
+    assert "--- check 5/6: mask-library unit tests ---" in out and "--- check 6/6: plan ---" in out, out
+    assert "not defined in 'groups'" not in out and "unknown canonical value" not in out
+    assert check.returncode == 0 or "=== make check ENV=prod: FAILED (plan) ===" in out, out
+    assert promote_check.returncode == 0, promote_check.stdout + promote_check.stderr
+    assert "OK: promote-to ENV=prod CHECK=1: committed files match." in promote_check.stdout
+    assert _state(repo) == before
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, ci):
+    _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+
+
+def _policies(env_dir):
+    return {rel: hcl2.loads((env_dir / rel).read_text())["fgac_policies"]
+            for rel in ("generated/abac.auto.tfvars", "data_access/abac.auto.tfvars")}
+
+
+# ── Each env applies with its own deployer SP ───────────────────────────────
+
+PROD_DEPLOYER = "5a7e0000-0000-0000-0000-00000000beef"
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_swaps_dev_deployer_for_prods_and_check_passes(repo, tmp_path, ci):
+    dev_policies = {p["name"]: p.get("except_principals") or []
+                    for p in hcl2.loads((_envs(repo) / "dev" / "generated" / "abac.auto.tfvars").read_text())["fgac_policies"]}
+    assert any(DEPLOYER in names for names in dev_policies.values())
+
+    _promote_to_prod(repo, tmp_path, deployer=PROD_DEPLOYER)
+
+    for rel, policies in _policies(_envs(repo) / "prod").items():
+        assert len(policies) == len(dev_policies), rel
+        for policy, dev_except in zip(policies, dev_policies.values()):
+            # Only the deployer changes, in place; a list without it gets none.
+            expected = [PROD_DEPLOYER if name == DEPLOYER else name for name in dev_except]
+            assert (policy.get("except_principals") or []) == expected, (rel, policy["name"])
+            assert PROD_DEPLOYER not in (policy.get("to_principals") or []), (rel, policy["name"])
+    for path in (_envs(repo) / "prod").rglob("*"):
+        if path.is_file() and path.name != "auth.auto.tfvars":
+            assert DEPLOYER not in path.read_text(), path
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_authless_pr_checkout_reproduces_a_distinct_sp_promotion(repo, tmp_path, ci):
+    """The PR checkout has no auth.auto.tfvars: check and promote-check use the committed IDs."""
+    _promote_to_prod(repo, tmp_path, deployer=PROD_DEPLOYER)
+    # Like a fresh clone: every auth file and the layers' links to them are gitignored.
+    for path in list(_envs(repo).rglob("auth.auto.tfvars")):
+        path.unlink()
+    assert "auth.auto.tfvars" not in _git(repo, "ls-files")
+    before = _state(repo)
+    extra = {"CI": ci} if ci else {}
+
+    check = _make(repo, tmp_path, "check", "ENV=prod", **extra)
+    promote_check = _make(repo, tmp_path, "promote-to", "ENV=prod", "CHECK=1", **extra)
+
+    out = check.stdout + check.stderr
+    assert "OK: promote-to ENV=prod CHECK=1: committed files match." in out, out
+    assert "OK: generated files (envs/prod): committed files match." in out, out
+    assert "--- check 6/6: plan ---" in out, out
+    assert "not defined in 'groups'" not in out, out
+    assert check.returncode == 0 or "=== make check ENV=prod: FAILED (plan) ===" in out, out
+    assert promote_check.returncode == 0, promote_check.stdout + promote_check.stderr
+    assert "OK: promote-to ENV=prod CHECK=1: committed files match." in promote_check.stdout
+    assert _state(repo) == before
+
+
+def _break_account(repo):
+    account = _envs(repo) / "account" / "abac.auto.tfvars"
+    account.write_text(account.read_text() + "tag_policies = [\n")
+
+
+# Every way a promotion refuses: each must leave every file under envs/ as it was.
+REFUSALS = {
+    "missing-deployer": (dict(deployer=None), None, "deployer_principal_id is required in deterministic mode"),
+    "everyone-deployer": (dict(deployer="account users"), None,
+                          "deployer_principal_id must be a service principal application ID"),
+    "group-collision": (dict(extra='group_map = { dev_ops = "dev_analysts" }\n'), None,
+                        "group_map would give groups 'dev_ops', 'dev_analysts' the one name 'dev_analysts'"),
+    "many-to-one-group-map": (dict(extra='group_map = { dev_ops = "x", dev_analysts = "x" }\n'), None,
+                              "many-to-one mappings"),
+    "everyone-exempt": (dict(extra='raw_exempt_principals = ["account users"]\n'), None, "everyone"),
+    "split-fails": (dict(), _break_account, "Unexpected"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(REFUSALS))
+def test_every_promote_refusal_changes_nothing(repo, tmp_path, case):
+    env_kwargs, setup, message = REFUSALS[case]
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(_prod_env(**env_kwargs))
+    (prod / "auth.auto.tfvars").write_text(_auth(PROD_DEPLOYER, host=""))
+    if setup:
+        setup(repo)
+    _commit(repo, f"prod set up ({case})")
+    before = _state(repo)
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert message in out, out
+    assert "Refused: nothing was changed" in out, out
+    assert _state(repo) == before, out
+
+
+def test_promotion_restore_puts_back_bytes_links_and_removes_additions(tmp_path):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from promotion_txn import restore, snapshot
+
+    env = tmp_path / "envs" / "prod"
+    (env / "data_access" / ".terraform").mkdir(parents=True)
+    (env / "data_access" / ".terraform" / "provider").write_text("big")
+    (env / "env.auto.tfvars").write_text("a = 1\n")
+    (env / "data_access" / "auth.auto.tfvars").symlink_to("../auth.auto.tfvars")
+    missing = tmp_path / "envs" / "new"
+    snapshot([env, missing], tmp_path / "txn")
+    before = _snapshot(tmp_path / "envs")
+
+    (env / "env.auto.tfvars").write_text("a = 2\n")
+    (env / "data_access" / "auth.auto.tfvars").unlink()
+    (env / "data_access" / "auth.auto.tfvars").write_text("not a link")
+    (env / "generated").mkdir()
+    (env / "generated" / "abac.auto.tfvars").write_text("x")
+    (env / "data_access" / ".terraform" / "provider").write_text("big")
+    missing.mkdir()
+    (missing / "env.auto.tfvars").write_text("y")
+    restore(tmp_path / "txn")
+
+    assert _snapshot(tmp_path / "envs") == before
+
+
+# ── Applies use the SP the committed policies exempt ────────────────────────
+
+@pytest.mark.parametrize("target", ["rehearse ENV=dev", "release-plan ENV=prod", "release ENV=prod MANIFEST=m.json",
+                                    "maintain ENV=prod"])
+def test_apply_refuses_before_the_lock_when_auth_is_not_the_committed_deployer(repo, tmp_path, target):
+    _promote_to_prod(repo, tmp_path, deployer=PROD_DEPLOYER)
+    env = target.split("ENV=")[1].split()[0]
+    (_envs(repo) / env / "auth.auto.tfvars").write_text(_auth("0badc0de-0000-0000-0000-000000000000", host=""))
+    before = _state(repo)
+
+    result = _make(repo, tmp_path, *target.split())
+
+    out = result.stdout + result.stderr
+    name = target.split()[0]
+    assert result.returncode != 0, out
+    assert f"ERROR: make {name} refused before taking the lock:" in out, out
+    assert "databricks_client_id is 0badc0de-0000-0000-0000-000000000000" in out, out
+    assert not list(_envs(repo).rglob(".governance.lock")), out
+    assert _state(repo) == before
+
+
+# Every Make variable a test harness used to stub a check with, plus the
+# derive-skip flag. None may skip the identity gate, from the command line or
+# the environment (make -e lets the environment beat ordinary assignments).
+FORMER_STUBS = {name: "true" for name in (
+    "_DEPLOYER_CHECK", "_ACCESS_CHECK", "_GROUP_CHECK", "_GROUP_MAP_RECORD", "_TABLE_READERS", "_SAVE_VERIFY_KEY",
+    "_STAGED_POLICY", "_STAGED_CONFIRM_RUN", "_EXTERNAL_MASK_INVENTORY", "_CLASSIFICATION_CHECK", "_LIVE_SNAPSHOT",
+    "_RELEASE_REPORTS", "_RELEASE_GATE", "_COVERAGE_GATE", "_STICKY", "_AGENT_OWNERSHIP", "_AGENT_COVERAGE",
+    "_ENV_LOCK_HELPER", "_RELEASE_HELPER", "_REQUIRE_MASK_PROOF", "_LEGACY_GUARD", "_APPLY_GUARD",
+    "_PROMOTION_TXN_BEGIN", "_PROMOTION_TXN_COMMIT", "_IS_DETERMINISTIC", "_GOVERNANCE_MODE_OF")} | {
+    "_EXPOSURE_DERIVED": "1", "AUDIT_SCHEMA_SCRIPT": "/dev/null", "DERIVE_ASSIGNMENTS_SCRIPT": "/dev/null",
+    "GENIE_ADOPT_PREFLIGHT_SCRIPT": "/dev/null"}
+ENTRY_POINTS = [("rehearse", "dev", ()), ("release-plan", "prod", ()), ("release", "prod", ("MANIFEST=m.json",)),
+                ("maintain", "prod", ()), ("ungovern", "prod", ("TABLE=ppay.s.t", "YES=1")),
+                ("detach-agent", "prod", ("SPACE=Payments",))]
+
+
+@pytest.mark.parametrize("target, env, extra", ENTRY_POINTS, ids=[t for t, _e, _x in ENTRY_POINTS])
+def test_no_override_skips_the_deployer_gate_at_any_entry_point(repo, tmp_path, target, env, extra):
+    _promote_to_prod(repo, tmp_path, deployer=PROD_DEPLOYER)
+    auth = _envs(repo) / env / "auth.auto.tfvars"
+    cmdline = [f"{name}={value}" for name, value in FORMER_STUBS.items()]
+    for auth_text, how in ((_auth("0badc0de-0000-0000-0000-000000000000", host=""), "cmdline"),
+                           (_auth("0badc0de-0000-0000-0000-000000000000", host=""), "environment"),
+                           (_auth("0badc0de-0000-0000-0000-000000000000", host=""), "make -e"),
+                           (_auth("", host=""), "cmdline")):
+        auth.write_text(auth_text)
+        before = _state(repo)
+        args = [target, f"ENV={env}", *extra]
+        if how == "cmdline":
+            result = _make(repo, tmp_path, *args, *cmdline)
+        else:
+            result = _make(repo, tmp_path, *(["-e"] if how == "make -e" else []), *args, **FORMER_STUBS)
+        out = result.stdout + result.stderr
+        case = f"{target} ENV={env}, overrides via {how}, auth {auth_text.splitlines()[1]}"
+        assert result.returncode != 0, case + "\n" + out
+        assert f"ERROR: make {target} refused before taking the lock:" in out, case + "\n" + out
+        committed = PROD_DEPLOYER if env == "prod" else DEPLOYER
+        assert "databricks_client_id is" in out and committed in out, case
+        assert not list(_envs(repo).rglob(".governance.lock")), case
+        assert _state(repo) == before, case
+
+
+def test_every_check_guard_and_transaction_helper_is_non_overridable():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    loose = [line.split("=")[0].strip() for line in makefile.splitlines()
+             if re.match(r"^_[A-Z][A-Z0-9_]* *[:?]?= ", line)
+             and any(word in line for word in ("python3", "$(MAKE)", "trap", "exit", "$(_"))]
+    assert loose == [], f"overridable helpers: {loose}"
+    for name in ("AUDIT_SCHEMA_SCRIPT", "DERIVE_ASSIGNMENTS_SCRIPT", "GENIE_ADOPT_PREFLIGHT_SCRIPT"):
+        assert re.search(rf"(?m)^override {name} = ", makefile), name
+    assert "_EXPOSURE_DERIVED" not in makefile
+
+
+def test_the_exposure_token_works_once_and_only_for_its_env(tmp_path, monkeypatch):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from exposure_token import consume, mint
+
+    env, other = tmp_path / "prod", tmp_path / "dev"
+    env.mkdir()
+    other.mkdir()
+    token = mint(env)
+    assert oct(token.stat().st_mode & 0o777) == "0o600"
+    assert not consume(other, str(token)) and token.exists()  # another env's token skips nothing
+    assert consume(env, str(token)) and not token.exists()
+    assert not consume(env, str(token))  # once
+    forged = tmp_path / "forged"
+    forged.write_text(f"{env.resolve()}\n")
+    forged.chmod(0o644)
+    assert not consume(env, str(forged))  # not private
+    link = tmp_path / "link"
+    good = mint(env)
+    link.symlink_to(good)
+    assert not consume(env, str(link)) and good.exists()  # never through a link
+    assert not consume(env, None) and not consume(env, "")
+    good.unlink()
+
+
+def test_apply_check_passes_when_auth_matches_and_ignores_legacy(tmp_path):
+    from deployer_identity import apply_problems
+
+    env = tmp_path / "prod"
+    env.mkdir()
+    (env / "env.auto.tfvars").write_text(_prod_env(PROD_DEPLOYER))
+    (env / "auth.auto.tfvars").write_text(_auth(PROD_DEPLOYER.upper()))
+    assert apply_problems(env) == []
+    (env / "auth.auto.tfvars").unlink()
+    assert "databricks_client_id is not set" in apply_problems(env)[0]
+    (env / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    assert apply_problems(env) == []
+
+
+def test_promote_to_never_adds_the_deployer_to_a_never_raw_policy(tmp_path):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from remap_generated_config import map_principals
+
+    text = ('fgac_policies = [\n  {\n    name = "raw"\n    except_principals = ["t1", "dev-sp"]\n  },\n'
+            '  {\n    name = "never"\n    except_principals = []\n    to_principals = ["dev-sp"]\n  },\n]\n')
+
+    out = hcl2.loads(map_principals(text, {}, set(), [], ("dev-sp", "prod-sp")))["fgac_policies"]
+
+    assert out[0]["except_principals"] == ["t1", "prod-sp"]
+    assert out[1]["except_principals"] == [] and out[1]["to_principals"] == ["dev-sp"]
+
+
+# ── group_map renames the groups the policies name ──────────────────────────
+
+PROD_TIERS = ["prod_ops", "dev_analysts"]
+PROD_ENV_GROUP_MAP = _prod_env(extra='group_map = { dev_ops = "prod_ops" }\n')
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_maps_groups_with_policies_tiers_and_acls_and_check_passes(repo, tmp_path, ci):
+    _promote_to_prod(repo, tmp_path, env_text=PROD_ENV_GROUP_MAP)
+
+    prod = _envs(repo) / "prod"
+    env = hcl2.loads((prod / "env.auto.tfvars").read_text())
+    assert env["access_tier_groups"] == PROD_TIERS
+    assert env["genie_spaces"][0]["acl_groups"] == PROD_TIERS
+    assert env["table_readers"] == {"ppay.s.t": PROD_TIERS}
+    for rel in ("generated/abac.auto.tfvars", "data_access/abac.auto.tfvars", "abac.auto.tfvars"):
+        assert list(hcl2.loads((prod / rel).read_text())["groups"]) == PROD_TIERS, rel
+    account = hcl2.loads((_envs(repo) / "account" / "abac.auto.tfvars").read_text())
+    assert "prod_ops" in account["groups"]
+    for rel, policies in _policies(prod).items():
+        named = {n for p in policies for f in ("to_principals", "except_principals") for n in p.get(f) or []}
+        assert "prod_ops" in named and named <= set(PROD_TIERS) | {DEPLOYER, "account users"}, rel
+    for path in prod.rglob("*"):
+        if path.is_file():
+            text = path.read_text()
+            if path.name == "env.auto.tfvars":
+                text = text.replace('"dev_ops" = "prod_ops"', "")
+            assert '"dev_ops"' not in text, path
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+def test_group_keys_rename_bare_and_quoted_keys_and_group_members():
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from remap_generated_config import map_group_keys
+
+    text = ('groups = {\n  dev_ops = {\n    description = "a = { b }"\n  }\n  "dev x" = { description = "" }\n'
+            '  keep = {}\n}\ngroup_members = {\n  dev_ops = ["u1"]\n}\n')
+
+    out = hcl2.loads(map_group_keys(text, {"dev_ops": "prod_ops", "dev x": "prod x"}, set()))
+
+    assert list(out["groups"]) == ["prod_ops", "prod x", "keep"]
+    assert out["groups"]["prod_ops"]["description"] == "a = { b }"
+    assert out["group_members"] == {"prod_ops": ["u1"]}

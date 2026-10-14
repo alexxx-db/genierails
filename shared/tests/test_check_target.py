@@ -23,6 +23,7 @@ if shutil.which("make") is None or shutil.which("git") is None:
     pytest.skip("make and git are required", allow_module_level=True)
 
 DEV_ENV = '''governance_mode = "deterministic"
+deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"
 genie_spaces = [
   { genie_space_id = "s1", uc_tables = ["paycat.s.t"] },
 ]
@@ -128,7 +129,8 @@ def _commit(repo, message):
 def promoted(repo, tmp_path):
     prod = _envs(repo) / "prod"
     prod.mkdir()
-    (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n'
+                                          'deployer_principal_id = "d0000000-0000-0000-0000-00000000d002"\n')
     result = _make(repo, tmp_path, "promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay")
     assert result.returncode == 0, result.stdout + result.stderr
     _commit(repo, "promote")
@@ -298,6 +300,7 @@ def test_promote_check_fails_when_the_promotion_is_not_committed(repo, tmp_path)
     prod = _envs(repo) / "prod"
     prod.mkdir()
     (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\npromote_from = "dev"\n'
+                                          'deployer_principal_id = "d0000000-0000-0000-0000-00000000d002"\n'
                                           'catalog_map = { "paycat" = "ppay" }\n')
     _commit(repo, "prod settings only")
     before = _baseline(repo)

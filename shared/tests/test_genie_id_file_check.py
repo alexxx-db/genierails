@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs
+
 SHARED = Path(__file__).resolve().parents[1]
 ROOT = SHARED.parent
 SCRIPT = SHARED / "scripts" / "genie_adopt_preflight.py"
@@ -121,16 +123,19 @@ def _stubs(tmp_path):
         path.write_text("#!/bin/sh\n" + body.format(log=log) + "\n")
         path.chmod(0o755)
         stubs[name] = path
-    return log, [f"_COVERAGE_GATE={stubs['gate']}", f"ROOT_RUNNER={stubs['runner']}",
-                 f"IMPORT_EXISTING_SCRIPT={stubs['importer']}"]
+    # The coverage gate is stubbed below make (its helper can't be overridden).
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", {"coverage_gate.py": str(stubs["gate"])})
+    return log, {"args": [f"ROOT_RUNNER={stubs['runner']}", f"IMPORT_EXISTING_SCRIPT={stubs['importer']}"],
+                 "path": bin_dir}
 
 
 def _make(target, env, overrides, desired=None):
     extra = {"DESIRED": json.dumps(desired)} if desired is not None else {}
+    environ = {**_clean_env(), **extra}
+    environ["PATH"] = f"{overrides['path']}:{environ['PATH']}"
     return subprocess.run(["make", "--no-print-directory", target, "LAYER=workspace", "TARGET_ENV=prod",
-                           f"LAYER_ENV_DIR={env}", *overrides],
-                          cwd=ROOT / "aws", text=True, capture_output=True, env={**_clean_env(), **extra},
-                          timeout=120)
+                           f"LAYER_ENV_DIR={env}", *overrides["args"]],
+                          cwd=ROOT / "aws", text=True, capture_output=True, env=environ, timeout=120)
 
 
 def _calls(log):
@@ -246,9 +251,12 @@ def test_maintain_warns_but_still_runs_governance(tmp_path):
     make_stub.chmod(0o755)
     audit = tmp_path / "audit.py"
     audit.write_text("raise SystemExit(0)\n")
+    environ = _clean_env()
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", {"audit_schema_drift.py": script_stubs.python_file(audit)})
+    environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
     result = subprocess.run(["make", "--no-print-directory", "maintain", "ENV=prod", f"ENV_DIR={env}",
-                             f"MAKE={make_stub}", f"AUDIT_SCHEMA_SCRIPT={audit}"],
-                            cwd=ROOT / "aws", text=True, capture_output=True, env=_clean_env(), timeout=120)
+                             f"MAKE={make_stub}"],
+                            cwd=ROOT / "aws", text=True, capture_output=True, env=environ, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "WARNING: 1 Genie agent(s) created by GenieRails lost their ID file; make apply would refuse" in result.stderr
     assert any("apply-governance" in c for c in _calls(log))

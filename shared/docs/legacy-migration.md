@@ -8,19 +8,23 @@ show no change. Design: [deterministic-governance.md, section 8](design/determin
 ```bash
 make migrate-plan ENV=prod        # 1. read-only dry run on the live env; proposes table_readers
                                   #    (before step 2 it exits 1 and prints these next steps)
-# 2. in envs/<env>/env.auto.tfvars set governance_mode = "deterministic",
-#    access_tier_groups, table_readers, acl_groups; then, for each env:
+# 2. dev: in envs/dev/env.auto.tfvars set governance_mode = "deterministic",
+#    deployer_principal_id (dev's deployer SP application ID), access_tier_groups,
+#    table_readers and each agent's acl_groups; then
 make rebuild-governed-tables ENV=dev   # 2a. writes generated/governed_tables.json (commit it)
 make generate ENV=dev                  # 2b. dev: the deterministic draft (no model is called)
-make rebuild-governed-tables ENV=prod  #     prod: the same record, then
-make promote-to ENV=prod               #     prod's draft from dev's; add the reviewed ack.txt lines
+#    prod: in envs/prod/env.auto.tfvars set governance_mode = "deterministic"
+#    and deployer_principal_id (prod's own deployer SP) yourself (and group_map
+#    if prod's group names differ); promote-to never sets either. Then:
+make rebuild-governed-tables ENV=prod  # 2c. prod's record (refused until prod sets the mode)
+make promote-to ENV=prod               # 2d. prod's draft from dev's; add the reviewed ack.txt lines
 make migrate-plan ENV=prod        # 3. repeat until "the cutover may proceed"; PR, review, merge
 make rehearse ENV=dev             # 4. dev migrates here (and writes the receipt prod needs)
 make release-plan ENV=prod        # 5. one manifest per phase: approve, then
 make release ENV=prod MANIFEST=<manifest>   #    repeat 5 until "Release complete"
 ```
 
-Step 2a is required. A legacy env already has treatment tags deployed but no
+Steps 2a and 2c are required. A legacy env already has treatment tags deployed but no
 `generated/governed_tables.json` (the deterministic record of governed tables),
 so the first deterministic `generate`, and `migrate-plan`, `rehearse` and
 `release-plan` in prod, refuse with:
@@ -28,6 +32,11 @@ so the first deterministic `generate`, and `migrate-plan`, `rehearse` and
 ```
 ERROR: <path>/envs/dev/generated/governed_tables.json is missing but this env has recorded governance (treatment tags are deployed (data_access/terraform.tfstate); its generated or promoted config has treatment tags); rebuild it with: make rebuild-governed-tables ENV=dev
 ```
+
+In prod, step 2d brings the rest of the opt-in from dev: `access_tier_groups`
+always, and, where prod has none yet, `table_readers` and each agent's
+`acl_groups` (group names through prod's `group_map`). Values prod already has
+are kept, so review the promotion's diff and its printed differences.
 
 `make rebuild-governed-tables ENV=<env>` writes the record from the deployed
 treatment tags and the generated or promoted config. It is local and changes

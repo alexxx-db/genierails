@@ -46,6 +46,7 @@ TAG_ROWS = [
     ("dev_fin", "payments", "payments", "cvv", "class.card_security_code", ""),
 ]
 ENV = f'''governance_mode = "deterministic"
+deployer_principal_id = "{DEPLOYER}"
 enable_classification = true
 access_tier_groups = {json.dumps(TIERS)}
 genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]

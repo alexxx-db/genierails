@@ -21,6 +21,8 @@ from pathlib import Path
 import hcl2
 import pytest
 
+from tests import script_stubs
+
 SHARED = Path(__file__).resolve().parents[1]
 ROOT = SHARED.parent
 sys.path.insert(0, str(SHARED))
@@ -35,15 +37,23 @@ needs_make = pytest.mark.skipif(shutil.which("make") is None, reason="make not i
 
 
 def _cfg(**overrides):
-    cfg = {"governance_mode": "deterministic", "access_tier_groups": TIERS}
+    cfg = {"governance_mode": "deterministic", "access_tier_groups": TIERS, "deployer_principal_id": SP}
     cfg.update(overrides)
     return cfg
+
+
+# A deterministic env commits its deployer SP; this machine applies with it.
+SP = "d0000000-0000-0000-0000-00000000d001"
+DEPLOYER_LINE = f'deployer_principal_id = "{SP}"\n'
 
 
 def _env(tmp_path, text, discovered=None, name="dev"):
     env = tmp_path / "envs" / name
     (env / "generated").mkdir(parents=True, exist_ok=True)
     (env / "data_access").mkdir(exist_ok=True)
+    if 'governance_mode = "deterministic"' in text and "deployer_principal_id" not in text:
+        text += DEPLOYER_LINE
+        (env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{SP}"\n')
     (env / "env.auto.tfvars").write_text(text)
     if discovered is not None:
         tables = sorted({t for ts in discovered.values() for t in ts})
@@ -432,7 +442,7 @@ table_readers = { "sch.t" = ["dev_raw", "dev_etl"], "dev_cat.sch.*" = ["dev_part
 raw_exempt_principals = ["dev_etl"]
 row_filters = [{ table = "dev_cat.sch.t", column = "region", values_by_group = { dev_partial = ["APAC"] } }]
 '''
-PROD = 'governance_mode = "deterministic"\n'
+PROD = 'governance_mode = "deterministic"\n' + DEPLOYER_LINE
 GROUP_MAP = 'group_map = { dev_raw = "prod_raw", dev_partial = "prod_partial", dev_etl = "prod_etl" }\n'
 
 
@@ -618,7 +628,7 @@ POLICY_ONLY = '''fgac_policies = [
     policy_type      = "POLICY_TYPE_COLUMN_MASK"
     catalog          = "c"
     to_principals    = ["prod_policy_only"]
-    except_principals = ["prod_raw", "deployer-sp-id"]
+    except_principals = ["prod_raw", "d0000000-0000-0000-0000-00000000d001"]
     match_condition  = "hasTagValue('gr_treatment', 'email_partial__string__0a1b2c3d')"
     match_alias      = "masked_col"
     function_name    = "gr_mask_email_partial__string__0a1b2c3d_partial"
@@ -639,21 +649,21 @@ POLICY_ONLY = '''fgac_policies = [
   },
 ]
 '''
-LIVE = ["prod_raw", "prod_partial", "full", "prod_rf", "deployer-sp-id"]
+LIVE = ["prod_raw", "prod_partial", "full", "prod_rf", SP]
 
 
-def test_the_deployer_sp_is_accepted_only_as_the_envs_own_auth(tmp_path, capsys):
+def test_the_deployer_sp_is_accepted_only_as_the_envs_committed_deployer(tmp_path, capsys):
     # The live listing (the mock) never contains the deployer SP's
-    # application ID; only the env's own auth.auto.tfvars makes it acceptable.
-    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    # application ID; only the env's committed deployer_principal_id makes it
+    # acceptable, never auth.auto.tfvars.
+    other = "0badc0de-0000-0000-0000-000000000000"
+    env = _env(tmp_path, MAPPED_PROD + f'deployer_principal_id = "{other}"\n', name="prod")
     (env / "data_access" / "abac.auto.tfvars").write_text(POLICY_ONLY)
-    live = [name for name in LIVE if name != "deployer-sp-id"] + ["prod_policy_only"]
-    assert "deployer-sp-id" not in live
-    assert _check(env, live) == 1
-    assert "deployer-sp-id" in capsys.readouterr().err
-    (env / "auth.auto.tfvars").write_text('databricks_client_id = "other-sp-id"\n')
-    assert _check(env, live) == 1  # another SP's credentials accept nothing
-    (env / "auth.auto.tfvars").write_text('databricks_client_id = "deployer-sp-id"\n')
+    (env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{SP}"\n')
+    live = [name for name in LIVE if name != SP] + ["prod_policy_only"]
+    assert _check(env, live) == 1  # credentials for SP accept nothing
+    assert SP in capsys.readouterr().err
+    (env / "env.auto.tfvars").write_text(MAPPED_PROD + DEPLOYER_LINE)
     assert _check(env, live) == 0
 
 
@@ -683,11 +693,9 @@ def test_release_refuses_a_policy_only_principal_before_the_lock(tmp_path):
     script = tmp_path / "group_check.py"
     script.write_text(f"import sys\nsys.path.insert(0, {str(SHARED)!r})\nimport group_map\n"
                       f"raise SystemExit(group_map.main(sys.argv[1:], lister=lambda _d: {LIVE!r}))\n")
-    wrapper = tmp_path / "group-check"
-    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" check --env-dir "{env}" --env prod --command-name "$*"\n')
-    wrapper.chmod(0o755)
     # A deterministic prod is released through release-plan (rollout step 9).
-    result, calls = _make(tmp_path, env, "release-plan", "ENV=prod", f"_GROUP_CHECK={wrapper}")
+    result, calls = _make(tmp_path, env, "release-plan", "ENV=prod",
+                          stubs={"group_map.py check": script_stubs.python_file(script) + " check"})
     assert result.returncode != 0
     assert "make release-plan refused" in result.stderr and "prod_policy_only" in result.stderr
     assert calls == []
@@ -765,13 +773,22 @@ def _clean_env():
     return {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "ENV", "CI")}
 
 
-def _make(tmp_path, env, *args):
+def _stubbed_env(tmp_path, stubs):
+    """_clean_env with scripts stubbed below make (tests/script_stubs.py)."""
+    environ = _clean_env()
+    if stubs:
+        environ["PATH"] = f"{script_stubs.install(tmp_path / 'stub-bin', stubs)}:{environ['PATH']}"
+    return environ
+
+
+def _make(tmp_path, env, *args, stubs=None):
     log = tmp_path / "make-calls"
     stub = tmp_path / "make-stub"
     stub.write_text(f"#!/bin/sh\nprintf 'make %s\\n' \"$*\" >> '{log}'\nexit 0\n")
     stub.chmod(0o755)
     result = subprocess.run(["make", "--no-print-directory", *args, f"ENV_DIR={env}", f"MAKE={stub}"],
-                            cwd=ROOT / "aws", text=True, capture_output=True, env=_clean_env(), timeout=120)
+                            cwd=ROOT / "aws", text=True, capture_output=True, env=_stubbed_env(tmp_path, stubs),
+                            timeout=120)
     return result, (log.read_text().splitlines() if log.exists() else [])
 
 
@@ -795,9 +812,9 @@ def test_rehearse_and_release_stop_on_the_group_check_before_anything_runs(tmp_p
     check = tmp_path / "group-check"
     check.write_text(f"#!/bin/sh\necho \"$*\" > '{tmp_path / 'group-args'}'\nexit 1\n")
     check.chmod(0o755)
-    result, calls = _make(tmp_path, env, target, f"ENV={env_name}", f"_GROUP_CHECK={check}")
+    result, calls = _make(tmp_path, env, target, f"ENV={env_name}", stubs={"group_map.py check": str(check)})
     assert result.returncode != 0
-    assert (tmp_path / "group-args").read_text().strip() == f"make {target}"
+    assert (tmp_path / "group-args").read_text().strip().endswith(f"--command-name make {target}")
     assert calls == []
     assert not (env / "generated" / ".governance.lock").exists()
 
@@ -815,9 +832,9 @@ def test_deterministic_workspace_plan_runs_the_live_check_before_the_can_run_che
         stubs[name] = path
     result = subprocess.run(
         ["make", "--no-print-directory", "_plan-layer", "LAYER=workspace", "TARGET_ENV=dev", f"LAYER_ENV_DIR={env}",
-         f"_AGENT_COVERAGE={stubs['agent']}", f"_COVERAGE_GATE={stubs['gate']}", f"ROOT_RUNNER={stubs['runner']}",
-         f"GENIE_ADOPT_PREFLIGHT_SCRIPT={SHARED / 'scripts' / 'genie_adopt_preflight.py'}"],
-        cwd=ROOT / "aws", env=_clean_env(), text=True, capture_output=True, timeout=60)
+         f"ROOT_RUNNER={stubs['runner']}"],
+        cwd=ROOT / "aws", text=True, capture_output=True, timeout=60,
+        env=_stubbed_env(tmp_path, {"agent_coverage.py": str(stubs["agent"]), "coverage_gate.py": str(stubs["gate"])}))
     assert result.returncode == 0, result.stdout + result.stderr
     calls = log.read_text().splitlines()
     first = [c.split()[0] + " " + c.split()[1] for c in calls]
@@ -831,8 +848,9 @@ def test_maintain_skips_the_genie_id_preflight_without_agents(tmp_path):
     preflight.write_text(f"open({str(tmp_path / 'preflight-called')!r}, 'w').write('x')\n")
     audit = tmp_path / "audit.py"
     audit.write_text("raise SystemExit(0)\n")
-    result, _calls = _make(tmp_path, env, "maintain", "ENV=prod", f"GENIE_ADOPT_PREFLIGHT_SCRIPT={preflight}",
-                           f"AUDIT_SCHEMA_SCRIPT={audit}", f"SHARED_ROOT={SHARED}")
+    result, _calls = _make(tmp_path, env, "maintain", "ENV=prod", f"SHARED_ROOT={SHARED}",
+                           stubs={"genie_adopt_preflight.py": script_stubs.python_file(preflight),
+                                  "audit_schema_drift.py": script_stubs.python_file(audit)})
     # The external-mask inventory needs Databricks; whatever it does, the
     # preflight must never be the thing that ran for a governance-only env.
     assert not (tmp_path / "preflight-called").exists(), result.stdout + result.stderr

@@ -570,7 +570,7 @@ def report(env_dir: Path, env: str, *, desired_abac: Path | None = None) -> tupl
                      f"{', '.join(outside)}. Add each to a tier (or raw_exempt_principals), or leave it out and "
                      "acknowledge its revocation.")
     if not deterministic(env_dir):
-        lines += ["", f"Next: set governance_mode = \"deterministic\" and access_tier_groups in envs/{env}/env.auto.tfvars,",
+        lines += ["", f"Next: set governance_mode = \"deterministic\", deployer_principal_id and access_tier_groups in envs/{env}/env.auto.tfvars,",
                   f"  add the table_readers above, run make rebuild-governed-tables ENV={env} (the first deterministic",
                   "  generate refuses without it), then make generate (the promotion, for a promoted env), then re-run",
                   f"  make migrate-plan ENV={env} for the column-by-column comparison and the refusals."]

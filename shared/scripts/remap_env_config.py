@@ -29,6 +29,9 @@ from scripts.footprint import (
     resolve_footprint,
 )
 from scripts.remap_generated_config import remap_hcl
+from deployer_identity import (DeployerIdentityError as _DeployerIdentityError,
+                               promotion_deployers as _promotion_deployers,
+                               validation_errors as _deployer_errors)
 from group_map import map_groups as _map_groups, mapping as _group_mapping, validation_errors as _group_map_errors
 from table_readers import is_everyone as _is_everyone, normalize as _normalize_readers
 from verify_effective_access import normalize_key_map
@@ -123,6 +126,17 @@ def _deployed_space_keys(dest_env_dir: str) -> dict[str, list[str]]:
             if isinstance(key, str):
                 keys.setdefault(key, []).append(prefix)
     return keys
+
+
+def _source_policies(source_env_dir: str) -> list:
+    path = Path(source_env_dir) / "generated" / "abac.auto.tfvars"
+    if not path.is_file():
+        return []
+    try:
+        return load_hcl(path).get("fgac_policies") or []
+    except FootprintError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
 
 
 def _promoted_access_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict,
@@ -453,10 +467,21 @@ def main():
         map_errors.append(
             f"raw_exempt_principals names {', '.join(repr(p) for p in everyone_exempt)}, which is everyone "
             "(everyone would see raw values)")
+    # The destination's own deployer SP (env-owned, never the source's). The
+    # generated remap after this swaps the source's for it, so a missing or
+    # malformed one is refused here, before anything is written.
+    if dest_deterministic:
+        map_errors.extend(_deployer_errors(dest_cfg))
+    if not map_errors:
+        try:
+            _promotion_deployers(source_env_dir, dest_env_dir, _source_policies(source_env_dir))
+        except _DeployerIdentityError as exc:
+            map_errors.append(str(exc))
     if map_errors:
         for error in map_errors:
             print(f"ERROR: destination {error}; nothing was written.")
         sys.exit(1)
+    preserved_deployer = _str(dest_cfg.get("deployer_principal_id", ""))
     group_map = _group_mapping(dest_cfg) if dest_deterministic else {}
     source_exempt = [_str(p) for p in cfg.get("raw_exempt_principals") or []]
 
@@ -613,6 +638,13 @@ def main():
         # seeds from the source; later ACL changes are reviewed directly in prod.
         is_repromote = bool(dest_space)
         acl_source = dest_space if is_repromote else space
+        # A legacy destination may omit acl_groups (derived from its policies);
+        # a deterministic one can't (decision 4). The first deterministic
+        # promotion seeds a missing one from the source, like a new agent's.
+        seed_acl = (is_repromote and dest_deterministic and dest_space.get("acl_groups") is None
+                    and isinstance(space.get("acl_groups"), list))
+        if seed_acl:
+            acl_source = space
         if "acl_groups" in acl_source:
             acl_groups = acl_source["acl_groups"]
             if acl_groups is not None and (
@@ -626,11 +658,16 @@ def main():
                 )
                 sys.exit(1)
             if acl_groups is not None:
-                if not is_repromote:
+                if not is_repromote or seed_acl:
                     acl_groups = map_groups(acl_groups)
                 rendered_acl = ", ".join(json.dumps(group) for group in acl_groups)
                 lines.append(f"    acl_groups       = [{rendered_acl}]")
-        if is_repromote:
+        if seed_acl:
+            print(
+                f"  Seeded destination Genie space {name!r} acl_groups={acl_groups!r} from "
+                f"{source_env} (it had none; groups through group_map); from now on the destination keeps its own"
+            )
+        elif is_repromote:
             if "acl_groups" in dest_space:
                 print(
                     f"  Preserved destination Genie space {name!r} "
@@ -686,6 +723,9 @@ def main():
     lines.append("enable_classification = true")
     if preserved_mode is not None:
         lines.append(f"governance_mode = {json.dumps(preserved_mode)}")
+    if preserved_deployer:
+        lines.append("# This env's deployer SP (application ID; env-owned, never promoted).")
+        lines.append(f"deployer_principal_id = {json.dumps(preserved_deployer)}")
     if "group_map" in dest_cfg:
         lines.append("")
         lines.append("# Dev group names to this env's (env-owned; changing it needs an ack).")

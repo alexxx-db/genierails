@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from scripts import release_gate as rg
+from tests import script_stubs
 from tests.test_release_gate import EMPTY_ABAC, PROD_ENV, Repo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -90,21 +91,32 @@ class Make:
     def exit_code(self, name: str, rc: int) -> None:
         (self.tmp / f"{name}.rc").write_text(str(rc))
 
-    def __call__(self, target: str, env: str, *extra: str, stub_make: bool = True, ci: bool = False):
+    def script_stubs(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """The live checks, stubbed below make (the helpers themselves can't be overridden)."""
+        return {
+            "table_readers.py check": "true", "group_map.py": "true", "deployer_identity.py": "true",
+            "saved_settings.py verify-key": "true", "staged_policy_apply.py confirm": "true",
+            "external_mask_inventory.py": str(self.stubs["inventory"]),
+            "classification_completeness.py check": str(self.stubs["classification"]),
+            "release_gate.py live-snapshot": str(self.stubs["live"]),
+            "release_gate.py reports": str(self.stubs["reports"]),
+            "staged_policy_apply.py": str(self.stubs["staged"]), "coverage_gate.py": str(self.stubs["gate"]),
+            "audit_schema_drift.py": str(self.stubs["audit"]), **(extra or {}),
+        }
+
+    def __call__(self, target: str, env: str, *extra: str, stub_make: bool = True, ci: bool = False,
+                 stubs: dict[str, str] | None = None, environ_extra: dict[str, str] | None = None):
         env_dir = self.repo.cloud / "envs" / env
         args = ["make", "--no-print-directory", target, f"ENV={env}", f"ENV_DIR={env_dir}",
                 f"ACCOUNT_ENV_DIR={self.repo.cloud / 'envs' / 'account'}",
-                "_ACCESS_CHECK=true", "_GROUP_CHECK=true", "_GROUP_MAP_RECORD=true", "_SAVE_VERIFY_KEY=true",
-                "_STAGED_CONFIRM_RUN=true", f"_EXTERNAL_MASK_INVENTORY={self.stubs['inventory']}",
-                f"_CLASSIFICATION_CHECK={self.stubs['classification']}", f"_LIVE_SNAPSHOT={self.stubs['live']}",
-                f"_RELEASE_REPORTS={self.stubs['reports']}", f"_STAGED_POLICY={self.stubs['staged']}",
-                f"_COVERAGE_GATE={self.stubs['gate']}", f"ROOT_RUNNER={self.stubs['runner']}",
-                f"AUDIT_SCHEMA_SCRIPT={self.stubs['audit']}", *extra]
+                f"ROOT_RUNNER={self.stubs['runner']}", *extra]
         if stub_make:
             args.append(f"MAKE={self.make}")
+        bin_dir = script_stubs.install(self.tmp / "stub-bin", self.script_stubs(stubs))
         environ = {k: v for k, v in os.environ.items()
                    if k not in ("MAKEFLAGS", "MAKELEVEL", "CI", "VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MANIFEST")}
-        environ |= self.repo.env | ({"CI": "true"} if ci else {})
+        environ |= self.repo.env | ({"CI": "true"} if ci else {}) | (environ_extra or {})
+        environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
         return subprocess.run(args, cwd=ROOT / self.cloud, text=True, capture_output=True, env=environ)
 
     def calls(self) -> list[list[str]]:
@@ -158,7 +170,9 @@ def test_legacy_release_is_unchanged(make, repo):
     assert result.returncode == 0, result.stdout + result.stderr
     names = make.names()
     assert "_release-manifest" not in names
-    assert names[:4] == ["_verify-access-keys-readonly", "derive-assignments", "validate-generated", "coverage-gate"]
+    # The classification check is stubbed below make now, so it is recorded too.
+    assert names[:5] == ["classification", "_verify-access-keys-readonly", "derive-assignments",
+                         "validate-generated", "coverage-gate"]
     assert not rg.release_receipts(repo.cloud, "prod")
 
 
@@ -372,9 +386,10 @@ def test_derive_assignments_writes_the_overlay_in_deterministic_envs_only(tmp_pa
     committed = repo.dev / "generated" / "abac.auto.tfvars"
     before = committed.read_text()
     environ = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL")} | repo.env
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", {"derive_assignments.py": str(derive)})
+    environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
     result = subprocess.run(["make", "--no-print-directory", "derive-assignments", "ENV=dev", f"ENV_DIR={repo.dev}",
-                             f"ACCOUNT_ENV_DIR={repo.cloud / 'envs' / 'account'}",
-                             f"DERIVE_ASSIGNMENTS_SCRIPT={derive}"], cwd=ROOT / "aws", text=True,
+                             f"ACCOUNT_ENV_DIR={repo.cloud / 'envs' / 'account'}"], cwd=ROOT / "aws", text=True,
                             capture_output=True, env=environ)
     assert result.returncode == 0, result.stdout + result.stderr
     if mode == "deterministic":

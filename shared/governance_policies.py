@@ -24,6 +24,7 @@ principals in place and never needs a new function.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -98,6 +99,21 @@ def parse_treatment_value(value: str) -> tuple[str, str, str] | None:
     """``(treatment, type token, generation)`` of a deterministic value, else None."""
     match = _VALUE_RE.fullmatch(value or "")
     return (match["treatment"], match["type"], match["generation"]) if match else None
+
+
+def is_library_treatment_value(tag_key: str, value: str) -> bool:
+    """Whether a ``gr_treatment`` value is deterministic and names a treatment this checkout ships.
+
+    Mode-blind: the account tag policy is shared, so it can hold deterministic
+    values next to legacy ones. Callers that know the env's mode also check it.
+    """
+    parsed = parse_treatment_value(value)
+    return bool(tag_key == TAG_KEY and parsed and parsed[0] in _library_treatments())
+
+
+@functools.cache
+def _library_treatments() -> frozenset[str]:
+    return frozenset(load_library()["treatments"]) | {FAILSAFE_TREATMENT}
 
 
 def base_treatment(value: str) -> str:

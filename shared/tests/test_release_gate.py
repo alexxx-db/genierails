@@ -43,8 +43,10 @@ envs/*/.*
 *.tfstate.backup
 .terraform/
 """
-DEV_ENV = 'governance_mode = "deterministic"\naccess_tier_groups = ["analysts", "viewers"]\n'
-PROD_ENV = ('governance_mode = "deterministic"\npromote_from = "dev"\n'
+DEV_ENV = ('governance_mode = "deterministic"\ndeployer_principal_id = "d0000000-0000-0000-0000-00000000d001"\n'
+           'access_tier_groups = ["analysts", "viewers"]\n')
+PROD_ENV = ('governance_mode = "deterministic"\ndeployer_principal_id = "d0000000-0000-0000-0000-00000000d002"\n'
+            'promote_from = "dev"\n'
             'catalog_map = { "dev_cat" = "prod_cat" }\naccess_tier_groups = ["analysts", "viewers"]\n')
 EMPTY_ABAC = "tag_policies = [\n]\ntag_assignments = [\n]\nfgac_policies = [\n]\n"
 

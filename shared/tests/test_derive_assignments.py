@@ -135,6 +135,7 @@ def test_refresh_fails_closed_on_unmapped_native_class(tmp_path, monkeypatch):
 
 DETERMINISTIC_ENV = '''
 governance_mode = "deterministic"
+deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"
 uc_catalog = "prod"
 uc_tables = ["sales.customers"]
 access_tier_groups = ["raw", "partial", "full"]
@@ -488,7 +489,7 @@ def test_make_target_exposes_assignment_only_command():
     source = MAKEFILE.read_text()
     body = source[source.index("derive-assignments:") : source.index("\naudit-schema:")]
     assert '"$(DERIVE_ASSIGNMENTS_SCRIPT)"' in body
-    assert "DERIVE_ASSIGNMENTS_SCRIPT ?= $(SHARED_ROOT)/scripts/derive_assignments.py" in source
+    assert "override DERIVE_ASSIGNMENTS_SCRIPT = $(SHARED_ROOT)/scripts/derive_assignments.py" in source
     assert "generated/abac.auto.tfvars" in body
     assert "generate_abac.py" not in body
 

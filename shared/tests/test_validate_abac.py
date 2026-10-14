@@ -52,10 +52,10 @@ def _real_deterministic_output(tmp_path):
     generated.mkdir(parents=True)
     (env_dir / "env.auto.tfvars").write_text('''
 governance_mode = "deterministic"
+deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"
 access_tier_groups = ["raw", "regional", "masked"]
 raw_exempt_principals = ["break-glass"]
 ''')
-    (env_dir / "auth.auto.tfvars").write_text('databricks_client_id = "deployer-sp"\n')
     tfvars = generated / "abac.auto.tfvars"
     sql = generated / "masking_functions.sql"
     tfvars.write_text('''
@@ -69,7 +69,6 @@ tag_assignments = []
 fgac_policies = []
 ''')
     runtime = hcl2.loads((env_dir / "env.auto.tfvars").read_text())
-    runtime["databricks_client_id"] = "deployer-sp"
     model = deterministic_model_for(
         runtime, _GeneratedClassification(),
         "CREATE TABLE cat.sch.customers (email STRING);",
@@ -164,7 +163,7 @@ def test_deterministic_overlap_proof_refuses_reviewer_counterexamples(tmp_path, 
         full["except_principals"] = []
     elif counterexample == "overlapping_named_groups":
         full["to_principals"] = ["masked"]
-        full["except_principals"] = ["raw", "break-glass", "deployer-sp"]
+        full["except_principals"] = ["raw", "break-glass", "d0000000-0000-0000-0000-00000000d001"]
     elif counterexample == "dropped_partial_tier_exception":
         full["except_principals"].remove("regional")
     elif counterexample == "swapped_functions":
@@ -220,15 +219,15 @@ def test_never_raw_deterministic_policy_refuses_deployer_and_raw_exempt_exceptio
         "governance_mode": "deterministic",
         "access_tier_groups": ["raw", "regional", "masked"],
         "raw_exempt_principals": ["break-glass"],
-        "databricks_client_id": "deployer-sp",
+        "deployer_principal_id": "d0000000-0000-0000-0000-00000000d001",
     }
     model = build_model(
         {"cat.sch.payments.cvv": ["card_security_code"]},
         {"cat.sch.payments.cvv": "STRING"}, settings,
-        deployer_principal="deployer-sp",
+        deployer_principal="d0000000-0000-0000-0000-00000000d001",
     )
     policy = model.fgac_policies[0]
-    policy["except_principals"] = ["deployer-sp", "break-glass"]
+    policy["except_principals"] = ["d0000000-0000-0000-0000-00000000d001", "break-glass"]
     cfg = settings | {
         "groups": {name: {} for name in ("raw", "regional", "masked")},
         "tag_policies": [{"key": "gr_treatment", "values": model.tag_values}],
@@ -974,3 +973,71 @@ class TestValidateAclGroups:
         assert any("Bad_Group" in e for e in r.errors)
         # Finance should pass, only Clinical should fail
         assert not any("Analyst" in e for e in r.errors)
+
+
+# ---------------------------------------------------------------------------
+# The shared account tag policy holds deterministic values (live AWS Phase A, N3)
+# ---------------------------------------------------------------------------
+
+DETERMINISTIC_VALUE = "card_last4__string__951e00ac"
+SHARED_POLICY = [{"key": "gr_treatment", "values": ["account_last4", DETERMINISTIC_VALUE]}]
+
+
+def _envs_with_account_policy(tmp_path, values):
+    envs = tmp_path / "envs"
+    (envs / "account").mkdir(parents=True)
+    (envs / "dev").mkdir()
+    rendered = ", ".join(f'"{v}"' for v in values)
+    (envs / "account" / "abac.auto.tfvars").write_text(
+        f'tag_policies = [{{ key = "gr_treatment", description = "t", values = [{rendered}] }}]\n')
+    (envs / "dev" / "env.auto.tfvars").write_text("")  # legacy
+    (envs / "dev" / "abac.auto.tfvars").write_text("groups = {}\n")
+    return envs
+
+
+def test_account_layer_accepts_deterministic_values_next_to_legacy_ones(tmp_path):
+    envs = _envs_with_account_policy(tmp_path, ["account_last4", DETERMINISTIC_VALUE])
+    result = _result()
+
+    cfg = load_validation_context({"tag_policies": SHARED_POLICY}, result, envs / "account" / "abac.auto.tfvars")
+    validate_tag_policies(cfg, result)
+
+    assert result.errors == []
+
+
+def test_a_legacy_env_accepts_the_shared_account_policy_it_loads(tmp_path):
+    envs = _envs_with_account_policy(tmp_path, ["account_last4", DETERMINISTIC_VALUE])
+    result = _result()
+
+    cfg = load_validation_context({"groups": {}}, result, envs / "dev" / "abac.auto.tfvars")
+    validate_tag_policies(cfg, result)
+
+    assert cfg["tag_policies"][0]["values"] == ["account_last4", DETERMINISTIC_VALUE]
+    assert result.errors == []
+
+
+@pytest.mark.parametrize("value", ["not_a_treatment", "not_a_treatment__string__951e00ac"])
+def test_account_layer_still_refuses_unknown_values(tmp_path, value):
+    envs = _envs_with_account_policy(tmp_path, [value])
+    result = _result()
+
+    cfg = load_validation_context({"tag_policies": [{"key": "gr_treatment", "values": [value]}]},
+                                  result, envs / "account" / "abac.auto.tfvars")
+    validate_tag_policies(cfg, result)
+
+    assert any(f"value '{value}' is not in the canonical registry" in e for e in result.errors)
+
+
+def test_a_legacy_env_still_refuses_deterministic_values_in_its_own_config(tmp_path):
+    envs = _envs_with_account_policy(tmp_path, ["account_last4"])
+    own = {"tag_policies": SHARED_POLICY, "tag_assignments": [
+        {"entity_type": "columns", "entity_name": "c.s.t.card", "tag_key": "gr_treatment",
+         "tag_value": DETERMINISTIC_VALUE}]}
+    result = _result()
+
+    cfg = load_validation_context(own, result, envs / "dev" / "generated" / "abac.auto.tfvars")
+    tag_map = validate_tag_policies(cfg, result)
+    validate_tag_assignments(cfg, tag_map, result)
+
+    assert any(f"value '{DETERMINISTIC_VALUE}' is not in the canonical registry" in e for e in result.errors)
+    assert any(f"tag_value '{DETERMINISTIC_VALUE}' is not in the canonical registry" in e for e in result.errors)

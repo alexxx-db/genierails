@@ -846,7 +846,7 @@ def test_release_needs_no_key_and_proves_keys_before_applying(tmp_path, env_text
 
     assert result.returncode == 0, result.stdout + result.stderr
     keys = calls.index("verify-access-keys ENV=prod")
-    assert keys < calls.index("apply ENV=prod APPLY_FLAGS= _EXPOSURE_DERIVED=1 _STAGED_CONFIRM=0")
+    assert keys < calls.index("apply ENV=prod APPLY_FLAGS= _STAGED_CONFIRM=0")
     assert "verify-access ENV=prod VERIFY_REQUIRE_MASKS=1" in calls
 
 

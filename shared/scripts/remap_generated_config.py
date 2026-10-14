@@ -31,13 +31,14 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 
-def _top_level_list_span(text: str, key: str) -> tuple[int, int, int] | None:
-    """Return (key_start, open_bracket, end_after_close) for a top-level list."""
-    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*\[", text)
+def _top_level_list_span(text: str, key: str, opener: str = "[") -> tuple[int, int, int] | None:
+    """Return (key_start, open_bracket, end_after_close) for a top-level list (or map, opener "{")."""
+    closer = {"[": "]", "{": "}"}[opener]
+    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*{re.escape(opener)}", text)
     if not match:
         return None
 
-    opening_bracket = text.find("[", match.start(), match.end())
+    opening_bracket = text.find(opener, match.start(), match.end())
     depth = 0
     in_string = False
     escaped = False
@@ -54,15 +55,15 @@ def _top_level_list_span(text: str, key: str) -> tuple[int, int, int] | None:
                 in_string = False
         elif char == '"':
             in_string = True
-        elif char == "[":
+        elif char == opener:
             depth += 1
-        elif char == "]":
+        elif char == closer:
             depth -= 1
             if depth == 0:
                 return match.start(), opening_bracket, index + 1
         index += 1
 
-    raise ValueError(f"Unterminated top-level {key} list")
+    raise ValueError(f"Unterminated top-level {key} {'list' if opener == '[' else 'map'}")
 
 
 def remove_tag_assignments(text: str) -> str:
@@ -366,7 +367,7 @@ class PromotionError(ValueError):
 
 
 def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str],
-                   dest_exempt: list[str] | None = None) -> str:
+                   dest_exempt: list[str] | None = None, deployers: tuple[str, str] | None = None) -> str:
     """Rename policy principals through group_map (decision 8).
 
     raw_exempt_principals are env-owned and never mapped: where a policy
@@ -376,6 +377,11 @@ def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str],
     (account users, users) would exempt everyone from the mask, so that
     refuses the promotion instead (PromotionError) whether or not a policy
     names a source exempt.
+
+    ``deployers`` is (source, destination) deployer SP application IDs: each
+    env applies with its own SP, so the source's in an ``except_principals``
+    list becomes the destination's. Only that one principal is replaced; a
+    list without it (a never-raw policy) gets none.
     """
     dest_exempt = list(dest_exempt or [])
     from table_readers import is_everyone
@@ -386,20 +392,112 @@ def map_principals(hcl_text: str, group_map: dict[str, str], exempt: set[str],
             f"destination raw_exempt_principals names {', '.join(repr(n) for n in everyone)}, which is "
             "everyone: substituting it into the promoted policies' except_principals would let everyone "
             "see raw values")
-    if not group_map and not exempt:
+    source_deployer, dest_deployer = deployers or ("", "")
+    if not group_map and not exempt and source_deployer == dest_deployer:
         return hcl_text
 
     def rename(match: re.Match) -> str:
         names = json.loads(match["list"])
+        except_list = match["lead"].lstrip().startswith("except_")
         mapped = []
         for name in names:
-            targets = dest_exempt if name in exempt else [group_map.get(name, name)]
+            if source_deployer and name == source_deployer and except_list:
+                targets = [dest_deployer]
+            else:
+                targets = dest_exempt if name in exempt else [group_map.get(name, name)]
             for target in targets:
                 if target not in mapped:
                     mapped.append(target)
         return f"{match['lead']}[{', '.join(json.dumps(n) for n in mapped)}]{match['tail']}"
 
     return _PRINCIPALS_LINE.sub(rename, hcl_text)
+
+
+def map_group_keys(hcl_text: str, group_map: dict[str, str], exempt: set[str]) -> str:
+    """Rename the keys of the top-level ``groups`` and ``group_members`` maps through group_map.
+
+    The policies' principals are mapped, so the groups they name must be
+    defined under the same names. raw_exempt_principals keep their names, as
+    in map_principals. Two keys that would end up with one name (a mapping
+    onto a group the source already defines) merge tiers, so that refuses the
+    promotion (PromotionError). The result is re-read; a layout this can't
+    rename in place refuses rather than leave a dev name behind.
+    """
+    import hcl2
+
+    if not group_map:
+        return hcl_text
+    cfg = hcl2.loads(hcl_text)
+    for key in ("groups", "group_members"):
+        value = cfg.get(key)
+        if not isinstance(value, dict) or not value:
+            continue
+        renames = {name: group_map[name] for name in value if name in group_map and name not in exempt}
+        targets: dict[str, list[str]] = {}
+        for name in value:
+            targets.setdefault(renames.get(name, name), []).append(name)
+        collisions = {target: names for target, names in targets.items() if len(names) > 1}
+        if collisions:
+            raise PromotionError("; ".join(
+                f"group_map would give {key} {', '.join(repr(n) for n in names)} the one name {target!r}"
+                for target, names in sorted(collisions.items())))
+        if not renames:
+            continue
+        span = _top_level_list_span(hcl_text, key, "{")
+        if span is None:
+            raise PromotionError(f"cannot find the top-level {key} map to apply group_map to")
+        _start, brace, end = span
+        section = hcl_text[brace:end]
+        # Keys sit one level in, at the start of their line.
+        out, depth = [], 0
+        for line in section.splitlines(keepends=True):
+            if depth == 1:
+                key_match = re.match(r'^(\s*)(?:"([^"\\]*)"|([A-Za-z_][\w-]*))(\s*=)', line)
+                name = key_match and (key_match[2] if key_match[2] is not None else key_match[3])
+                if name in renames:
+                    line = f"{key_match[1]}{json.dumps(renames[name])}{key_match[4]}{line[key_match.end():]}"
+            out.append(line)
+            depth += _brace_delta(line)
+        hcl_text = hcl_text[:brace] + "".join(out) + hcl_text[end:]
+        expected = [renames.get(name, name) for name in value]
+        if list((hcl2.loads(hcl_text).get(key) or {})) != expected:
+            raise PromotionError(f"could not rename the {key} keys through group_map in place")
+    return hcl_text
+
+
+def _brace_delta(line: str) -> int:
+    depth, in_string, escaped = 0, False, False
+    for char in line:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "#":
+            break
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return depth
+
+
+def _deployer_ids(args, hcl_text: str) -> tuple[str, str] | None:
+    """(source, destination) committed deployer IDs for a deterministic source (deployer_identity.py)."""
+    import hcl2
+    from deployer_identity import DeployerIdentityError, promotion_deployers
+
+    if not args.source_env or not args.group_map_env:
+        return None
+    try:
+        return promotion_deployers(args.source_env.parent, args.group_map_env.parent,
+                                   hcl2.loads(hcl_text).get("fgac_policies") or [])
+    except DeployerIdentityError as exc:
+        raise PromotionError(str(exc)) from exc
 
 
 def _group_map_inputs(args) -> tuple[dict[str, str], set[str], list[str] | None]:
@@ -549,7 +647,9 @@ def main() -> None:
         sys.exit(1)
     group_map, exempt, dest_exempt = _group_map_inputs(args)
     try:
-        remapped_hcl = map_principals(remapped_hcl, group_map, exempt, dest_exempt)
+        deployers = _deployer_ids(args, remapped_hcl)
+        remapped_hcl = map_principals(remapped_hcl, group_map, exempt, dest_exempt, deployers)
+        remapped_hcl = map_group_keys(remapped_hcl, group_map, exempt)
     except PromotionError as exc:
         print(f"ERROR: {exc}; nothing was written.")
         sys.exit(1)

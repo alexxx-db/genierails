@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs
+
 from scripts import environment_lock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,12 +58,16 @@ def run(tmp_path, envs, target, env, *extra, stub_make=True):
     log.unlink(missing_ok=True)
     args = ["make", "--no-print-directory", target, f"ENV={env}", f"ENV_DIR={env_dir}",
             f"ACCOUNT_ENV_DIR={cloud / 'envs' / 'account'}", f"ROOT_RUNNER={stubs['runner']}",
-            f"_STAGED_POLICY={stubs['staged']}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
-            f"_AGENT_COVERAGE={stubs['agent']}", f"IMPORT_EXISTING_SCRIPT={stubs['importer']}",
-            "_ACCESS_CHECK=true", "_GROUP_CHECK=true", *extra]
+            f"IMPORT_EXISTING_SCRIPT={stubs['importer']}", *extra]
     if stub_make:
         args.append(f"MAKE={stubs['make']}")
+    # The checks and the staged controller are stubbed below make (their helpers can't be overridden).
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", {
+        "staged_policy_apply.py": str(stubs["staged"]), "coverage_gate.py": str(stubs["gate"]),
+        "sticky_governance.py": str(stubs["sticky"]), "agent_coverage.py": str(stubs["agent"]),
+        "table_readers.py check": "true", "group_map.py": "true", "deployer_identity.py": "true"})
     environ = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "CI", "APPLY_FLAGS")}
+    environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
     result = subprocess.run(args, cwd=ROOT / "aws", text=True, capture_output=True,
                             env=environ | {"SIDE_DOOR_LOG": str(log)})
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []

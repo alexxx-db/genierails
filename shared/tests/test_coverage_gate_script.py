@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import script_stubs
+
 SHARED = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SHARED))
 
@@ -471,8 +473,9 @@ def test_apply_paths_derive_before_promote_unless_already_derived(target):
     assert recipe.index("_derive-before-exposure") < recipe.index(" promote ENV=")
     # Same-env promote, whatever DEST_ENV/SOURCE_ENV the shell exports.
     assert 'SOURCE_ENV="dev"' in recipe and "DEST_ENV= DEST_ENV_DIR= DEST_CATALOG_MAP=" in recipe
-    assert 'if [ -z "" ]; then' in recipe
-    assert 'if [ -z "1" ]; then' in _dry_run(target, "ENV=dev", "_EXPOSURE_DERIVED=1")
+    # Only a one-time token from a caller that already derived skips it; no variable does.
+    assert 'exposure_token.py" consume --env-dir' in recipe
+    assert _dry_run(target, "ENV=dev", "_EXPOSURE_DERIVED=1") == recipe
 
 
 def test_data_access_layer_gates_before_plan_and_apply():
@@ -817,8 +820,9 @@ def live_uc(live_like_env, tmp_path, monkeypatch):
         env["TF_CLI_ARGS_plan"] = "-no-color"
         return subprocess.run(
             ["make", "--no-print-directory", "plan", "ENV=prod", f"CLOUD_ROOT={cloud_root}",
-             f"SHARED_ROOT={TF_SHARED}", f"DERIVE_ASSIGNMENTS_SCRIPT={fake}"],
-            cwd=SHARED.parent / "aws", text=True, capture_output=True, env=env,
+             f"SHARED_ROOT={TF_SHARED}"],
+            cwd=SHARED.parent / "aws", text=True, capture_output=True,
+            env=_with_stubs(env, tmp_path, {"derive_assignments.py": script_stubs.python_file(fake)}),
         )
 
     return live_like_env, live_ddl, plan
@@ -1027,7 +1031,14 @@ exit 0
 
 # The import and Genie-adopt steps of _apply-layer call live Databricks APIs;
 # stand them in with no-ops (the decision under test happens before them).
-_OFFLINE_STEPS = ["IMPORT_EXISTING_SCRIPT=true", f"GENIE_ADOPT_PREFLIGHT_SCRIPT={SHARED / 'tests' / '__init__.py'}"]
+# The adopt preflight is stubbed below make (its script variable can't be overridden).
+_OFFLINE_STEPS = ["IMPORT_EXISTING_SCRIPT=true"]
+_OFFLINE_STUBS = {"genie_adopt_preflight.py": "true"}
+
+
+def _with_stubs(environ, tmp_path, stubs):
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", stubs)
+    return {**environ, "PATH": f"{bin_dir}:{environ['PATH']}"}
 
 _GATE_OUTPUT_TYPE = ["object", {
     "business_access_enabled": "bool", "fingerprint": "string", "status": "string",
@@ -1078,9 +1089,9 @@ def genie_env(live_like_env, tmp_path, monkeypatch):
         clean = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "APPLY_FLAGS")}
         result = subprocess.run(
             ["make", "--no-print-directory", "apply-genie", "ENV=prod", f"CLOUD_ROOT={env.parents[1]}",
-             f"SHARED_ROOT={TF_SHARED}", f"ROOT_RUNNER={runner}", f"DERIVE_ASSIGNMENTS_SCRIPT={fake}",
-             *_OFFLINE_STEPS],
-            cwd=SHARED.parent / "aws", text=True, capture_output=True, env=clean,
+             f"SHARED_ROOT={TF_SHARED}", f"ROOT_RUNNER={runner}", *_OFFLINE_STEPS],
+            cwd=SHARED.parent / "aws", text=True, capture_output=True,
+            env=_with_stubs(clean, tmp_path, {**_OFFLINE_STUBS, "derive_assignments.py": script_stubs.python_file(fake)}),
         )
         applied = log.exists() and "workspace prod apply" in log.read_text()
         return result, applied
@@ -1164,7 +1175,7 @@ def _failed_refresh_apply(env, tmp_path):
     result = subprocess.run(
         ["make", "--no-print-directory", "_apply-layer", "LAYER=data_access", "TARGET_ENV=prod",
          f"LAYER_ENV_DIR={env / 'data_access'}", f"ROOT_RUNNER={runner}", *_OFFLINE_STEPS],
-        cwd=SHARED.parent / "aws", text=True, capture_output=True, env=clean,
+        cwd=SHARED.parent / "aws", text=True, capture_output=True, env=_with_stubs(clean, tmp_path, _OFFLINE_STUBS),
     )
     applied = log.exists() and "data_access prod apply" in log.read_text()
     return result, applied

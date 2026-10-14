@@ -166,6 +166,7 @@ def _validate_ack_list(name: str, value: str | None, *, principal: bool) -> list
 
 
 from table_readers import is_everyone  # noqa: E402
+import deployer_identity  # noqa: E402
 
 
 def validate_config(
@@ -350,4 +351,5 @@ def validate_config(
     errors.extend(group_map_errors(cfg))
     errors.extend(_validate_ack_list("ACK_UNCLASSIFIED", ack_unclassified, principal=False))
     errors.extend(_validate_ack_list("ACK_WEAKEN", ack_weaken, principal=True))
+    errors.extend(deployer_identity.validation_errors(cfg))
     return errors

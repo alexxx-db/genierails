@@ -17,6 +17,7 @@ except ImportError:
     print("  pip install python-hcl2")
     sys.exit(2)
 
+from governance_policies import is_library_treatment_value  # noqa: E402
 from tag_vocabulary import REGISTRY  # noqa: E402
 
 
@@ -184,7 +185,10 @@ def merge_tag_policies(existing: list, new: list) -> list:
         values: list[str] = []
         for raw_value in policy.get("values", []) or []:
             canonical_value = REGISTRY.canonical_value(canonical_key, raw_value)
-            if REGISTRY.is_allowed_value(canonical_key, canonical_value) is False:
+            # Deterministic gr_treatment values aren't in the registry; any env
+            # may add them to the shared account tag policy.
+            if (REGISTRY.is_allowed_value(canonical_key, canonical_value) is False
+                    and not is_library_treatment_value(canonical_key, canonical_value)):
                 raise ValueError(
                     f"tag_policy '{canonical_key}' contains unknown canonical value "
                     f"'{canonical_value}'"

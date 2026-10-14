@@ -173,8 +173,8 @@ class Scratch:
     def close(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def make(self, target: str, *args: str) -> int:
-        env = {k: v for k, v in os.environ.items() if k not in LEAKED_VARS}
+    def make(self, target: str, *args: str, extra_env: dict[str, str] | None = None) -> int:
+        env = {k: v for k, v in os.environ.items() if k not in LEAKED_VARS} | (extra_env or {})
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         # The copy has no runtime overlay: regenerations write generated/ in
         # place, which is what the comparison checks (scripts/runtime_overlay.py).
@@ -344,8 +344,17 @@ def _check(args) -> None:
               "configured). It shows every resource as new and proves the config plans; it is not the "
               "change a release would make. Live tags are not re-read, so new SELECT grants show as withheld.")
         scratch.add_credentials(env)
-        if scratch.make("plan", f"ENV={env}", "_EXPOSURE_DERIVED=1") != 0:
-            raise CheckFailed("plan")
+        # The structural plan doesn't re-read live tags (a plan applies nothing;
+        # the gate withholds new grants), so it hands the plan the one-time
+        # token that skips the derive (scripts/exposure_token.py).
+        from exposure_token import ENV_VAR, mint
+
+        token = mint(scratch.envs / env)
+        try:
+            if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token)}) != 0:
+                raise CheckFailed("plan")
+        finally:
+            token.unlink(missing_ok=True)
     finally:
         scratch.close()
 
