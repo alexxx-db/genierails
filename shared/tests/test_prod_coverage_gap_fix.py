@@ -46,7 +46,10 @@ class _Statements:
         if _uc().get("fail_sql"):
             raise RuntimeError("PERMISSION_DENIED: no SELECT on system.information_schema")
         if "data_classification.results" in statement:
-            raise RuntimeError("TABLE_OR_VIEW_NOT_FOUND")
+            raise RuntimeError(
+                "[TABLE_OR_VIEW_NOT_FOUND] The table or view "
+                "system.data_classification.results cannot be found"
+            )
         rows = [row for row in _uc()["tags"] if f"'{row[0]}'" in statement or row[0] in statement]
         if "LIKE 'class.%'" in statement:
             rows = [row for row in rows if row[4].lower().startswith("class.")]
