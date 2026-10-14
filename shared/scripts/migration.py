@@ -49,6 +49,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -371,7 +372,7 @@ def shape_problems(generation: Mapping) -> list[str]:
             for p in generation["fgac_policies"] if not _policy_value(p)]
 
 
-def analyze(env_dir: Path, env: str, generation: Mapping) -> dict:
+def analyze(env_dir: Path, env: str, generation: Mapping, *, desired_abac: Path | None = None) -> dict:
     """Every check the cutover needs, against the committed config (pure apart from file reads)."""
     from ack_file import AckFileError, parse_file
     from weakening import check_weakenings
@@ -380,13 +381,13 @@ def analyze(env_dir: Path, env: str, generation: Mapping) -> dict:
 
     env_dir = Path(env_dir)
     cfg = _load_hcl(env_dir / "env.auto.tfvars")
-    desired_cfg = _load_hcl(effective(env_dir, "abac.auto.tfvars"))
+    desired_cfg = _load_hcl(desired_abac or effective(env_dir, "abac.auto.tfvars"))
     try:
         entries = parse_file(env_dir / "ack.txt", env) if (env_dir / "ack.txt").is_file() else ()
     except AckFileError as exc:
         raise Refused(f"envs/{env}/ack.txt: {exc}") from exc
     keys = {e.key for e in entries}
-    before, after = legacy_view(generation), rg._desired(env_dir)
+    before, after = legacy_view(generation), rg._desired(env_dir, desired_abac)
     states = rg.governance_states(before, after)
     weak = check_weakenings(*states, env, keys)
     revoked = revocations(env_dir, env, generation, cfg)
@@ -523,7 +524,21 @@ def _short(text: str, width: int = 100) -> str:
     return text if len(text) <= width else text[: width - 3] + "..."
 
 
-def report(env_dir: Path, env: str) -> tuple[list[str], dict]:
+def _derive_live_desired(env_dir: Path, out_dir: Path) -> Path:
+    """Derive a promoted env's assignments from live class.* tags into scratch output."""
+    script = SHARED / "scripts" / "derive_assignments.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--auth-file", "auth.auto.tfvars", "--env-file", "env.auto.tfvars",
+         "--config", "generated/abac.auto.tfvars", "--out-dir", str(out_dir)],
+        cwd=env_dir, check=False,
+    )
+    if result.returncode:
+        raise Refused("re-reading live class.* tags for the migration comparison failed (above); "
+                      "no raw fallback was assumed")
+    return out_dir / "abac.auto.tfvars"
+
+
+def report(env_dir: Path, env: str, *, desired_abac: Path | None = None) -> tuple[list[str], dict]:
     """(printed lines, JSON report) of the dry run; never changes anything."""
     env_dir = Path(env_dir)
     dep = deployment(env_dir)
@@ -561,7 +576,13 @@ def report(env_dir: Path, env: str) -> tuple[list[str], dict]:
                   f"  make migrate-plan ENV={env} for the column-by-column comparison and the refusals."]
         return lines, data | {"ok": False, "ready": False}
 
-    result = analyze(env_dir, env, generation)
+    committed = _load_hcl(env_dir / "generated" / "abac.auto.tfvars")
+    if desired_abac is None and not any(i.get("tag_key") == TAG_KEY
+                                       for i in committed.get("tag_assignments") or []):
+        with tempfile.TemporaryDirectory(prefix=f"genierails-migrate-{env}-") as tmp:
+            return report(env_dir, env, desired_abac=_derive_live_desired(env_dir, Path(tmp)))
+
+    result = analyze(env_dir, env, generation, desired_abac=desired_abac)
     before_state, after_state = result["states"]
     functions = _functions(env_dir)
     desired = result["after"]
@@ -607,7 +628,7 @@ def report(env_dir: Path, env: str) -> tuple[list[str], dict]:
     lines += [f"  {name}" for name in sorted(dep["frozen"])] or ["  none"]
     lines += ["", "Tag state moves (run by the cutover under the env lock; tags are never destroyed):"]
     lines += [f"  terraform state mv '{s}' '{t}'" for s, t in dep["moves"]] or ["  none"]
-    forget = forgotten_tags(dep, _load_hcl(_effective_abac(env_dir)))
+    forget = forgotten_tags(dep, _load_hcl(desired_abac or _effective_abac(env_dir)))
     lines += [f"  terraform state rm '{tag_address(k, 'assignments')}'  (legacy sensitivity tag, left on the column)"
               for k in forget]
     if result["stale"]:

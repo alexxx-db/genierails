@@ -628,6 +628,30 @@ def _policy_value(policy: Mapping, known: Iterable[str] = ()) -> str:
     return max(found, key=len) if found else ""
 
 
+def _resolved_policy_level(value: str, policy: Mapping) -> str:
+    """The output level pinned by a deterministic value's generation hash."""
+    if policy.get("level"):
+        return str(policy["level"])
+    if policy["name"].endswith("_full"):
+        return "redacted"
+
+    from governance_policies import ColumnTreatment, normalize_sql_type, parse_treatment_value
+    from mask_library import load_library
+
+    parsed = parse_treatment_value(value)
+    item = load_library()["treatments"].get(parsed[0]) if parsed else None
+    if not parsed or not item:
+        return "partial"  # Unknown values must never be assumed to provide stronger protection.
+    token = parsed[1].upper()
+    sql_type = (f"DECIMAL({token.split('_')[1]},{token.split('_')[2]})"
+                if token.startswith("DECIMAL_") else normalize_sql_type(token))
+    redacting = {
+        ColumnTreatment(parsed[0], sql_type, version, item["full"], False).generation
+        for version in ("redacted", "null")
+    }
+    return "redacted" if parsed[2] in redacting else "partial"
+
+
 def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str]) -> dict:
     """column -> principal -> (level, consequence) from the mask policies that match it."""
     from governance_policies import base_treatment
@@ -646,8 +670,7 @@ def _levels(tags: Mapping[str, str], policies: list[Mapping], universe: set[str]
         levels = {}
         for who in universe:
             on = [p for p in by_value.get(value, []) if covers(p, who)]
-            if any(p.get("level", "redacted" if p["name"].endswith("_full") else "partial") == "redacted"
-                   for p in on):
+            if any(_resolved_policy_level(value, p) == "redacted" for p in on):
                 levels[who] = ("redacted", f"redacted ({treatment})")
             elif on:
                 levels[who] = ("partial", f"partial ({treatment})")
@@ -683,12 +706,12 @@ def _deployed(env_dir: Path) -> dict:
             "table_readers": readers, "has_generation": bool(journal.get("active"))}
 
 
-def _desired(env_dir: Path) -> dict:
+def _desired(env_dir: Path, config_path: Path | None = None) -> dict:
     from scripts.runtime_overlay import effective
     from governance_policies import TAG_KEY
     from table_readers import governed_tables, normalize, readers_for
 
-    cfg = _load_hcl(effective(env_dir, "abac.auto.tfvars"))
+    cfg = _load_hcl(config_path or effective(env_dir, "abac.auto.tfvars"))
     env_cfg = _load_hcl(Path(env_dir) / "env.auto.tfvars")
     tags = {str(i["entity_name"]): str(i["tag_value"]) for i in cfg.get("tag_assignments") or []
             if i.get("entity_type") == "columns" and i.get("tag_key") == TAG_KEY}
