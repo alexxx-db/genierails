@@ -14,7 +14,8 @@ with no mapping is used as is. ``raw_exempt_principals`` are env-owned and
 never mapped. Nested membership is expanded only after mapping (the reader
 and agent checks read the destination's own, mapped config).
 
-promote-to stays a pure function of committed files. What needs the live
+promote-to stays a pure function of committed files (and each env's deployer
+application ID, the one auth value make check also gets). What needs the live
 destination runs in rehearse and release (release-plan once it exists):
 ``check`` refuses any resulting group that doesn't exist there, mapped or
 not, including every principal of the committed promoted policies, and ``check-ack`` refuses a changed ``group_map`` (added, removed or

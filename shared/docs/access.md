@@ -98,8 +98,9 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
 - `raw_exempt_principals` are env-owned and never mapped; a `group_map` key
   that is one is refused. Many-to-one mappings are refused (they would merge
   tiers or readers), and so is mapping `account users`.
-- `promote-to` reads only committed files. `rehearse` and `release` check
-  live, before the lock: every group the env names (tiers, readers,
+- `promote-to` reads only committed files, plus each env's deployer application ID
+  (`databricks_client_id` in its `auth.auto.tfvars`, which `make check` also gets).
+  `rehearse` and `release` check live, before the lock: every group the env names (tiers, readers,
   `acl_groups`, row-filter groups, mapped or not) and every principal of the
   committed promoted policies (`data_access/abac.auto.tfvars` and
   `generated/abac.auto.tfvars`, `to_principals` and `except_principals`)
