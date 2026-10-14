@@ -9,12 +9,13 @@ show no change. Design: [deterministic-governance.md, section 8](design/determin
 make migrate-plan ENV=prod        # 1. read-only dry run on the live env; proposes table_readers
                                   #    (before step 2 it exits 1 and prints these next steps)
 # 2. dev: in envs/dev/env.auto.tfvars set governance_mode = "deterministic",
-#    access_tier_groups, table_readers and each agent's acl_groups; then
+#    deployer_principal_id (dev's deployer SP application ID), access_tier_groups,
+#    table_readers and each agent's acl_groups; then
 make rebuild-governed-tables ENV=dev   # 2a. writes generated/governed_tables.json (commit it)
 make generate ENV=dev                  # 2b. dev: the deterministic draft (no model is called)
 #    prod: in envs/prod/env.auto.tfvars set governance_mode = "deterministic"
-#    yourself (and group_map if prod's group names differ); promote-to never
-#    sets the mode. Then:
+#    and deployer_principal_id (prod's own deployer SP) yourself (and group_map
+#    if prod's group names differ); promote-to never sets either. Then:
 make rebuild-governed-tables ENV=prod  # 2c. prod's record (refused until prod sets the mode)
 make promote-to ENV=prod               # 2d. prod's draft from dev's; add the reviewed ack.txt lines
 make migrate-plan ENV=prod        # 3. repeat until "the cutover may proceed"; PR, review, merge

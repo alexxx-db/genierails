@@ -71,7 +71,9 @@ def test_python_accepted_uuid_group_passes_terraform_validate_and_plan(tmp_path,
 
 
 def test_governance_mode_and_raw_exempt_principals():
-    assert errors(governance_mode="deterministic", raw_exempt_principals=["etl"]) == []
+    assert errors(governance_mode="deterministic", raw_exempt_principals=["etl"],
+                  deployer_principal_id="d0000000-0000-0000-0000-00000000d001") == []
+    assert any("deployer_principal_id is required" in e for e in errors(governance_mode="deterministic"))
     assert errors(governance_mode="future")
     assert errors(governance_mode=[])
     assert errors(raw_exempt_principals="etl")

@@ -35,15 +35,23 @@ needs_make = pytest.mark.skipif(shutil.which("make") is None, reason="make not i
 
 
 def _cfg(**overrides):
-    cfg = {"governance_mode": "deterministic", "access_tier_groups": TIERS}
+    cfg = {"governance_mode": "deterministic", "access_tier_groups": TIERS, "deployer_principal_id": SP}
     cfg.update(overrides)
     return cfg
+
+
+# A deterministic env commits its deployer SP; this machine applies with it.
+SP = "d0000000-0000-0000-0000-00000000d001"
+DEPLOYER_LINE = f'deployer_principal_id = "{SP}"\n'
 
 
 def _env(tmp_path, text, discovered=None, name="dev"):
     env = tmp_path / "envs" / name
     (env / "generated").mkdir(parents=True, exist_ok=True)
     (env / "data_access").mkdir(exist_ok=True)
+    if 'governance_mode = "deterministic"' in text and "deployer_principal_id" not in text:
+        text += DEPLOYER_LINE
+        (env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{SP}"\n')
     (env / "env.auto.tfvars").write_text(text)
     if discovered is not None:
         tables = sorted({t for ts in discovered.values() for t in ts})
@@ -432,7 +440,7 @@ table_readers = { "sch.t" = ["dev_raw", "dev_etl"], "dev_cat.sch.*" = ["dev_part
 raw_exempt_principals = ["dev_etl"]
 row_filters = [{ table = "dev_cat.sch.t", column = "region", values_by_group = { dev_partial = ["APAC"] } }]
 '''
-PROD = 'governance_mode = "deterministic"\n'
+PROD = 'governance_mode = "deterministic"\n' + DEPLOYER_LINE
 GROUP_MAP = 'group_map = { dev_raw = "prod_raw", dev_partial = "prod_partial", dev_etl = "prod_etl" }\n'
 
 
@@ -618,7 +626,7 @@ POLICY_ONLY = '''fgac_policies = [
     policy_type      = "POLICY_TYPE_COLUMN_MASK"
     catalog          = "c"
     to_principals    = ["prod_policy_only"]
-    except_principals = ["prod_raw", "deployer-sp-id"]
+    except_principals = ["prod_raw", "d0000000-0000-0000-0000-00000000d001"]
     match_condition  = "hasTagValue('gr_treatment', 'email_partial__string__0a1b2c3d')"
     match_alias      = "masked_col"
     function_name    = "gr_mask_email_partial__string__0a1b2c3d_partial"
@@ -639,21 +647,21 @@ POLICY_ONLY = '''fgac_policies = [
   },
 ]
 '''
-LIVE = ["prod_raw", "prod_partial", "full", "prod_rf", "deployer-sp-id"]
+LIVE = ["prod_raw", "prod_partial", "full", "prod_rf", SP]
 
 
-def test_the_deployer_sp_is_accepted_only_as_the_envs_own_auth(tmp_path, capsys):
+def test_the_deployer_sp_is_accepted_only_as_the_envs_committed_deployer(tmp_path, capsys):
     # The live listing (the mock) never contains the deployer SP's
-    # application ID; only the env's own auth.auto.tfvars makes it acceptable.
-    env = _env(tmp_path, MAPPED_PROD, name="prod")
+    # application ID; only the env's committed deployer_principal_id makes it
+    # acceptable, never auth.auto.tfvars.
+    other = "0badc0de-0000-0000-0000-000000000000"
+    env = _env(tmp_path, MAPPED_PROD + f'deployer_principal_id = "{other}"\n', name="prod")
     (env / "data_access" / "abac.auto.tfvars").write_text(POLICY_ONLY)
-    live = [name for name in LIVE if name != "deployer-sp-id"] + ["prod_policy_only"]
-    assert "deployer-sp-id" not in live
-    assert _check(env, live) == 1
-    assert "deployer-sp-id" in capsys.readouterr().err
-    (env / "auth.auto.tfvars").write_text('databricks_client_id = "other-sp-id"\n')
-    assert _check(env, live) == 1  # another SP's credentials accept nothing
-    (env / "auth.auto.tfvars").write_text('databricks_client_id = "deployer-sp-id"\n')
+    (env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{SP}"\n')
+    live = [name for name in LIVE if name != SP] + ["prod_policy_only"]
+    assert _check(env, live) == 1  # credentials for SP accept nothing
+    assert SP in capsys.readouterr().err
+    (env / "env.auto.tfvars").write_text(MAPPED_PROD + DEPLOYER_LINE)
     assert _check(env, live) == 0
 
 

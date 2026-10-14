@@ -58,7 +58,7 @@ def run(tmp_path, envs, target, env, *extra, stub_make=True):
             f"ACCOUNT_ENV_DIR={cloud / 'envs' / 'account'}", f"ROOT_RUNNER={stubs['runner']}",
             f"_STAGED_POLICY={stubs['staged']}", f"_COVERAGE_GATE={stubs['gate']}", f"_STICKY={stubs['sticky']}",
             f"_AGENT_COVERAGE={stubs['agent']}", f"IMPORT_EXISTING_SCRIPT={stubs['importer']}",
-            "_ACCESS_CHECK=true", "_GROUP_CHECK=true", *extra]
+            "_ACCESS_CHECK=true", "_GROUP_CHECK=true", "_DEPLOYER_CHECK=true", *extra]
     if stub_make:
         args.append(f"MAKE={stubs['make']}")
     environ = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "CI", "APPLY_FLAGS")}

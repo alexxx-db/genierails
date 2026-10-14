@@ -996,8 +996,8 @@ def validate_fgac_policies(
     deterministic_exempt_principals = set()
     if cfg.get("governance_mode") == "deterministic":
         deterministic_exempt_principals.update(cfg.get("raw_exempt_principals") or [])
-        if cfg.get("databricks_client_id"):
-            deterministic_exempt_principals.add(cfg["databricks_client_id"])
+        if cfg.get("deployer_principal_id"):
+            deterministic_exempt_principals.add(cfg["deployer_principal_id"])
 
     for i, p in enumerate(policies):
         name = p.get("name", "")
@@ -1348,19 +1348,16 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
             )
         merged["governance_mode"] = env_governance_mode
 
-    for key in ("access_tier_groups", "raw_exempt_principals"):
+    # The deployer SP the policies exempt is the committed one, never
+    # auth.auto.tfvars, so validation needs no credentials.
+    for key in ("access_tier_groups", "raw_exempt_principals", "deployer_principal_id"):
         if key not in merged and key in env_cfg:
             merged[key] = env_cfg[key]
-    if "databricks_client_id" not in merged and env_cfg.get("databricks_client_id"):
-        merged["databricks_client_id"] = env_cfg["databricks_client_id"]
-    auth_path = _find_tfvars_file(tfvars_path, "auth.auto.tfvars")
-    if "databricks_client_id" not in merged and auth_path:
-        try:
-            auth_cfg = parse_tfvars(auth_path)
-            if auth_cfg.get("databricks_client_id"):
-                merged["databricks_client_id"] = auth_cfg["databricks_client_id"]
-        except Exception as e:
-            result.warn(f"Could not parse {auth_path}: {e}")
+    if env_path is not None and not env_parse_failed:
+        from deployer_identity import validation_errors as deployer_errors
+
+        for error in deployer_errors(env_cfg):
+            result.error(f"{env_path}: {error}")
 
     if (
         env_path is not None  # Only enforce in real workspace envs that have an env.auto.tfvars

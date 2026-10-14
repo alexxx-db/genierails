@@ -3415,13 +3415,19 @@ def deterministic_model_for(
     columns: list[str] | None = None,
 ):
     """The deterministic model for the classified columns of the governed set."""
-    from governance_policies import build_model, column_types_from_ddl
+    from deployer_identity import SETTING, validation_errors
+    from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
 
+    # The committed deployer ID, never auth.auto.tfvars: the output is a
+    # function of the commit (deployer_identity.py).
+    errors = validation_errors({**env_cfg, "governance_mode": "deterministic"})
+    if errors:
+        raise DeterministicGovernanceError(f"{errors[0]} in env.auto.tfvars")
     return build_model(
         classification_source.classes_by_column(columns) if classification_source else {},
         column_types_from_ddl(ddl_text),
         env_cfg,
-        deployer_principal=str(env_cfg.get("databricks_client_id") or ""),
+        deployer_principal=str(env_cfg[SETTING]),
     )
 
 

@@ -135,6 +135,7 @@ def test_refresh_fails_closed_on_unmapped_native_class(tmp_path, monkeypatch):
 
 DETERMINISTIC_ENV = '''
 governance_mode = "deterministic"
+deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"
 uc_catalog = "prod"
 uc_tables = ["sales.customers"]
 access_tier_groups = ["raw", "partial", "full"]

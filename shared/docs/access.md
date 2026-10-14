@@ -98,9 +98,8 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
 - `raw_exempt_principals` are env-owned and never mapped; a `group_map` key
   that is one is refused. Many-to-one mappings are refused (they would merge
   tiers or readers), and so is mapping `account users`.
-- `promote-to` reads only committed files, plus each env's deployer application ID
-  (`databricks_client_id` in its `auth.auto.tfvars`, which `make check` also gets).
-  `rehearse` and `release` check live, before the lock: every group the env names (tiers, readers,
+- `promote-to` reads only committed files. `rehearse` and `release` check
+  live, before the lock: every group the env names (tiers, readers,
   `acl_groups`, row-filter groups, mapped or not) and every principal of the
   committed promoted policies (`data_access/abac.auto.tfvars` and
   `generated/abac.auto.tfvars`, `to_principals` and `except_principals`)
@@ -109,8 +108,7 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
   env's own deployer SP is accepted. Dev's `raw_exempt_principals` are not
   carried into prod policies: promotion replaces them with prod's own. Dev's
   deployer SP isn't either: where a policy exempts it, promotion puts prod's
-  (`databricks_client_id` in `envs/prod/auth.auto.tfvars`) in its place, and
-  refuses, writing no promoted config, when prod's isn't set.
+  committed `deployer_principal_id` in its place (see below).
 - Nested groups are expanded only after mapping: the reader and agent
   checks read the destination's own (mapped) config.
 - Adding, removing or retargeting a mapping is a weakening. Compared with
@@ -119,6 +117,33 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
   `<env>:weaken:group_map:<dev>=<target>` (for a removed mapping the target
   is the dev group itself).
 - Legacy destinations keep their own tiers on re-promotion, as before.
+
+## The deployer SP: `deployer_principal_id`
+
+Deterministic policies exempt the service principal that applies them (it
+reads raw rows to verify the masks; never-raw treatments exempt nobody). Each
+env applies with its own SP and commits that SP's application ID, which is
+not secret, in `envs/<env>/env.auto.tfvars`:
+
+```hcl
+deployer_principal_id = "5a7e0000-0000-0000-0000-00000000beef"   # databricks_client_id of this env's SP
+```
+
+- Required in deterministic mode, and must be an application ID
+  (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`); a group name such as
+  `account users` is refused.
+- `make generate`, `make validate`, `make check` and `make promote-to` read
+  only this committed value, never `auth.auto.tfvars`, so a PR check with no
+  credentials reproduces the committed output.
+- It is env-owned: `promote-to` keeps prod's, never copies dev's, and in the
+  promoted policies' `except_principals` replaces dev's ID with prod's. Only
+  that principal changes; a never-raw policy gets none. A promotion whose
+  policies exempt dev's deployer is refused, changing nothing, when prod's
+  `deployer_principal_id` is missing or malformed.
+- Before taking the env lock, `rehearse`, `release-plan`, `release` and
+  `maintain` refuse unless `databricks_client_id` in the env's
+  `auth.auto.tfvars` is this ID. To change the SP, set the new ID here, run
+  `make generate` (or `promote-to` in prod) and commit.
 
 ## Upgrading an existing deterministic env
 

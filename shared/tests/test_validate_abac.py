@@ -52,10 +52,10 @@ def _real_deterministic_output(tmp_path):
     generated.mkdir(parents=True)
     (env_dir / "env.auto.tfvars").write_text('''
 governance_mode = "deterministic"
+deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"
 access_tier_groups = ["raw", "regional", "masked"]
 raw_exempt_principals = ["break-glass"]
 ''')
-    (env_dir / "auth.auto.tfvars").write_text('databricks_client_id = "deployer-sp"\n')
     tfvars = generated / "abac.auto.tfvars"
     sql = generated / "masking_functions.sql"
     tfvars.write_text('''
@@ -69,7 +69,6 @@ tag_assignments = []
 fgac_policies = []
 ''')
     runtime = hcl2.loads((env_dir / "env.auto.tfvars").read_text())
-    runtime["databricks_client_id"] = "deployer-sp"
     model = deterministic_model_for(
         runtime, _GeneratedClassification(),
         "CREATE TABLE cat.sch.customers (email STRING);",
@@ -164,7 +163,7 @@ def test_deterministic_overlap_proof_refuses_reviewer_counterexamples(tmp_path, 
         full["except_principals"] = []
     elif counterexample == "overlapping_named_groups":
         full["to_principals"] = ["masked"]
-        full["except_principals"] = ["raw", "break-glass", "deployer-sp"]
+        full["except_principals"] = ["raw", "break-glass", "d0000000-0000-0000-0000-00000000d001"]
     elif counterexample == "dropped_partial_tier_exception":
         full["except_principals"].remove("regional")
     elif counterexample == "swapped_functions":
@@ -220,15 +219,15 @@ def test_never_raw_deterministic_policy_refuses_deployer_and_raw_exempt_exceptio
         "governance_mode": "deterministic",
         "access_tier_groups": ["raw", "regional", "masked"],
         "raw_exempt_principals": ["break-glass"],
-        "databricks_client_id": "deployer-sp",
+        "deployer_principal_id": "d0000000-0000-0000-0000-00000000d001",
     }
     model = build_model(
         {"cat.sch.payments.cvv": ["card_security_code"]},
         {"cat.sch.payments.cvv": "STRING"}, settings,
-        deployer_principal="deployer-sp",
+        deployer_principal="d0000000-0000-0000-0000-00000000d001",
     )
     policy = model.fgac_policies[0]
-    policy["except_principals"] = ["deployer-sp", "break-glass"]
+    policy["except_principals"] = ["d0000000-0000-0000-0000-00000000d001", "break-glass"]
     cfg = settings | {
         "groups": {name: {} for name in ("raw", "regional", "masked")},
         "tag_policies": [{"key": "gr_treatment", "values": model.tag_values}],

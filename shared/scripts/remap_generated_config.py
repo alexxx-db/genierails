@@ -487,38 +487,17 @@ def _brace_delta(line: str) -> int:
 
 
 def _deployer_ids(args, hcl_text: str) -> tuple[str, str] | None:
-    """(source, destination) deployer application IDs for a deterministic source.
-
-    Read from each env's auth.auto.tfvars, only databricks_client_id, the way
-    make check reads them. A source policy that names the source deployer
-    needs the destination's; when that can't be determined, PromotionError.
-    """
+    """(source, destination) committed deployer IDs for a deterministic source (deployer_identity.py)."""
     import hcl2
-    from group_map import GroupMapError, deployer_id
+    from deployer_identity import DeployerIdentityError, promotion_deployers
 
-    if not args.source_env or not args.source_env.is_file() or not args.group_map_env:
-        return None
-    if hcl2.loads(args.source_env.read_text()).get("governance_mode", "legacy") != "deterministic":
+    if not args.source_env or not args.group_map_env:
         return None
     try:
-        source = deployer_id(args.source_env.parent)
-    except GroupMapError as exc:
-        raise PromotionError(f"cannot read the source deployer ID: {exc}") from exc
-    named = any(source in (policy.get("except_principals") or [])
-                for policy in hcl2.loads(hcl_text).get("fgac_policies") or [] if isinstance(policy, dict))
-    if not source or not named:
-        return None
-    dest_auth = args.group_map_env.parent / "auth.auto.tfvars"
-    try:
-        dest = deployer_id(args.group_map_env.parent)
-    except GroupMapError as exc:
-        raise PromotionError(f"cannot read the destination deployer ID: {exc}") from exc
-    if not dest:
-        raise PromotionError(
-            f"the promoted policies exempt the source deployer {source!r}, and no destination deployer ID "
-            f"is set: put the destination deployer SP's application ID in databricks_client_id in "
-            f"{dest_auth}, then re-run make promote-to")
-    return source, dest
+        return promotion_deployers(args.source_env.parent, args.group_map_env.parent,
+                                   hcl2.loads(hcl_text).get("fgac_policies") or [])
+    except DeployerIdentityError as exc:
+        raise PromotionError(str(exc)) from exc
 
 
 def _group_map_inputs(args) -> tuple[dict[str, str], set[str], list[str] | None]:

@@ -291,6 +291,10 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@echo "=== Setup ($(ENV)) ==="
 	@gov_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 	det="$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+	deployer_note=""; \
+	if [ "$$det" = 1 ] && ! python3 -c 'import sys,hcl2; sys.exit(0 if hcl2.load(open(sys.argv[1])).get("deployer_principal_id") else 1)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
+		deployer_note="     Then commit that SP's client_id as deployer_principal_id in $(_SETUP_ENV_REL)/env.auto.tfvars (required in deterministic mode; not secret)"; \
+	fi; \
 	access_note="     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)"; \
 	if [ "$$gov_only" = 1 ]; then \
 		access_note="     (governance only: applies masks; grants SELECT only from table_readers, after its coverage check passes)"; \
@@ -314,6 +318,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "       make promote-to ENV=$(ENV)"; \
 		echo "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)"; \
 		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + prod workspace host & id"; \
+		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
 		echo "  3. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
 		echo "  4. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
@@ -342,6 +347,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 			echo "       cp ../shared/examples/dev_to_prod/env.auto.tfvars.example $(_SETUP_ENV_REL)/env.auto.tfvars"; step=$$((step+1)); \
 		fi; \
 		echo "  $$step. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deploying SP client_id / client_secret + workspace host & id"; step=$$((step+1)); \
+		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
 		if [ "$$gov_only" = 1 ]; then \
 			echo "  $$step. Edit $(_SETUP_ENV_REL)/env.auto.tfvars — governance only (no agent): set uc_tables to the tables to govern"; \
 			echo "     and access_tier_groups to your IdP groups, most to least privileged; optionally table_readers"; \
@@ -645,6 +651,9 @@ _ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --command-name
 # every group the env names (after mapping) must exist live, and a changed
 # group_map needs its <env>:weaken:group_map:<dev>=<target> ack. After a
 # successful run, the applied group_map is recorded (ignored runtime file).
+# Before any lock: a deterministic env applies only with the SP its policies
+# exempt (auth.auto.tfvars databricks_client_id = deployer_principal_id).
+_DEPLOYER_CHECK = python3 "$(SHARED_ROOT)/deployer_identity.py" check --env-dir "$(ENV_DIR)" --command-name
 _GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 _GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
@@ -763,6 +772,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 			echo "rehearse: ENV=$(ENV) is promoted (promote_from is set): rehearse its source env, then make release-plan ENV=$(ENV) and make release ENV=$(ENV) MANIFEST=<manifest>." >&2; \
 			exit 1; \
 		fi; \
+		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
@@ -936,6 +946,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 		echo "release-plan: ENV=$(ENV) is not in deterministic governance mode; release-plan and MANIFEST releases are for deterministic envs. Legacy envs keep: make release ENV=$(ENV)" >&2; \
 		exit 1; \
 	fi; \
+	$(_DEPLOYER_CHECK) "make release-plan" || exit 1; \
 	$(_ACCESS_CHECK) "make release-plan" || exit 1; \
 	$(_GROUP_CHECK) "make release-plan" || exit 1; \
 	prov="$$(mktemp)"; \
@@ -1040,6 +1051,7 @@ _release-manifest: _guard-not-ci-apply
 		echo "  3. make release ENV=$(ENV) MANIFEST=<the manifest release-plan printed>" >&2; \
 		exit 1; \
 	fi; \
+	$(_DEPLOYER_CHECK) "make release" || exit 1; \
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
@@ -1103,7 +1115,7 @@ _release-manifest: _guard-not-ci-apply
 maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): audit-schema -> derive-assignments -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); export GENIERAILS_RERUN_TARGET=maintain; mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
-	if [ "$$mode" = deterministic ]; then $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
+	if [ "$$mode" = deterministic ]; then $(_DEPLOYER_CHECK) "make maintain" || exit 1; $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	else $(_LEGACY_GUARD) maintain || exit 1; fi; \
 	if [ "$$mode" = deterministic ]; then $(_EXTERNAL_MASK_INVENTORY) || exit 1; fi; $(call _ENV_LOCK,maintain); \
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
@@ -1172,9 +1184,9 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		fi; \
 		python3 "$(SHARED_ROOT)/scripts/validate_catalog_map.py" "$(SOURCE_ENV_DIR)" "$(DEST_CATALOG_MAP)" || exit 1; \
 		echo "=== Cross-env promote: $(SOURCE_ENV) -> $(DEST_ENV) ==="; \
-		_SEED_PROMOTION_SETTINGS=0 $(MAKE) --no-print-directory _prepare-env ENV="$(DEST_ENV)" ENV_DIR="$(DEST_ENV_DIR)"; \
 		dest_env_dir="$(DEST_ENV_DIR)"; \
-		acl_ok=0; trap 'if [ "$$acl_ok" != 1 ]; then rm -f "$$dest_env_dir/generated/genie_space_derived_acl_groups.auto.tfvars" "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" "$$dest_env_dir/abac.auto.tfvars"; fi' EXIT; \
+		$(call _PROMOTION_TXN_BEGIN,"$$dest_env_dir" "$(ACCOUNT_ENV_DIR)"); \
+		_SEED_PROMOTION_SETTINGS=0 $(MAKE) --no-print-directory _prepare-env ENV="$(DEST_ENV)" ENV_DIR="$(DEST_ENV_DIR)"; \
 		python3 "$(SHARED_ROOT)/scripts/remap_env_config.py" "$(SOURCE_ENV_DIR)" "$$dest_env_dir" "$(DEST_CATALOG_MAP)" || exit 1; \
 		mkdir -p "$$dest_env_dir/generated"; \
 		map_flags=$$(python3 -c 'pairs = [p.strip() for p in "$(DEST_CATALOG_MAP)".split(",") if "=" in p]; print(" ".join("--map " + p for p in pairs))'); \
@@ -1192,7 +1204,6 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 			"$$dest_env_dir/generated/abac.auto.tfvars" \
 			"$$dest_env_dir/env.auto.tfvars"; \
 		cd "$$dest_env_dir" && python3 "$(SHARED_ROOT)/scripts/split_abac_config.py" generated/abac.auto.tfvars ../$(ACCOUNT_ENV)/abac.auto.tfvars $(DATA_ACCESS_SUBDIR)/abac.auto.tfvars abac.auto.tfvars; \
-		acl_ok=1; \
 		cp "$$dest_env_dir/generated/masking_functions.sql" "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)/masking_functions.sql"; \
 		cd "$(ACCOUNT_ENV_DIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-account); fi; \
 		cd "$$dest_env_dir/$(DATA_ACCESS_SUBDIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars masking_functions.sql $(call _VALIDATION_FLAGS,promote-data-access); fi; \
@@ -1206,7 +1217,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		echo "        When the scan finishes, review detections, exclude false positives, enable auto-tagging,"; \
 		echo "        and wait for class.* tags,"; \
 		echo "        and run make release ENV=$(DEST_ENV) (the walkthrough's Prod section)"; \
-		trap - EXIT; \
+		$(_PROMOTION_TXN_COMMIT); \
 	else \
 		if [ "$(SOURCE_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(SOURCE_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: SOURCE_ENV must be a workspace environment, not $(SOURCE_ENV)."; exit 1; \
@@ -1237,6 +1248,16 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-workspace); trap - EXIT; \
 	fi
 
+# A refused promotion changes nothing: _PROMOTION_TXN_BEGIN snapshots the trees
+# it writes (the destination env and the shared account layer) and, if the
+# recipe exits non-zero, the EXIT trap restores them byte for byte
+# (scripts/promotion_txn.py). _PROMOTION_TXN_COMMIT keeps the result.
+_PROMOTION_TXN_BEGIN = txn_dir="$$(mktemp -d)" || exit 1; \
+	trap 'rc=$$?; trap "" HUP INT TERM; if [ $$rc -ne 0 ]; then python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" restore --from "$$txn_dir/snapshot" && echo "  Refused: nothing was changed (the destination env and the account layer were restored)." >&2; fi; rm -rf "$$txn_dir"; exit $$rc' EXIT; \
+	trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" snapshot --to "$$txn_dir/snapshot" $(1) || exit 1
+_PROMOTION_TXN_COMMIT = rm -rf "$$txn_dir"; trap - EXIT HUP INT TERM
+
 # make promote-to ENV=<dest> [FROM=<src>] [CATALOG_MAP="a=b,..."] is a thin
 # wrapper over the cross-env promote above (same remap, validation and policy-name
 # protection). promote_from and catalog_map live in the destination's
@@ -1260,6 +1281,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	resolved="$$($(_SAVED_SETTINGS) promote-resolve --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" \
 		--from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)")" || exit 1; \
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
+	$(call _PROMOTION_TXN_BEGIN,"$$dest_dir" "$(ACCOUNT_ENV_DIR)"); \
 	$(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
 		DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" write --source "$$src_dir/generated/abac.auto.tfvars" \
@@ -1268,6 +1290,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
 	fi; \
 	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
+	$(_PROMOTION_TXN_COMMIT); \
 	$(_TABLE_READERS) show --env-dir "$$dest_dir"
 
 # Read-only PR check (scripts/check_env.py): every step runs in a scratch copy

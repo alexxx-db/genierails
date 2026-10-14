@@ -45,6 +45,8 @@ def _env(env, tables=("sales.customers", "sales.orders"), mode="deterministic"):
     listed = ", ".join(f'"{t}"' for t in tables)
     (env / "env.auto.tfvars").write_text(
         f'governance_mode = "{mode}"\nuc_catalog = "prod"\n'
+        + ('deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"\n' if mode == "deterministic" else "")
+        +
         f'genie_spaces = [{{ name = "A", uc_tables = [{listed}] }}]\n'
     )
     config = env / "generated/abac.auto.tfvars"

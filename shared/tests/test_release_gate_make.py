@@ -94,7 +94,7 @@ class Make:
         env_dir = self.repo.cloud / "envs" / env
         args = ["make", "--no-print-directory", target, f"ENV={env}", f"ENV_DIR={env_dir}",
                 f"ACCOUNT_ENV_DIR={self.repo.cloud / 'envs' / 'account'}",
-                "_ACCESS_CHECK=true", "_GROUP_CHECK=true", "_GROUP_MAP_RECORD=true", "_SAVE_VERIFY_KEY=true",
+                "_ACCESS_CHECK=true", "_GROUP_CHECK=true", "_DEPLOYER_CHECK=true", "_GROUP_MAP_RECORD=true", "_SAVE_VERIFY_KEY=true",
                 "_STAGED_CONFIRM_RUN=true", f"_EXTERNAL_MASK_INVENTORY={self.stubs['inventory']}",
                 f"_CLASSIFICATION_CHECK={self.stubs['classification']}", f"_LIVE_SNAPSHOT={self.stubs['live']}",
                 f"_RELEASE_REPORTS={self.stubs['reports']}", f"_STAGED_POLICY={self.stubs['staged']}",

@@ -14,8 +14,7 @@ with no mapping is used as is. ``raw_exempt_principals`` are env-owned and
 never mapped. Nested membership is expanded only after mapping (the reader
 and agent checks read the destination's own, mapped config).
 
-promote-to stays a pure function of committed files (and each env's deployer
-application ID, the one auth value make check also gets). What needs the live
+promote-to stays a pure function of committed files. What needs the live
 destination runs in rehearse and release (release-plan once it exists):
 ``check`` refuses any resulting group that doesn't exist there, mapped or
 not, including every principal of the committed promoted policies, and ``check-ack`` refuses a changed ``group_map`` (added, removed or
@@ -130,11 +129,6 @@ def policy_principals(env_dir: Path) -> list[str]:
     return sorted(n for n in names if n.lower() not in EVERYONE)
 
 
-def deployer_id(env_dir: Path) -> str:
-    """The env's deployer SP application ID from its auth.auto.tfvars ("" when unset)."""
-    return str(_load_hcl(Path(env_dir) / "auth.auto.tfvars").get("databricks_client_id") or "")
-
-
 def missing_groups(cfg: Mapping, existing: Iterable[str], policy_names: Iterable[str] = (),
                    deployer: str = "") -> list[str]:
     present = set(existing) | ({deployer} if deployer else set())
@@ -237,7 +231,8 @@ def main(argv: list[str] | None = None, lister: Callable[[Path], Iterable[str]] 
             return 0
         problems = validation_errors(cfg)
         policy_names = policy_principals(args.env_dir) if not problems else []
-        missing = missing_groups(cfg, lister(args.env_dir), policy_names, deployer_id(args.env_dir)) if not problems else []
+        deployer = str(cfg.get("deployer_principal_id") or "")
+        missing = missing_groups(cfg, lister(args.env_dir), policy_names, deployer) if not problems else []
         unacked = ack_problems(args.env_dir, args.env, cfg) if not problems else []
     except Exception as exc:  # an unreadable account or ack file never passes
         print(f"ERROR: {args.command_name} refused: the group check could not run: {exc}", file=sys.stderr)

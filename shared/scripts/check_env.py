@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import json
 import os
 import shutil
 import subprocess
@@ -166,7 +165,6 @@ class Scratch:
                                 ignore=_ignore_runtime(self.real_envs))
             else:
                 self.envs.mkdir()
-            self._add_deployer_ids()
             _assert_contained(self.root)
         except BaseException:
             self.close()
@@ -185,32 +183,6 @@ class Scratch:
                    f"CLOUD_ROOT={self.cloud}", f"SHARED_ROOT={SHARED_ROOT}", *args]
         sys.stdout.flush()
         return subprocess.run(command, env=env).returncode
-
-    def _add_deployer_ids(self) -> None:
-        """Give each workspace env in the copy its deployer SP's application ID, nothing else.
-
-        Plain make validate reads the ID from auth.auto.tfvars to accept the
-        deployer SP in deterministic EXCEPT lists; without it the copy refuses
-        every one (#134). The ID isn't secret. Every other auth value stays
-        blank, as the scaffold writes them, so no step before the plan signs in.
-        A layer's own auth file (not a link) carries its own ID.
-        """
-        template = (SHARED_ROOT / "auth.auto.tfvars.example").read_text()
-        for env_dir in sorted(p for p in self.envs.iterdir() if p.is_dir() and p.name not in RESERVED_ENVS):
-            for rel in (Path("auth.auto.tfvars"), Path("data_access") / "auth.auto.tfvars"):
-                source = self.real_envs / env_dir.name / rel
-                if rel.parent != Path(".") and (source.is_symlink() or not (env_dir / rel.parent).is_dir()):
-                    continue  # the scaffold links it to the env's file
-                try:
-                    client_id = str(_load_hcl(source).get("databricks_client_id") or "")
-                except GovernedTablesError:
-                    continue  # unreadable: validate refuses the deployer as unknown, as it would here
-                if not client_id:
-                    continue
-                dest = env_dir / rel
-                dest.write_text(template.replace('databricks_client_id     = ""',
-                                                 f"databricks_client_id     = {json.dumps(client_id)}"))
-                os.chmod(dest, 0o600)
 
     def add_credentials(self, env_name: str) -> None:
         """Copy the env's and account's auth files in for the plan step only."""

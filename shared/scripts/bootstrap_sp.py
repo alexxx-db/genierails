@@ -941,6 +941,8 @@ def bootstrap(
         emit(f'databricks_client_secret = "{shown_secret}"')
         emit(f'databricks_workspace_host = "{host}"')
         emit(f'databricks_workspace_id   = "{workspace_id}"')
+        emit("# envs/<env>/env.auto.tfvars (deterministic governance; committed, not secret)")
+        emit(f'deployer_principal_id = "{client_id}"')
     return 0
 
 
