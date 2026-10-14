@@ -34,7 +34,8 @@ SHARED = ROOT / "shared"
 if shutil.which("make") is None or shutil.which("git") is None:
     pytest.skip("make and git are required", allow_module_level=True)
 
-# One deployer SP for both envs and the same group names, like the live run.
+# One deployer SP for both envs and the same group names, like the live run
+# (the tests at the end give prod its own SP and its own group names).
 DEPLOYER = "82bb9d6d-0000-0000-0000-000000000001"
 TIERS = ["dev_ops", "dev_analysts"]
 SPACE = "Payments"
@@ -133,14 +134,13 @@ def repo(tmp_path):
     return repo
 
 
-@pytest.fixture
-def promoted(repo, tmp_path):
+def _promote_to_prod(repo, tmp_path, env_text=PROD_ENV, deployer=DEPLOYER):
     prod = _envs(repo) / "prod"
     prod.mkdir()
-    (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    (prod / "env.auto.tfvars").write_text(env_text)
     # No host: check's plan step (6) reads prod's classification config live
     # (promote-to turns classification on), which fails fast without one.
-    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+    (prod / "auth.auto.tfvars").write_text(_auth(deployer, host=""))
     result = _make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
@@ -148,6 +148,11 @@ def promoted(repo, tmp_path):
                     "--env-dir", str(prod), "--config", str(prod / "generated" / "abac.auto.tfvars")], check=True)
     _commit(repo, "promote")
     return repo
+
+
+@pytest.fixture
+def promoted(repo, tmp_path):
+    return _promote_to_prod(repo, tmp_path)
 
 
 def _state(repo):
@@ -257,13 +262,12 @@ def test_promote_to_keeps_acl_groups_prod_already_has(promoted, tmp_path):
     assert "Preserved destination Genie space 'Payments' acl_groups=['dev_ops']" in result.stdout
 
 
-@pytest.mark.parametrize("ci", ["", "true"])
-def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, ci):
-    before = _state(promoted)
+def _assert_check_and_promote_check_pass(repo, tmp_path, ci):
+    before = _state(repo)
     extra = {"CI": ci} if ci else {}
 
-    check = _make(promoted, tmp_path, "check", "ENV=prod", **extra)
-    promote_check = _make(promoted, tmp_path, "promote-to", "ENV=prod", "CHECK=1", **extra)
+    check = _make(repo, tmp_path, "check", "ENV=prod", **extra)
+    promote_check = _make(repo, tmp_path, "promote-to", "ENV=prod", "CHECK=1", **extra)
 
     out = check.stdout + check.stderr
     # Steps 1-5 pass offline; the plan (6) needs prod's live classification config.
@@ -274,4 +278,128 @@ def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, 
     assert check.returncode == 0 or "=== make check ENV=prod: FAILED (plan) ===" in out, out
     assert promote_check.returncode == 0, promote_check.stdout + promote_check.stderr
     assert "OK: promote-to ENV=prod CHECK=1: committed files match." in promote_check.stdout
-    assert _state(promoted) == before
+    assert _state(repo) == before
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, ci):
+    _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+
+
+def _policies(env_dir):
+    return {rel: hcl2.loads((env_dir / rel).read_text())["fgac_policies"]
+            for rel in ("generated/abac.auto.tfvars", "data_access/abac.auto.tfvars")}
+
+
+# ── Each env applies with its own deployer SP ───────────────────────────────
+
+PROD_DEPLOYER = "5a7e0000-0000-0000-0000-00000000beef"
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_swaps_dev_deployer_for_prods_and_check_passes(repo, tmp_path, ci):
+    dev_policies = {p["name"]: p.get("except_principals") or []
+                    for p in hcl2.loads((_envs(repo) / "dev" / "generated" / "abac.auto.tfvars").read_text())["fgac_policies"]}
+    assert any(DEPLOYER in names for names in dev_policies.values())
+
+    _promote_to_prod(repo, tmp_path, deployer=PROD_DEPLOYER)
+
+    for rel, policies in _policies(_envs(repo) / "prod").items():
+        assert len(policies) == len(dev_policies), rel
+        for policy, dev_except in zip(policies, dev_policies.values()):
+            # Only the deployer changes, in place; a list without it gets none.
+            expected = [PROD_DEPLOYER if name == DEPLOYER else name for name in dev_except]
+            assert (policy.get("except_principals") or []) == expected, (rel, policy["name"])
+            assert PROD_DEPLOYER not in (policy.get("to_principals") or []), (rel, policy["name"])
+    for path in (_envs(repo) / "prod").rglob("*"):
+        if path.is_file() and path.name != "auth.auto.tfvars":
+            assert DEPLOYER not in path.read_text(), path
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+def test_promote_to_refuses_without_a_destination_deployer_id(repo, tmp_path):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    (prod / "auth.auto.tfvars").write_text(_auth("", host=""))
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "no destination deployer ID is set" in out and "nothing was written" in out, out
+    assert not (prod / "generated" / "abac.auto.tfvars").exists()
+    assert not (prod / "data_access" / "abac.auto.tfvars").exists()
+
+
+def test_promote_to_never_adds_the_deployer_to_a_never_raw_policy(tmp_path):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from remap_generated_config import map_principals
+
+    text = ('fgac_policies = [\n  {\n    name = "raw"\n    except_principals = ["t1", "dev-sp"]\n  },\n'
+            '  {\n    name = "never"\n    except_principals = []\n    to_principals = ["dev-sp"]\n  },\n]\n')
+
+    out = hcl2.loads(map_principals(text, {}, set(), [], ("dev-sp", "prod-sp")))["fgac_policies"]
+
+    assert out[0]["except_principals"] == ["t1", "prod-sp"]
+    assert out[1]["except_principals"] == [] and out[1]["to_principals"] == ["dev-sp"]
+
+
+# ── group_map renames the groups the policies name ──────────────────────────
+
+PROD_TIERS = ["prod_ops", "dev_analysts"]
+PROD_ENV_GROUP_MAP = PROD_ENV + 'group_map = { dev_ops = "prod_ops" }\n'
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_maps_groups_with_policies_tiers_and_acls_and_check_passes(repo, tmp_path, ci):
+    _promote_to_prod(repo, tmp_path, env_text=PROD_ENV_GROUP_MAP)
+
+    prod = _envs(repo) / "prod"
+    env = hcl2.loads((prod / "env.auto.tfvars").read_text())
+    assert env["access_tier_groups"] == PROD_TIERS
+    assert env["genie_spaces"][0]["acl_groups"] == PROD_TIERS
+    assert env["table_readers"] == {"ppay.s.t": PROD_TIERS}
+    for rel in ("generated/abac.auto.tfvars", "data_access/abac.auto.tfvars", "abac.auto.tfvars"):
+        assert list(hcl2.loads((prod / rel).read_text())["groups"]) == PROD_TIERS, rel
+    account = hcl2.loads((_envs(repo) / "account" / "abac.auto.tfvars").read_text())
+    assert "prod_ops" in account["groups"]
+    for rel, policies in _policies(prod).items():
+        named = {n for p in policies for f in ("to_principals", "except_principals") for n in p.get(f) or []}
+        assert "prod_ops" in named and named <= set(PROD_TIERS) | {DEPLOYER, "account users"}, rel
+    for path in prod.rglob("*"):
+        if path.is_file():
+            text = path.read_text()
+            if path.name == "env.auto.tfvars":
+                text = text.replace('"dev_ops" = "prod_ops"', "")
+            assert '"dev_ops"' not in text, path
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+def test_promote_to_refuses_a_group_map_onto_a_group_dev_already_has(repo, tmp_path):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(PROD_ENV + 'group_map = { dev_ops = "dev_analysts" }\n')
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "group_map would give groups 'dev_ops', 'dev_analysts' the one name 'dev_analysts'" in out, out
+    assert not (prod / "generated" / "abac.auto.tfvars").exists()
+    assert not (prod / "data_access" / "abac.auto.tfvars").exists()
+
+
+def test_group_keys_rename_bare_and_quoted_keys_and_group_members():
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from remap_generated_config import map_group_keys
+
+    text = ('groups = {\n  dev_ops = {\n    description = "a = { b }"\n  }\n  "dev x" = { description = "" }\n'
+            '  keep = {}\n}\ngroup_members = {\n  dev_ops = ["u1"]\n}\n')
+
+    out = hcl2.loads(map_group_keys(text, {"dev_ops": "prod_ops", "dev x": "prod x"}, set()))
+
+    assert list(out["groups"]) == ["prod_ops", "prod x", "keep"]
+    assert out["groups"]["prod_ops"]["description"] == "a = { b }"
+    assert out["group_members"] == {"prod_ops": ["u1"]}

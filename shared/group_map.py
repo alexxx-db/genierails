@@ -7,8 +7,9 @@ env-owned ``group_map`` maps them, like ``catalog_map`` maps catalogs::
     group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
 
 ``make promote-to`` maps every group it writes: ``access_tier_groups``,
-``row_filters`` ``values_by_group``, the principals of the promoted policies,
-and the first seeding of ``acl_groups`` and ``table_readers``. A dev group
+``row_filters`` ``values_by_group``, the principals of the promoted policies
+and the generated ``groups`` (and ``group_members``) keys that define them, and
+the first seeding of ``acl_groups`` and ``table_readers``. A dev group
 with no mapping is used as is. ``raw_exempt_principals`` are env-owned and
 never mapped. Nested membership is expanded only after mapping (the reader
 and agent checks read the destination's own, mapped config).
@@ -128,7 +129,8 @@ def policy_principals(env_dir: Path) -> list[str]:
     return sorted(n for n in names if n.lower() not in EVERYONE)
 
 
-def _deployer(env_dir: Path) -> str:
+def deployer_id(env_dir: Path) -> str:
+    """The env's deployer SP application ID from its auth.auto.tfvars ("" when unset)."""
     return str(_load_hcl(Path(env_dir) / "auth.auto.tfvars").get("databricks_client_id") or "")
 
 
@@ -234,7 +236,7 @@ def main(argv: list[str] | None = None, lister: Callable[[Path], Iterable[str]] 
             return 0
         problems = validation_errors(cfg)
         policy_names = policy_principals(args.env_dir) if not problems else []
-        missing = missing_groups(cfg, lister(args.env_dir), policy_names, _deployer(args.env_dir)) if not problems else []
+        missing = missing_groups(cfg, lister(args.env_dir), policy_names, deployer_id(args.env_dir)) if not problems else []
         unacked = ack_problems(args.env_dir, args.env, cfg) if not problems else []
     except Exception as exc:  # an unreadable account or ack file never passes
         print(f"ERROR: {args.command_name} refused: the group check could not run: {exc}", file=sys.stderr)

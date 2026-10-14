@@ -90,9 +90,10 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
 ```
 
 - `promote-to` maps every group it writes: `access_tier_groups`, the groups
-  in `row_filters`, the principals of the promoted policies, and the first
-  seeding of `acl_groups` and `table_readers`. A dev group with no mapping
-  keeps its name. Later promotions keep prod's own `acl_groups` and
+  in `row_filters`, the principals of the promoted policies and the generated
+  `groups` that define them, and the first seeding of `acl_groups` and
+  `table_readers`. A dev group with no mapping keeps its name; a mapping onto
+  a group dev already defines is refused. Later promotions keep prod's own `acl_groups` and
   `table_readers`, and print how dev's (mapped) values differ.
 - `raw_exempt_principals` are env-owned and never mapped; a `group_map` key
   that is one is refused. Many-to-one mappings are refused (they would merge
@@ -105,7 +106,10 @@ group_map = { dev_analysts = "prod_analysts", dev_viewers = "prod_viewers" }
   must exist in the workspace, as a group or a service principal
   (application ID). `account users` is built in and not looked up; the
   env's own deployer SP is accepted. Dev's `raw_exempt_principals` are not
-  carried into prod policies: promotion replaces them with prod's own.
+  carried into prod policies: promotion replaces them with prod's own. Dev's
+  deployer SP isn't either: where a policy exempts it, promotion puts prod's
+  (`databricks_client_id` in `envs/prod/auth.auto.tfvars`) in its place, and
+  refuses, writing no promoted config, when prod's isn't set.
 - Nested groups are expanded only after mapping: the reader and agent
   checks read the destination's own (mapped) config.
 - Adding, removing or retargeting a mapping is a weakening. Compared with
