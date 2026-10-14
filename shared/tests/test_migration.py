@@ -218,6 +218,20 @@ def test_the_dry_run_before_opting_in_proposes_table_readers_from_todays_grants(
     assert not data["ok"]
 
 
+def test_the_dry_run_before_opting_in_a_promoted_env_points_at_promote_to(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    env_dir.mkdir(parents=True)
+    write_legacy_state(env_dir)
+    (env_dir / "env.auto.tfvars").write_text('access_tier_groups = ["raw", "regional"]\n')
+    lines, data = migration.report(env_dir, "prod")
+    text = " ".join(" ".join(lines).split())
+    # promote-to brings table_readers and acl_groups from dev (docs/legacy-migration.md), never make generate.
+    assert "make promote-to ENV=prod" in text and "table_readers" in text and "acl_groups from dev" in text
+    assert "make generate" not in text and "add the table_readers above" not in text
+    assert text.index("make rebuild-governed-tables ENV=prod") < text.index("make promote-to ENV=prod")
+    assert not data["ok"]
+
+
 # -- the dry run ---------------------------------------------------------------------
 def test_the_dry_run_reports_every_column_principal_revocation_and_writes_nothing(env_dir, tmp_path):
     write_legacy_state(env_dir, grants=("regional", "masked", "bi-sp"), can_run=("regional", "masked"))
@@ -283,6 +297,29 @@ def test_a_revoked_select_is_refused_until_acknowledged(env_dir):
     assert "unacknowledged revocation dev:revoke:cat.sch.t:bi-sp" in _refusal(env_dir)
     opt_in(env_dir, ack=["dev:revoke:cat.sch.t:bi-sp"])
     assert migration.check(env_dir, ENV, migration.legacy_generation(migration.deployment(env_dir)))["ok"]
+
+
+def test_a_table_the_config_drops_is_one_revocation_per_reader_not_a_weakening(env_dir):
+    opt_in(env_dir, readers=())  # cat.sch.t has no table_readers: known absent, not unknown
+    result = migration.analyze(env_dir, ENV, migration.legacy_generation(migration.deployment(env_dir)))
+    keys = {w.ack_key for w in result["weakening"].all_weakenings}
+    assert not {f"dev:weaken:cat.sch.t:{p}" for p in ("regional", "masked")} & keys
+    assert {"dev:revoke:cat.sch.t:regional", "dev:revoke:cat.sch.t:masked"} <= set(result["unacked_revocations"])
+    refusal = _refusal(env_dir)
+    assert "unacknowledged revocation dev:revoke:cat.sch.t:masked" in refusal
+    assert "weakening dev:weaken:cat.sch.t:" not in refusal
+    # release-plan reconciles the same way: acking the documented revoke lines is enough for the readers.
+    report = rg.reports(env_dir, ENV, reader_source=_source)
+    assert not any(w["object_name"] == "cat.sch.t" for w in report["weakening"]["unacknowledged"])
+
+
+def test_a_missing_reader_without_its_revocation_still_refuses():
+    from weakening import GovernanceState, check_weakenings
+
+    weak = check_weakenings(GovernanceState(table_readers={"cat.sch.t": {"masked"}}), GovernanceState(), ENV, set())
+    assert [w.category for w in migration.without_revoked(weak, ENV, {}).unacknowledged] == \
+        ["missing_table_readers_after"]
+    assert not migration.without_revoked(weak, ENV, {"dev:revoke:cat.sch.t:masked": "lost"}).all_weakenings
 
 
 def test_a_revoked_can_run_is_refused_until_acknowledged(env_dir):

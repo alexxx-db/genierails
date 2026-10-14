@@ -1575,16 +1575,20 @@ policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target #
 migrate-plan: _guard-workspace-target ## [migration] Read-only dry run of legacy -> deterministic: per column and principal, revocations, proposed table_readers
 	@$(_GUARD_WORKSPACE_ENV); \
 	out="$$($(_RELEASE_GATE) state-dir --env-dir "$(ENV_DIR)" --env "$(ENV)")/migration" || exit 1; \
-	inventory_rc=0; \
+	inventory_rc=0; inventory_err=; \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
 		echo "=== Masks GenieRails didn't create ($(ENV)) ==="; \
-		$(_EXTERNAL_MASK_INVENTORY) || inventory_rc=$$?; \
+		{ inventory_err="$$($(_EXTERNAL_MASK_INVENTORY) 2>&1 1>&3)" || inventory_rc=$$?; } 3>&1; \
+		if [ -n "$$inventory_err" ]; then printf '%s\n' "$$inventory_err" >&2; fi; \
 	fi; \
 	rc=0; python3 "$(SHARED_ROOT)/scripts/migration.py" report --env-dir "$(ENV_DIR)" --env "$(ENV)" --out-dir "$$out" || rc=$$?; \
-	if [ $$inventory_rc -ne 0 ]; then \
+	if [ $$inventory_rc -eq 1 ]; then \
 		echo "migrate-plan: masks GenieRails didn't create block the cutover until they are removed (above)." >&2; \
-		if [ $$rc -eq 0 ]; then rc=1; fi; \
+	elif [ $$inventory_rc -ne 0 ]; then \
+		reason="$$(printf '%s\n' "$$inventory_err" | sed -n 's/^ERROR: external-mask inventory failed: //p' | tail -n 1)"; \
+		echo "migrate-plan: the external-mask inventory failed: $${reason:-exit $$inventory_rc (see above)}; fix that and re-run make migrate-plan ENV=$(ENV). The cutover stays blocked until it passes." >&2; \
 	fi; \
+	if [ $$inventory_rc -ne 0 ] && [ $$rc -eq 0 ]; then rc=1; fi; \
 	exit $$rc
 
 genie-adopt-preflight: _guard-workspace-target ## Read-only: check every legacy Genie agent can be adopted (ID file, host, GET 200) before migrating

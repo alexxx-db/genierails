@@ -486,3 +486,38 @@ def test_maintain_applies_prod_governance_through_the_gate_with_its_own_lock(tmp
     assert result.returncode == 0, result.stdout + result.stderr
     assert "refused" not in result.stderr
     assert [c for c in make.calls() if "_apply-layer" in c and "LAYER=data_access" in c]
+
+
+# -- migrate-plan ----------------------------------------------------------------------
+
+INVENTORY_FAILS = """#!/bin/sh
+echo "ERROR: external-mask inventory failed: governed_tables.json is missing" >&2
+exit 2
+"""
+INVENTORY_FINDS = """#!/bin/sh
+echo "ERROR: a mask GenieRails didn't create can resolve on a governed column" >&2
+echo "  - cat.sch.t.email: rogue_mask" >&2
+exit 1
+"""
+
+
+@pytest.mark.parametrize("inventory, expected, not_expected", [
+    (INVENTORY_FAILS, "the external-mask inventory failed: governed_tables.json is missing; fix that and re-run",
+     "block the cutover until they are removed"),
+    (INVENTORY_FINDS, "masks GenieRails didn't create block the cutover until they are removed",
+     "inventory failed"),
+])
+def test_migrate_plan_tells_a_failed_inventory_from_found_external_masks(make, repo, inventory, expected,
+                                                                         not_expected):
+    stub = make._write("inventory-case", inventory)
+    result = make("migrate-plan", "prod", stubs={"external_mask_inventory.py": str(stub),
+                                                 "migration.py report": "true"})
+    assert result.returncode != 0, result.stdout + result.stderr  # still refused either way
+    assert expected in result.stderr and not_expected not in result.stderr
+    assert "ERROR:" in result.stderr  # the inventory's own output is still shown
+
+
+def test_migrate_plan_passes_when_the_inventory_and_the_report_pass(make, repo):
+    result = make("migrate-plan", "prod", stubs={"migration.py report": "true"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "inventory failed" not in result.stderr and "block the cutover" not in result.stderr
