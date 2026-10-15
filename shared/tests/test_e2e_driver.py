@@ -31,7 +31,9 @@ def test_dry_run_is_offline_and_writes_reports(tmp_path, monkeypatch):
     assert any(item["command"] == "make setup ENV=dev" for item in champion["steps"])
     assert not any("terraform" in item["command"].split()[:1] for item in champion["steps"])
     assert (tmp_path / "s1.md").is_file()
-    assert json.loads((tmp_path / "s1.json").read_text())["would_not_run"] == []
+    s1 = json.loads((tmp_path / "s1.json").read_text())
+    assert s1["human_gates"] and "agent_a" in s1["missing_values"]
+    assert s1["target_source"].endswith("aws/Makefile")
 
 
 def test_snapshot_diff_is_stable_and_order_insensitive():
@@ -46,11 +48,11 @@ def test_snapshot_diff_is_stable_and_order_insensitive():
 def test_missing_target_has_step_marker():
     s1 = next(s for s in driver.SCENARIOS if s.key == "s1")
     fake = dataclasses.replace(s1.steps[1], command=("make", "future-target", "ENV=dev"),
-                               target="future-target", requires_step=99)
+                               target="future-target")
     plan = driver.scenario_plan(dataclasses.replace(s1, steps=(s1.steps[0], fake, *s1.steps[2:])), REAL_TARGETS)
     item = next(item for item in plan if item["command"].startswith("make future-target"))
     assert item["status"] == "skip"
-    assert item["skip_reason"] == "requires step 99"
+    assert item["skip_reason"] == "target not implemented"
 
 
 def test_every_executable_step_uses_public_make_target():
@@ -80,7 +82,7 @@ def test_report_redacts_secrets(tmp_path):
 def test_scenario_catalog_contains_plan_matrix_and_governance_only():
     keys = {s.key for s in driver.SCENARIOS}
     assert {f"s{i}" for i in range(1, 17)} <= keys
-    assert {"champion", "manifest", "migration"} <= keys
+    assert {"champion", "manifest", "migration", "migration-cutover"} <= keys
     assert next(s for s in driver.SCENARIOS if s.key == "s14").title == "Governance-only environment"
 
 
@@ -136,8 +138,8 @@ def live_args(tmp_path, scenario, *extra):
 
 
 def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False, refuse=None,
-                    drift_after_make=False, on_make=None):
-    state = {"makes": 0}
+                    drift_after_make=False, on_make=None, staged_release=False):
+    state = {"makes": 0, "releases": 0}
 
     def run(argv, **kwargs):
         argv = list(argv); calls.append((argv, kwargs.get("env", {})))
@@ -165,6 +167,10 @@ def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False,
             if on_make: on_make(argv)
             if "release-plan" in argv:
                 text = "ok\n" if no_manifest else "  Manifest (immutable): /tmp/approved.json\n"
+            if argv[1:2] == ["release"]:
+                state["releases"] += 1
+                if staged_release and state["releases"] == 1:
+                    text = "=== Release phase applied; need another release-plan\n"
             if "ungovern" in argv and unrelated:
                 rc, text = 2, "unrelated syntax error\n"
             if refuse and refuse[0](argv):
@@ -195,7 +201,7 @@ def live(monkeypatch):
 def test_missing_fake_target_scenario_is_not_run_and_issues_no_make(tmp_path, live, monkeypatch):
     s1 = next(s for s in driver.SCENARIOS if s.key == "s1")
     fake = dataclasses.replace(s1.steps[1], command=("make", "future-target", "ENV=dev"),
-                               target="future-target", requires_step=99)
+                               target="future-target")
     monkeypatch.setattr(driver, "SCENARIOS", (dataclasses.replace(s1, steps=(s1.steps[0], fake, *s1.steps[2:])),))
     calls = live(REAL_TARGETS)
     assert driver.main(live_args(tmp_path, "s1"), snapshot_factory=FakeSnapshots) == 0
@@ -215,7 +221,7 @@ def test_step_10_11_scenarios_are_runnable_in_this_repo_and_dry_run_is_offline(t
     for key in keys.split(","):
         report = json.loads((tmp_path / f"{key}.json").read_text())
         assert report["status"] == "dry-run"
-        assert report["would_not_run"] == []
+        assert not [x for x in report["would_not_run"] if x == "target not implemented"]
 
 
 # Blocker 2: refusals, placeholders, CI and unrelated failures.
@@ -267,17 +273,18 @@ def test_refusal_message_with_changed_snapshot_is_an_error(tmp_path, live):
 
 def test_s13_sets_ci_unsets_override_and_passes_on_exact_refusals(tmp_path, live):
     calls = live(refuse=(lambda argv: True, "ERROR: applying targets cannot run in CI. ...\n"))
-    assert driver.main(live_args(tmp_path, "s13", "--value", "agent_a=A"), snapshot_factory=FakeSnapshots) == 0
+    assert driver.main(live_args(tmp_path, "s13"), snapshot_factory=FakeSnapshots) == 0
     envs = [env for argv, env in calls if argv and argv[0] == "make"]
-    assert len(envs) == 6 and all(env.get("CI") == "true" for env in envs)
+    assert len(envs) == 5 and all(env.get("CI") == "true" for env in envs)
     assert all("GENIERAILS_ALLOW_CI_APPLY" not in env for env in envs)
     assert all("<" not in " ".join(argv) for argv in makes(calls))
     report = json.loads((tmp_path / "reports" / "s13.json").read_text())
     assert report["status"] == "passed" and report["restored_lifecycle"] is False
 
 
-def test_missing_release_plan_manifest_errors_before_release(tmp_path, live):
+def test_missing_release_plan_manifest_errors_before_release(tmp_path, live, monkeypatch):
     calls = live(no_manifest=True)
+    monkeypatch.setattr(driver, "governance_only_env", lambda *_: True)
     assert driver.main(live_args(tmp_path, "s14"), snapshot_factory=FakeSnapshots) == 1
     scenario_makes = makes(calls)
     assert any("release-plan" in argv for argv in scenario_makes)
@@ -366,7 +373,7 @@ def test_exception_writes_report_and_attempts_public_restore(tmp_path, live):
     assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=Boom) == 1
     report = json.loads((tmp_path / "reports" / "s4.json").read_text())
     assert report["status"] in ("ERROR", "RESTORE FAILED")
-    assert [a[1] for a in makes(calls)][-4:] == ["rehearse", "release-plan", "release", "maintain"]
+    assert not makes(calls)  # the new pre-command snapshot failed; no mutation occurred
 
 
 def test_sigterm_mid_step_restores_writes_partial_report_and_stops(tmp_path, live):
@@ -763,3 +770,108 @@ def test_dirty_checkout_is_refused_before_anything_runs(sim, tmp_path):
     assert "is not clean at" in str(exc.value)
     assert sim.log() == [] and not reports.exists()
     _git(sim.checkout, "checkout", "-q", "--", "aws/.gitignore")
+
+
+# D1-D12 regression coverage. Each assertion distinguishes this driver from
+# origin/main 16c9797 and remains entirely offline.
+def test_d1_detach_refusal_matches_wrong_agent_only():
+    pattern = driver.REFUSALS["detach"]
+    assert re.search(pattern, "ERROR: detach: missing not found: detach-agent works on an agent file")
+    assert not re.search(pattern, "make detach-agent refused before taking the lock")
+
+
+def test_d2_ci_scenario_needs_no_value_and_omits_allowed_dev_rehearse():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "s13")
+    assert driver.unresolved_values(scenario, {}) == []
+    assert not any(s.target == "rehearse" for s in scenario.steps)
+    assert any("SPACE=ci-guard-fixture" in s.command for s in scenario.steps)
+
+
+def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
+    calls = live(staged_release=True)
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 0
+    targets = [argv[1] for argv in makes(calls)]
+    assert targets[:5] == ["rehearse", "release-plan", "release", "release-plan", "release"]
+
+
+def test_d4_snapshot_query_includes_deterministic_masks():
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            assert "gr\\_mask\\_%" in statement if "routines" in statement else True
+            cols = [SimpleNamespace(name=n) for n in ("table_catalog", "table_schema", "table_name")]
+            rows = [["cat", "s", "t"]] if "information_schema.tables" in statement else []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(columns=cols)),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: []))
+    driver._sql_snapshots(client, "wh", "cat")
+
+
+def _deterministic_snapshot(value, *, policy_value=None):
+    policy_value = policy_value or value
+    snap = snapshot(masks=(f"gr_mask_{value}_full",), tags=())
+    evidence = snap["uc"]["cat"]
+    evidence["governed_tags"] = [{"catalog_name": "cat", "schema_name": "s", "table_name": "t",
+        "column_name": "ssn", "tag_name": "gr_treatment", "tag_value": value}]
+    evidence["abac_policies"][0]["policies"][0].update({
+        "name": f"gr_mask_cat_{policy_value}_full",
+        "column_mask": {"function_name": f"cat.s.gr_mask_{policy_value}_full"}})
+    return snap
+
+
+def test_d5_generation_changes_normalize_but_legacy_and_failsafe_are_weaker():
+    old = _deterministic_snapshot("email_partial__string__11111111")
+    new = _deterministic_snapshot("email_partial__string__22222222")
+    assert driver.protection_diff(old, new) == {}
+    legacy = _deterministic_snapshot("email_partial")
+    assert "columns" in driver.protection_diff(old, legacy)
+    failsafe = _deterministic_snapshot("unmapped_redact__string__33333333")
+    assert "columns" in driver.protection_diff(old, failsafe)
+
+
+def test_d6_prod_keyed_agent_id_files_are_snapshotted(tmp_path):
+    env = tmp_path / "env"; env.mkdir()
+    (env / ".genie_space_id_agent_a").write_text("prod-a\n")
+    assert ("agent_a", "prod-a") in driver._agent_ids(env, {}, tmp_path / "state", tmp_path)
+
+
+def test_d7_remote_state_is_never_silently_empty(tmp_path):
+    env = tmp_path / "env"; env.mkdir(); (env / "remote_state.hcl").write_text("address = \"x\"\n")
+    assert driver._state_serials(tmp_path / "state", env) == {"remote_state": "remote, not snapshotted"}
+
+
+def test_d8_dry_run_reports_values_gates_refusals_and_cloud_entrypoint(tmp_path):
+    driver.main(["--cloud", "azure", "--repo", str(ROOT), "--dry-run", "--scenarios", "s7",
+                 "--reports", str(tmp_path)])
+    report = json.loads((tmp_path / "s7.json").read_text())
+    assert report["target_source"].endswith("azure/Makefile")
+    assert {"agent_a", "wrong_agent"} <= set(report["missing_values"])
+    assert report["refusal_patterns"] and report["refusal_patterns"][0]["found_in_source"]
+
+
+def test_d9_migration_is_read_only_and_cutover_is_explicit():
+    assert driver.ALLOWED_CHANGES["migration"] == frozenset()
+    assert "migration" not in driver.WEAKENING_EXPECTED
+    cutover = next(s for s in driver.SCENARIOS if s.key == "migration-cutover")
+    assert [s.target for s in cutover.steps] == ["rehearse", "release-plan", "release"]
+    assert "fix/migration-adopt-order" in " ".join(cutover.preconditions)
+
+
+def test_d10_s14_is_blocked_unless_dev_is_governance_only(tmp_path):
+    cloud = tmp_path / "aws"; env = cloud / "envs/dev"; env.mkdir(parents=True)
+    (env / "env.auto.tfvars").write_text('governance_mode = "deterministic"\ngenie_spaces = []\n')
+    assert driver.governance_only_env(cloud, "dev")
+    (env / "agents").mkdir(); (env / "agents/a.auto.tfvars").write_text("")
+    assert not driver.governance_only_env(cloud, "dev")
+
+
+def test_d11_s5_releases_before_maintain_and_commits_scaffold():
+    targets = [s.target or s.action for s in next(s for s in driver.SCENARIOS if s.key == "s5").steps]
+    assert targets == ["release-plan", "release", "maintain", "scaffold-treatments", "local_merge"]
+
+
+def test_d12_readme_prepares_both_environments():
+    text = (ROOT / "shared/scripts/e2e/README.md").read_text()
+    assert "make setup ENV=dev GITIGNORE=customer" in text
+    assert "make setup ENV=prod GITIGNORE=customer" in text

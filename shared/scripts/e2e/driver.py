@@ -22,6 +22,9 @@ import signal
 import time
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from governance_policies import FAILSAFE_TREATMENT, parse_treatment_value
+
 
 DESIGN_SOURCE = "shared/docs/design/deterministic-governance.md"
 SECRET_KEYS = re.compile(r"(?i)(secret|token|password|private[_-]?key)")
@@ -32,6 +35,8 @@ PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
 # main" provenance rule holds without touching origin.
 E2E_REMOTE = "genierails-e2e"
 E2E_BRANCH_PREFIX = "genierails-e2e/"
+MAX_RELEASE_PHASES = 8
+ANOTHER_RELEASE_PHASE = re.compile(r"(?:Release phase applied|need another release-plan)", re.I)
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genierails-e2e@localhost",
                 "GIT_COMMITTER_NAME": "genierails-e2e", "GIT_COMMITTER_EMAIL": "genierails-e2e@localhost"}
 # Targets that apply to a workspace/account: the checkout must be clean and
@@ -43,7 +48,7 @@ APPLYING = frozenset({"rehearse", "release-plan", "release", "maintain", "detach
 AUTHORING = frozenset({"setup", "generate", "promote-to", "capture", "ungovern", "scaffold-treatments"})
 # Scenarios whose purpose is to remove or loosen protection mid-scenario. The
 # post-restore check still applies to them.
-WEAKENING_EXPECTED = frozenset({"s8", "s9", "migration"})
+WEAKENING_EXPECTED = frozenset({"s8", "s9"})
 # The upstream .gitignore ignores envs/, so a local merge can only commit
 # authored changes in a checkout whose <cloud>/.gitignore has the block
 # `make setup GITIGNORE=customer` writes (scripts/customer_gitignore.py BEGIN).
@@ -57,7 +62,6 @@ class Step:
     command: tuple[str, ...] = ()
     env: str | None = None
     target: str | None = None
-    requires_step: int | None = None
     human_prompt: str | None = None
     expect_failure: bool = False
     refusal: str | None = None
@@ -78,12 +82,12 @@ class Scenario:
     requires: tuple[str, ...] = ()
 
 
-def mk(name: str, target: str, env: str | None = None, *, step: int | None = None,
+def mk(name: str, target: str, env: str | None = None, *,
        args: Sequence[str] = (), fail: bool = False, refusal: str | None = None,
        extra_env: Mapping[str, str | None] | None = None,
        assertions: Sequence[str] = ()) -> Step:
     command = ("make", target) + ((f"ENV={env}",) if env else ()) + tuple(args)
-    return Step(name, command, env, target, step, expect_failure=fail, refusal=refusal,
+    return Step(name, command, env, target, expect_failure=fail, refusal=refusal,
                 extra_env=tuple((extra_env or {}).items()),
                 assertions=tuple(assertions))
 
@@ -101,7 +105,7 @@ REFUSALS = {
     "maintain_provenance": r"make maintain refused",
     "ci": r"applying targets cannot run in CI",
     "weakening": r"(refused by the reader or weakening check|unacknowledged (weakening|reader) )",
-    "detach": r"detach-agent(:| refused)",
+    "detach": r"ERROR: detach: .*?(?:not found: detach-agent works on an agent file|is not detached)",
     "tamper": r"(make release refused: \S+ no longer matches|is not a release manifest|is a manifest for \S+, not)",
     "stale": r"committed files differ from what the commit regenerates",
 }
@@ -110,15 +114,15 @@ CI_ENV = {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": None}
 
 AUTHOR_MERGE = action("Commit and merge authored changes on the driver's local main", "local_merge")
 DAY2 = (
-    mk("PR check (dev)", "check", "dev", step=12),
+    mk("PR check (dev)", "check", "dev"),
     mk("Dev rehearsal", "rehearse", "dev"),
     mk("Promote deterministic output", "promote-to", "prod"),
     action("Commit and merge promotion on the driver's local main", "local_merge"),
-    mk("PR check (prod)", "check", "prod", step=12),
+    mk("PR check (prod)", "check", "prod"),
     mk("Promotion determinism", "promote-to", "prod", args=("CHECK=1",)),
     mk("Rehearse promotion merge", "rehearse", "dev"),
-    mk("Create immutable release manifest", "release-plan", "prod", step=9),
-    mk("Apply approved manifest", "release", "prod", step=9, args=("MANIFEST={manifest}",)),
+    mk("Create immutable release manifest", "release-plan", "prod"),
+    mk("Apply approved manifest", "release", "prod", args=("MANIFEST={manifest}",)),
     mk("Governance-only maintenance", "maintain", "prod"),
 )
 
@@ -146,7 +150,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     _scenario("s1", "Promote A while B has unfinished dev edits", (
         "A and B have released captured baselines; make an unmistakable UI-only edit to dev B.",
     ), (Step("Curate only A", human_prompt="Curate dev A and leave B unfinished."),
-        mk("Capture A only", "capture", "dev", step=11, args=("SPACE={agent_a}",)), AUTHOR_MERGE) + DAY2, (
+        mk("Capture A only", "capture", "dev", args=("SPACE={agent_a}",)), AUTHOR_MERGE) + DAY2, (
         "Only A changes; dev B remains UI-edited and prod B stays byte-identical with stable conversations.",
     ), ("Revert/capture A through lifecycle; manually discard or separately capture B edit.",)),
     _scenario("s2", "Mask-only change while B is mid-curation", ("Begin an uncaptured edit to dev B; review a mask version/override change.",),
@@ -156,7 +160,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Revert governance change through the same lifecycle.",), ("Staged policy operation may require step 6 operation targets.",)),
     _scenario("s3", "Agent adds a new table", ("Create uniquely prefixed, classified dev/prod test table pair.",),
         (Step("Add table to A", human_prompt="Add the dev table to A in the UI and review classification."),
-         mk("Capture A", "capture", "dev", step=11, args=("SPACE={agent_a}",)), mk("Generate governance", "generate", "dev"),
+         mk("Capture A", "capture", "dev", args=("SPACE={agent_a}",)), mk("Generate governance", "generate", "dev"),
          AUTHOR_MERGE) + DAY2,
         ("Unreadable table is refused; once readers are reviewed, prod is masked before access and identifiers are remapped.",),
         ("Remove table from A, capture/release, ungovern, then drop disposable fixtures.",)),
@@ -165,24 +169,27 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Known class is masked in one run for every tier; no Genie update occurs.",),
         ("Remove disposable column through its owning migration.",)),
     _scenario("s5", "Unmapped class fail-safe", ("Add prefixed unknown_secret with an unmapped class tag; no acknowledgement.",),
-        (mk("Plan protected release", "release-plan", "prod", step=9), mk("Maintain fail-safe", "maintain", "prod"),
-         mk("Scaffold reviewed treatment", "scaffold-treatments", "dev", args=("TREATMENT={treatment}",))),
+        (mk("Plan protected release", "release-plan", "prod"),
+         mk("Apply protected release", "release", "prod", args=("MANIFEST={manifest}",)),
+         mk("Maintain fail-safe", "maintain", "prod"),
+         mk("Scaffold reviewed treatment", "scaffold-treatments", "dev", args=("TREATMENT={treatment}",)),
+         AUTHOR_MERGE),
         ("Gap is reported and every principal sees never-raw redaction; new access is blocked.",),
         ("Promote a reviewed mapping or remove the fixture tag/column; prove no stale fail-safe policy.",)),
     _scenario("s6", "table_readers widening requires acknowledgement", ("Prepare a prod-owned reader widening with stale coverage and no matching ack.",),
-        (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", step=9, fail=True, refusal=REFUSALS["weakening"]),
+        (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", fail=True, refusal=REFUSALS["weakening"]),
          action("Write exact reviewed acknowledgement", "add_ack", "ack_entry"),
          action("Commit and merge acknowledgement on the driver's local main", "local_merge")) + DAY2,
         ("Negative plan creates no applicable manifest; exact reviewed ack permits only the named grant.",),
         ("Revert reader and acknowledgement through lifecycle; verify only GenieRails-owned SELECT is revoked.",)),
     _scenario("s7", "Detach agent", ("A is released, detached=true and acl_groups=[] have been released.",),
-        (mk("Refuse wrong commit/agent", "detach-agent", "prod", step=11, args=("SPACE={wrong_agent}",), fail=True, refusal=REFUSALS["detach"]),
-         mk("Detach A state only", "detach-agent", "prod", step=11, args=("SPACE={agent_a}",))) + DAY2[:2],
+        (mk("Refuse wrong commit/agent", "detach-agent", "prod", args=("SPACE={wrong_agent}",), fail=True, refusal=REFUSALS["detach"]),
+         mk("Detach A state only", "detach-agent", "prod", args=("SPACE={agent_a}",))) + DAY2[:2],
         ("Only A resource addresses leave state; live space, conversations, grants and masks remain.",),
         ("Use documented adoption/reattachment; otherwise retain disposable agent for explicit cleanup.",)),
     _scenario("s8", "Stop governing a table", ("Disposable table is in governed list; prepare each covering-source negative case.",),
-        (mk("Refuse while covered", "ungovern", "dev", step=4, args=("TABLE={table}", "YES=1"), fail=True, refusal=REFUSALS["covered"]),
-         mk("Edit governed list", "ungovern", "dev", step=4, args=("TABLE={uncovered_table}", "YES=1")), AUTHOR_MERGE) + DAY2,
+        (mk("Refuse while covered", "ungovern", "dev", args=("TABLE={table}", "YES=1"), fail=True, refusal=REFUSALS["covered"]),
+         mk("Edit governed list", "ungovern", "dev", args=("TABLE={uncovered_table}", "YES=1")), AUTHOR_MERGE) + DAY2,
         ("Every coverage source is named/refused; only reviewed lifecycle removes policies/tags.",),
         ("Re-add via uc_tables/agent/readers and lifecycle, or drop disposable table.",)),
     _scenario("s9", "Rollback", ("R1 and visible-change R2 are released; exact prod rollback ack is reviewed.",), DAY2,
@@ -190,13 +197,13 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Forward-fix through lifecycle and remove obsolete acknowledgement.",)),
     _scenario("s10", "Stale promotion PR refusal", ("Create promotion at M1, advance main to M2 and leave promotion stale.",),
         (mk("Refuse stale generated output", "promote-to", "prod", args=("CHECK=1",), fail=True, refusal=REFUSALS["stale"]),
-         mk("Refuse stale prod check", "check", "prod", step=12, fail=True, refusal=REFUSALS["stale"])),
+         mk("Refuse stale prod check", "check", "prod", fail=True, refusal=REFUSALS["stale"])),
         ("Scratch regeneration differs and checks fail without workspace mutation.",), ("Delete simulator branches/worktrees.",)),
     _scenario("s11", "Release refuses unrehearsed or older commit", ("Fixture receipts model U, N and ancestor O around last release R.",),
         (action("Checkout unrehearsed U", "checkout_value", "u"),
-         mk("Refuse candidate provenance", "release-plan", "prod", step=9, fail=True, refusal=REFUSALS["plan_provenance"]),
+         mk("Refuse candidate provenance", "release-plan", "prod", fail=True, refusal=REFUSALS["plan_provenance"]),
          action("Checkout older O", "checkout_value", "o"),
-         mk("Refuse foreign manifest", "release", "prod", step=9, args=("MANIFEST={manifest}",), fail=True, refusal=REFUSALS["release_provenance"])),
+         mk("Refuse foreign manifest", "release", "prod", args=("MANIFEST={manifest}",), fail=True, refusal=REFUSALS["release_provenance"])),
         ("Unrehearsed, dirty, off-main, older and mismatched-manifest cases refuse with no mutation.",), ("Remove negative-case branches only.",)),
     _scenario("s12", "Maintain refuses off released commit", ("Release receipt points to R while main is R+1.",),
         (action("Checkout R+1", "checkout_value", "r_plus_1"),
@@ -204,15 +211,15 @@ SCENARIOS: tuple[Scenario, ...] = (
          action("Checkout exact release R", "checkout_value", "r"), mk("Maintain exact R", "maintain", "prod")),
         ("Off-receipt/dirty/digest mismatch refuse before mutation; exact R is governance-only.",), ("Return persistent checkout to requested commit.",)),
     _scenario("s13", "CI apply guard", ("No authorized pipeline provenance; CI=true is set by the scenario fixture.",),
-        tuple(mk(f"Refuse CI {t}", t, "dev" if t == "rehearse" else "prod", step=11 if t == "detach-agent" else None,
-                 args=(("SPACE={agent_a}",) if t == "detach-agent" else ()), fail=True, refusal=REFUSALS["ci"],
+        tuple(mk(f"Refuse CI {t}", t, "prod",
+                 args=(("SPACE=ci-guard-fixture",) if t == "detach-agent" else ()), fail=True, refusal=REFUSALS["ci"],
                  extra_env=CI_ENV)
-              for t in ("rehearse", "release-plan", "maintain", "detach-agent")) +
+              for t in ("release-plan", "maintain", "detach-agent")) +
         # The guard refuses before MANIFEST is read; the path is a fixed, real
         # value so no placeholder ever reaches make.
-        (mk("Refuse CI release", "release", "prod", step=9, args=("MANIFEST=/tmp/genierails-ci-guard-fixture.json",),
+        (mk("Refuse CI release", "release", "prod", args=("MANIFEST=/tmp/genierails-ci-guard-fixture.json",),
             fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),) +
-        (mk("Refuse CI account apply", "apply-account", step=9, fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),),
+        (mk("Refuse CI account apply", "apply-account", fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),),
         ("Every unauthorized apply fails with zero API calls and unchanged state/locks; authoring/check remain usable.",), ("Unset CI markers.",)),
     _scenario("s14", "Governance-only environment", ("Test env has prefixed uc_tables, no agent files/IDs, initially no table_readers.",),
         (mk("Setup", "setup", "dev"), mk("Generate governance only", "generate", "dev"), AUTHOR_MERGE) + DAY2,
@@ -228,13 +235,22 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Overwrite report names drift; config equals Git after remap; ID/conversations remain; no recreation.",),
         ("Restore desired content via dev UI, capture and lifecycle.",)),
     _scenario("manifest", "Manifest tamper and concurrency refusals", ("Disposable fixtures and an approved manifest exist.",),
-        (mk("Refuse tampered manifest", "release", "prod", step=9, args=("MANIFEST={tampered_manifest}",), fail=True, refusal=REFUSALS["tamper"]),),
+        (mk("Refuse tampered manifest", "release", "prod", args=("MANIFEST={tampered_manifest}",), fail=True, refusal=REFUSALS["tamper"]),),
         ("Commit, plan bytes, serial, live snapshot and kept-name changes each invalidate the old manifest; locks serialize applies.",),
         ("Remove each external grant/mask through its owning fixture immediately.",)),
     _scenario("migration", "Legacy migration operations", ("Reviewed report-only legacy fixture and revocation report exist.",),
-        (mk("Migration report", "migrate-plan", "prod", step=10),),
+        (mk("Migration report", "migrate-plan", "prod"),),
         ("Every column/reader consequence and proposed table_readers entry is reported without mutation.",),
-        ("Remove the generated proposal if the migration fixture is not proceeding.",)),
+        ("Nothing to restore; migrate-plan is report-only.",)),
+    _scenario("migration-cutover", "Legacy migration cutover", (
+        "Reviewed pending legacy migration fixture exists in dev and prod.",
+        "Expected to fail on main until fix/migration-adopt-order lands (layout guard order and deterministic import).",
+    ), (
+        mk("Rehearse dev adoption", "rehearse", "dev"),
+        mk("Plan prod adopt-only release", "release-plan", "prod"),
+        mk("Apply prod adopt-only release", "release", "prod", args=("MANIFEST={manifest}",)),
+    ), ("Legacy values are adopted into deterministic values without weaker protection or raw exposure.",),
+       ("Forward-release the pinned baseline through the same bounded staged lifecycle.",)),
 )
 
 # Explicit top-level snapshot components each scenario is allowed to change.
@@ -248,7 +264,7 @@ ALLOWED_CHANGES: Mapping[str, frozenset[str]] = {
     "s10": frozenset(), "s11": frozenset(), "s12": frozenset({"uc", "state_serials", "receipts"}),
     "s13": frozenset(), "s14": frozenset({"uc", "state_serials", "receipts"}), "s15": _ALL_COMPONENTS,
     "s16": _ALL_COMPONENTS, "manifest": frozenset(),
-    "migration": frozenset({"uc", "state_serials", "receipts"}),
+    "migration": frozenset(), "migration-cutover": frozenset({"uc", "state_serials", "receipts"}),
 }
 
 
@@ -413,7 +429,7 @@ class LiveSnapshotProvider:
         return redact({
             "uc": sql,
             "agents": agents,
-            "state_serials": _state_serials(self.state_dir / env),
+            "state_serials": _state_serials(self.state_dir / env, env_dir),
             "receipts": _receipt_inventory(self.state_dir / env),
         }, self.secret_values)
 
@@ -429,7 +445,7 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str) -> Mapping[str, An
         "schema_grants": f"SELECT * FROM system.information_schema.schema_privileges WHERE catalog_name = '{_sql_lit(catalog)}'",
         "table_grants": f"SELECT * FROM system.information_schema.table_privileges WHERE table_catalog = '{_sql_lit(catalog)}'",
         "governed_tags": f"SELECT * FROM system.information_schema.column_tags WHERE catalog_name = '{_sql_lit(catalog)}'",
-        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND routine_name LIKE 'mask\\_%' ESCAPE '\\'",
+        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND (routine_name LIKE 'mask\\_%' ESCAPE '\\' OR routine_name LIKE 'gr\\_mask\\_%' ESCAPE '\\')",
         "tables": f"SELECT table_catalog,table_schema,table_name FROM system.information_schema.tables WHERE table_catalog = '{_sql_lit(catalog)}' AND table_schema <> 'information_schema'",
     }
     out: dict[str, Any] = {}
@@ -516,6 +532,9 @@ def _agent_ids(env_dir: Path, config: Mapping[str, Any], state_root: Path, cloud
         if match: found.append((path.stem, match.group(1)))
     for legacy in (env_dir / ".genie_space_id", cloud_root / ".genie_space_id"):
         if legacy.is_file() and legacy.read_text().strip(): found.append(("legacy", legacy.read_text().strip()))
+    for path in sorted(env_dir.glob(".genie_space_id_*")):
+        if path.is_file() and path.read_text().strip():
+            found.append((path.name.removeprefix(".genie_space_id_"), path.read_text().strip()))
     for path in sorted(state_root.rglob("*.tfstate")) if state_root.exists() else []:
         try:
             for resource in json.loads(path.read_text()).get("resources", []):
@@ -529,12 +548,15 @@ def _agent_ids(env_dir: Path, config: Mapping[str, Any], state_root: Path, cloud
     return sorted(set(found))
 
 
-def _state_serials(root: Path) -> Mapping[str, int]:
-    result: dict[str, int] = {}
+def _state_serials(root: Path, env_dir: Path | None = None) -> Mapping[str, int | str]:
+    result: dict[str, int | str] = {}
     for path in sorted(root.rglob("*.tfstate")) if root.exists() else []:
         try: result[str(path.relative_to(root))] = int(json.loads(path.read_text())["serial"])
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise RuntimeError(f"could not read the Terraform serial of {path}") from exc
+    remote = bool(env_dir and any(env_dir.rglob("remote_state.hcl")))
+    if remote:
+        result["remote_state"] = "remote, not snapshotted"
     return result
 
 
@@ -593,6 +615,16 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
     return sorted(set(missing))
 
 
+def governance_only_env(cloud_root: Path, env: str) -> bool:
+    path = cloud_root / "envs" / env / "env.auto.tfvars"
+    if not path.is_file(): return False
+    config = _load_hcl(path)
+    return (config.get("governance_mode") == "deterministic"
+            and not config.get("genie_spaces") and not config.get("genie_space_id")
+            and not config.get("genie_space_title")
+            and not list((path.parent / "agents").glob("*.auto.tfvars")))
+
+
 def parse_manifest(output: str) -> str:
     matches = re.findall(r"(?m)Manifest \(immutable\):\s*(\S+)", output) or re.findall(r"MANIFEST=(\S+)", output)
     if not matches: raise RuntimeError("release-plan succeeded but printed no manifest path")
@@ -602,11 +634,15 @@ def parse_manifest(output: str) -> str:
     return manifest
 
 
+def release_needs_another_phase(output: str) -> bool:
+    return bool(ANOTHER_RELEASE_PHASE.search(output))
+
+
 def scenario_plan(scenario: Scenario, targets: set[str]) -> list[dict[str, Any]]:
     planned = []
     for step in scenario.steps:
         missing = bool(step.target and step.target not in targets)
-        marker = f"requires step {step.requires_step}" if step.requires_step else "target not implemented"
+        marker = "target not implemented"
         planned.append({"name": step.name, "command": " ".join(step.command), "human_prompt": step.human_prompt,
                         "expect_failure": step.expect_failure, "refusal": step.refusal,
                         "action": step.action, "status": "skip" if missing else "planned",
@@ -761,20 +797,28 @@ def customer_checkout_problems(checkout_dir: Path, cloud: str, commit: str) -> l
 
 def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Per-column and per-principal protection facts, independent of IDs and timestamps."""
-    result: dict[str, Any] = {"columns": set(), "masks": set(), "policies": {}, "grants": set()}
+    result: dict[str, Any] = {"columns": {}, "masks": set(), "policies": {}, "grants": set()}
     uc = snapshot.get("uc", {})
     for catalog, evidence in uc.items() if isinstance(uc, Mapping) else []:
         if not isinstance(evidence, Mapping): continue
         for row in evidence.get("governed_tags") or []:
-            result["columns"].add(".".join(str(row.get(k)) for k in ("catalog_name", "schema_name", "table_name", "column_name"))
-                                  + f" {row.get('tag_name')}={row.get('tag_value')}")
+            location = ".".join(str(row.get(k)) for k in ("catalog_name", "schema_name", "table_name", "column_name"))
+            tag, value = str(row.get("tag_name")), str(row.get("tag_value"))
+            parsed = parse_treatment_value(value) if tag == "gr_treatment" else None
+            result["columns"][(location, tag)] = (parsed[0], parsed[1]) if parsed else value
         for row in evidence.get("mask_functions") or []:
-            result["masks"].add(".".join(str(row.get(k)) for k in ("routine_catalog", "routine_schema", "routine_name")))
+            name = str(row.get("routine_name"))
+            normalized = _normalized_mask(name)
+            prefix = f"{row.get('routine_catalog')}.{row.get('routine_schema')}."
+            result["masks"].add(prefix + ("__".join(normalized) if normalized else name))
         for entry in evidence.get("abac_policies") or []:
             for policy in entry.get("policies") or []:
                 mask = policy.get("column_mask") or policy.get("row_filter") or {}
-                key = f"{entry.get('table')} {policy.get('name')}"
-                result["policies"][key] = {"function": mask.get("function_name"),
+                function = str(mask.get("function_name") or "")
+                normalized = _normalized_mask(function.rsplit(".", 1)[-1])
+                key = (f"{entry.get('table')} {catalog} {normalized[0]}__{normalized[2]}" if normalized
+                       else f"{entry.get('table')} {policy.get('name')}")
+                result["policies"][key] = {"function": normalized or function,
                                            "to": set(policy.get("to_principals") or []),
                                            "except": set(policy.get("except_principals") or [])}
         for kind in ("catalog_grants", "schema_grants", "table_grants"):
@@ -785,14 +829,39 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalized_mask(name: str) -> tuple[str, str, str] | None:
+    match = re.fullmatch(r"gr_mask_(.+)_(partial|full)", name or "")
+    parsed = parse_treatment_value(match.group(1)) if match else None
+    return (parsed[0], parsed[1], match.group(2)) if parsed and match else None
+
+
 def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, include_grants: bool = False) -> dict[str, list[str]]:
     """What is weaker in ``current``: a column untagged, a mask or policy gone,
     a principal newly exempted or no longer covered, and (optionally) a grant added."""
     before, after = _protection(baseline), _protection(current)
     weaker: dict[str, list[str]] = {}
-    for bucket in ("columns", "masks"):
-        lost = sorted(before[bucket] - after[bucket])
-        if lost: weaker[bucket] = lost
+    lost_columns = []
+    for key, was in sorted(before["columns"].items()):
+        now = after["columns"].get(key)
+        if now is None:
+            display = "__".join(was) if isinstance(was, tuple) else was
+            lost_columns.append(f"{key[0]} {key[1]}={display}")
+        elif key[1] == "gr_treatment":
+            # Generation hashes are intentionally ignored. Legacy -> deterministic
+            # adoption is safe when it retains the treatment; the reverse is not.
+            if isinstance(was, tuple) and not isinstance(now, tuple):
+                lost_columns.append(f"{key[0]} gr_treatment became legacy ({now})")
+            elif isinstance(now, tuple) and now[0] == FAILSAFE_TREATMENT and was != now:
+                lost_columns.append(f"{key[0]} gr_treatment became fail-safe ({now[0]})")
+            elif isinstance(was, tuple) and isinstance(now, tuple) and was != now:
+                lost_columns.append(f"{key[0]} gr_treatment {was} -> {now}")
+            elif not isinstance(was, tuple) and isinstance(now, tuple) and was != now[0]:
+                lost_columns.append(f"{key[0]} gr_treatment {was} -> {now}")
+        elif was != now:
+            lost_columns.append(f"{key[0]} {key[1]}={was}: changed to {now}")
+    if lost_columns: weaker["columns"] = lost_columns
+    lost_masks = sorted(before["masks"] - after["masks"])
+    if lost_masks: weaker["masks"] = lost_masks
     policies = []
     for key, was in sorted(before["policies"].items()):
         now = after["policies"].get(key)
@@ -818,6 +887,14 @@ def unexpected_changes(scenario: str, before: Mapping[str, Any], after: Mapping[
         changed = set(snapshot_diff(before.get(env, {}), after.get(env, {}))) - allowed
         if changed: result[env] = sorted(changed)
     return result
+
+
+def release_plan_workspace_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, Any]:
+    """Release planning may write immutable manifests, but never live/state facts."""
+    return {env: {key: value for key, value in snapshot_diff(before.get(env, {}), after.get(env, {})).items()
+                  if key != "receipts"}
+            for env in ("dev", "prod")
+            if any(key != "receipts" for key in snapshot_diff(before.get(env, {}), after.get(env, {})))}
 
 
 def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[str, str]) -> None:
@@ -846,13 +923,21 @@ def _restore_baseline(runner: CommandRunner, repo: Checkout, targets: set[str], 
     if missing: raise RuntimeError(f"restore targets unavailable: {', '.join(sorted(missing))}")
     repo.reset()
     repo.forward_fix()
-    for argv, step in ((("make", "rehearse", "ENV=dev"), "rehearse"), (("make", "release-plan", "ENV=prod"), "release-plan")):
-        result = runner.run(argv, f"{label}-restore-{step}")
-        if result.returncode: raise RuntimeError(f"baseline restore {step} failed")
-    manifest = parse_manifest(result.stdout)
-    for argv, step in ((("make", "release", "ENV=prod", f"MANIFEST={manifest}"), "release"), (("make", "maintain", "ENV=prod"), "maintain")):
-        result = runner.run(argv, f"{label}-restore-{step}")
-        if result.returncode: raise RuntimeError(f"baseline restore {step} failed")
+    result = runner.run(("make", "rehearse", "ENV=dev"), f"{label}-restore-rehearse")
+    if result.returncode: raise RuntimeError("baseline restore rehearse failed")
+    for phase in range(1, MAX_RELEASE_PHASES + 1):
+        plan = runner.run(("make", "release-plan", "ENV=prod"), f"{label}-restore-release-plan-{phase}")
+        if plan.returncode: raise RuntimeError("baseline restore release-plan failed")
+        manifest = parse_manifest(plan.stdout)
+        result = runner.run(("make", "release", "ENV=prod", f"MANIFEST={manifest}"),
+                            f"{label}-restore-release-{phase}")
+        if result.returncode: raise RuntimeError("baseline restore release failed")
+        if not release_needs_another_phase(plan.stdout + "\n" + result.stdout):
+            break
+    else:
+        raise RuntimeError(f"baseline restore exceeded {MAX_RELEASE_PHASES} release phases")
+    result = runner.run(("make", "maintain", "ENV=prod"), f"{label}-restore-maintain")
+    if result.returncode: raise RuntimeError("baseline restore maintain failed")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -903,16 +988,34 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
         if "=" not in item or not item.split("=", 1)[0]: raise SystemExit(f"--value must be KEY=VALUE, got {item!r}")
         key, value = item.split("=", 1); values[key] = value
     if args.dry_run:
-        # Dry-run is hermetic: target inventory is source parsing, not make execution.
-        target_text = (repo_root / "shared" / "Makefile.shared").read_text(encoding="utf-8")
+        # Dry-run is hermetic: source parsing only, but it resolves the selected
+        # cloud entry point and describes every reason a live scenario cannot run.
+        cloud_makefile = repo_root / args.cloud / "Makefile"
+        target_text = cloud_makefile.read_text(encoding="utf-8") + "\n" + (
+            repo_root / "shared" / "Makefile.shared").read_text(encoding="utf-8")
         targets = set(re.findall(r"^([a-zA-Z0-9][\w.-]*):(?:\s|$)", target_text, re.M))
+        source_text = "\n".join(path.read_text(encoding="utf-8", errors="replace")
+                                 for path in sorted((repo_root / "shared").rglob("*"))
+                                 if path.is_file() and path.suffix in (".py", ".sh", ".shared"))
         for scenario in selected:
+            plan = scenario_plan(scenario, targets)
+            gates = [step.human_prompt for step in scenario.steps if step.human_prompt]
+            missing_values = unresolved_values(scenario, values)
+            refusals = [{"step": step.name, "pattern": step.refusal,
+                         "found_in_source": bool(step.refusal and re.search(step.refusal, source_text))}
+                        for step in scenario.steps if step.expect_failure]
+            would_not_run = [x["skip_reason"] for x in plan if x["status"] == "skip"]
+            would_not_run += ["human UI gate requires typed confirmation"] if gates else []
+            would_not_run += [f"missing value: {name}" for name in missing_values]
+            would_not_run += [f"refusal pattern not found in source: {x['pattern']}"
+                              for x in refusals if not x["found_in_source"]]
             payload = {"scenario": scenario.key, "status": "dry-run", "cloud": args.cloud,
                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                       "steps": scenario_plan(scenario, targets), "snapshot_diff": {},
-                       "would_not_run": [x["skip_reason"] for x in scenario_plan(scenario, targets) if x["status"] == "skip"]}
+                       "target_source": str(cloud_makefile), "steps": plan, "snapshot_diff": {},
+                       "human_gates": gates, "missing_values": missing_values,
+                       "refusal_patterns": refusals, "would_not_run": would_not_run}
             write_report(reports, scenario, payload)
-            print(f"[{scenario.key}] {scenario.title}" + (" — NOT RUN live (missing targets)" if payload["would_not_run"] else ""))
+            print(f"[{scenario.key}] {scenario.title}" + (" — NOT RUN live (see report)" if payload["would_not_run"] else ""))
             for item in payload["steps"]:
                 suffix = f" — SKIP ({item['skip_reason']})" if item["status"] == "skip" else ""
                 print(f"  {item['command'] or ('[' + item['action'] + ']' if item['action'] else '[human pause]')}{suffix}")
@@ -931,7 +1034,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
         raise SystemExit(
             f"live execution requires a customer-shaped checkout that commits envs/; {checkout_dir} at "
             f"{args.commit[:12]} does not:\n" + "".join(f"  - {p}\n" for p in problems)
-            + f"  Fix: cd {args.cloud} && make setup ENV=dev GITIGNORE=customer, commit {args.cloud}/.gitignore "
+            + f"  Fix: cd {args.cloud} && make setup ENV=dev GITIGNORE=customer && "
+            f"make setup ENV=prod GITIGNORE=customer, commit {args.cloud}/.gitignore "
             f"and {args.cloud}/envs/, check that commit out and pass it as --commit. Nothing was run.")
     log_root = reports / "logs"; log_root.mkdir(parents=True, exist_ok=True)
     secrets = collect_secrets(cloud_root)
@@ -958,6 +1062,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             # Everything a scenario needs is checked before it touches anything:
             # one missing target, gate or value and nothing of it runs.
             blocked = [item["skip_reason"] for item in plan if item["status"] == "skip"]
+            if scenario.key == "s14" and not governance_only_env(cloud_root, "dev"):
+                blocked.append("s14 requires dev to be a deterministic governance-only environment")
             if any(s.human_prompt for s in scenario.steps) and (args.non_interactive or not sys.stdin.isatty()):
                 blocked.append("human UI gate needs an interactive TTY and a typed confirmation")
             missing_values = unresolved_values(scenario, values)
@@ -977,7 +1083,9 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             scenario_status = "passed"
             error_message: str | None = None
             refusal_diffs: list[dict[str, Any]] = []
+            successful_step_diffs: list[dict[str, Any]] = []
             manifest = values.get("manifest", "")
+            release_plan_output = ""
             mutated = False
             stop = False
             confirmations: list[dict[str, str]] = []
@@ -1001,7 +1109,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     argv2 = [render(part, {**values, "manifest": manifest}) for part in step.command]
                     applying = step.target in APPLYING
                     if applying: repo.require_clean(label)
-                    refusal_before = capture() if step.expect_failure else None
+                    step_before = capture() if (step.expect_failure or applying) else None
                     # Assume a mutation from the moment an applying command
                     # starts (it may be interrupted half-way); a refusal that
                     # held with an unchanged snapshot takes the assumption back.
@@ -1009,20 +1117,60 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     mutated |= applying or step.target == "ungovern"
                     result = runner.run(argv2, f"{label}-{step.name}", dict(step.extra_env))
                     item["exit_code"] = result.returncode
-                    if step.expect_failure:
+                    if step.target == "migrate-plan" and not step.expect_failure:
+                        ok = result.returncode in (0, 1) and "=== Migration dry run" in result.stdout and "Result:" in result.stdout
+                        if not ok: item["assertion"] = "migrate-plan must exit 0/1 with its report header and Result line"
+                    elif step.expect_failure:
                         ok = result.returncode != 0 and bool(step.refusal and re.search(step.refusal, result.stdout))
                         if not ok: item["assertion"] = "nonzero exit and the expected refusal message are both required"
                     else: ok = result.returncode == 0
                     item["status"] = "passed" if ok else "ERROR"
-                    if refusal_before is not None:
-                        refusal_after = capture()
-                        mutation = snapshot_diff(refusal_before, refusal_after)
+                    step_after = capture() if step_before is not None else None
+                    if step.expect_failure and step_before is not None and step_after is not None:
+                        mutation = snapshot_diff(step_before, step_after)
                         refusal_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
                         if mutation: item["status"] = "ERROR"; item["assertion"] = "refusal changed the snapshot"; ok = False
+                    elif applying and step_before is not None and step_after is not None:
+                        mutation = snapshot_diff(step_before, step_after)
+                        successful_step_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
+                        if step.target == "release-plan" and release_plan_workspace_diff(step_before, step_after):
+                            item["status"] = "ERROR"; item["assertion"] = "successful release-plan changed the snapshot"; ok = False
+                        weak_step = protection_diff_envs(step_before, step_after)
+                        if weak_step and scenario.key not in WEAKENING_EXPECTED:
+                            item["status"] = "ERROR"; item["assertion"] = f"successful apply weakened protection: {weak_step}"; ok = False
                     if not ok: raise RuntimeError(f"step did not satisfy its contract: {step.name}")
                     if step.expect_failure: mutated = prior_mutated
                     if step.target == "release-plan" and not step.expect_failure:
                         manifest = parse_manifest(result.stdout)
+                        release_plan_output = result.stdout
+                    if step.target == "release" and not step.expect_failure:
+                        phase_output = release_plan_output + "\n" + result.stdout
+                        for phase in range(2, MAX_RELEASE_PHASES + 1):
+                            if not release_needs_another_phase(phase_output): break
+                            repo.require_clean(f"{label}-phase-{phase}")
+                            phase_before = capture()
+                            plan_result = runner.run(("make", "release-plan", "ENV=prod"),
+                                                     f"{label}-release-plan-phase-{phase}")
+                            if plan_result.returncode: raise RuntimeError(f"release phase {phase} plan failed")
+                            phase_plan_after = capture()
+                            plan_diff = snapshot_diff(phase_before, phase_plan_after)
+                            successful_step_diffs.append({"step": f"{step.name} phase {phase} plan", "env": "prod", "diff": plan_diff})
+                            if release_plan_workspace_diff(phase_before, phase_plan_after):
+                                raise RuntimeError(f"release phase {phase} plan changed the snapshot")
+                            manifest = parse_manifest(plan_result.stdout)
+                            phase_release = runner.run(("make", "release", "ENV=prod", f"MANIFEST={manifest}"),
+                                                       f"{label}-release-phase-{phase}")
+                            if phase_release.returncode: raise RuntimeError(f"release phase {phase} failed")
+                            phase_after = capture()
+                            successful_step_diffs.append({"step": f"{step.name} phase {phase}", "env": "prod",
+                                                          "diff": snapshot_diff(phase_plan_after, phase_after)})
+                            weak_phase = protection_diff_envs(phase_plan_after, phase_after)
+                            if weak_phase and scenario.key not in WEAKENING_EXPECTED:
+                                raise RuntimeError(f"release phase {phase} weakened protection: {weak_phase}")
+                            phase_output = plan_result.stdout + "\n" + phase_release.stdout
+                        else:
+                            if release_needs_another_phase(phase_output):
+                                raise RuntimeError(f"release exceeded {MAX_RELEASE_PHASES} phases")
                     if applying: repo.require_clean(f"after-{label}")
                 after = capture()
                 if scenario.key not in WEAKENING_EXPECTED:
@@ -1063,7 +1211,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                            "cloud": args.cloud, "commit": args.commit, "steps": plan, "confirmations": confirmations,
                            "before": before, "after": after, "restored": restored, "restored_lifecycle": mutated,
                            "snapshot_diff": snapshot_diff(before, after) if before and after else {},
-                           "refusal_snapshot_diffs": refusal_diffs}
+                           "refusal_snapshot_diffs": refusal_diffs,
+                           "successful_step_snapshot_diffs": successful_step_diffs}
                 write_report(reports, scenario, payload, runner.secrets)
             if stop: break
     finally:
