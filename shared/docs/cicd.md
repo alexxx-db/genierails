@@ -269,6 +269,12 @@ Rollout step 9 (design sections 10 and 17). Legacy envs are unchanged.
   time: each `release` applies that phase and its verification, and says to
   run `release-plan` again. The workspace is planned with the last phase. A
   release that changes no policy is one manifest.
+- **Existing resources are imported by their own manifest.** `release-plan`
+  changes nothing live or in state: when resources exist in Databricks but
+  not in Terraform state (or a non-treatment tag holds a stale value), it
+  records those imports and tag cleanups in the manifest instead of running
+  them, and plans nothing else. `release MANIFEST=` runs exactly the recorded
+  entries under the lock and says to run `release-plan` again.
 - **`make maintain ENV=prod`** refuses unless HEAD is the last release
   receipt's commit, the checkout is clean and the code, prod-input and
   `envs/prod/generated` digests match the receipt.

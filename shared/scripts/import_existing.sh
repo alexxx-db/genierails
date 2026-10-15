@@ -17,6 +17,11 @@
 #   ./scripts/import_existing.sh --tags-only   # import only tag policies
 #   ./scripts/import_existing.sh --fgac-only   # import only FGAC policies
 #   ./scripts/import_existing.sh --dry-run     # show commands without running
+#   ./scripts/import_existing.sh --skip-treatment-tags  # deterministic env: never touch gr_treatment
+#   ./scripts/import_existing.sh --record=FILE  # release-plan: append the needed imports and
+#                                               # stale-tag cleanups to FILE; change nothing
+#   ./scripts/import_existing.sh --apply-recorded=FILE  # release MANIFEST=: run exactly FILE's
+#                                               # entries for this layer; fail on any failure
 # =============================================================================
 
 set -euo pipefail
@@ -37,6 +42,9 @@ else
 fi
 
 DRY_RUN=false
+SKIP_TREATMENT_TAGS=""
+RECORD_FILE=""
+APPLY_RECORDED=""
 IMPORT_GROUPS=true
 IMPORT_TAGS=true
 IMPORT_FGAC=true
@@ -47,13 +55,16 @@ IMPORT_WAREHOUSE=true
 for arg in "$@"; do
   case "$arg" in
     --dry-run)     DRY_RUN=true ;;
+    --skip-treatment-tags) SKIP_TREATMENT_TAGS=true ;;
+    --record=*)    RECORD_FILE="${arg#--record=}" ;;
+    --apply-recorded=*) APPLY_RECORDED="${arg#--apply-recorded=}" ;;
     --groups-only) IMPORT_TAGS=false; IMPORT_FGAC=false; IMPORT_TAG_ASSIGNMENTS=false; IMPORT_GRANTS=false; IMPORT_WAREHOUSE=false ;;
     --tags-only)   IMPORT_GROUPS=false; IMPORT_FGAC=false; IMPORT_TAG_ASSIGNMENTS=false; IMPORT_GRANTS=false; IMPORT_WAREHOUSE=false ;;
     --fgac-only)   IMPORT_GROUPS=false; IMPORT_TAGS=false; IMPORT_TAG_ASSIGNMENTS=false; IMPORT_GRANTS=false; IMPORT_WAREHOUSE=false ;;
     --tag-assignments-only) IMPORT_GROUPS=false; IMPORT_TAGS=false; IMPORT_FGAC=false; IMPORT_GRANTS=false; IMPORT_WAREHOUSE=false ;;
     --grants-only) IMPORT_GROUPS=false; IMPORT_TAGS=false; IMPORT_FGAC=false; IMPORT_TAG_ASSIGNMENTS=false; IMPORT_WAREHOUSE=false ;;
     -h|--help)
-      echo "Usage: $0 [--dry-run] [--groups-only|--tags-only|--fgac-only|--tag-assignments-only|--grants-only]"
+      echo "Usage: $0 [--dry-run] [--skip-treatment-tags] [--record=FILE|--apply-recorded=FILE] [--groups-only|--tags-only|--fgac-only|--tag-assignments-only|--grants-only]"
       exit 0
       ;;
     *)
@@ -66,6 +77,49 @@ done
 
 cd "$MODULE_DIR"
 
+# Who owns gr_treatment tags: the Makefile passes --skip-treatment-tags for a
+# deterministic env (the staged policy controller retags). Without the flag,
+# read governance_mode from the env-level env.auto.tfvars (the file make
+# validated), never a layer-local copy, and stop (exit 3, before any import or
+# UNSET) if it can't be read: a guess of legacy would UNSET and re-import
+# treatment tags behind the controller's back.
+if [ "$LAYER" = "data_access" ] && [ -z "$SKIP_TREATMENT_TAGS" ]; then
+  mode=$(python3 - <<'PYEOF'
+import hcl2, sys
+path = '../env.auto.tfvars'
+try:
+    with open(path) as f:
+        mode = hcl2.load(f).get('governance_mode', 'legacy')
+    mode = (mode[0] if isinstance(mode, list) else mode or '').strip()
+    if mode not in ('legacy', 'deterministic'):
+        raise ValueError(f'governance_mode = {mode!r} is neither legacy nor deterministic')
+except Exception as exc:
+    print(f'ERROR: cannot tell who owns gr_treatment tags: {path}: {exc}. Nothing was imported or cleared; '
+          'fix the file (or pass --skip-treatment-tags for a deterministic env).', file=sys.stderr)
+    sys.exit(3)
+print(mode)
+PYEOF
+  ) || exit 3
+  if [ "$mode" = "deterministic" ]; then SKIP_TREATMENT_TAGS=true; else SKIP_TREATMENT_TAGS=false; fi
+fi
+export GENIERAILS_IMPORT_SKIP_TREATMENT_TAGS="${SKIP_TREATMENT_TAGS:-false}"
+# record: read-only discovery (release-plan); apply: run recorded entries only.
+if [ -n "$RECORD_FILE" ] && [ -n "$APPLY_RECORDED" ]; then
+  echo "ERROR: --record and --apply-recorded are exclusive" >&2
+  exit 1
+fi
+if [ -n "$RECORD_FILE" ]; then
+  RECORD_FILE="$(cd "$(dirname "$RECORD_FILE")" && pwd)/$(basename "$RECORD_FILE")"
+  touch "$RECORD_FILE"
+  export GENIERAILS_IMPORT_MODE=record GENIERAILS_IMPORT_RECORD="$RECORD_FILE"
+elif [ -n "$APPLY_RECORDED" ]; then
+  APPLY_RECORDED="$(cd "$(dirname "$APPLY_RECORDED")" && pwd)/$(basename "$APPLY_RECORDED")"
+  export GENIERAILS_IMPORT_MODE=apply GENIERAILS_IMPORT_RECORD="$APPLY_RECORDED"
+else
+  export GENIERAILS_IMPORT_MODE=import GENIERAILS_IMPORT_RECORD=""
+fi
+export GENIERAILS_IMPORT_LAYER="$LAYER"
+
 if [ ! -f abac.auto.tfvars ]; then
   echo "ERROR: abac.auto.tfvars not found. Configure it before importing."
   exit 1
@@ -77,6 +131,17 @@ run_import() {
 
   if $DRY_RUN; then
     echo "  [DRY RUN] $TF_RUNNER '$LAYER' '$ENV_NAME' import '$address' '$id'"
+    return 0
+  fi
+
+  if [ -n "$RECORD_FILE" ]; then
+    if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state list 2>/dev/null | grep -qF "$address"; then
+      return 0
+    fi
+    echo "  Recorded import (release applies it): $address -> $id"
+    python3 -c 'import json, sys; open(sys.argv[1], "a").write(json.dumps(
+        {"kind": "import", "layer": sys.argv[2], "address": sys.argv[3], "id": sys.argv[4]}) + "\n")' \
+      "$RECORD_FILE" "$LAYER" "$address" "$id"
     return 0
   fi
 
@@ -104,8 +169,10 @@ run_import() {
   else
     echo "$import_out" >&2
     echo "  ✗ Failed to import $address (may not exist in Databricks)"
+    IMPORT_FAILURES=$((IMPORT_FAILURES + 1))
   fi
 }
+IMPORT_FAILURES=0
 
 # Look up group display-names from abac.auto.tfvars and resolve their numeric
 # account-level SCIM IDs via the Databricks SDK (required for terraform import).
@@ -222,14 +289,7 @@ def _str(v): return (v[0] if isinstance(v, list) else v or '').strip()
 with open('abac.auto.tfvars') as f:
     cfg = hcl2.load(f)
 
-env_cfg = {}
-for fname in ['env.auto.tfvars', '../env.auto.tfvars']:
-    if os.path.exists(fname):
-        try:
-            with open(fname) as f: env_cfg = hcl2.load(f)
-        except Exception: pass
-        break
-deterministic = _str(env_cfg.get('governance_mode', 'legacy')) == 'deterministic'
+skip_treatments = os.environ.get('GENIERAILS_IMPORT_SKIP_TREATMENT_TAGS') == 'true'
 
 desired = []
 for ta in cfg.get('tag_assignments', []):
@@ -237,7 +297,7 @@ for ta in cfg.get('tag_assignments', []):
     ename = ta.get('entity_name', '')
     tkey  = ta.get('tag_key', '')
     tval  = ta.get('tag_value', '')
-    if etype and ename and tkey and tval and not (deterministic and tkey == 'gr_treatment'):
+    if etype and ename and tkey and tval and not (skip_treatments and tkey == 'gr_treatment'):
         desired.append((etype, ename, tkey, tval))
 
 if not desired:
@@ -312,9 +372,25 @@ except Exception as e:
     sys.stderr.write(f'WARNING: tag assignment check failed ({e}), falling back\n')
     use_existing_check = False
 
+recording = os.environ.get('GENIERAILS_IMPORT_MODE') == 'record'
+cleared = set()
+if recording:
+    if not use_existing_check:
+        sys.exit('ERROR: release-plan records only imports it verified exist in Databricks, and the live tag assignments '
+                 'could not be checked (above). Fix the access and re-run release-plan.')
+    # Recorded cleanups run first at release: those tags are gone by the import.
+    import json
+    with open(os.environ['GENIERAILS_IMPORT_RECORD']) as f:
+        for line in f:
+            entry = json.loads(line)
+            if entry.get('kind') == 'cleanup':
+                cleared.add((entry['entity_type'], entry['entity_name'], entry['tag_key']))
+
 for (etype, ename, tkey, tval) in desired:
     if use_existing_check and (etype, ename, tkey) not in existing:
         continue  # does not exist — skip to avoid import error
+    if (etype, ename, tkey) in cleared:
+        continue
     tf_key    = f'{etype}|{ename}|{tkey}|{tval}'
     import_id = f'{etype},{ename},{tkey}'
     print(tf_key + '\t' + import_id)
@@ -352,8 +428,8 @@ for fname in ['env.auto.tfvars', '../env.auto.tfvars']:
         break
 
 tag_assignments = cfg.get('tag_assignments', [])
-deterministic = _str(env_cfg.get('governance_mode', 'legacy')) == 'deterministic'
-if deterministic:
+skip_treatments = os.environ.get('GENIERAILS_IMPORT_SKIP_TREATMENT_TAGS') == 'true'
+if skip_treatments:
     # The staged policy controller owns treatment retags. Clearing one here
     # creates an unmasked interval, including from read-only release-plan.
     tag_assignments = [ta for ta in tag_assignments if ta.get('tag_key') != 'gr_treatment']
@@ -376,7 +452,23 @@ if not warehouse_id:
     except Exception as e:
         sys.stderr.write(f'WARNING: warehouse lookup failed: {e}\n')
 
+recording = os.environ.get('GENIERAILS_IMPORT_MODE') == 'record'
+if recording:
+    import json
+
+    def record_cleanup(etype, ename, tkey, sql):
+        with open(os.environ['GENIERAILS_IMPORT_RECORD'], 'a') as f:
+            f.write(json.dumps({'kind': 'cleanup', 'layer': 'data_access', 'entity_type': etype,
+                                'entity_name': ename, 'tag_key': tkey, 'statement': sql,
+                                'warehouse_id': warehouse_id}) + '\n')
+
+    def unverified(why):
+        sys.exit(f'ERROR: release-plan changes nothing live, so it records stale tags to clear instead '
+                 f'of clearing them, and {why}. Fix the access and re-run release-plan.')
+
 if not warehouse_id:
+    if recording:
+        unverified('no SQL warehouse was found to check the live tags')
     sys.stderr.write('WARNING: no warehouse_id; skipping tag assignment pre-cleanup\n')
     sys.exit(0)
 
@@ -384,6 +476,8 @@ try:
     from databricks.sdk import WorkspaceClient
     w = WorkspaceClient(host=host, client_id=client_id, client_secret=client_secret)
 except Exception as e:
+    if recording:
+        unverified(f'the SDK could not start ({e})')
     sys.stderr.write(f'WARNING: SDK init failed: {e}\n')
     sys.exit(0)
 
@@ -449,12 +543,23 @@ for ta in tag_assignments:
         rows = getattr(getattr(lookup, 'result', None), 'data_array', None) or []
         current_value = rows[0][0] if rows and rows[0] else None
         lookup_matches_target = 'SUCCEEDED' in lookup_state and current_value == tval
+        if recording and 'SUCCEEDED' not in lookup_state:
+            unverified(f'the tag lookup for {ename}/{tkey} ended {lookup_state or "without a state"}')
+        if recording and current_value is None:
+            continue  # no live tag: nothing to clear
     except Exception as e:
+        if recording:
+            unverified(f'the tag lookup for {ename}/{tkey} failed ({e})')
         sys.stderr.write(
             f'  WARNING: tag lookup failed for {ename}/{tkey}: {e}; clearing tag\n'
         )
 
     if lookup_matches_target:
+        continue
+
+    if recording:
+        print(f'  Recorded cleanup (release clears it): {tkey} on {ename}')
+        record_cleanup(etype, ename, tkey, sql)
         continue
 
     try:
@@ -577,6 +682,9 @@ except Exception as sdk_err:
 sep = '\t'
 for catalog in sorted(catalogs):
     known = existing_grants.get(catalog)  # None=unknown(fallback), set=verified
+    if known is None and os.environ.get('GENIERAILS_IMPORT_MODE') == 'record':
+        sys.exit(f'ERROR: release-plan records only imports it verified exist in Databricks, and the grants on catalog {catalog} '
+                 'could not be checked (above). Fix the access and re-run release-plan.')
     for group in groups:
         if known is not None and group not in known:
             continue  # grant does not exist — skip to avoid import error
@@ -706,12 +814,72 @@ except Exception as e:
 
 for (name, catalog, sec_type, full_name) in desired:
     known = existing_by_catalog.get(catalog)
+    if known is None and os.environ.get('GENIERAILS_IMPORT_MODE') == 'record':
+        sys.exit(f'ERROR: release-plan records only imports it verified exist in Databricks, and the policies on catalog {catalog} '
+                 'could not be checked (above). Fix the access and re-run release-plan.')
     if known is not None and full_name not in known:
         continue  # policy does not exist yet — skip to avoid import error
     import_id = f'{sec_type},{catalog},{full_name}'
     print(name + '\t' + import_id)
 FEOF
 }
+
+# release MANIFEST=: the stale-tag cleanups release-plan recorded, exactly as recorded.
+apply_recorded_cleanups() {
+  python3 - << 'PYEOF'
+import hcl2, json, os, sys
+
+def _str(v): return (v[0] if isinstance(v, list) else v or '').strip()
+
+layer = os.environ['GENIERAILS_IMPORT_LAYER']
+with open(os.environ['GENIERAILS_IMPORT_RECORD']) as f:
+    entries = [json.loads(line) for line in f if line.strip()]
+cleanups = [e for e in entries if e.get('kind') == 'cleanup' and e.get('layer') == layer]
+if not cleanups:
+    sys.exit(0)
+auth = {}
+for fname in ['auth.auto.tfvars', '../auth.auto.tfvars']:
+    if os.path.exists(fname):
+        with open(fname) as f: auth = hcl2.load(f)
+        break
+from databricks.sdk import WorkspaceClient
+w = WorkspaceClient(
+    host=_str(auth.get('databricks_workspace_host', '')) or os.environ.get('DATABRICKS_HOST', ''),
+    client_id=_str(auth.get('databricks_client_id', '')) or os.environ.get('DATABRICKS_CLIENT_ID', ''),
+    client_secret=_str(auth.get('databricks_client_secret', '')) or os.environ.get('DATABRICKS_CLIENT_SECRET', ''))
+failed = 0
+for entry in cleanups:
+    resp = w.statement_execution.execute_statement(
+        statement=entry['statement'], warehouse_id=entry['warehouse_id'], wait_timeout='30s')
+    raw_state = getattr(getattr(resp, 'status', None), 'state', None)
+    state = raw_state.value if hasattr(raw_state, 'value') else str(raw_state or '')
+    if 'SUCCEEDED' in state:
+        print(f"  Cleared tag {entry['tag_key']} on {entry['entity_name']}")
+    else:
+        failed += 1
+        print(f"  ✗ Could not clear {entry['tag_key']} on {entry['entity_name']} ({state})", file=sys.stderr)
+sys.exit(1 if failed else 0)
+PYEOF
+}
+
+if [ -n "$APPLY_RECORDED" ]; then
+  echo "=== Recorded imports and stale-tag cleanups ($LAYER) ==="
+  apply_recorded_cleanups
+  entries=$(python3 -c 'import json, sys
+for line in open(sys.argv[1]):
+    e = json.loads(line) if line.strip() else {}
+    if e.get("kind") == "import" and e.get("layer") == sys.argv[2]:
+        print(e["address"] + "\t" + e["id"])' "$APPLY_RECORDED" "$LAYER")
+  while IFS=$'\t' read -r address import_id; do
+    [ -z "$address" ] && continue
+    run_import "$address" "$import_id"
+  done <<< "$entries"
+  if [ "$IMPORT_FAILURES" -ne 0 ]; then
+    echo "ERROR: $IMPORT_FAILURES recorded import(s) failed (above)." >&2
+    exit 1
+  fi
+  exit 0
+fi
 
 echo "============================================"
 echo "  Import Existing Resources into Terraform"
@@ -794,8 +962,13 @@ if $IMPORT_TAG_ASSIGNMENTS; then
     echo "  Skipping tag assignment imports outside envs/<workspace>/data_access"
   else
     # Pre-cleanup: remove stale assignments (wrong tag_value from prior LLM run)
-    echo "  Pre-cleanup: removing stale tag assignments via SQL..."
-    cleanup_stale_tag_assignments 2>&1 | sed 's/^/  /'
+    if [ -n "$RECORD_FILE" ]; then
+      echo "  Pre-cleanup: recording stale tag assignments (nothing is cleared now)..."
+      cleanup_stale_tag_assignments
+    else
+      echo "  Pre-cleanup: removing stale tag assignments via SQL..."
+      cleanup_stale_tag_assignments 2>&1 | sed 's/^/  /'
+    fi
 
     tag_assignment_entries=$(extract_tag_assignments)
     if [ -z "$tag_assignment_entries" ]; then
@@ -862,7 +1035,9 @@ if $IMPORT_WAREHOUSE; then
 fi
 
 echo "============================================"
-if $DRY_RUN; then
+if [ -n "$RECORD_FILE" ]; then
+  echo "  Recorded the needed imports in $RECORD_FILE; nothing was imported or cleared."
+elif $DRY_RUN; then
   echo "  Dry run complete. $imported import(s) would be attempted."
 else
   echo "  Done. $imported import(s) attempted."

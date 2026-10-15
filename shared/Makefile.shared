@@ -1020,13 +1020,26 @@ _release-plan-roots:
 	echo "=== Saved plans (data_access:$(ENV), staged policy phases) ==="; \
 	layer_dir="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
 	$(_STICKY) check-layout --env-dir "$(ENV_DIR)" --env-name "$(ENV)"; \
-	$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$(ENV)" CLASSIFICATION_ENV_DIR="$(ENV_DIR)" IMPORT_CLASSIFICATION=1; \
-	(cd "$$layer_dir" && LAYER_ENV_DIR="$$layer_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
+	echo "=== Existing resources to import (recorded; release-plan changes nothing live) ==="; \
+	record="$$plan_dir/imports.jsonl"; : > "$$record"; \
+	$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$(ENV)" CLASSIFICATION_ENV_DIR="$(ENV_DIR)" IMPORT_CLASSIFICATION=record IMPORT_RECORD="$$record"; \
+	(cd "$$layer_dir" && LAYER_ENV_DIR="$$layer_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --record="$$record"); \
+	governance_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null || true)"; \
+	if [ "$$governance_only" != 1 ] && [ -f "$(ENV_DIR)/abac.auto.tfvars" ]; then \
+		(cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --record="$$record"); \
+	fi; \
+	if [ -s "$$record" ]; then \
+		mkdir -p "$$plan_dir/data_access"; \
+		echo '{"steps": [], "final": false, "imports_only": true}' > "$$plan_dir/data_access/phases.json"; \
+		echo '{"skipped": "deferred: existing resources are imported first; the next release-plan plans the rest"}' > "$$plan_dir/workspace.json"; \
+		echo "  $$(wc -l < "$$record" | tr -d ' ') import(s)/cleanup(s) recorded: this manifest only imports them (make release MANIFEST=, under the lock)."; \
+		exit 0; \
+	fi; \
 	$(_COVERAGE_GATE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" $(if $(filter 1,$(VERBOSE)),--verbose,); \
 	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) plan --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --out-dir "$$plan_dir/data_access"; \
 	final="$$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["final"]))' "$$plan_dir/data_access/phases.json")"; \
 	env_dir="$(ENV_DIR)"; \
-	if [ "$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+	if [ "$$governance_only" = 1 ]; then \
 		echo '{"skipped": "governance-only (no agents): GenieRails creates and grants nothing in the workspace layer"}' > "$$plan_dir/workspace.json"; \
 	elif [ "$$final" != 1 ]; then \
 		echo '{"skipped": "deferred: staged policy phases remain; the workspace is planned with the last one"}' > "$$plan_dir/workspace.json"; \
@@ -1039,7 +1052,6 @@ _release-plan-roots:
 		$(_AGENT_COVERAGE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" || true; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
 		python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --arm --quiet; \
-		(cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
 		set +e; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"; status=$$?; set -e; \
 		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: workspace plan failed." >&2; exit 1; fi; \
 		printf '{"file": "workspace.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/workspace.json"; \
@@ -1068,6 +1080,21 @@ _release-manifest: _guard-not-ci-apply
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
+	imports="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field imports.count)" || exit 1; \
+	if [ "$$imports" != 0 ] && [ "$$imports" != null ]; then \
+		echo "=== Import existing resources ($(ENV)): the manifest's recorded imports and stale-tag cleanups ==="; \
+		if ! (cd "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" && LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --apply-recorded="$$plans/imports.jsonl") \
+			|| { grep -q '"layer": "workspace"' "$$plans/imports.jsonl" && ! (cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --apply-recorded="$$plans/imports.jsonl"); }; then \
+			echo "release: a recorded import or stale-tag cleanup failed (above); the ones before it are done, nothing else was applied. Fix the cause, then make release-plan ENV=$(ENV) again." >&2; \
+			exit 1; \
+		fi; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		echo ""; \
+		echo "=== Release phase applied ($(ENV)) ==="; \
+		echo "  This manifest imported existing resources into Terraform state; nothing else was applied."; \
+		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV) MANIFEST=<it>."; \
+		exit 0; \
+	fi; \
 	$(_AGENT_OWNERSHIP) preflight --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || { echo "release: the Genie agents no longer match the manifest (above); nothing was applied." >&2; exit 1; }; \
 	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only || exit 1; \
 	$(MAKE) --no-print-directory wait-tag-policies REQUIRED_VALUES_TFVARS="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" || exit 1; \
@@ -1320,11 +1347,16 @@ check: ## Read-only PR check: validate, generated files current, validate-genera
 
 _prepare-classification:
 	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)")" || exit 1; \
-	if [ "$(IMPORT_CLASSIFICATION)" = "1" ]; then \
+	if [ "$(IMPORT_CLASSIFICATION)" = "1" ] || [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
 		for catalog in $$existing_catalogs; do \
 			address='module.data_access.databricks_data_classification_catalog_config.classification["'"$$catalog"'"]'; \
 			if ! LAYER_ENV_DIR="$(CLASSIFICATION_ENV_DIR)/$(DATA_ACCESS_SUBDIR)" "$(ROOT_RUNNER)" data_access "$(TARGET_ENV)" state-list 2>/dev/null | grep -qF "$$address"; then \
-				LAYER_ENV_DIR="$(CLASSIFICATION_ENV_DIR)/$(DATA_ACCESS_SUBDIR)" "$(ROOT_RUNNER)" data_access "$(TARGET_ENV)" import "$$address" "catalogs/$$catalog/config"; \
+				if [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
+					python3 -c 'import json, sys; open(sys.argv[1], "a").write(json.dumps({"kind": "import", "layer": "data_access", "address": sys.argv[2], "id": sys.argv[3]}) + "\n")' \
+						"$(IMPORT_RECORD)" "$$address" "catalogs/$$catalog/config" || exit 1; \
+				else \
+					LAYER_ENV_DIR="$(CLASSIFICATION_ENV_DIR)/$(DATA_ACCESS_SUBDIR)" "$(ROOT_RUNNER)" data_access "$(TARGET_ENV)" import "$$address" "catalogs/$$catalog/config"; \
+				fi; \
 			fi; \
 		done; \
 	fi
@@ -1456,7 +1488,8 @@ _apply-layer: _guard-not-ci-apply
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		echo "=== Auto-importing existing data_access resources (idempotent apply) ==="; \
-		(cd "$$env_dir" && LAYER_ENV_DIR="$$env_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
+		import_rc=0; (cd "$$env_dir" && LAYER_ENV_DIR="$$env_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" $$([ "$$staged" = 1 ] && echo --skip-treatment-tags) 2>&1) || import_rc=$$?; \
+		if [ $$import_rc -eq 3 ]; then echo "ERROR: the data_access import refused (above); nothing was applied." >&2; exit 1; fi; \
 	fi; \
 	if [ "$$layer" = "workspace" ]; then \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags"; \

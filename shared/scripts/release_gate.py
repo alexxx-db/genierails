@@ -978,6 +978,23 @@ def _data_access_entry(plan_dir: Path) -> dict:
     return info
 
 
+def _imports_entry(plan_dir: Path) -> dict:
+    """The imports and stale-tag cleanups release-plan recorded instead of running (import_existing.sh --record).
+
+    release MANIFEST= runs exactly these, under the env lock, and nothing else.
+    """
+    path = plan_dir / "imports.jsonl"
+    if not path.is_file():
+        return {"count": 0}
+    try:
+        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except ValueError as exc:
+        raise Refused(f"the recorded imports {path} are not readable: {exc}") from exc
+    if not entries:
+        return {"count": 0}
+    return {"count": len(entries), "file": path.name, "sha256": sha256_file(path), "entries": entries}
+
+
 def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live: str,
                    report: Mapping) -> Path:
     from scripts import runtime_overlay as ro
@@ -1004,7 +1021,7 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
     manifest = {
         "kind": "release-manifest", "version": VERSION, "id": manifest_id, "env": env,
         "cloud": cloud_dir_of(env_dir).name, "commit": prov["commit"], "provenance": dict(prov),
-        "state_serials": state_serials(env_dir), "plans": plans,
+        "state_serials": state_serials(env_dir), "plans": plans, "imports": _imports_entry(plan_dir),
         "final": bool(data_access.get("final")),
         "effective_digest": ro.digest(env_dir), "live_snapshot": live,
         "kept_names": ro.load_kept_names(env_dir), "reports": dict(report), "agents": agents,
@@ -1058,6 +1075,11 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
             path = plan_dir / "data_access" / step["file"]
             if not path.is_file() or sha256_file(path) != step.get("sha256"):
                 drift.append(f"the saved data_access plan {path} changed or is missing")
+    imports = manifest.get("imports") or {}
+    if imports.get("file"):
+        path = plan_dir / imports["file"]
+        if not path.is_file() or sha256_file(path) != imports.get("sha256"):
+            drift.append(f"the recorded imports {path} changed or are missing")
     if ro.digest(env_dir) != manifest["effective_digest"]:
         drift.append("the effective config (generated/.runtime) changed since release-plan")
     if ro.load_kept_names(env_dir) != manifest.get("kept_names", {}):
