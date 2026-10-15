@@ -86,6 +86,13 @@ def test_generate_prunes_a_new_unused_function_and_the_validator_stays_quiet(env
     _coverage_gate(env_dir)
 
 
+def test_generated_tuning_md_ends_with_exactly_one_newline(env_dir, monkeypatch, capfd):
+    """git diff --check flags a trailing blank line in the committed TUNING.md."""
+    _generate_response(env_dir, monkeypatch, _response_with())
+    text = (env_dir / "generated/TUNING.md").read_text()
+    assert text.endswith("\n") and not text.endswith("\n\n")
+
+
 def test_generate_never_prunes_a_function_that_was_already_in_the_sql(env_dir, monkeypatch, capfd):
     _generate_response(env_dir, monkeypatch, _response_with())
     sql_path = env_dir / "generated/masking_functions.sql"

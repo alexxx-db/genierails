@@ -54,7 +54,7 @@ Azure). Recursive applies pass only while the real rehearsal lock is held.
 Prod, account, direct apply targets, and a dev rehearsal without locked remote
 state still refuse. Only the listed targets are guarded: `make check`, `plan`,
 `validate` and `audit-schema` are allowed, and `sync-tags` (which adds account
-tag values), `bootstrap-sp` and `generate` are not guarded, so don't run them
+tag values), `bootstrap-sp`, `bootstrap-pipelines` and `generate` are not guarded, so don't run them
 from CI.
 `GENIERAILS_ALLOW_CI_APPLY=1` exists only for GenieRails' own throwaway
 integration tests; never set it on a deployment job.
@@ -80,6 +80,51 @@ integration tests; never set it on a deployment job.
 - Protect the prod environment (the samples use `production` on GitHub and
   `genierails-prod` on Azure DevOps): required reviewers, no self-approval,
   `main` only.
+- On GitHub, the prod release-plan job runs in the `production-plan`
+  environment (`main` only, no reviewer), so the prod read-only SP trusts
+  only that job and the `production-maintain` one, not every workflow on `main`.
+
+## Setting up the pipelines
+
+`make bootstrap-pipelines` sets up the Databricks side of the pipelines, one
+env at a time, and prints everything to set on the repo side. Run it as an
+account admin, from your cloud's folder, after `make bootstrap-sp` and after
+committing each env's `deployer_principal_id`:
+
+```bash
+make bootstrap-pipelines ENV=dev  CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws>  REPO=<owner>/<name> PLAN=1
+make bootstrap-pipelines ENV=dev  CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws>  REPO=<owner>/<name>
+make bootstrap-pipelines ENV=prod CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<prod-ws> REPO=<owner>/<name> WAREHOUSE_ID=<id>
+```
+
+For Azure DevOps use `CI=azure-devops ADO_ORG=<org> ADO_ORG_ID=<org-guid> ADO_PROJECT=<project>`
+instead of `REPO`. Pass `CI=` on the command line; a runner's `CI=true` is refused.
+
+| It does | Details |
+|---|---|
+| Creates or reuses the env's **read-only SP** | `genierails-<env>-readonly` (`READONLY_SP_NAME=`), workspace `USER` access, no secret |
+| Adds **OIDC federation** for each pipeline identity | read-only SP: the PR check, plus for prod the release-plan and maintain jobs (on GitHub, each under its own environment: `production-plan` and `production-maintain`, main only, no reviewer); dev deployer SP (`deployer_principal_id`): the dev rehearsal. The prod deployer is not federated while prod releases run on the deployment machine |
+| Grants the **section 17 privileges**, nothing more | `USE CATALOG`, `USE SCHEMA`, `BROWSE` on the env's catalogs (default: the catalogs of its committed `uc_tables`; `CATALOGS=` overrides); read on `system.information_schema` (only when not already inherited); `CAN_VIEW` on the agents (dev: the committed IDs; prod: `GENIE_SPACE_IDS=`, from the release receipt); `CAN_USE` on `WAREHOUSE_ID` when given (prod maintain's drift audit needs one) |
+| **Prints** the repo settings | repo variables (or the `genierails-ids` variable group), environments with required reviewers, branch protection, the Azure DevOps pipeline names the federation subjects use, and a `CODEOWNERS` that matches the [persona split](design/deterministic-governance.md#181-personas-and-the-files-each-owns) (`GOVERNANCE_OWNERS=`, `AGENT_OWNERS=`) |
+
+- **`PLAN=1`** runs the read-only preflight and prints the plan and the
+  settings; it changes nothing.
+- **It refuses before any write** when the caller can't make every change:
+  not an account admin, no authority over a catalog or `system` grant, no
+  `CAN_MANAGE` on an agent or warehouse, or a committed
+  `deployer_principal_id` that isn't in the account. Nothing was changed.
+- **A re-run changes nothing** and reports each item `UNCHANGED`.
+- **It never writes to the repo and never makes or prints a secret.** Every
+  value it prints is an ID. Apply the printed settings yourself; the remote
+  state roles (`DEV_STATE_*`) and service connection are yours to create.
+- **It never revokes or downgrades, so it refuses instead** while the
+  read-only SP is a workspace `ADMIN` or in the `admins` group, or
+  effectively holds more than `CAN_VIEW` on an agent (`CAN_RUN`, `CAN_EDIT`,
+  `CAN_MANAGE`) or more than `CAN_USE` on the warehouse (`CAN_MANAGE`,
+  `IS_OWNER`): directly, through one of its groups (including `users`), or
+  inherited from a parent object. The message names where the grant comes
+  from; remove it by hand and re-run. If the SP's group memberships or the
+  object's permissions can't be read, it refuses too.
 
 ## Pipeline samples: where each command runs
 
@@ -278,6 +323,17 @@ Rollout step 9 (design sections 10 and 17). Legacy envs are unchanged.
   time: each `release` applies that phase and its verification, and says to
   run `release-plan` again. The workspace is planned with the last phase. A
   release that changes no policy is one manifest.
+- **Existing resources are imported by their own manifest.** `release-plan`
+  changes nothing live or in state: when resources exist in Databricks but
+  not in Terraform state (or a non-treatment tag holds a stale value), it
+  records those imports and tag cleanups in the manifest instead of running
+  them, and plans nothing else. `release MANIFEST=` runs exactly the recorded
+  entries under the lock and says to run `release-plan` again. Both refuse a
+  record holding anything the recorder doesn't write
+  (`scripts/import_record.py`): only imports of the resource addresses
+  `import_existing.sh` imports, and UNSETs of non-`gr_treatment` tags on the
+  env's own SQL warehouse. Release rebuilds each UNSET from the checked names;
+  it never runs SQL stored in the record.
 - **`make maintain ENV=prod`** refuses unless HEAD is the last release
   receipt's commit, the checkout is clean and the code, prod-input and
   `envs/prod/generated` digests match the receipt.

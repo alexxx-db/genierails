@@ -557,10 +557,16 @@ def _preflight(
                 inherited_execute = _principal_has_effective_privilege(
                     account_users_effective, "account users", "EXECUTE"
                 )
-            except Exception:
+            except Exception as exc:
                 # Azure can deny inspecting another principal on system.ai even though
                 # the caller's own effective response exposes the inherited assignment.
-                pass
+                # Any other failure is not a permissions answer; stop on it.
+                if not _is_permission_denied(exc):
+                    raise RuntimeError(
+                        f"preflight failed in workspace {workspace_id}: could not inspect "
+                        f"account users access to function {foundation_model!r}. "
+                        f"Cause: {_error_details(exc)}"
+                    ) from exc
             if not inherited_execute:
                 try:
                     caller_function_effective = workspace.grants.get_effective(
@@ -571,10 +577,16 @@ def _preflight(
                     inherited_execute = _principal_has_effective_privilege(
                         caller_function_effective, "account users", "EXECUTE"
                     )
-                except Exception:
-                    # Caller authority below reports a clear failure if no other
-                    # read-only check proves that a grant is unnecessary.
-                    pass
+                except Exception as exc:
+                    # Permission denied: the caller-authority check below reports a
+                    # clear failure if no other read-only check proves that a grant
+                    # is unnecessary. Any other failure stops here.
+                    if not _is_permission_denied(exc):
+                        raise RuntimeError(
+                            f"preflight failed in workspace {workspace_id}: could not inspect "
+                            f"caller access to function {foundation_model!r}. "
+                            f"Cause: {_error_details(exc)}"
+                        ) from exc
             if not inherited_execute and existing_sp is not None:
                 client_id = str(_value(existing_sp, "application_id"))
                 try:
@@ -683,17 +695,16 @@ def _preflight(
         if model_access == "UC EXECUTE" and not model_grant_needed:
             emit(
                 f"PLAN RESOLVED workspace {workspace_id}: model access UNCHANGED via "
-                f"{resolved_access}"
+                f"{resolved_access} on {cfg.model_endpoint}"
             )
         else:
             emit(
                 f"PLAN RESOLVED workspace {workspace_id}: model access path "
-                f"{resolved_access}"
+                f"{resolved_access} on {cfg.model_endpoint}"
             )
         emit(
             f"PREFLIGHT OK workspace {workspace_id} ({host}): authenticated as "
-            f"{caller_name}; grant scope {securable_type} {full_name}; model access "
-            f"{resolved_access} on {cfg.model_endpoint}"
+            f"{caller_name}; grant scope {securable_type} {full_name}"
         )
         results[workspace_id] = WorkspacePreflight(
             workspace, host, metastore_id, target_catalog, model_access, model_resource,
@@ -819,12 +830,21 @@ def bootstrap(
         from databricks.sdk.service.iam import WorkspacePermission
         from databricks.sdk.service.catalog import PermissionsChange, Privilege
 
-        account.workspace_assignment.update(
-            workspace_id=workspace_id,
-            principal_id=int(sp_id),
-            permissions=[WorkspacePermission.ADMIN],
+        already_admin = any(
+            str(_value(_value(assignment, "principal"), "principal_id")) == sp_id
+            and any(str(getattr(permission, "value", permission)).upper() == "ADMIN"
+                    for permission in _value(assignment, "permissions") or [])
+            for assignment in account.workspace_assignment.list(workspace_id=workspace_id)
         )
-        emit(f"GRANTED workspace {workspace_id}: ADMIN")
+        if already_admin:
+            emit(f"UNCHANGED workspace {workspace_id}: ADMIN (already granted)")
+        else:
+            account.workspace_assignment.update(
+                workspace_id=workspace_id,
+                principal_id=int(sp_id),
+                permissions=[WorkspacePermission.ADMIN],
+            )
+            emit(f"GRANTED workspace {workspace_id}: ADMIN")
         checked = preflight[workspace_id]
         w, host = checked.workspace, checked.host
         target_catalog = checked.target_catalog

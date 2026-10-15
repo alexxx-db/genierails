@@ -271,6 +271,26 @@ def check_layout(env_dir: Path, env_name: str, tag_key: str | None = None) -> No
     old = [(key, column) for name, key, column in _state_tags(env_dir, tag_key) if name == "assignments"]
     if not old:
         return
+    # The staged controller deliberately adopts an untouched legacy deployment
+    # from this old address.  This guard runs before that controller (and before
+    # its read-only description in `make plan`), so exempt only that exact case.
+    from governance_policies import parse_treatment_value
+    from scripts import migration
+
+    record = migration.load_record(env_dir)
+    # Each old-address instance's own value (as migration.deployment reads it),
+    # not a per-column merge that a stable-key instance could overwrite.
+    attrs = dict(migration._instances(migration._read_state(env_dir, "data_access"),
+                                      "databricks_entity_tag_assignment", "assignments"))
+    legacy_values = [str((attrs.get(key) or {}).get("tag_value") or str(key).rsplit("|", 1)[-1])
+                     for key, _column in old]
+    if (migration.pending(env_dir) and not migration.adopted(record)
+            and all(not parse_treatment_value(value) for value in legacy_values)):
+        print(
+            f"NOTE: {len(old)} legacy treatment tag(s) are pending migration; "
+            "the staged controller adopts them under the environment lock."
+        )
+        return
     prefix = shlex.join([
         f"ENVS_DIR={Path(env_dir).resolve().parent}", str(SHARED / "scripts" / "terraform_layer.sh"),
         "data_access", env_name, "state-mv",
@@ -384,6 +404,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ungovern(args.env_dir, args.table, commit=args.commit)
     except GovernedTablesError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # Migration record/journal readers use their own Refused classes. Map
+        # those expected data errors to the command's normal clean error path,
+        # while leaving programming errors visible.
+        from scripts import migration, staged_policy_apply
+        if not isinstance(exc, (migration.Refused, staged_policy_apply.Refused)):
+            raise
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     return 0

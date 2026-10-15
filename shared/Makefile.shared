@@ -1,4 +1,4 @@
-.PHONY: help bootstrap-sp genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
+.PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
@@ -1056,13 +1056,26 @@ _release-plan-roots:
 	echo "=== Saved plans (data_access:$(ENV), staged policy phases) ==="; \
 	layer_dir="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
 	$(_STICKY) check-layout --env-dir "$(ENV_DIR)" --env-name "$(ENV)"; \
-	$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$(ENV)" CLASSIFICATION_ENV_DIR="$(ENV_DIR)" IMPORT_CLASSIFICATION=1; \
-	(cd "$$layer_dir" && LAYER_ENV_DIR="$$layer_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
+	echo "=== Existing resources to import (recorded; release-plan changes nothing live) ==="; \
+	record="$$plan_dir/imports.jsonl"; : > "$$record"; \
+	$(MAKE) --no-print-directory _prepare-classification TARGET_ENV="$(ENV)" CLASSIFICATION_ENV_DIR="$(ENV_DIR)" IMPORT_CLASSIFICATION=record IMPORT_RECORD="$$record"; \
+	(cd "$$layer_dir" && LAYER_ENV_DIR="$$layer_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --record="$$record"); \
+	governance_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null || true)"; \
+	if [ "$$governance_only" != 1 ] && [ -f "$(ENV_DIR)/abac.auto.tfvars" ]; then \
+		(cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --record="$$record"); \
+	fi; \
+	if [ -s "$$record" ]; then \
+		mkdir -p "$$plan_dir/data_access"; \
+		echo '{"steps": [], "final": false, "imports_only": true}' > "$$plan_dir/data_access/phases.json"; \
+		echo '{"skipped": "deferred: existing resources are imported first; the next release-plan plans the rest"}' > "$$plan_dir/workspace.json"; \
+		echo "  $$(wc -l < "$$record" | tr -d ' ') import(s)/cleanup(s) recorded: this manifest only imports them (make release MANIFEST=, under the lock)."; \
+		exit 0; \
+	fi; \
 	$(_COVERAGE_GATE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" $(if $(filter 1,$(VERBOSE)),--verbose,); \
 	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) plan --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --out-dir "$$plan_dir/data_access"; \
 	final="$$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["final"]))' "$$plan_dir/data_access/phases.json")"; \
 	env_dir="$(ENV_DIR)"; \
-	if [ "$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+	if [ "$$governance_only" = 1 ]; then \
 		echo '{"skipped": "governance-only (no agents): GenieRails creates and grants nothing in the workspace layer"}' > "$$plan_dir/workspace.json"; \
 	elif [ "$$final" != 1 ]; then \
 		echo '{"skipped": "deferred: staged policy phases remain; the workspace is planned with the last one"}' > "$$plan_dir/workspace.json"; \
@@ -1075,7 +1088,6 @@ _release-plan-roots:
 		$(_AGENT_COVERAGE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" || true; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
 		python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --arm --quiet; \
-		(cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
 		set +e; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"; status=$$?; set -e; \
 		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: workspace plan failed." >&2; exit 1; fi; \
 		printf '{"file": "workspace.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/workspace.json"; \
@@ -1104,6 +1116,21 @@ _release-manifest: _guard-not-ci-apply
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
+	imports="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field imports.count)" || exit 1; \
+	if [ "$$imports" != 0 ] && [ "$$imports" != null ]; then \
+		echo "=== Import existing resources ($(ENV)): the manifest's recorded imports and stale-tag cleanups ==="; \
+		if ! (cd "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" && LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --apply-recorded="$$plans/imports.jsonl") \
+			|| { grep -q '"layer": "workspace"' "$$plans/imports.jsonl" && ! (cd "$(ENV_DIR)" && LAYER_ENV_DIR="$(ENV_DIR)" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" --skip-treatment-tags --apply-recorded="$$plans/imports.jsonl"); }; then \
+			echo "release: a recorded import or stale-tag cleanup failed (above); the ones before it are done, nothing else was applied. Fix the cause, then make release-plan ENV=$(ENV) again." >&2; \
+			exit 1; \
+		fi; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		echo ""; \
+		echo "=== Release phase applied ($(ENV)) ==="; \
+		echo "  This manifest imported existing resources into Terraform state; nothing else was applied."; \
+		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV) MANIFEST=<it>."; \
+		exit 0; \
+	fi; \
 	$(_AGENT_OWNERSHIP) preflight --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || { echo "release: the Genie agents no longer match the manifest (above); nothing was applied." >&2; exit 1; }; \
 	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only || exit 1; \
 	$(MAKE) --no-print-directory wait-tag-policies REQUIRED_VALUES_TFVARS="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)/abac.auto.tfvars" || exit 1; \
@@ -1360,11 +1387,16 @@ check: ## Read-only PR check: validate, generated files current, validate-genera
 
 _prepare-classification:
 	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)")" || exit 1; \
-	if [ "$(IMPORT_CLASSIFICATION)" = "1" ]; then \
+	if [ "$(IMPORT_CLASSIFICATION)" = "1" ] || [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
 		for catalog in $$existing_catalogs; do \
 			address='module.data_access.databricks_data_classification_catalog_config.classification["'"$$catalog"'"]'; \
 			if ! LAYER_ENV_DIR="$(CLASSIFICATION_ENV_DIR)/$(DATA_ACCESS_SUBDIR)" "$(ROOT_RUNNER)" data_access "$(TARGET_ENV)" state-list 2>/dev/null | grep -qF "$$address"; then \
-				LAYER_ENV_DIR="$(CLASSIFICATION_ENV_DIR)/$(DATA_ACCESS_SUBDIR)" "$(ROOT_RUNNER)" data_access "$(TARGET_ENV)" import "$$address" "catalogs/$$catalog/config"; \
+				if [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
+					python3 -c 'import json, sys; open(sys.argv[1], "a").write(json.dumps({"kind": "import", "layer": "data_access", "address": sys.argv[2], "id": sys.argv[3]}) + "\n")' \
+						"$(IMPORT_RECORD)" "$$address" "catalogs/$$catalog/config" || exit 1; \
+				else \
+					LAYER_ENV_DIR="$(CLASSIFICATION_ENV_DIR)/$(DATA_ACCESS_SUBDIR)" "$(ROOT_RUNNER)" data_access "$(TARGET_ENV)" import "$$address" "catalogs/$$catalog/config"; \
+				fi; \
 			fi; \
 		done; \
 	fi
@@ -1496,7 +1528,8 @@ _apply-layer: _guard-not-ci-apply
 	fi; \
 	if [ "$$layer" = "data_access" ]; then \
 		echo "=== Auto-importing existing data_access resources (idempotent apply) ==="; \
-		(cd "$$env_dir" && LAYER_ENV_DIR="$$env_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" 2>&1) || true; \
+		import_rc=0; (cd "$$env_dir" && LAYER_ENV_DIR="$$env_dir" TERRAFORM_RUNNER="$(ROOT_RUNNER)" "$(IMPORT_EXISTING_SCRIPT)" $$([ "$$staged" = 1 ] && echo --skip-treatment-tags) 2>&1) || import_rc=$$?; \
+		if [ $$import_rc -eq 3 ]; then echo "ERROR: the data_access import refused (above); nothing was applied." >&2; exit 1; fi; \
 	fi; \
 	if [ "$$layer" = "workspace" ]; then \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$$env_dir" --env-name "$$target_env" --runner "$(ROOT_RUNNER)" --apply-flags="$$apply_flags"; \
@@ -1798,6 +1831,26 @@ bootstrap-sp: ## Create/reuse and authorize the GenieRails deployment service pr
 		--profile "$(ACCOUNT_PROFILE)" --account-id "$(ACCOUNT_ID)" \
 		--workspace-id "$(WORKSPACE_ID)" --sp-name "$(SP_NAME)" \
 		--model-endpoint "$(MODEL_ENDPOINT)" $(_BOOTSTRAP_SP_FLAGS)
+
+# Set up the Databricks side of the pipelines for one env (design section 18.2):
+# a read-only SP, OIDC federation for each pipeline identity, the section 17
+# grants; then print the repo settings. Never writes to the repo, never makes a
+# secret. Run it once per env, as an account admin:
+#   make bootstrap-pipelines ENV=dev|prod CI=github|azure-devops ACCOUNT_ID=<id> WORKSPACE_ID=<id> REPO=<owner>/<name>
+# Azure DevOps: ADO_ORG, ADO_ORG_ID and ADO_PROJECT instead of REPO. Optional:
+# ACCOUNT_PROFILE, WORKSPACE_PROFILE, READONLY_SP_NAME, CATALOGS, GENIE_SPACE_IDS,
+# WAREHOUSE_ID, DEPLOYER_CLIENT_ID, GOVERNANCE_OWNERS, AGENT_OWNERS, PLAN=1, YES=1.
+# CI=true (set by CI runners) is refused: pass CI= on the command line.
+_BOOTSTRAP_PIPELINES_FLAGS = $(if $(filter 1,$(PLAN)),--dry-run,) $(if $(filter 1,$(YES)),--yes,) \
+	$(foreach opt,WORKSPACE_PROFILE:workspace-profile READONLY_SP_NAME:sp-name REPO:repo ADO_ORG:ado-org ADO_ORG_ID:ado-org-id ADO_PROJECT:ado-project CATALOGS:catalogs GENIE_SPACE_IDS:genie-space-ids WAREHOUSE_ID:warehouse-id DEPLOYER_CLIENT_ID:deployer-client-id GOVERNANCE_OWNERS:governance-owners AGENT_OWNERS:agent-owners,$(if $($(word 1,$(subst :, ,$(opt)))),--$(word 2,$(subst :, ,$(opt))) "$($(word 1,$(subst :, ,$(opt))))",))
+
+bootstrap-pipelines: ## Create read-only pipeline SPs + OIDC federation for ENV (CI=github|azure-devops); prints repo settings, writes nothing to the repo
+	@test -n "$(ACCOUNT_ID)" || { echo "ERROR: ACCOUNT_ID is required"; exit 2; }
+	@test -n "$(WORKSPACE_ID)" || { echo "ERROR: WORKSPACE_ID is required (the $(ENV) workspace)"; exit 2; }
+	python3 "$(SHARED_ROOT)/scripts/bootstrap_pipelines.py" \
+		--cloud "$(CLOUD)" --env "$(ENV)" --ci "$(CI)" --env-dir "$(ENVS_DIR)/$(ENV)" \
+		--profile "$(ACCOUNT_PROFILE)" --account-id "$(ACCOUNT_ID)" \
+		--workspace-id "$(WORKSPACE_ID)" $(_BOOTSTRAP_PIPELINES_FLAGS)
 
 test-unit: ## Run fast unit tests (no Databricks/LLM/Terraform required) — use before integration tests
 	cd "$(SHARED_ROOT)" && python3 -m pytest tests/ -v --tb=short
