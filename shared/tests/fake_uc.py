@@ -92,7 +92,7 @@ urllib.request.urlopen = _urlopen  # import_existing.sh lists grants and policie
 '''
 
 RUNNER = r'''#!{python}
-"""terraform_layer.sh stand-in: state list / import / plan against the layer's JSON terraform.tfstate."""
+"""terraform_layer.sh stand-in: state-list / import / plan against the layer's JSON terraform.tfstate."""
 import json, os, re, sys
 layer, env_name, command, *args = sys.argv[1:]
 layer_dir = os.environ.get("LAYER_ENV_DIR", "")
@@ -108,7 +108,9 @@ def address(resource, instance):
     return f"{{resource['module'] + '.' if resource.get('module') else ''}}{{resource['type']}}.{{resource['name']}}{{index}}"
 
 
-if (command, args[:1]) == ("state", ["list"]) or command == "state-list":
+if command == "state":  # as the real runner: its alias is state-list
+    sys.exit("Unsupported terraform command alias: state")
+if command == "state-list":
     for resource in state.get("resources", []):
         for instance in resource.get("instances", []):
             print(address(resource, instance))

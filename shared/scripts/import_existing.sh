@@ -137,7 +137,7 @@ run_import() {
   fi
 
   if [ -n "$RECORD_FILE" ]; then
-    if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state list 2>/dev/null | grep -qF "$address"; then
+    if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null | grep -qF "$address"; then
       return 0
     fi
     echo "  Recorded import (release applies it): $address -> $id"
@@ -150,7 +150,7 @@ run_import() {
   # Fast-path: skip if already tracked in state. We list all resources and
   # grep for an exact match (not the address directly, because brackets are
   # treated as glob patterns by `terraform state list <address>`).
-  if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state list 2>/dev/null | grep -qF "$address"; then
+  if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null | grep -qF "$address"; then
     echo "  ↩ Already in state: $address (skipping)"
     return 0
   fi
