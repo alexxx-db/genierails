@@ -50,6 +50,61 @@ envs/
 | `envs/<env>/generated/` | Reviewed rules; `make check` re-derives and verifies the layer files from it |
 | `envs/dev/remote_state.hcl`, `envs/account/remote_state.hcl` | Remote state backend (non-secret settings only), when the dev pipeline runs in CI ([CI/CD](cicd.md#state-location-and-dev-remote-state)) |
 
+### Who owns which file
+
+Each persona changes its own files (design section 18.1), so CODEOWNERS can
+require only the owners of what changed:
+
+| Persona | Files |
+|---|---|
+| Governance engineer (treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, top-level `uc_tables`, `ungovern`; approves the governed-table set) | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/` (including `governed_tables.json`), `envs/<env>/ack.txt` |
+| Data citizen (curates an agent in the dev UI, including its tables, captures it, promotes it) | `envs/<env>/agents/<agent>.auto.tfvars` (`genie_space_id`, `acl_groups`, `uc_tables`, `detached`, `delete`) and `envs/<env>/agents/<agent>.space.json` |
+
+- `env.auto.tfvars` holds only governance and env-owned settings; agent
+  settings live only in `agents/` files, so an agent-only PR never touches a
+  governance file. Customer class mappings are the env's `tag_treatments`
+  (`make scaffold-treatments ENV=<env> TREATMENT=<name>` writes them), never
+  `shared/`, which is GenieRails product code.
+- An agent's table list is agent-owned, and governance approves the result:
+  `make generate`, `make capture` and `make promote-to` record every
+  file-defined agent's tables under `agent_tables` in
+  `generated/governed_tables.json` (commit it). So an agent change that adds
+  or removes a table, even one with no classified column, always changes that
+  governance-owned file, and `make check` fails while it is stale. It grants
+  nothing: `SELECT` comes only from `table_readers`, and `CAN_RUN` is refused
+  while an `acl_groups` group can't read one of the agent's tables
+  ([access.md](access.md)).
+- `make promote-to` writes agent output under `envs/<target>/agents/` and
+  governance output under `envs/<target>/generated/` and
+  `envs/<target>/env.auto.tfvars`, and prints which kind it changed. An
+  agent-only promotion (capture, then promote) changes only `agents/` files;
+  one that changes an agent's tables also changes
+  `envs/<target>/generated/governed_tables.json`, never `env.auto.tfvars`.
+- [`shared/examples/CODEOWNERS.example`](../examples/CODEOWNERS.example) is a
+  sample with both rules; copy it to `.github/CODEOWNERS` and use your teams.
+
+**Moving an existing env's agents out of `env.auto.tfvars`.** An env that
+keeps its agents inline in `genie_spaces` (the legacy layout) keeps working
+as it is; nothing moves them implicitly. To split them, run the explicit
+migration and review its diff in a PR:
+
+```bash
+make split-agent-files ENV=dev   # then each promote-to target, e.g. ENV=prod
+make plan ENV=dev                # no change: Terraform gets the same agents
+```
+
+It moves each entry's `genie_space_id`, `acl_groups`, `uc_tables` and
+`sql_warehouse_id` into `agents/<name>.auto.tfvars`, sets `genie_spaces = []`
+and leaves every other setting as it was. It refuses, writing nothing, when
+moving an entry would change what Terraform plans: an entry with no `name`
+(its key is its ID), a setting agent files don't hold (such as
+`declared_footprint`), a pending `delete = true`, two names with the same
+Terraform key, or an agent ID in a promoted env (move it to
+`.genie_space_id_<key>` first). Migrate an env and its promote-to targets
+together: while prod still has an agent inline that dev keeps in a file,
+`make promote-to ENV=prod` refuses and points here, so prod's own
+`acl_groups` are never replaced.
+
 ### Never commit
 
 | File | Why |

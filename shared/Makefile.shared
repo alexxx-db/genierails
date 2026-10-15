@@ -3,7 +3,7 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
-.PHONY: capture detach-agent
+.PHONY: capture detach-agent split-agent-files
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -446,14 +446,19 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	fi
 
 # Agents (scripts/agent_ownership.py, design section 5). capture is authoring:
-# one read-only GET, writes only envs/dev/agents/<agent>.space.json; no
-# governance drafting, no model call, no Terraform state. A plain generate
+# one read-only GET, writes only envs/dev/agents/<agent>.space.json and, in a
+# deterministic env, the agent tables in generated/governed_tables.json (so a
+# table change is a governance-owned diff, design 18.1); no governance
+# drafting, no model call, no Terraform state written. A plain generate
 # captures only agents with no capture yet (import-new) and never re-captures.
 override _AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
 capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/dev/agents/<agent>.space.json: SPACE="<agent>" (read-only)
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
 	@if [ "$(ENV)" != "$(DEFAULT_ENV)" ]; then echo "ERROR: capture runs only with ENV=$(DEFAULT_ENV); promote-to carries agents to $(ENV)." >&2; exit 1; fi
 	@$(_DRY_RUN_GUARD); $(_AGENT_OWNERSHIP) capture --env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)"
+	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars")" = 1 ]; then \
+		$(_STICKY) record --env-dir "$(ENV_DIR)" --config "$(ENV_DIR)/generated/abac.auto.tfvars"; \
+	fi
 
 # Step 2 of removing an agent (operations stage). Step 1, a released PR with
 # acl_groups = [] and detached = true, revoked CAN_RUN; this only forgets the
@@ -500,7 +505,17 @@ rebuild-governed-tables: ## Rebuild envs/<env>/generated/governed_tables.json af
 	$(_DRY_RUN_GUARD); \
 	$(_STICKY) rebuild --env-dir "$(ENV_DIR)"
 
-scaffold-treatments: _guarded-bootstrap _guard-workspace-target ## Map unmapped native class.* tags: TREATMENT=<existing> reuses that mask; without it, adds fail-safe REVIEW stubs
+# The explicit migration to per-agent files (design 18.1): moves ENV's inline
+# genie_spaces into agents/<agent>.auto.tfvars so agent changes stop touching
+# the governance-owned env.auto.tfvars. Authoring: writes only those committed
+# files, refuses (writing nothing) unless Terraform gets exactly the same agents,
+# and is never run implicitly; an env that never runs it keeps working as is.
+split-agent-files: _guard-workspace-target ## Move ENV's inline genie_spaces into agents/<agent>.auto.tfvars (explicit migration; the plan is unchanged)
+	@$(_GUARD_WORKSPACE_ENV); \
+	$(_DRY_RUN_GUARD); \
+	python3 "$(SHARED_ROOT)/agent_files.py" split --env-dir "$(ENV_DIR)"
+
+scaffold-treatments: _guarded-bootstrap _guard-workspace-target ## Map unmapped native class.* tags: TREATMENT=<existing> reuses that mask (deterministic envs: a mask-library treatment, written to the env's tag_treatments); without it, adds fail-safe REVIEW stubs (legacy only)
 	@python3 "$(SHARED_ROOT)/scripts/scaffold_treatments.py" \
 		--tfvars "$(ENV_DIR)/generated/abac.auto.tfvars" \
 		--sql "$(ENV_DIR)/generated/masking_functions.sql" \
@@ -1296,6 +1311,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 		--from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)")" || exit 1; \
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
 	$(call _PROMOTION_TXN_BEGIN,"$$dest_dir" "$(ACCOUNT_ENV_DIR)"); \
+	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
 	$(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
 		DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" write --source "$$src_dir/generated/abac.auto.tfvars" \
@@ -1303,7 +1319,10 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	if [ -f "$$src_dir/generated/abac.auto.tfvars" ]; then \
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
 	fi; \
-	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
+	if [ "$$($(_IS_DETERMINISTIC) "$$dest_dir/env.auto.tfvars")" = 1 ]; then \
+		$(_STICKY) record --if-agent-files --env-dir "$$dest_dir" --config "$$dest_dir/generated/abac.auto.tfvars" || exit 1; \
+	fi; \
+	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" changes --from "$$txn_dir/snapshot" || exit 1; \
 	$(_PROMOTION_TXN_COMMIT); \
 	$(_TABLE_READERS) show --env-dir "$$dest_dir"
 

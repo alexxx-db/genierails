@@ -45,3 +45,26 @@ the Python reference against the same values. Results are rendered in
 `America/Los_Angeles` per statement, because the Statement Execution API does
 not keep session settings between calls. The run is read-only: it creates no
 schema, function or secret.
+
+## Customer classes: `tag_treatments`
+
+A class the library doesn't ship (for example a custom class from Data
+Classification) is unmapped: its columns get the fail-safe never-raw
+redaction and new access is blocked until it is mapped. Map it in the env's
+own `env.auto.tfvars`, never in `shared/` (GenieRails product code, replaced
+on upgrade):
+
+```hcl
+tag_treatments = {
+  "class.loyalty_id" = "identifier"   # any mask-library treatment, e.g. redact
+}
+```
+
+`make scaffold-treatments ENV=<env> TREATMENT=<treatment>` writes the entry
+for every unmapped class it finds (in the env's generated rules, a stopped
+release's runtime overlay, or live). For a promote-to target it writes the
+env it is promoted from, and `make promote-to` carries the setting. Keys are
+`class.<name>`, lowercase as the `class.*` tag names it. Refused: a class the
+library already maps (change one column with `column_overrides`), a value
+that is not a library treatment, and keys for tags other than `class.*`,
+which this version does not read (the mapping would mask nothing).
