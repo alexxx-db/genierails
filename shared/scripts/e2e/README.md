@@ -3,7 +3,18 @@
 The driver encodes the champion flow from
 `shared/docs/design/deterministic-governance.md` sections 9, 12, 13 and 17,
 plan scenarios S1–S16, cross-cutting
-manifest/concurrency checks, and the migration operation. Lifecycle mutations
+manifest/concurrency checks, the report-only migration operation, and the
+migration cutover. The cutover is intentionally expected to fail on main until
+`fix/migration-adopt-order` lands; if it passes, its status is
+`UNEXPECTED PASS — remove known_failure ...` and the run fails, so the marker
+gets removed. The cutover's protection check accepts only the column retags
+migrate-plan printed, and only once the replacement is live: for each adopted
+column, the `gr_mask_<value>_full` (and `_partial`, unless never-raw) policy and
+function exist on that table, and every principal the legacy policy masked is
+still masked by one of them. Only then may the legacy policy that used that
+column's "mask today" function on that table, and that function, disappear. A
+legacy `redact`/`compensation_redacted` column may only become a never-raw
+treatment. Lifecycle mutations
 are issued only as public `make` targets. Read-only snapshots cover UC grants,
 column tags, effective ABAC policies, mask functions, Genie exports and ACLs,
 Terraform serials, receipts, and manifests.
@@ -44,7 +55,9 @@ If any check fails it exits non-zero with what is missing and the fix, and
 runs nothing. Prepare the checkout once:
 
 ```bash
-cd aws && make setup ENV=dev GITIGNORE=customer
+cd aws
+make setup ENV=dev GITIGNORE=customer
+make setup ENV=prod GITIGNORE=customer
 git add .gitignore envs && git commit -m "Commit envs/ (customer repo)"
 ```
 
@@ -64,13 +77,12 @@ driver's own main. That main lives in a bare repo under `<reports>/e2e-remote.gi
 without pushing to `origin`.
 
 Everything a scenario needs is checked before it touches anything. A missing
-target (for example `capture`, `detach-agent` or the step-10 migration targets)
-or a human gate without a TTY makes the whole scenario `NOT RUN`. An
+public target or a human gate without a TTY makes the whole scenario `NOT RUN`. An
 unsupplied `--value` makes it `ERROR`. Either way no snapshot, git switch or
 `make` runs. Placeholder text (`<...>`, `{...}`) and empty `KEY=` arguments
 never reach `make`. A refusal step passes only with a non-zero exit, the exact
 diagnostic the target prints, and identical before/after snapshots. Any other
-failure is `ERROR`. S13 runs every command with `CI=true` and without
+failure is `ERROR`. S13 runs every refusal command with `CI=true` and without
 `GENIERAILS_ALLOW_CI_APPLY`.
 
 Scenario values: `agent_a`, `wrong_agent`, `table` (covered), `uncovered_table`,
@@ -82,7 +94,10 @@ Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
 `databricks_client_secret`) and connect with OAuth M2M while `DATABRICKS_*`,
 `ARM_*` and `AZURE_*` are hidden from the SDK. A client that resolves any other
 host is refused. A failed query, an unreadable catalog, or an unreadable state
-file is an error, never empty evidence.
+file is an error, never empty evidence. Prod agent IDs are also read from
+`.genie_space_id_<key>`. Local Terraform serials are recorded; an environment
+configured only with remote state is recorded explicitly as
+`remote, not snapshotted`, never as an empty inventory.
 
 Human gates need an interactive TTY and the typed scenario ID. A closed or
 piped stdin aborts the run, and the scenario is `NOT RUN`. A wrong token is
@@ -90,7 +105,19 @@ piped stdin aborts the run, and the scenario is `NOT RUN`. A wrong token is
 case the scenario's `finally` restores and writes a partial report. The restore
 first resets the checkout to the commit. After any applying step it then
 releases the commit's tree again as a forward fix on the driver's main
-(`rehearse`, `release-plan`, `release MANIFEST=`, `maintain`). The driver then
+(`rehearse`, bounded `release-plan`/`release MANIFEST=` cycles, `maintain`). A
+fresh immutable manifest is used for every staged release phase. Successful
+release plans must leave the snapshot unchanged, and successful applying steps
+are checked immediately for weaker protection. This catches protection loss at
+command boundaries; no snapshot driver can observe a transient exposure made
+and repaired entirely within one command. As an additional guard, deterministic
+applying steps fail if `import_existing.sh` logs either its literal
+`Cleared tag gr_treatment on ...` cleanup or `; clearing tag` warning. A test
+(and `--dry-run`, under "would not run") checks that `import_existing.sh` still
+prints those lines, so a rewording fails CI instead of silently passing. The
+guard only sees what the log says: a wholly quiet internal exposure still cannot
+be observed, so the engine must preserve its internal masks-before-access
+ordering. The driver then
 re-snapshots dev and prod. A column that lost a tag, a removed mask or policy, a
 newly exempted or uncovered principal, or a new grant compared with the
 scenario's baseline is `RESTORE FAILED`. `<reports>/final-protection.json`

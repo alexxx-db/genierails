@@ -24,6 +24,7 @@ principals in place and never needs a new function.
 
 from __future__ import annotations
 
+import copy
 import functools
 import hashlib
 import json
@@ -58,6 +59,61 @@ _SCALAR_TYPES = {
 
 class DeterministicGovernanceError(ValueError):
     """Config or input that deterministic governance refuses to guess about."""
+
+
+# A customer class (Data Classification's custom classes) as class.* tags carry
+# it: lowercase, words joined by "_" (sensitivity_source._normalize_semantic).
+_CLASS_KEY = re.compile(r"class\.([a-z0-9][a-z0-9_]*)")
+
+
+def tag_treatment_errors(tag_treatments, library: dict | None = None) -> list[str]:
+    """Schema errors for ``tag_treatments``: the env's own class mappings.
+
+    Customer class mappings are governance config in the env's
+    env.auto.tfvars, never in shared/ (product code, replaced on upgrade). A
+    key is ``class.<name>``; its value is a mask-library treatment. A class the
+    library already maps can't be remapped here (one column changes through
+    column_overrides). Tags other than class.* are not read in this version,
+    so a mapping for one would mask nothing; it is refused rather than ignored.
+    """
+    if tag_treatments is None:
+        return []
+    if not isinstance(tag_treatments, Mapping):
+        return ['tag_treatments must be a map of "class.<name>" to a mask-library treatment']
+    data = library or load_library()
+    mapped = {name: treatment for treatment, item in data["treatments"].items() for name in item["classes"]}
+    errors = []
+    for key, treatment in sorted(tag_treatments.items(), key=lambda item: str(item[0])):
+        label = f'tag_treatments["{key}"]'
+        match = _CLASS_KEY.fullmatch(str(key))
+        if not match:
+            errors.append(
+                f"{label}: keys must be class.<name> (lowercase, as the class.* tag names it); "
+                "tags other than class.* are not read in this version, so this mapping would mask nothing")
+            continue
+        if match.group(1) in mapped:
+            errors.append(
+                f"{label}: the mask library already maps {key} (to {mapped[match.group(1)]}); "
+                "change one column with column_overrides instead")
+        if not isinstance(treatment, str) or treatment not in data["treatments"]:
+            errors.append(
+                f"{label} names {treatment!r}, which is not a mask-library treatment "
+                f"(one of: {', '.join(sorted(data['treatments']))})")
+    return errors
+
+
+def with_tag_treatments(library: dict, tag_treatments) -> dict:
+    """The mask library with the env's ``tag_treatments`` classes added to their treatments."""
+    errors = tag_treatment_errors(tag_treatments, library)
+    if errors:
+        raise DeterministicGovernanceError("; ".join(errors))
+    if not tag_treatments:
+        return library
+    data = copy.deepcopy(library)
+    for key, treatment in sorted(tag_treatments.items()):
+        item = data["treatments"][treatment]
+        item["classes"] = list(item["classes"]) + [_CLASS_KEY.fullmatch(key).group(1)]
+    return data
 
 
 @dataclass(frozen=True)
@@ -355,14 +411,15 @@ def build_model(
     """The whole governance model for the classified columns of the governed set.
 
     ``settings`` is the env config (``access_tier_groups``,
-    ``raw_exempt_principals``, ``treatment_versions``, ``column_overrides``).
+    ``raw_exempt_principals``, ``treatment_versions``, ``column_overrides``,
+    ``tag_treatments``).
     """
     if settings.get("tier_access_overrides"):
         raise DeterministicGovernanceError(
             "tier_access_overrides are deferred (group-level overrides of the tier rule); "
             "remove them for deterministic governance"
         )
-    library = load_library()
+    library = with_tag_treatments(load_library(), settings.get("tag_treatments"))
     configured_overrides = settings.get("column_overrides") or {}
     overrides = {}
     duplicate_overrides = []
