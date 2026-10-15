@@ -304,6 +304,11 @@ CLEANUP = {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "
 FORGED = {
     "treatment-cleanup": CLEANUP | {"entity_type": "columns", "entity_name": "cat.sch.t.ssn", "tag_key": "gr_treatment",
                                     "statement": "ALTER TABLE `cat`.`sch`.`t` ALTER COLUMN `ssn` UNSET TAGS ('gr_treatment')"},
+    "treatment-cleanup-upper": CLEANUP | {"entity_type": "columns", "entity_name": "cat.sch.t.ssn", "tag_key": "GR_TREATMENT",
+                                          "statement": "ALTER TABLE `cat`.`sch`.`t` ALTER COLUMN `ssn` UNSET TAGS ('GR_TREATMENT')"},
+    "treatment-tag-import-mixed-case": CLASSIFICATION_IMPORT | {
+        "address": 'module.data_access.databricks_entity_tag_assignment.assignments["columns|cat.sch.t.ssn|Gr_Treatment|redact"]',
+        "id": "columns,cat.sch.t.ssn,Gr_Treatment"},
     "arbitrary-sql": CLEANUP | {"statement": "GRANT SELECT ON CATALOG cat TO `account users`"},
     "unsupported-address": CLASSIFICATION_IMPORT | {"address": 'module.data_access.databricks_grant.anything["cat"]'},
     "foreign-warehouse": CLEANUP | {"warehouse_id": "someone-elses"},

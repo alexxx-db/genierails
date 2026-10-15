@@ -327,6 +327,12 @@ FORGED = {
     "treatment-import": {"kind": "import", "layer": "data_access",
                          "address": 'module.data_access.databricks_entity_tag_assignment.treatment["columns|cat.sch.tbl.ssn|gr_treatment"]',
                          "id": "columns,cat.sch.tbl.ssn,gr_treatment"},
+    "treatment-cleanup-upper": CLEANUP | {"entity_type": "columns", "entity_name": "cat.sch.tbl.ssn", "tag_key": "GR_TREATMENT",
+                                          "statement": "ALTER TABLE `cat`.`sch`.`tbl` ALTER COLUMN `ssn` UNSET TAGS ('GR_TREATMENT')"},
+    "treatment-tag-import-mixed-case": {
+        "kind": "import", "layer": "data_access",
+        "address": 'module.data_access.databricks_entity_tag_assignment.assignments["columns|cat.sch.tbl.ssn|Gr_Treatment|redact"]',
+        "id": "columns,cat.sch.tbl.ssn,Gr_Treatment"},
     "mismatched-id": {"kind": "import", "layer": "data_access", "address": TAG_IMPORT, "id": "tables,cat.sch.other,owner"},
     "missing-field": {"kind": "import", "layer": "data_access", "address": TAG_IMPORT},
 }
