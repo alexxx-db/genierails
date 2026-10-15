@@ -54,6 +54,57 @@ def _promotion_setting(value) -> str:
     return json.dumps(_str(value))
 
 
+def _hcl_value(value, indent: int = 0) -> str:
+    """Render the small JSON-shaped governance settings as stable HCL."""
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        pad, child = " " * indent, " " * (indent + 2)
+        body = [f"{child}{json.dumps(str(key))} = {_hcl_value(item, indent + 2)}"
+                for key, item in sorted(value.items())]
+        return "{\n" + "\n".join(body) + f"\n{pad}}}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_hcl_value(item, indent) for item in value) + "]"
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "null"
+    return json.dumps(value)
+
+
+def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_columns: set[str]) -> dict:
+    """Return source-owned governance inputs, remapping column identifiers.
+
+    Overrides are exact column contracts.  Refuse malformed, unmappable, or
+    stale ones here rather than silently omitting them from destination rules.
+    The live destination derivation repeats the existence check against its DDL.
+    """
+    result = {}
+    for key in ("treatment_versions", "tag_treatments"):
+        if key in cfg:
+            result[key] = cfg[key]
+    overrides = cfg.get("column_overrides")
+    if overrides is None:
+        return result
+    remapped = {}
+    for column, rule in overrides.items():
+        parts = str(column).split(".")
+        if len(parts) != 4:
+            raise ValueError(f'column_overrides[{column!r}] must name catalog.schema.table.column')
+        if parts[0] not in pairs:
+            raise ValueError(
+                f'column_overrides[{column!r}] catalog {parts[0]!r} has no DEST_CATALOG_MAP mapping'
+            )
+        if str(column).lower() not in known_columns:
+            raise ValueError(
+                f'column_overrides[{column!r}] does not name a classified column in generated governance'
+            )
+        parts[0] = pairs[parts[0]]
+        remapped[".".join(parts)] = rule
+    result["column_overrides"] = remapped
+    return result
+
+
 def _discover_from_genie_api(space_id: str, auth_cfg: dict) -> tuple[str, list[str]]:
     """Query Genie agent API to get name and tables.
 
@@ -213,6 +264,16 @@ def main():
         generated_cfg = hcl2.load(open(generated_path))
         id_to_name = generated_cfg.get("genie_space_id_to_name") or {}
         source_space_configs = generated_cfg.get("genie_space_configs") or {}
+    generated_columns = {
+        str(item.get("entity_name") or "").lower()
+        for item in generated_cfg.get("tag_assignments") or []
+        if item.get("entity_type") == "columns"
+    } if os.path.exists(generated_path) else set()
+    try:
+        promoted_governance = _promoted_governance_settings(cfg, pairs, generated_columns)
+    except ValueError as exc:
+        print(f"ERROR: {exc}; nothing was written.")
+        sys.exit(1)
 
     # Load source auth for API queries
     auth_cfg = {}
@@ -732,6 +793,11 @@ def main():
         lines.append("group_map = {")
         lines.extend(f"  {json.dumps(dev)} = {json.dumps(target)}" for dev, target in sorted(_group_mapping(dest_cfg).items()))
         lines.append("}")
+    for setting in ("treatment_versions", "column_overrides", "tag_treatments"):
+        if setting in promoted_governance:
+            lines.append("")
+            lines.append(f"# Promoted governance input from {source_env}; do not edit in the destination.")
+            lines.append(f"{setting} = {_hcl_value(promoted_governance[setting])}")
     source_filters = cfg.get("row_filters") or []
     if dest_deterministic and source_filters:
         lines.append("")

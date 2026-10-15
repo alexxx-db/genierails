@@ -26,7 +26,7 @@ import hcl2
 import pytest
 
 import generate_abac
-from governance_policies import build_model, column_types_from_ddl
+from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
 from tests.test_check_target import FAKE_TERRAFORM, GITIGNORE, _env, _git, _snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -170,6 +170,74 @@ def promoted(repo, tmp_path):
 
 def _state(repo):
     return _snapshot(_envs(repo)), _git(repo, "status", "--porcelain", "--ignored", "--untracked-files=all")
+
+
+def _set_dev_override(repo, tmp_path, column="paycat.s.notes.free_text", treatment="redact"):
+    dev = _envs(repo) / "dev"
+    env_file = dev / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() +
+                        f'column_overrides = {{ {json.dumps(column)} = {{ treatment = {json.dumps(treatment)} }} }}\n'
+                        'treatment_versions = { phone = { partial = "redacted" } }\n'
+                        'tag_treatments = { "sensitivity=confidential" = "redact" }\n')
+    settings = hcl2.loads(env_file.read_text())
+    classes = CLASSES | {"paycat.s.notes.free_text": ["class.phone_number"]}
+    ddl = DDL + "\nCREATE TABLE paycat.s.notes (free_text STRING);\n"
+    model = build_model(classes, column_types_from_ddl(ddl), settings,
+                        deployer_principal=DEPLOYER)
+    generate_abac.write_deterministic_model(
+        dev / "generated" / "abac.auto.tfvars",
+        dev / "generated" / "masking_functions.sql", model,
+    )
+    result = _make(repo, tmp_path, "promote", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    _commit(repo, "dev governance override")
+
+
+def test_promote_and_prod_live_derivation_honor_remapped_column_override(repo, tmp_path):
+    """Regression: migrate/release/maintain all use this live derivation path."""
+    _set_dev_override(repo, tmp_path)
+    _promote_to_prod(repo, tmp_path)
+
+    prod = hcl2.loads((_envs(repo) / "prod" / "env.auto.tfvars").read_text())
+    assert prod["column_overrides"] == {"ppay.s.notes.free_text": {"treatment": "redact"}}
+    assert prod["treatment_versions"] == {"phone": {"partial": "redacted"}}
+    assert prod["tag_treatments"] == {"sensitivity=confidential": "redact"}
+
+    native_prod = {"ppay.s.notes.free_text": ["class.phone_number"]}
+    model = build_model(native_prod, {"ppay.s.notes.free_text": "STRING"}, prod,
+                        deployer_principal=DEPLOYER)
+    resolved = model.columns["ppay.s.notes.free_text"]
+    assert resolved.treatment == "redact"
+    assert resolved.partial == "redacted"
+    assert resolved.full == "redacted"
+
+
+def test_promote_refuses_column_override_with_unmappable_catalog(repo, tmp_path):
+    dev_env = _envs(repo) / "dev" / "env.auto.tfvars"
+    dev_env.write_text(dev_env.read_text() +
+        'column_overrides = { "other.s.t.card" = { treatment = "redact" } }\n')
+    _commit(repo, "unmappable override")
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    before = (prod / "env.auto.tfvars").read_bytes()
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    assert result.returncode != 0
+    assert "column_overrides" in result.stdout + result.stderr
+    assert "has no DEST_CATALOG_MAP mapping" in result.stdout + result.stderr
+    assert (prod / "env.auto.tfvars").read_bytes() == before
+
+
+def test_live_derivation_refuses_override_for_column_absent_from_prod():
+    settings = hcl2.loads(DEV_ENV +
+        'column_overrides = { "paycat.s.t.missing" = { treatment = "redact" } }\n')
+
+    with pytest.raises(DeterministicGovernanceError,
+                       match="absent from the governed DDL.*missing"):
+        build_model(CLASSES, column_types_from_ddl(DDL), settings,
+                    deployer_principal=DEPLOYER)
 
 
 # ── N3: the split takes deterministic tag values next to legacy ones ────────
