@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from scripts import environment_lock
+from scripts import import_record
 from scripts import migration
 from scripts import staged_policy_apply as spa
 from tests import fake_uc, script_stubs
@@ -222,6 +223,8 @@ def test_release_plan_records_imports_and_stale_tags_instead_of_changing_them(tm
     """release-plan changes nothing live: a stale non-treatment tag and importable resources are recorded."""
     live = LIVE | {"table_tags": [["cat.sch.t", "sensitivity", "public"], ["cat.sch.t", "owner", "fin"]]}
     recipes = Recipes(tmp_path, live, catalogs="cat")
+    env_file = recipes.env_dir / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + 'sql_warehouse_id = "wh"\n')  # where release clears the stale tag
     layer_abac = recipes.env_dir / "data_access" / "abac.auto.tfvars"
     layer_abac.write_text(layer_abac.read_text().replace("tag_assignments = [", (
         'tag_assignments = [\n'
@@ -232,10 +235,10 @@ def test_release_plan_records_imports_and_stale_tags_instead_of_changing_them(tm
     assert result.returncode == 0, result.stdout + result.stderr
     assert fake_uc.sql_writes(recipes.fake) == [] and fake_uc.runner_imports(recipes.fake) == []
     assert _runtime_bytes(recipes.env_dir) == before and recipes.files() == files
-    entries = [json.loads(line) for line in (tmp_path / "plan" / "imports.jsonl").read_text().splitlines()]
+    entries = import_record.load(tmp_path / "plan" / "imports.jsonl", recipes.env_dir)  # what release accepts
     assert [(e["kind"], e.get("address") or e["statement"]) for e in entries] == [
         ("import", 'module.data_access.databricks_data_classification_catalog_config.classification["cat"]'),
-        ("cleanup", "ALTER TABLE cat.sch.t UNSET TAGS ('sensitivity')"),
+        ("cleanup", "ALTER TABLE `cat`.`sch`.`t` UNSET TAGS ('sensitivity')"),
         ("import", 'module.data_access.databricks_entity_tag_assignment.assignments["tables|cat.sch.t|owner|fin"]'),
     ]
     # This manifest only imports; the controller plans nothing until the next release-plan.

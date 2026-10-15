@@ -236,7 +236,7 @@ def test_record_mode_changes_nothing_live_or_in_state(tmp_path):
     entries = [json.loads(line) for line in record.read_text().splitlines()]
     assert entries == [
         {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "entity_name": "cat.sch.tbl",
-         "tag_key": "sensitivity", "statement": "ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')",
+         "tag_key": "sensitivity", "statement": "ALTER TABLE `cat`.`sch`.`tbl` UNSET TAGS ('sensitivity')",
          "warehouse_id": "wh"},
         {"kind": "import", "layer": "data_access",
          "address": 'module.data_access.databricks_entity_tag_assignment.assignments["tables|cat.sch.tbl|owner|fin"]',
@@ -256,26 +256,113 @@ def test_record_mode_refuses_what_it_cannot_verify(tmp_path):
     assert (tmp_path / "imports.jsonl").read_text() == ""
 
 
+TAG_IMPORT = 'module.data_access.databricks_entity_tag_assignment.assignments["tables|cat.sch.tbl|owner|fin"]'
+CLEANUP = {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "entity_name": "cat.sch.tbl",
+           "tag_key": "sensitivity", "statement": "ALTER TABLE `cat`.`sch`.`tbl` UNSET TAGS ('sensitivity')",
+           "warehouse_id": "wh"}
+DETERMINISTIC = 'governance_mode = "deterministic"\nsql_warehouse_id = "wh"\n'
+
+
+def _write_record(path, entries):
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    return path
+
+
 def test_apply_recorded_runs_exactly_the_layers_recorded_entries(tmp_path):
-    data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n')
+    data_access = _layer(tmp_path, DETERMINISTIC)
     fake = fake_uc.install(tmp_path, LIVE)
-    record = tmp_path / "imports.jsonl"
-    entries = [
-        {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "entity_name": "cat.sch.tbl",
-         "tag_key": "sensitivity", "statement": "ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')",
-         "warehouse_id": "wh"},
-        {"kind": "import", "layer": "data_access", "address": 'module.data_access.x.y["k"]', "id": "k-id"},
-        {"kind": "import", "layer": "workspace", "address": 'module.workspace.x.y["w"]', "id": "w-id"},
-    ]
-    record.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    record = _write_record(tmp_path / "imports.jsonl", [
+        CLEANUP,
+        {"kind": "import", "layer": "data_access", "address": TAG_IMPORT, "id": "tables,cat.sch.tbl,owner"},
+        {"kind": "import", "layer": "workspace", "address": "module.workspace.databricks_sql_endpoint.warehouse[0]",
+         "id": "w-id"},
+    ])
     result = _run(data_access, fake, "--skip-treatment-tags", f"--apply-recorded={record}")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert fake_uc.sql_writes(fake) == ["ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')"]
-    assert [argv[3:] for argv in fake_uc.runner_imports(fake)] == [['module.data_access.x.y["k"]', "k-id"]]
+    assert fake_uc.sql_writes(fake) == ["ALTER TABLE `cat`.`sch`.`tbl` UNSET TAGS ('sensitivity')"]
+    assert [e["warehouse_id"] for e in fake_uc.events(fake) if e["src"] == "sql"] == ["wh"]
+    assert [argv[3:] for argv in fake_uc.runner_imports(fake)] == [[TAG_IMPORT, "tables,cat.sch.tbl,owner"]]
     # A recorded import that fails fails the release (it was verified to exist).
     failing = _run(data_access, fake | {"FAKE_UC_FAIL_IMPORT": "1"}, "--skip-treatment-tags",
                    f"--apply-recorded={record}")
     assert failing.returncode == 1 and "recorded import(s) failed" in failing.stderr
+
+
+def test_what_release_plan_records_release_runs(tmp_path):
+    """The recorder's own output passes the check, and release runs the rebuilt UNSET and the import."""
+    data_access = _layer(tmp_path, DETERMINISTIC)
+    record = tmp_path / "imports.jsonl"
+    recorded = _run(data_access, fake_uc.install(tmp_path / "plan", LIVE), "--skip-treatment-tags",
+                    f"--record={record}")
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    assert [json.loads(line) for line in record.read_text().splitlines()][0] == CLEANUP
+    fake = fake_uc.install(tmp_path / "release", LIVE)
+    result = _run(data_access, fake, "--skip-treatment-tags", f"--apply-recorded={record}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fake_uc.sql_writes(fake) == [CLEANUP["statement"]]
+    assert [argv[3] for argv in fake_uc.runner_imports(fake)] == [TAG_IMPORT]
+
+
+def test_record_mode_needs_the_envs_own_warehouse_for_a_cleanup(tmp_path):
+    """No sql_warehouse_id: the recorder doesn't pick some running warehouse release would then refuse."""
+    data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n')
+    fake = fake_uc.install(tmp_path, LIVE)
+    result = _run(data_access, fake, "--skip-treatment-tags", f"--record={tmp_path / 'imports.jsonl'}")
+    assert result.returncode != 0 and "configures no SQL warehouse" in result.stderr
+    assert fake_uc.sql_writes(fake) == [] and fake_uc.runner_imports(fake) == []
+
+
+FORGED = {
+    "treatment-cleanup": CLEANUP | {"entity_type": "columns", "entity_name": "cat.sch.tbl.ssn", "tag_key": "gr_treatment",
+                                    "statement": "ALTER TABLE `cat`.`sch`.`tbl` ALTER COLUMN `ssn` UNSET TAGS ('gr_treatment')"},
+    "arbitrary-sql": CLEANUP | {"statement": "GRANT SELECT ON CATALOG cat TO `account users`"},
+    "sql-in-identifier": CLEANUP | {"entity_name": "cat.sch.tbl` SET OWNER TO `x",
+                                    "statement": "ALTER TABLE cat.sch.tbl` SET OWNER TO `x UNSET TAGS ('sensitivity')"},
+    "foreign-warehouse": CLEANUP | {"warehouse_id": "someone-elses"},
+    "extra-field": CLEANUP | {"note": "x"},
+    "unknown-layer": {"kind": "import", "layer": "account", "address": "module.account.databricks_group.groups[\"g\"]",
+                      "id": "1"},
+    "unsupported-address": {"kind": "import", "layer": "data_access",
+                            "address": 'module.data_access.databricks_grant.anything["cat|g"]', "id": "catalog/cat/g"},
+    "treatment-import": {"kind": "import", "layer": "data_access",
+                         "address": 'module.data_access.databricks_entity_tag_assignment.treatment["columns|cat.sch.tbl.ssn|gr_treatment"]',
+                         "id": "columns,cat.sch.tbl.ssn,gr_treatment"},
+    "mismatched-id": {"kind": "import", "layer": "data_access", "address": TAG_IMPORT, "id": "tables,cat.sch.other,owner"},
+    "missing-field": {"kind": "import", "layer": "data_access", "address": TAG_IMPORT},
+}
+
+
+@pytest.mark.parametrize("forged", FORGED, ids=list(FORGED))
+def test_apply_recorded_refuses_an_entry_the_recorder_never_writes_before_any_call(tmp_path, forged):
+    """Even a hash-matching record: one bad entry and nothing runs, not the good entries before it either."""
+    data_access = _layer(tmp_path, DETERMINISTIC)
+    fake = fake_uc.install(tmp_path, LIVE)
+    good = {"kind": "import", "layer": "data_access", "address": TAG_IMPORT, "id": "tables,cat.sch.tbl,owner"}
+    record = _write_record(tmp_path / "imports.jsonl", [CLEANUP, good, FORGED[forged]])
+    result = _run(data_access, fake, "--skip-treatment-tags", f"--apply-recorded={record}")
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "entry 3:" in result.stderr and "never records" in result.stderr
+    assert fake_uc.events(fake) == []  # no SQL (lookup or write), no runner call
+
+
+def test_the_check_accepts_every_shape_the_recorder_writes(tmp_path):
+    from scripts import import_record
+    (tmp_path / "env.auto.tfvars").write_text('sql_warehouse_id = "wh"\n')
+    imports = [
+        ('module.data_access.databricks_policy_info.policies["mask_ssn"]', "CATALOG,cat,cat_mask_ssn"),
+        (TAG_IMPORT, "tables,cat.sch.tbl,owner"),
+        ('module.data_access.databricks_entity_tag_assignment.assignments["columns|cat.sch.tbl.ssn|pii|yes"]',
+         "columns,cat.sch.tbl.ssn,pii"),
+        ('module.data_access.databricks_grant.catalog_access["cat|Finance Analysts"]', "catalog/cat/Finance Analysts"),
+        ('module.data_access.databricks_grant.terraform_sp_manage_catalog["cat"]', "catalog/cat/1234-abcd"),
+        ("module.data_access.databricks_sql_endpoint.warehouse[0]", "abc123"),
+        ('module.data_access.databricks_data_classification_catalog_config.classification["cat"]', "catalogs/cat/config"),
+    ]
+    entries = [{"kind": "import", "layer": "data_access", "address": a, "id": i} for a, i in imports]
+    entries += [{"kind": "import", "layer": "workspace", "address": "module.workspace.databricks_sql_endpoint.warehouse[0]",
+                 "id": "abc123"}, import_record.cleanup_entry("columns", "cat.sch.tbl.ssn", "pii", "wh")]
+    assert import_record.validate(entries, tmp_path) == entries
+    assert entries[-1]["statement"] == "ALTER TABLE `cat`.`sch`.`tbl` ALTER COLUMN `ssn` UNSET TAGS ('pii')"
 
 
 def test_failed_optional_import_continues_and_surfaces_failure(tmp_path):
