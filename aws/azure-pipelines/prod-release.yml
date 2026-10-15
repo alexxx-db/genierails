@@ -2,8 +2,11 @@
 #
 # Stage 4, "Prod release", of shared/docs/cicd.md. It starts only when the
 # Rehearse stage of the dev pipeline ("genierails-dev-aws") succeeds on main,
-# and releases only a commit that touches envs/prod/** or shared/** (a
-# product or mapping change can change prod's generated output).
+# and releases only when envs/prod/** or shared/** changed (a product or
+# mapping change can change prod's generated output) since the commit of the
+# last succeeded run of this pipeline. That covers every commit in between,
+# including one whose own dev run was refused as obsolete. With no earlier
+# succeeded run at an ancestor commit, the run counts as a prod change.
 #
 #   make release-plan ENV=prod                     publishes the approval manifest
 #   (Approvals check on the "genierails-prod" environment)
@@ -60,26 +63,48 @@ variables:
 
 stages:
   - stage: Scope
-    displayName: Did the commit touch envs/prod or shared?
+    displayName: Did envs/prod or shared change since the last succeeded run?
     jobs:
       - job: scope
         pool:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
-            fetchDepth: 2
+            fetchDepth: 0
 
+          # A succeeded run either found no prod change in its range or was
+          # approved, so everything up to its commit is covered. The newest
+          # such commit that is an ancestor of this one is the base.
           - script: |
               if [ "$(Build.SourceVersion)" != "$(resources.pipeline.dev.sourceCommit)" ]; then
                 echo "##[error]checked out $(Build.SourceVersion), but dev rehearsed $(resources.pipeline.dev.sourceCommit)"
                 exit 1
               fi
-              changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?
+              builds="$(curl -fsS -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" \
+                "$(System.CollectionUri)$(System.TeamProjectId)/_apis/build/builds?definitions=$(System.DefinitionId)&resultFilter=succeeded&statusFilter=completed&queryOrder=finishTimeDescending&\$top=100&api-version=7.1")" || exit $?
+              released="$(printf '%s' "$builds" | python3 -c 'import json, sys; print("\n".join(b["sourceVersion"] for b in json.load(sys.stdin)["value"]))')" || exit $?
+              base=""
+              for sha in $released; do
+                if [ "$sha" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+                  base="$sha"
+                  break
+                fi
+              done
+              if [ -z "$base" ]; then
+                echo "No earlier succeeded run is at an ancestor of this commit: treating it as a prod change."
+                echo "##vso[task.setvariable variable=prod;isOutput=true]true"
+                exit 0
+              fi
+              echo "Changes since $base:"
+              changed="$(git diff --name-only "$base" HEAD -- envs/prod ../shared)" || exit $?
               if [ -n "$changed" ]; then
+                printf '%s\n' "$changed"
                 echo "##vso[task.setvariable variable=prod;isOutput=true]true"
               fi
             name: diff
             workingDirectory: aws
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
   - stage: ReleasePlan
     displayName: Release plan (v1, check only; REQUIRES PROD REMOTE STATE)
@@ -97,7 +122,7 @@ stages:
               versionSpec: '3.11'
 
           - script: |
-              pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
+              pip install 'python-hcl2>=7.3.1,<8' 'databricks-sdk==0.150.0' pytest
               curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
               sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
             displayName: Install dependencies and Terraform
