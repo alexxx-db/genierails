@@ -40,6 +40,8 @@ elif [ "$MODULE_BASENAME" = "data_access" ]; then
 else
   LAYER="workspace"
 fi
+# The env dir (envs/<env>): data_access is one level below it.
+if [ "$LAYER" = "data_access" ]; then ENV_ROOT="$(dirname "$MODULE_DIR")"; else ENV_ROOT="$MODULE_DIR"; fi
 
 DRY_RUN=false
 SKIP_TREATMENT_TAGS=""
@@ -118,7 +120,7 @@ elif [ -n "$APPLY_RECORDED" ]; then
 else
   export GENIERAILS_IMPORT_MODE=import GENIERAILS_IMPORT_RECORD=""
 fi
-export GENIERAILS_IMPORT_LAYER="$LAYER"
+export GENIERAILS_IMPORT_LAYER="$LAYER" GENIERAILS_IMPORT_ENV_ROOT="$ENV_ROOT" GENIERAILS_SHARED_ROOT="$(dirname "$SCRIPT_DIR")"
 
 if [ ! -f abac.auto.tfvars ]; then
   echo "ERROR: abac.auto.tfvars not found. Configure it before importing."
@@ -441,7 +443,7 @@ client_id     = _str(auth.get('databricks_client_id', ''))     or os.environ.get
 client_secret = _str(auth.get('databricks_client_secret', '')) or os.environ.get('DATABRICKS_CLIENT_SECRET', '')
 warehouse_id  = _str(env_cfg.get('sql_warehouse_id', ''))
 
-if not warehouse_id:
+if not warehouse_id and os.environ.get('GENIERAILS_IMPORT_MODE') != 'record':
     try:
         from databricks.sdk import WorkspaceClient
         w = WorkspaceClient(host=host, client_id=client_id, client_secret=client_secret)
@@ -455,16 +457,29 @@ if not warehouse_id:
 recording = os.environ.get('GENIERAILS_IMPORT_MODE') == 'record'
 if recording:
     import json
+    sys.path.insert(0, os.environ['GENIERAILS_SHARED_ROOT'])
+    from scripts import import_record
 
-    def record_cleanup(etype, ename, tkey, sql):
+    def record_cleanup(etype, ename, tkey):
+        # Only what release accepts back (scripts/import_record.py): its rebuilt UNSET, the env's warehouse.
+        try:
+            entry = import_record.cleanup_entry(etype, ename, tkey, warehouse_id)
+        except import_record.Invalid as exc:
+            unverified(f'the stale tag {tkey} on {ename} can\'t be recorded ({exc})')
         with open(os.environ['GENIERAILS_IMPORT_RECORD'], 'a') as f:
-            f.write(json.dumps({'kind': 'cleanup', 'layer': 'data_access', 'entity_type': etype,
-                                'entity_name': ename, 'tag_key': tkey, 'statement': sql,
-                                'warehouse_id': warehouse_id}) + '\n')
+            f.write(json.dumps(entry) + '\n')
 
     def unverified(why):
         sys.exit(f'ERROR: release-plan changes nothing live, so it records stale tags to clear instead '
                  f'of clearing them, and {why}. Fix the access and re-run release-plan.')
+
+    # Release runs a recorded cleanup only on the env's own SQL warehouse.
+    try:
+        warehouse_id = import_record.configured_warehouse(os.environ['GENIERAILS_IMPORT_ENV_ROOT'])
+    except import_record.Invalid as exc:
+        unverified(str(exc))
+    if not warehouse_id:
+        unverified('this env configures no SQL warehouse to clear them on (set sql_warehouse_id in env.auto.tfvars)')
 
 if not warehouse_id:
     if recording:
@@ -559,7 +574,7 @@ for ta in tag_assignments:
 
     if recording:
         print(f'  Recorded cleanup (release clears it): {tkey} on {ename}')
-        record_cleanup(etype, ename, tkey, sql)
+        record_cleanup(etype, ename, tkey)
         continue
 
     try:
@@ -824,17 +839,20 @@ for (name, catalog, sec_type, full_name) in desired:
 FEOF
 }
 
-# release MANIFEST=: the stale-tag cleanups release-plan recorded, exactly as recorded.
+# release MANIFEST=: the stale-tag cleanups release-plan recorded. The stored
+# statement is never run: each UNSET is rebuilt from the checked identifiers.
 apply_recorded_cleanups() {
   python3 - << 'PYEOF'
-import hcl2, json, os, sys
+import hcl2, os, sys
+sys.path.insert(0, os.environ['GENIERAILS_SHARED_ROOT'])
+from scripts import import_record
 
 def _str(v): return (v[0] if isinstance(v, list) else v or '').strip()
 
 layer = os.environ['GENIERAILS_IMPORT_LAYER']
-with open(os.environ['GENIERAILS_IMPORT_RECORD']) as f:
-    entries = [json.loads(line) for line in f if line.strip()]
-cleanups = [e for e in entries if e.get('kind') == 'cleanup' and e.get('layer') == layer]
+env_root = os.environ['GENIERAILS_IMPORT_ENV_ROOT']
+entries = import_record.load(os.environ['GENIERAILS_IMPORT_RECORD'], env_root)
+cleanups = [e for e in entries if e['kind'] == 'cleanup' and e['layer'] == layer]
 if not cleanups:
     sys.exit(0)
 auth = {}
@@ -848,9 +866,11 @@ w = WorkspaceClient(
     client_id=_str(auth.get('databricks_client_id', '')) or os.environ.get('DATABRICKS_CLIENT_ID', ''),
     client_secret=_str(auth.get('databricks_client_secret', '')) or os.environ.get('DATABRICKS_CLIENT_SECRET', ''))
 failed = 0
+warehouse_id = import_record.configured_warehouse(env_root)
 for entry in cleanups:
     resp = w.statement_execution.execute_statement(
-        statement=entry['statement'], warehouse_id=entry['warehouse_id'], wait_timeout='30s')
+        statement=import_record.unset_sql(entry['entity_type'], entry['entity_name'], entry['tag_key']),
+        warehouse_id=warehouse_id, wait_timeout='30s')
     raw_state = getattr(getattr(resp, 'status', None), 'state', None)
     state = raw_state.value if hasattr(raw_state, 'value') else str(raw_state or '')
     if 'SUCCEEDED' in state:
@@ -864,12 +884,9 @@ PYEOF
 
 if [ -n "$APPLY_RECORDED" ]; then
   echo "=== Recorded imports and stale-tag cleanups ($LAYER) ==="
+  # Before any SQL or runner call: every entry must be one the recorder writes.
+  entries=$(python3 "$SCRIPT_DIR/import_record.py" imports "$APPLY_RECORDED" --env-dir "$ENV_ROOT" --layer "$LAYER") || exit 3
   apply_recorded_cleanups
-  entries=$(python3 -c 'import json, sys
-for line in open(sys.argv[1]):
-    e = json.loads(line) if line.strip() else {}
-    if e.get("kind") == "import" and e.get("layer") == sys.argv[2]:
-        print(e["address"] + "\t" + e["id"])' "$APPLY_RECORDED" "$LAYER")
   while IFS=$'\t' read -r address import_id; do
     [ -z "$address" ] && continue
     run_import "$address" "$import_id"

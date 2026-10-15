@@ -274,7 +274,12 @@ Rollout step 9 (design sections 10 and 17). Legacy envs are unchanged.
   not in Terraform state (or a non-treatment tag holds a stale value), it
   records those imports and tag cleanups in the manifest instead of running
   them, and plans nothing else. `release MANIFEST=` runs exactly the recorded
-  entries under the lock and says to run `release-plan` again.
+  entries under the lock and says to run `release-plan` again. Both refuse a
+  record holding anything the recorder doesn't write
+  (`scripts/import_record.py`): only imports of the resource addresses
+  `import_existing.sh` imports, and UNSETs of non-`gr_treatment` tags on the
+  env's own SQL warehouse. Release rebuilds each UNSET from the checked names;
+  it never runs SQL stored in the record.
 - **`make maintain ENV=prod`** refuses unless HEAD is the last release
   receipt's commit, the checkout is clean and the code, prod-input and
   `envs/prod/generated` digests match the receipt.
