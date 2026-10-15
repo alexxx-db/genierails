@@ -445,7 +445,7 @@ Each playbook follows the champion README's style: the flow in one code block, s
 
 14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample.
 15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2). Built: an existing job moves from the workspace state to the data_access state before any command on either root (`move_scheduled_job.py`), and the workspace root's `removed` block forgets rather than destroys it.
-16. `make bootstrap-pipelines` (18.2).
+16. `make bootstrap-pipelines` (18.2). Built ([cicd.md](../cicd.md#setting-up-the-pipelines)).
 17. Optional AI helpers (18.4).
 18. Persona docs (18.5).
 19. Live persona runs, real pipeline runs, and migration of the existing deployments (18.6).
