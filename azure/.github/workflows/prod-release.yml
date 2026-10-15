@@ -2,8 +2,13 @@ name: GenieRails prod release (azure)
 
 # Stage 4, "Prod release", of shared/docs/cicd.md. Copy to .github/workflows/
 # at the repository root. It starts only when the dev pipeline ("GenieRails
-# dev (azure)") succeeds on main, and only for a commit that touches envs/prod/**
-# or shared/** (a product or mapping change can change prod's generated output).
+# dev (azure)") succeeds on main, and only when envs/prod/** or shared/**
+# changed (a product or mapping change can change prod's generated output)
+# since the last successful run of this workflow (the commit GitHub records
+# as its head_sha). That covers every commit in between, including one whose
+# own dev run was refused as obsolete. With no earlier successful run at an
+# ancestor, the run counts as a prod change; if the runs can't be listed, it
+# fails.
 #
 #   make release-plan ENV=prod                     publishes the approval manifest
 #   (required approval on the "production" environment)
@@ -31,8 +36,8 @@ name: GenieRails prod release (azure)
 # The "production-plan" environment deploys only from main and has no
 # reviewer; the prod read-only SP's federation policy names it
 # (make bootstrap-pipelines prints these settings).
-# Auth: OIDC workload identity federation, no PATs or secrets. Repository
-# variables (IDs, not credentials) for the read-only plan job:
+# Auth: OIDC workload identity federation, no PATs or secrets.
+# Repository variables (IDs, not credentials) for the read-only plan job:
 #   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
 #   PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
 # Once release applies in CI, the "production" environment holds the prod
@@ -43,6 +48,9 @@ on:
     workflows: ["GenieRails dev (azure)"]
     types: [completed]
     branches: [main]
+
+# For people only: the scope job never reads run names.
+run-name: ${{ github.workflow }} for ${{ github.event.workflow_run.head_sha }}
 
 # Deliberately no concurrency group, as in the dev workflow: GitHub keeps
 # only one pending run per group and cancels the older one, so a newer run
@@ -61,22 +69,77 @@ defaults:
     working-directory: azure
 
 jobs:
+  # A run succeeds only for a successful dev run, so a failed or cancelled
+  # one never becomes a later run's base.
+  dev-failed:
+    name: Dev run did not succeed
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Nothing to release
+        working-directory: .
+        run: |
+          echo "::error::the dev run for ${{ github.event.workflow_run.head_sha }} concluded ${{ github.event.workflow_run.conclusion }}; nothing to release."
+          exit 1
+
   scope:
-    name: Did the commit touch envs/prod or shared?
+    name: Did envs/prod or shared change since the last successful run?
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       prod: ${{ steps.diff.outputs.prod }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 2
+          fetch-depth: 0
 
+      # genierails-release-base-v2: a successful run covers everything up to
+      # its head_sha (GitHub's own field, the main commit it ran at:
+      # $GITHUB_SHA). The run checks out the dev commit, which can be older,
+      # so it succeeds only when nothing for prod changed in between; those
+      # commits' own runs release them. The base is the newest ancestor of
+      # this commit among those head_shas; titles are never read. Runs from
+      # before this check (their file lacks the marker above) never count.
       - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?
+          git cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null || git fetch --no-tags -q origin "$GITHUB_SHA" || exit $?
+          if ! git merge-base --is-ancestor HEAD "$GITHUB_SHA"; then
+            echo "::error::this run is at $GITHUB_SHA, which does not contain the dev commit $DEV_SHA."
+            exit 1
+          fi
+          ahead="$(git diff --name-only HEAD "$GITHUB_SHA" -- envs/prod ../shared)" || exit $?
+          if [ -n "$ahead" ]; then
+            echo "::error::main moved on to $GITHUB_SHA, which changes envs/prod or shared after $DEV_SHA; that commit's own run releases both."
+            exit 1
+          fi
+          workflow_path="${GITHUB_WORKFLOW_REF#*/*/}"
+          workflow_path="${workflow_path%@*}"
+          released="$(gh api "repos/${{ github.repository }}/actions/workflows/${workflow_path##*/}/runs?branch=main&event=workflow_run&status=success&per_page=100" \
+            --jq '.workflow_runs[] | select(.conclusion == "success" and .head_branch == "main" and .event == "workflow_run") | .head_sha')" || exit $?
+          base=""
+          for sha in $released; do
+            if [ "$sha" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$sha" HEAD 2>/dev/null \
+                && git show "$sha:$workflow_path" 2>/dev/null | grep -qF genierails-release-base-v2; then
+              base="$sha"
+              break
+            fi
+          done
+          if [ -z "$base" ]; then
+            echo "No earlier successful run is at an ancestor of this commit: treating it as a prod change."
+            echo "prod=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changes since $base:"
+          changed="$(git diff --name-only "$base" HEAD -- envs/prod ../shared)" || exit $?
           if [ -n "$changed" ]; then
+            printf '%s\n' "$changed"
             echo "prod=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -104,10 +167,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
+        run: pip install 'python-hcl2>=7.3.1,<8' 'databricks-sdk==0.150.0' pytest
 
-      - uses: hashicorp/setup-terraform@v3
+      # Pinned by commit (v3.1.2), with the Terraform the repository's CI tests.
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
+          terraform_version: "1.11.4"
           terraform_wrapper: false
 
       - name: Write OIDC auth file (IDs only, no secrets)

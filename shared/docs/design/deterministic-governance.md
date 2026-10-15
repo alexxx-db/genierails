@@ -333,7 +333,7 @@ One command per stage. People run the authoring commands on their own machine; p
 | Stage | Where | Command | Changes Databricks? |
 |---|---|---|---|
 | **1. Author** | a person's machine | `make capture ENV=dev SPACE="<agent>"` (agent), `make generate ENV=dev` (governance), `make scaffold-treatments` (new class), `make promote-to ENV=prod` (promotion); commit, open a PR | no; files only |
-| **2. PR check** | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` | no |
+| **2. PR check** | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` or `shared/**` | no |
 | **3. Dev rehearsal** | **dev pipeline**, every merge to `main` that touches code, governance or `envs/**`; every commit gets its own run, in order | `make rehearse ENV=dev` | dev only |
 | **4. Prod release** | **prod pipeline**, when stage 3 **succeeds** on a commit that touches `envs/prod/**`: `make release-plan ENV=prod` publishes the approval manifest; after a required approval, `make release ENV=prod MANIFEST=<manifest>` applies it | `release-plan`, then `release` | prod |
 | **5. Keep protected** | **prod pipeline**, on a schedule, checked out at the last released commit (read from the release receipt) | `make maintain ENV=prod` | prod, governance only |
