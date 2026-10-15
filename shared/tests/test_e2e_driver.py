@@ -172,6 +172,7 @@ def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False,
             if "migrate-plan" in argv:
                 text = ("=== Migration dry run\n"
                         "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+                        "    mask today: mask_masked_ssn: legacy sql\n"
                         "Result: ready\n")
                 rc = migrate_rc
             if argv[1:2] == ["release"]:
@@ -804,12 +805,14 @@ def test_d2_ci_scenario_needs_no_value_and_omits_allowed_dev_rehearse():
 
 def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
     calls = live(staged_release=True)
-    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 0
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
     commands = makes(calls)
     assert [argv[1] for argv in commands[:7]] == [
         "migrate-plan", "migrate-plan", "rehearse", "release-plan", "release", "release-plan", "release"]
     manifests = [next(a for a in argv if a.startswith("MANIFEST=")) for argv in commands if argv[1] == "release"]
     assert manifests[:2] == ["MANIFEST=/tmp/approved-1.json", "MANIFEST=/tmp/approved-2.json"]
+    report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
+    assert report["status"] == "UNEXPECTED PASS — remove known_failure fix/migration-adopt-order"
 
 
 def test_d4_snapshot_query_includes_deterministic_masks():
@@ -871,16 +874,131 @@ def test_d5_policy_types_do_not_collide_on_exemption_or_removal():
     assert any("unmapped_redact int full: removed" in item for item in removed["policies"])
 
 
-def test_migration_mapping_allows_only_exact_reviewed_adoption_and_never_raw_stays_safe():
-    before = _deterministic_snapshot("masked_email")
-    after = _deterministic_snapshot("email_partial__string__11111111")
-    exact = {"cat.s.t.ssn": ("masked_email", "email_partial__string__11111111")}
-    assert driver.protection_diff(before, after, allowed_adoptions=exact) == {}
-    wrong = {"cat.s.t.ssn": ("masked_email", "email_partial__string__99999999")}
+def test_same_key_policy_aggregation_catches_exemption_on_first_policy():
+    def staged(exempt_first):
+        snap = _deterministic_snapshot("email_partial__string__11111111")
+        snap["uc"]["cat"]["abac_policies"][0]["policies"] = [
+            {"name": generation, "to_principals": ["account users"],
+             "except_principals": ["analysts"] if exempt_first and index == 0 else [],
+             "column_mask": {"function_name": f"cat.s.gr_mask_email_partial__string__{generation}_full"}}
+            for index, generation in enumerate(("11111111", "22222222"))]
+        return snap
+    weak = driver.protection_diff(staged(False), staged(True))
+    assert any("newly exempts analysts" in item for item in weak["policies"])
+
+
+def _policy(name, function, to, exempt=(), value=None):
+    policy = {"name": name, "to_principals": list(to), "except_principals": list(exempt),
+              "column_mask": {"function_name": function}}
+    if value:
+        policy["match_columns"] = [{"alias": "c", "condition": f"hasTagValue('gr_treatment', '{value}')"}]
+    return policy
+
+
+def _cutover_snapshots(old="masked_email", new="email_partial__string__11111111", *, columns=("ssn",)):
+    """A legacy policy -> the generator's tiered layout: partial to tier 2, full
+    to everyone else (tiers and deployer exempt), as governance_policies builds it."""
+    def tagged(value_by_column):
+        return [{"catalog_name": "cat", "schema_name": "s", "table_name": "t", "column_name": column,
+                 "tag_name": "gr_treatment", "tag_value": value} for column, value in value_by_column.items()]
+    before = snapshot(masks=(f"mask_{old}",), tags=())
+    before["uc"]["cat"]["governed_tags"] = tagged({c: old for c in columns})
+    before["uc"]["cat"]["abac_policies"][0]["policies"] = [
+        _policy(f"legacy_{old}", f"cat.s.mask_{old}", ["account users"], ["admins", "deployer"], old)]
+    levels = ("full",) if driver.is_never_raw(new) else ("partial", "full")
+    after = snapshot(masks=tuple(f"gr_mask_{new}_{level}" for level in levels), tags=())
+    after["uc"]["cat"]["governed_tags"] = tagged({c: new for c in columns})
+    after["uc"]["cat"]["abac_policies"][0]["policies"] = [
+        _policy(f"gr_mask_cat_{new}_{level}", f"cat.s.gr_mask_{new}_{level}",
+                ["analysts"] if level == "partial" else ["account users"],
+                [] if driver.is_never_raw(new) else ["admins", "deployer"] if level == "partial"
+                else ["admins", "analysts", "deployer"], new)
+        for level in levels]
+    adoption = {f"cat.s.t.{c}": driver.Adoption(old, new, f"mask_{old}") for c in columns}
+    return before, after, adoption
+
+
+def test_migration_correct_tiered_cutover_passes():
+    for old, new in (("masked_email", "email_partial__string__11111111"), ("redact", "secret__string__11111111")):
+        before, after, adoption = _cutover_snapshots(old, new)
+        assert driver.protection_diff(before, after, allowed_adoptions=adoption) == {}
+
+
+def test_migration_mapping_requires_exact_reviewed_pair():
+    before, after, _ = _cutover_snapshots()
+    wrong = {"cat.s.t.ssn": driver.Adoption("masked_email", "email_partial__string__99999999", "mask_masked_email")}
     assert "columns" in driver.protection_diff(before, after, allowed_adoptions=wrong)
     never_raw = _deterministic_snapshot("secret")
-    unsafe = {"cat.s.t.ssn": ("secret", "email_partial__string__11111111")}
+    unsafe = {"cat.s.t.ssn": driver.Adoption("secret", "email_partial__string__11111111", "mask_secret")}
     assert "columns" in driver.protection_diff(never_raw, after, allowed_adoptions=unsafe)
+
+
+def test_migration_retag_as_planned_without_deterministic_policy_is_flagged():
+    for old, new in (("masked_email", "email_partial__string__11111111"), ("redact", "secret__string__11111111")):
+        before, after, adoption = _cutover_snapshots(old, new)
+        after["uc"]["cat"]["mask_functions"] = []
+        after["uc"]["cat"]["abac_policies"][0]["policies"] = []
+        weak = driver.protection_diff(before, after, allowed_adoptions=adoption)
+        assert any("-> ('" in item for item in weak["columns"]), weak
+        assert weak["masks"] == [f"cat.s.mask_{old}"]
+        assert weak["policies"] == [f"cat.s.t legacy_{old}: removed"]
+
+
+def test_migration_replacement_must_exist_at_every_level_with_its_function():
+    before, after, adoption = _cutover_snapshots()
+    no_partial = {**after, "uc": {"cat": {**after["uc"]["cat"], "abac_policies": [{"table": "cat.s.t",
+        "policies": after["uc"]["cat"]["abac_policies"][0]["policies"][1:]}]}}}
+    assert "policies" in driver.protection_diff(before, no_partial, allowed_adoptions=adoption)
+    no_function = {**after, "uc": {"cat": {**after["uc"]["cat"],
+        "mask_functions": after["uc"]["cat"]["mask_functions"][:1]}}}
+    assert "policies" in driver.protection_diff(before, no_function, allowed_adoptions=adoption)
+
+
+def test_migration_replacement_must_cover_every_legacy_masked_principal():
+    before, after, adoption = _cutover_snapshots()
+    after["uc"]["cat"]["abac_policies"][0]["policies"][1]["except_principals"].append("contractors")
+    weak = driver.protection_diff(before, after, allowed_adoptions=adoption)
+    assert weak["policies"] == ["cat.s.t legacy_masked_email: removed"]
+
+
+def test_migration_does_not_excuse_unrelated_failsafe_mask_loss():
+    before, after, adoption = _cutover_snapshots("redact", "secret__string__11111111")
+    before["uc"]["cat"]["mask_functions"].append({"routine_catalog": "cat", "routine_schema": "s",
+        "routine_name": "gr_mask_unmapped_redact__string__aaaaaaaa_full"})
+    weak = driver.protection_diff(before, after, allowed_adoptions=adoption)
+    assert weak == {"masks": ["cat.s.unmapped_redact__string__full"]}
+
+
+def test_migration_legacy_policy_stays_while_any_old_column_is_unadopted():
+    before, after, adoption = _cutover_snapshots(columns=("ssn", "email"))
+    after["uc"]["cat"]["governed_tags"][1]["tag_value"] = "masked_email"
+    adoption.pop("cat.s.t.email")
+    weak = driver.protection_diff(before, after, allowed_adoptions=adoption)
+    assert weak["policies"] == ["cat.s.t legacy_masked_email: removed"]
+    assert weak["masks"] == ["cat.s.mask_masked_email"]
+
+
+def test_migration_inherited_legacy_policy_on_untagged_table_is_excused_but_shared_function_is_not():
+    before, after, adoption = _cutover_snapshots()
+    legacy = before["uc"]["cat"]["abac_policies"][0]["policies"][0]
+    before["uc"]["cat"]["abac_policies"].append({"table": "cat.s.u", "policies": [dict(legacy)]})
+    assert driver.protection_diff(before, after, allowed_adoptions=adoption) == {}
+    # cat.s.u still masks with the legacy function: dropping it is a loss.
+    after["uc"]["cat"]["abac_policies"].append({"table": "cat.s.u", "policies": [dict(legacy)]})
+    assert driver.protection_diff(before, after, allowed_adoptions=adoption) == {"masks": ["cat.s.mask_masked_email"]}
+
+
+def test_migration_legacy_match_value_must_be_the_adopted_old_value():
+    before, after, adoption = _cutover_snapshots()
+    before["uc"]["cat"]["abac_policies"][0]["policies"][0]["match_columns"][0]["condition"] = \
+        "hasTagValue('gr_treatment', 'masked_phone')"
+    assert "policies" in driver.protection_diff(before, after, allowed_adoptions=adoption)
+
+
+def test_legacy_redact_to_partial_treatment_is_always_weakening():
+    before, after, adoption = _cutover_snapshots("redact")
+    weak = driver.protection_diff(before, after, allowed_adoptions=adoption)
+    assert weak["columns"] == ["cat.s.t.ssn gr_treatment never-raw redact -> email_partial__string__11111111"]
 
 
 def test_d6_prod_keyed_agent_id_files_are_snapshotted(tmp_path):
@@ -1033,6 +1151,14 @@ def test_deterministic_apply_log_that_clears_gr_treatment_is_error(tmp_path, liv
     assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 1
     report = json.loads((tmp_path / "reports/s4.json").read_text())
     assert report["steps"][0]["assertion"] == "deterministic apply attempted to clear gr_treatment"
+
+
+def test_import_unset_log_guard_is_anchored_to_import_script_literals():
+    assert driver.import_unset_source_anchored(ROOT)
+    source = (ROOT / "shared/scripts/import_existing.sh").read_text()
+    assert all(anchor in source for anchor in driver.IMPORT_UNSET_SOURCE_ANCHORS)
+    assert driver.import_unset_treatment("  Cleared tag gr_treatment on cat.s.t.ssn")
+    assert driver.import_unset_treatment("lookup failed for x/gr_treatment: boom; clearing tag")
 
 
 def test_another_phase_signal_accepts_needs_form():

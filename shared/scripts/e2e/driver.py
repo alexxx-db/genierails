@@ -37,6 +37,12 @@ E2E_REMOTE = "genierails-e2e"
 E2E_BRANCH_PREFIX = "genierails-e2e/"
 MAX_RELEASE_PHASES = 8
 ANOTHER_RELEASE_PHASE = re.compile(r"(?:Release phase applied|needs? another release-plan)", re.I)
+IMPORT_UNSET_LOG = re.compile(
+    r"(?im)(?:Cleared tag gr_treatment|gr_treatment.*(?:clearing tag|UNSET TAGS)|UNSET TAGS.*gr_treatment)"
+)
+IMPORT_UNSET_SOURCE_ANCHORS = ("Cleared tag {tkey} on", "; clearing tag")
+TAG_VALUE_MATCH = re.compile(r"hasTagValue\(\s*'gr_treatment'\s*,\s*'([^']*)'\s*\)", re.I)
+LEGACY_REDACTED_TREATMENTS = frozenset({"redact", "compensation_redacted"})
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genierails-e2e@localhost",
                 "GIT_COMMITTER_NAME": "genierails-e2e", "GIT_COMMITTER_EMAIL": "genierails-e2e@localhost"}
 # Targets that apply to a workspace/account: the checkout must be clean and
@@ -81,6 +87,13 @@ class Scenario:
     restore: tuple[str, ...]
     requires: tuple[str, ...] = ()
     known_failure: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Adoption:
+    old: str
+    new: str
+    legacy_function: str
 
 
 def mk(name: str, target: str, env: str | None = None, *,
@@ -647,10 +660,14 @@ def deterministic_env(cloud_root: Path, env: str | None) -> bool:
 
 
 def import_unset_treatment(output: str) -> bool:
-    return bool(re.search(
-        r"(?im)(?:Cleared tag gr_treatment|gr_treatment.*(?:clearing tag|UNSET TAGS)|UNSET TAGS.*gr_treatment)",
-        output,
-    ))
+    return bool(IMPORT_UNSET_LOG.search(output))
+
+
+def import_unset_source_anchored(repo_root: Path) -> bool:
+    source = repo_root / "shared/scripts/import_existing.sh"
+    if not source.is_file(): return False
+    text = source.read_text(encoding="utf-8", errors="replace")
+    return all(anchor in text for anchor in IMPORT_UNSET_SOURCE_ANCHORS)
 
 
 def parse_manifest(output: str) -> str:
@@ -674,13 +691,22 @@ def refusal_found_in_source(repo_root: Path, pattern: str) -> bool:
     return source.is_file() and tail in source.read_text(encoding="utf-8", errors="replace")
 
 
-def parse_migration_mappings(output: str) -> dict[str, tuple[str, str]]:
-    mappings: dict[str, tuple[str, str]] = {}
-    for location, old, new in re.findall(r"(?m)^\s+(\S+\.\S+\.\S+\.\S+):\s+(\S+)\s+->\s+(\S+)\s*$", output):
-        if old != "untagged" and parse_treatment_value(new):
-            mappings[location] = (old, new)
+def parse_migration_mappings(output: str) -> dict[str, Adoption]:
+    mappings: dict[str, Adoption] = {}
+    current: tuple[str, str, str] | None = None
+    for line in output.splitlines():
+        match = re.fullmatch(r"\s+(\S+\.\S+\.\S+\.\S+):\s+(\S+)\s+->\s+(\S+)\s*", line)
+        if match:
+            location, old, new = match.groups()
+            current = (location, old, new) if old != "untagged" and parse_treatment_value(new) else None
+            continue
+        mask = re.match(r"\s+mask today:\s+([^:]+):", line)
+        if current and mask:
+            location, old, new = current
+            mappings[location] = Adoption(old, new, mask.group(1).strip())
+            current = None
     if not mappings:
-        raise RuntimeError("migrate-plan printed no reviewed legacy-to-deterministic column mapping")
+        raise RuntimeError("migrate-plan printed no reviewed mapping with its exact legacy mask function")
     return mappings
 
 
@@ -843,7 +869,7 @@ def customer_checkout_problems(checkout_dir: Path, cloud: str, commit: str) -> l
 
 def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Per-column and per-principal protection facts, independent of IDs and timestamps."""
-    result: dict[str, Any] = {"columns": {}, "masks": set(), "policies": {}, "grants": set()}
+    result: dict[str, Any] = {"columns": {}, "masks": set(), "mask_names": set(), "policies": {}, "grants": set()}
     uc = snapshot.get("uc", {})
     for catalog, evidence in uc.items() if isinstance(uc, Mapping) else []:
         if not isinstance(evidence, Mapping): continue
@@ -857,19 +883,29 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             normalized = _normalized_mask(name)
             prefix = f"{row.get('routine_catalog')}.{row.get('routine_schema')}."
             result["masks"].add(prefix + ("__".join(normalized) if normalized else name))
+            result["mask_names"].add(prefix + name)
         for entry in evidence.get("abac_policies") or []:
             for policy in entry.get("policies") or []:
                 mask = policy.get("column_mask") or policy.get("row_filter") or {}
                 function = str(mask.get("function_name") or "")
                 normalized = _normalized_mask(function.rsplit(".", 1)[-1])
+                prefix = function.rsplit(".", 1)[0] + "." if "." in function else ""
+                normalized_function = prefix + "__".join(normalized) if normalized else function
                 key = ((str(entry.get("table")), str(catalog), *normalized) if normalized
                        else (str(entry.get("table")), str(catalog), str(policy.get("name"))))
                 fact = {"function": {normalized or (function,)},
+                        "masks": {normalized_function},
+                        "raw_functions": {function},
+                        "values": {value for column in policy.get("match_columns") or []
+                                   for value in TAG_VALUE_MATCH.findall(str(column.get("condition") or ""))},
                         "to": set(policy.get("to_principals") or []),
                         "except": set(policy.get("except_principals") or [])}
                 prior = result["policies"].get(key)
                 if prior:
                     prior["function"].update(fact["function"])
+                    prior["masks"].update(fact["masks"])
+                    prior["raw_functions"].update(fact["raw_functions"])
+                    prior["values"].update(fact["values"])
                     prior["to"].intersection_update(fact["to"])
                     prior["except"].update(fact["except"])
                 else:
@@ -881,6 +917,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 result["grants"].add(f"{row.get('grantee')} {row.get('privilege_type')} {securable}")
     for fact in result["policies"].values():
         fact["function"] = tuple(sorted(fact["function"]))
+        fact["masks"] = tuple(sorted(fact["masks"]))
     return result
 
 
@@ -890,12 +927,79 @@ def _normalized_mask(name: str) -> tuple[str, str, str] | None:
     return (parsed[0], parsed[1], match.group(2)) if parsed and match else None
 
 
+def _covers(fact: Mapping[str, Any], principal: str) -> bool:
+    return (principal in fact["to"] or "account users" in fact["to"]) and principal not in fact["except"]
+
+
+def _verified_adoptions(before: Mapping[str, Any], after: Mapping[str, Any],
+                        requested: Mapping[str, Adoption]) -> dict[str, dict[str, set[Any]]]:
+    """Reviewed adoptions whose deterministic replacement exists and covers at
+    least every principal the exact legacy policy on that table covered."""
+    verified: dict[str, dict[str, set[Any]]] = {}
+    for location, adoption in requested.items():
+        parsed = parse_treatment_value(adoption.new)
+        if not parsed: continue
+        table, catalog = location.rsplit(".", 1)[0], location.split(".", 1)[0]
+        legacy_function = adoption.legacy_function.lower()
+        # Only the policies on this table that masked with migrate-plan's
+        # "mask today" function and (when listed) matched the old value.
+        legacy = {key: fact for key, fact in before["policies"].items()
+                  if len(key) == 3 and key[0] == table
+                  and any(fn.lower() == legacy_function or ("." not in legacy_function
+                          and fn.rsplit(".", 1)[-1].lower() == legacy_function) for fn in fact["masks"])
+                  and (not fact["values"] or adoption.old in fact["values"])}
+        if not legacy: continue
+        levels = ("full",) if is_never_raw(adoption.new) else ("partial", "full")
+        replacements = []
+        for level in levels:
+            policy = after["policies"].get((table, catalog, parsed[0], parsed[1], level))
+            wanted = f"gr_mask_{adoption.new}_{level}"
+            if not policy or not any(fn.startswith(f"{catalog}.") and fn.rsplit(".", 1)[-1] == wanted
+                                     and fn in after["mask_names"] for fn in policy["raw_functions"]):
+                break
+            replacements.append(policy)
+        else:
+            principals = {"account users"}.union(*(f["to"] | f["except"] for f in (*legacy.values(), *replacements)))
+            if all(any(_covers(r, who) for r in replacements)
+                   for fact in legacy.values() for who in principals if _covers(fact, who)):
+                verified[location] = {"legacy_keys": set(legacy),
+                                      "legacy_masks": {fn for f in legacy.values() for fn in f["masks"]}}
+    return verified
+
+
+def _excused_legacy(before: Mapping[str, Any], after: Mapping[str, Any],
+                    requested: Mapping[str, Adoption]) -> tuple[set[Any], set[str]]:
+    """Legacy policies and functions a verified cutover may remove: on a table,
+    only once every column there that carried the old value was adopted."""
+    verified = _verified_adoptions(before, after, requested)
+    tagged: dict[tuple[str, str], set[str]] = {}
+    for (location, tag), value in before["columns"].items():
+        raw = value[2] if isinstance(value, tuple) else value
+        if tag == "gr_treatment": tagged.setdefault((location.rsplit(".", 1)[0], raw), set()).add(location)
+    keys: set[Any] = set(); masks: set[str] = set()
+    for location, item in verified.items():
+        table, old = location.rsplit(".", 1)[0], requested[location].old
+        if tagged.get((table, old), set()) <= set(verified): keys |= item["legacy_keys"]; masks |= item["legacy_masks"]
+    # A catalog-level legacy policy is listed on every table; where no column
+    # carried the old value it masked nothing, so its removal there is excused.
+    names = {(k[1], k[2], before["policies"][k]["masks"]): requested[loc].old
+             for loc, item in verified.items() for k in item["legacy_keys"] if k in keys}
+    for key, fact in before["policies"].items():
+        old = names.get((key[1], key[2], fact["masks"])) if len(key) == 3 else None
+        if old is not None and not tagged.get((key[0], old)): keys.add(key)
+    # Never excuse a function that a surviving policy still masks with.
+    masks -= {fn for fact in after["policies"].values() for fn in fact["masks"]}
+    return keys, masks
+
+
 def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, include_grants: bool = False,
-                    allowed_adoptions: Mapping[str, tuple[str, str]] | None = None) -> dict[str, list[str]]:
+                    allowed_adoptions: Mapping[str, Adoption] | None = None) -> dict[str, list[str]]:
     """What is weaker in ``current``: a column untagged, a mask or policy gone,
     a principal newly exempted or no longer covered, and (optionally) a grant added."""
     before, after = _protection(baseline), _protection(current)
     allowed_adoptions = allowed_adoptions or {}
+    verified_adoptions = _verified_adoptions(before, after, allowed_adoptions)
+    excused_policy_keys, excused_masks = _excused_legacy(before, after, allowed_adoptions)
     weaker: dict[str, list[str]] = {}
     lost_columns = []
     for key, was in sorted(before["columns"].items()):
@@ -906,10 +1010,13 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
         elif key[1] == "gr_treatment":
             was_raw = was[2] if isinstance(was, tuple) else was
             now_raw = now[2] if isinstance(now, tuple) else now
-            adoption = allowed_adoptions.get(key[0]) == (was_raw, now_raw)
+            requested = allowed_adoptions.get(key[0])
+            adoption = (key[0] in verified_adoptions and requested is not None
+                        and (requested.old, requested.new) == (was_raw, now_raw))
             # A reviewed cutover may replace only the exact pair migrate-plan
             # printed. Never-raw -> weaker remains forbidden regardless.
-            if is_never_raw(was_raw) and not is_never_raw(now_raw):
+            legacy_never_raw = was_raw in LEGACY_REDACTED_TREATMENTS
+            if (is_never_raw(was_raw) or legacy_never_raw) and not is_never_raw(now_raw):
                 lost_columns.append(f"{key[0]} gr_treatment never-raw {was_raw} -> {now_raw}")
             elif adoption:
                 pass
@@ -926,20 +1033,13 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
         elif was != now:
             lost_columns.append(f"{key[0]} {key[1]}={was}: changed to {now}")
     if lost_columns: weaker["columns"] = lost_columns
-    adoption_values = {old for old, _new in allowed_adoptions.values()}
-    adoption_values_by_table: dict[str, set[str]] = {}
-    for location, (old, _new) in allowed_adoptions.items():
-        adoption_values_by_table.setdefault(location.rsplit(".", 1)[0], set()).add(old)
-    lost_masks = sorted(mask for mask in before["masks"] - after["masks"]
-                        if not any(re.search(rf"(?:^|_)({re.escape(old)})(?:_|$)", mask) for old in adoption_values))
+    lost_masks = sorted((before["masks"] - after["masks"]) - excused_masks)
     if lost_masks: weaker["masks"] = lost_masks
     policies = []
     for key, was in sorted(before["policies"].items()):
         label = f"{key[0]} {key[2]}" if len(key) == 3 else " ".join((key[0], *key[2:]))
         now = after["policies"].get(key)
-        table_adoptions = adoption_values_by_table.get(key[0], set())
-        legacy_replaced = len(key) == 3 and any(old in " ".join(str(part) for part in key)
-            or any(old in ".".join(fn) for fn in was["function"]) for old in table_adoptions)
+        legacy_replaced = key in excused_policy_keys
         if now is None and not legacy_replaced: policies.append(f"{label}: removed")
         elif now is not None and now["function"] != was["function"]:
             policies.append(f"{label}: function {sorted(was['function'])} -> {sorted(now['function'])}")
@@ -953,7 +1053,7 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
 
 
 def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any], *,
-                         allowed_adoptions: Mapping[str, Mapping[str, tuple[str, str]]] | None = None,
+                         allowed_adoptions: Mapping[str, Mapping[str, Adoption]] | None = None,
                          **kwargs: Any) -> dict[str, Any]:
     adoptions = allowed_adoptions or {}
     return {env: weak for env in sorted(baseline)
@@ -1096,6 +1196,9 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             would_not_run += [f"missing value: {name}" for name in missing_values]
             would_not_run += [f"refusal pattern not found in source: {x['pattern']}"
                               for x in refusals if not x["found_in_source"]]
+            if not import_unset_source_anchored(repo_root):
+                would_not_run.append("import_existing.sh no longer prints the gr_treatment cleanup lines "
+                                     "the UNSET log guard matches")
             payload = {"scenario": scenario.key, "status": "dry-run", "cloud": args.cloud,
                        "known_failure": scenario.known_failure,
                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1178,7 +1281,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             mutated = False
             stop = False
             confirmations: list[dict[str, str]] = []
-            allowed_adoptions: dict[str, dict[str, tuple[str, str]]] = {}
+            allowed_adoptions: dict[str, dict[str, Adoption]] = {}
             try:
                 # Pin: every scenario starts at exactly the requested commit.
                 repo.switch(repo.baseline, f"{scenario.key}-pin")
@@ -1311,7 +1414,11 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                 except BaseException as exc:
                     scenario_status = "RESTORE FAILED"; failed = True; stop = True
                     error_message = "; ".join(filter(None, (error_message, f"restore: {type(exc).__name__}: {exc}")))
-                if scenario.known_failure and scenario_status == "ERROR":
+                if scenario.known_failure and scenario_status == "passed":
+                    scenario_status = f"UNEXPECTED PASS — remove known_failure {scenario.known_failure}"
+                    error_message = f"known failure unexpectedly passed; remove {scenario.known_failure}"
+                    failed = True
+                elif scenario.known_failure and scenario_status == "ERROR":
                     scenario_status = f"ERROR (expected until {scenario.known_failure})"
                     error_message = "; ".join(filter(None, (error_message,
                         f"known failure: expected until {scenario.known_failure}")))

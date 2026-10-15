@@ -5,7 +5,16 @@ The driver encodes the champion flow from
 plan scenarios S1–S16, cross-cutting
 manifest/concurrency checks, the report-only migration operation, and the
 migration cutover. The cutover is intentionally expected to fail on main until
-`fix/migration-adopt-order` lands. Lifecycle mutations
+`fix/migration-adopt-order` lands; if it passes, its status is
+`UNEXPECTED PASS — remove known_failure ...` and the run fails, so the marker
+gets removed. The cutover's protection check accepts only the column retags
+migrate-plan printed, and only once the replacement is live: for each adopted
+column, the `gr_mask_<value>_full` (and `_partial`, unless never-raw) policy and
+function exist on that table, and every principal the legacy policy masked is
+still masked by one of them. Only then may the legacy policy that used that
+column's "mask today" function on that table, and that function, disappear. A
+legacy `redact`/`compensation_redacted` column may only become a never-raw
+treatment. Lifecycle mutations
 are issued only as public `make` targets. Read-only snapshots cover UC grants,
 column tags, effective ABAC policies, mask functions, Genie exports and ACLs,
 Terraform serials, receipts, and manifests.
@@ -101,8 +110,14 @@ fresh immutable manifest is used for every staged release phase. Successful
 release plans must leave the snapshot unchanged, and successful applying steps
 are checked immediately for weaker protection. This catches protection loss at
 command boundaries; no snapshot driver can observe a transient exposure made
-and repaired entirely within one command, so the engine must preserve its
-internal masks-before-access ordering. The driver then
+and repaired entirely within one command. As an additional guard, deterministic
+applying steps fail if `import_existing.sh` logs either its literal
+`Cleared tag gr_treatment on ...` cleanup or `; clearing tag` warning. A test
+(and `--dry-run`, under "would not run") checks that `import_existing.sh` still
+prints those lines, so a rewording fails CI instead of silently passing. The
+guard only sees what the log says: a wholly quiet internal exposure still cannot
+be observed, so the engine must preserve its internal masks-before-access
+ordering. The driver then
 re-snapshots dev and prod. A column that lost a tag, a removed mask or policy, a
 newly exempted or uncovered principal, or a new grant compared with the
 scenario's baseline is `RESTORE FAILED`. `<reports>/final-protection.json`
