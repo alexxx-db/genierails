@@ -120,4 +120,4 @@ git status                               # pass looks like: no auth.auto.tfvars,
 git commit -m "Govern the first agent in dev and prod"
 git push -u origin first-agent
 ```
-Open a pull request from `first-agent` into `main`. From then on every change goes through a PR: see [CI/CD](../../docs/cicd.md).
+Open a pull request from `first-agent` into `main`. From then on every change goes through a PR: see [Pipelines](../../docs/pipelines.md) to set up CI, and the [agents](../../docs/playbooks/agents.md), [governance](../../docs/playbooks/governance.md) or [one-team](../../docs/playbooks/one-team.md) playbook for day-2 changes.

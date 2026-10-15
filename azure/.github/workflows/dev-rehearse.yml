@@ -1,6 +1,6 @@
 name: GenieRails dev (azure)
 
-# Stage 3, "Dev rehearsal", of shared/docs/cicd.md: on every merge to main that
+# Stage 3, "Dev rehearsal", of shared/docs/pipelines.md: on every merge to main that
 # touches code, governance or envs/**. Copy to .github/workflows/ at the
 # repository root.
 #
@@ -106,7 +106,7 @@ jobs:
       - name: Require locked remote state for dev and account
         run: |
           test -f envs/dev/remote_state.hcl && test -f envs/account/remote_state.hcl || {
-            echo "::error::commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/cicd.md)"
+            echo "::error::commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/pipelines.md)"
             exit 1
           }
 

@@ -63,6 +63,7 @@ Starting from a specific point? These entry guides feed into the dev-to-prod wal
 - [Dev-to-Prod Walkthrough](../shared/examples/dev_to_prod/) — the canonical end-to-end walkthrough (native classification → coverage check → safe dev→prod promotion)
 - [Import a Genie Agent from UI into Code](../shared/docs/import-genie-agent-from-ui.md) — import your existing agent, then follow the dev-to-prod walkthrough
 - [Quickstart](../shared/docs/quickstart.md) — create a Genie agent from scratch
-- [Playbook](../shared/docs/playbook.md) — after first deployment: add spaces, promote, overlays, advanced scenarios
+- Playbooks — after the first deployment: [agents](../shared/docs/playbooks/agents.md), [governance](../shared/docs/playbooks/governance.md), [one team](../shared/docs/playbooks/one-team.md)
+- [Pipelines](../shared/docs/pipelines.md) and the [deployment machine](../shared/docs/deployment-machine.md)
 - [Architecture](../shared/docs/architecture.md) — layers, artifact ownership, config files, Genie agent lifecycle
 - [All documentation](../shared/docs/) — full list

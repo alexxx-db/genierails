@@ -121,7 +121,7 @@ Account Layer (shared)
 
 ### Self-Service Model
 
-Use `MODE=governance` for the central team and `MODE=genie` for BU teams. See [Self-Service Genie](self-service-genie.md) for details.
+Use `MODE=governance` for the central team and `MODE=genie` for BU teams. This is legacy: see [legacy mode](legacy-mode.md#legacy-commands). Deterministic envs split ownership with per-agent files ([pipelines](pipelines.md#who-owns-which-file)).
 
 ## CI/CD Performance
 
