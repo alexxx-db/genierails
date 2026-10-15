@@ -30,6 +30,7 @@ from deterministic_governance import validate_config
 from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
 from sensitivity_source import ClassificationSource
 from scripts import derive_assignments as derive_script
+from scripts import remap_env_config
 from tests.test_check_target import FAKE_TERRAFORM, GITIGNORE, _env, _git, _snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -320,6 +321,38 @@ def test_live_derivation_normalizes_override_identifier_case():
 
     assert model.columns[column].treatment == "redact"
     assert model.columns[column].partial == "redacted"
+
+
+def test_case_only_duplicate_override_error_names_both_spellings():
+    column = "ppay.s.notes.free_text"
+    with pytest.raises(DeterministicGovernanceError,
+                       match=r"PPAY\.s\.notes\.FREE_TEXT and ppay\.s\.notes\.free_text"):
+        build_model(
+            {column: ["class.phone_number"]}, {column: "STRING"},
+            {"column_overrides": {
+                "ppay.s.notes.free_text": {"treatment": "redact"},
+                "PPAY.s.notes.FREE_TEXT": {"partial": "last4"},
+            }},
+        )
+
+
+def test_promote_case_only_duplicate_override_error_names_both_spellings():
+    with pytest.raises(ValueError, match=r"'paycat\.s\.t\.card' and 'PAYCAT\.S\.T\.CARD'"):
+        remap_env_config._promoted_governance_settings(
+            {"column_overrides": {
+                "paycat.s.t.card": {"treatment": "redact"},
+                "PAYCAT.S.T.CARD": {"partial": "last4"},
+            }},
+            {"paycat": "ppay"}, {"paycat.s.t.card"},
+        )
+
+
+def test_promote_refuses_catalog_map_sources_that_collide_after_lowercasing():
+    with pytest.raises(ValueError, match=r"catalogs 'paycat' and 'PayCat'.*same catalog"):
+        remap_env_config._promoted_governance_settings(
+            {"column_overrides": {"paycat.s.t.card": {"treatment": "redact"}}},
+            {"paycat": "ppay", "PayCat": "other"}, {"paycat.s.t.card"},
+        )
 
 
 # ── N3: the split takes deterministic tag values next to legacy ones ────────

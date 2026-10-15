@@ -346,6 +346,29 @@ class DeterministicModel:
     functions_sql: str
 
 
+def normalize_column_overrides(
+    configured: Mapping[str, Mapping[str, str]] | None,
+) -> dict[str, Mapping[str, str]]:
+    """``column_overrides`` keyed by lowercase column (UC identifiers ignore case).
+
+    Two keys that differ only by case are refused, naming every spelling, so
+    neither rule can silently win.
+    """
+    spellings: dict[str, list[str]] = {}
+    overrides: dict[str, Mapping[str, str]] = {}
+    for column, rule in (configured or {}).items():
+        normalized = str(column).lower()
+        spellings.setdefault(normalized, []).append(str(column))
+        overrides[normalized] = rule
+    duplicates = sorted(" and ".join(sorted(names)) for names in spellings.values() if len(names) > 1)
+    if duplicates:
+        raise DeterministicGovernanceError(
+            "column_overrides names the same case-insensitive column more than once: "
+            + "; ".join(duplicates)
+        )
+    return overrides
+
+
 def build_model(
     classes_by_column: Mapping[str, Sequence[str]],
     types_by_column: Mapping[str, str],
@@ -363,19 +386,7 @@ def build_model(
             "remove them for deterministic governance"
         )
     library = load_library()
-    configured_overrides = settings.get("column_overrides") or {}
-    overrides = {}
-    duplicate_overrides = []
-    for column, rule in configured_overrides.items():
-        normalized = column.lower()
-        if normalized in overrides:
-            duplicate_overrides.append(column)
-        overrides[normalized] = rule
-    if duplicate_overrides:
-        raise DeterministicGovernanceError(
-            "column_overrides names the same case-insensitive column more than once: "
-            + ", ".join(sorted(duplicate_overrides))
-        )
+    overrides = normalize_column_overrides(settings.get("column_overrides"))
     ddl_columns = {column.lower() for column in types_by_column}
     unknown_overrides = sorted(
         column for column in overrides

@@ -86,8 +86,16 @@ def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_column
     overrides = cfg.get("column_overrides")
     if overrides is None:
         return result
-    remapped = {}
-    catalog_pairs = {source.lower(): dest for source, dest in pairs.items()}
+    remapped, spelled = {}, {}
+    catalog_pairs, catalog_spelled = {}, {}
+    for source, dest in pairs.items():
+        if source.lower() in catalog_pairs:
+            raise ValueError(
+                f'DEST_CATALOG_MAP names catalogs {catalog_spelled[source.lower()]!r} and {source!r}, '
+                "which are the same catalog (UC catalog names ignore case)"
+            )
+        catalog_pairs[source.lower()] = dest
+        catalog_spelled[source.lower()] = source
     for column, rule in overrides.items():
         parts = str(column).split(".")
         if len(parts) != 4:
@@ -104,9 +112,11 @@ def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_column
         normalized = ".".join(parts).lower()
         if normalized in remapped:
             raise ValueError(
-                f'column_overrides names case-insensitive column {normalized!r} more than once'
+                f'column_overrides names case-insensitive column {normalized!r} more than once: '
+                f'{spelled[normalized]!r} and {column!r}'
             )
         remapped[normalized] = rule
+        spelled[normalized] = column
     result["column_overrides"] = remapped
     return result
 
