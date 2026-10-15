@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Optional AI helpers** (design 18.4, decision 5): `make suggest-treatment
+  ENV=dev CLASS=<class>`, `make draft-genie-content ENV=dev SPACE=<agent>` and
+  `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` ask a
+  model for a draft and write it only under `envs/dev/drafts/`, for review
+  and commit; `make test-custom-mask ENV=dev TREATMENT=<name>` runs the mask
+  library's exact-output checks on a drafted mask against the dev SQL
+  warehouse. They are the only commands that call a model, refuse in CI and
+  in prod or promoted envs, and need `ai_helper_endpoint` in the env's
+  `env.auto.tfvars`. Nothing reads `drafts/`: committing a draft changes no
+  rehearse fingerprint and no `make check` result.
 - **Persona file ownership** (design 18.1): agent settings live only in
   `envs/<env>/agents/` files and every reader merges them (`generate`, the
   Genie ACL sidecar, `promote`), so an env with its agents in files promotes;

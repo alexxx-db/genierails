@@ -82,6 +82,11 @@ def _is_runtime(rel: Path) -> bool:
     return False
 
 
+def _not_copied(rel: Path) -> bool:
+    """Runtime files, and envs/<env>/drafts/ (AI-helper drafts, which no check reads)."""
+    return _is_runtime(rel) or rel.parts[1:2] == ("drafts",)
+
+
 # The one link make itself scaffolds in a copied env (_prepare-env); it is not
 # copied, and the scratch make recreates it inside the copy.
 SCAFFOLD_LINKS = {("data_access", "env.auto.tfvars"): "../env.auto.tfvars"}
@@ -108,7 +113,7 @@ def _refuse_symlinks(cloud_dir: Path, envs: Path) -> None:
         for name in dirnames + filenames:
             path = Path(directory) / name
             rel = path.relative_to(envs)
-            if _is_runtime(rel) or not path.is_symlink():
+            if _not_copied(rel) or not path.is_symlink():
                 continue
             if _is_scaffold_link(envs, rel):
                 continue
@@ -129,7 +134,7 @@ def _assert_contained(root: Path) -> None:
 def _ignore_runtime(envs: Path):
     def ignore(directory: str, names: list[str]) -> set[str]:
         base = Path(directory).relative_to(envs)
-        return {name for name in names if _is_runtime(base / name) or _is_scaffold_link(envs, base / name)}
+        return {name for name in names if _not_copied(base / name) or _is_scaffold_link(envs, base / name)}
     return ignore
 
 
@@ -142,7 +147,7 @@ def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
     found = {}
     for path in sorted(envs.rglob("*")):
         rel = path.relative_to(envs)
-        if not _is_runtime(rel) and not path.is_symlink() and path.is_file():
+        if not _not_copied(rel) and not path.is_symlink() and path.is_file():
             found[str(rel)] = ("file", path.read_bytes())
     return found
 

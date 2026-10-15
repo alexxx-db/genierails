@@ -89,6 +89,9 @@ RUNTIME_FILES = {
     "generated/genie_space_derived_acl_groups.auto.tfvars",
 }
 RUNTIME_DIRS = {"data_access"}
+# AI-helper drafts (scripts/ai_helpers.py) are committed for review but are not
+# inputs: nothing that applies reads them, so they never change a fingerprint.
+DRAFTS_DIR = "drafts"
 STATE_SUFFIXES = (".tfstate", ".tfstate.backup", ".tfplan")
 # What promote-to writes into the destination's generated/ (design section 9:
 # it writes only the files it owns).
@@ -267,7 +270,7 @@ def code_files(repo: Path, cloud_dir: Path) -> list[Path]:
 
 def _is_input(rel: Path) -> bool:
     parts = rel.parts
-    if not parts or parts[0] in RUNTIME_DIRS or str(rel) in RUNTIME_FILES:
+    if not parts or parts[0] in RUNTIME_DIRS or parts[0] == DRAFTS_DIR or str(rel) in RUNTIME_FILES:
         return False
     return not any(part.startswith(".") or part.endswith(STATE_SUFFIXES) or part == "__pycache__"
                    for part in parts)
