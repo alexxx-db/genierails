@@ -7,6 +7,7 @@ refuse in CI and in prod or promoted envs, and the model endpoint comes from
 the env's config. Every test uses a fake model and a fake warehouse: no network.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -92,6 +93,9 @@ def envs(tmp_path):
     staging = envs / "staging"
     staging.mkdir()
     (staging / "env.auto.tfvars").write_text(DEV_ENV + 'promote_from = "dev"\n')
+    for name in ("qa", "sandbox"):  # real, valid, non-promoted envs: still not dev
+        (envs / name).mkdir()
+        (envs / name / "env.auto.tfvars").write_text(DEV_ENV)
     return envs
 
 
@@ -104,7 +108,7 @@ def _snapshot(env_dir):
 def _args(envs, command, env="dev", **extra):
     values = dict(class_name="", space="", treatment="", type="", force=False)
     values.update(extra)
-    return Namespace(command=command, env=env, env_dir=envs / env, envs_dir=envs, **values)
+    return Namespace(command=command, env=env, env_dir=envs / env, envs_dir=envs, cloud_dir=str(envs.parent), **values)
 
 
 def _run(envs, command, model, env="dev", **extra):
@@ -309,8 +313,8 @@ def test_test_custom_mask_passes_exact_outputs_and_records_the_digests(envs):
         assert statement.startswith(f"SELECT to_json(named_struct('v', CAST(({MASK_REPLY['sql']}) AS STRING)), {TO_JSON_OPTIONS}) FROM (SELECT ")
     sql_path, json_path, passed = ai_helpers.mask_paths(dev, "postcode_area")
     record = json.loads(passed.read_text())
-    assert record["sql_sha256"] == ai_helpers.sha256(sql_path)
-    assert record["fixture_sha256"] == ai_helpers.sha256(json_path)
+    assert record["sql_sha256"] == hashlib.sha256(sql_path.read_bytes()).hexdigest()
+    assert record["fixture_sha256"] == hashlib.sha256(json_path.read_bytes()).hexdigest()
     assert ai_helpers.passed_record(dev, "postcode_area") == record
     # Editing the draft after it passed invalidates the record.
     sql_path.write_text(sql_path.read_text().replace("'**'", "'##'"))
@@ -404,12 +408,15 @@ def test_every_helper_refuses_in_ci(envs, monkeypatch, command, extra, marker, v
 
 @pytest.mark.parametrize("command, extra", COMMANDS)
 @pytest.mark.parametrize("env, message", [
-    ("prod", "ENV=prod is promoted (prod is a promotion target)"),
-    ("staging", "ENV=staging is promoted (its promote_from is dev)"),
-    ("account", "not a workspace env"),
-    ("qa", "envs/qa/env.auto.tfvars does not exist"),
+    ("prod", "ENV=prod is not allowed (it is promoted)"),
+    ("staging", "ENV=staging is not allowed (the AI helpers run only in the dev env)"),
+    ("account", "ENV=account is not allowed"),
+    # Real, valid envs with no promote_from: still refused, only dev drafts.
+    ("qa", "ENV=qa is not allowed (the AI helpers run only in the dev env)"),
+    ("sandbox", "ENV=sandbox is not allowed (the AI helpers run only in the dev env)"),
+    ("missing", "ENV=missing is not allowed"),
 ])
-def test_every_helper_refuses_prod_promoted_and_other_envs(envs, command, extra, env, message):
+def test_every_helper_runs_only_in_dev(envs, command, extra, env, message):
     (envs / "account").mkdir()
     (envs / "account" / "env.auto.tfvars").write_text("")
     with pytest.raises(ai_helpers.Refused, match=re.escape(message)):
@@ -419,7 +426,34 @@ def test_every_helper_refuses_prod_promoted_and_other_envs(envs, command, extra,
 def test_helpers_refuse_a_redirected_env_dir(envs):
     args = _args(envs, "suggest-treatment", class_name="loyalty_id")
     args.env_dir = envs / "prod"
-    with pytest.raises(ai_helpers.Refused, match="is not envs/dev for ENV=dev"):
+    with pytest.raises(ai_helpers.Refused, match="is not envs/dev of this checkout"):
+        ai_helpers.run(args, client_factory=_no_model)
+
+
+@pytest.mark.parametrize("change, message", [
+    ("cloud_dir", "is not envs/dev of this checkout"),         # CLOUD_ROOT pointed at another tree
+    ("no_cloud_dir", "run it through the cloud Makefile"),
+    ("dev_link", "is a symlink or not a directory"),         # envs/dev -> another dir
+    ("envs_link", "is a symlink or not a directory"),        # envs -> another dir
+    ("dev_promoted", "envs/dev is promoted"),
+])
+def test_dev_must_be_this_checkouts_real_unpromoted_envs_dev(envs, tmp_path, change, message):
+    args = _args(envs, "suggest-treatment", class_name="loyalty_id")
+    elsewhere = tmp_path / "elsewhere"
+    if change == "cloud_dir":
+        shutil.copytree(envs, elsewhere / "envs")
+        args.envs_dir, args.env_dir = elsewhere / "envs", elsewhere / "envs" / "dev"
+    elif change == "no_cloud_dir":
+        args.cloud_dir = ""
+    elif change == "dev_link":
+        (envs / "dev").rename(elsewhere)
+        (envs / "dev").symlink_to(elsewhere)
+    elif change == "envs_link":
+        envs.rename(elsewhere)
+        envs.symlink_to(elsewhere)
+    else:
+        (envs / "dev" / "env.auto.tfvars").write_text(DEV_ENV + 'promote_from = "qa"\n')
+    with pytest.raises(ai_helpers.Refused, match=re.escape(message)):
         ai_helpers.run(args, client_factory=_no_model)
 
 
@@ -445,6 +479,162 @@ def test_ai_helper_endpoint_is_a_valid_env_setting_and_terraform_variable():
     assert validate_config({"ai_helper_endpoint": ENDPOINT}) == []
     for root in ("data_access", "workspace"):
         assert 'variable "ai_helper_endpoint"' in (SHARED / "roots" / root / "main.tf").read_text()
+
+
+# ── Review blockers (PR #150) ───────────────────────────────────────────────
+
+NOT_LITERALS = [
+    "current_user()", "IDENTIFIER('current_user')", "'x' || secret('scope', 'key')",
+    "'x' || http_request(conn => 'c', method => 'GET', path => '/')", "ѕelect 1", "(SELECT 1)",
+    "`select`", "value", "CAST(value AS STRING)", "CAST(current_user() AS STRING)", "'a' -- comment",
+    "'a' /* c */", "'a\\' || current_user() || '", "1; DROP TABLE t", "1 + 1", "concat('a', 'b')",
+    "CAST('x' AS ARRAY<STRING>)", "X'00'", "'café'", "is_account_group_member('t1')", "ai_query('m', 'x')",
+]
+
+
+@pytest.mark.parametrize("bad", NOT_LITERALS)
+def test_fixture_inputs_must_be_typed_literals_and_never_run(envs, bad):
+    dev = envs / "dev"
+    answers = _drafted_mask(envs)
+    json_path = ai_helpers.mask_paths(dev, "postcode_area")[1]
+    fixture = json.loads(json_path.read_text())
+    fixture["cases"].append({"input": bad, "expected": "x"})
+    json_path.write_text(json.dumps(fixture))
+    warehouse = FakeWarehouse(answers)
+    result = ai_helpers.check_custom_mask(dev, "postcode_area", (warehouse, "wh"))
+    assert result["passed"] is False
+    assert any("must be one typed SQL literal" in problem for problem in result["problems"])
+    assert warehouse.statements == []  # nothing ran, not even the valid cases
+    assert not ai_helpers.mask_paths(dev, "postcode_area")[2].exists()
+
+
+@pytest.mark.parametrize("bad", NOT_LITERALS[:6])
+def test_a_drafted_fixture_with_a_non_literal_input_is_never_written(envs, bad):
+    reply = dict(MASK_REPLY, cases=MASK_REPLY["cases"] + [{"input": bad, "expected": "x"}])
+    with pytest.raises(ai_helpers.Refused, match="must be one typed SQL literal"):
+        _run(envs, "draft-custom-mask", FakeModel(reply), treatment="postcode_area", type="STRING")
+    assert not (envs / "dev" / "drafts").exists()
+
+
+@pytest.mark.parametrize("good", [
+    "NULL", "CAST(NULL AS STRING)", "'it''s'", "CAST('-- not a comment' AS STRING)", "12.5", "-1E3",
+    "DATE'2024-01-01'", "TIMESTAMP'2024-12-31 20:00:00-08:00'", "TIMESTAMP_NTZ'2024-12-31 23:30:00'",
+    "CAST('9223372036854775807' AS BIGINT)", "CAST(12.5 AS DECIMAL(10,2))", "CAST('NaN' AS DOUBLE)",
+])
+def test_typed_literals_are_accepted(good):
+    assert ai_helpers.typed_literal(good) == good.strip()
+
+
+@pytest.mark.parametrize("sql, rule", [
+    ("concat(value, secret('scope', 'key'))", "free of secrets, network and data access: secret"),
+    ("concat(value, http_request(conn => 'c', method => 'GET', path => '/'))", "http_request"),
+    ("ai_query('endpoint', value)", "must not call a model"),
+    ("concat(value, IDENTIFIER('x'))", "identifier"),
+    ("concat(value, 'ѕ')", "must be ASCII"),
+])
+def test_the_mask_itself_cant_read_secrets_call_out_or_resolve_names(sql, rule):
+    assert any(rule in problem for problem in ai_helpers.expression_problems(sql))
+
+
+def _outside(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir(exist_ok=True)
+    return outside
+
+
+@pytest.mark.parametrize("link", ["drafts", "drafts/treatments"])
+def test_a_symlinked_drafts_folder_is_refused_and_nothing_lands_outside(envs, tmp_path, link):
+    dev, outside = envs / "dev", _outside(tmp_path)
+    (dev / link).parent.mkdir(parents=True, exist_ok=True)
+    (dev / link).symlink_to(outside)
+    model = FakeModel({"treatment": "redact", "rationale": "r", "custom_mask": None})
+    with pytest.raises(ai_helpers.Refused, match=f"envs/dev/{link} is a symlink"):
+        _run(envs, "suggest-treatment", model, class_name="loyalty_id")
+    assert list(outside.rglob("*")) == []
+
+
+def test_a_symlinked_draft_file_is_refused_even_with_force(envs, tmp_path):
+    dev, outside = envs / "dev", _outside(tmp_path)
+    target = outside / "victim.json"
+    target.write_text("keep")
+    (dev / "drafts" / "treatments").mkdir(parents=True)
+    (dev / "drafts" / "treatments" / "loyalty_id.json").symlink_to(target)
+    model = FakeModel({"treatment": "redact", "rationale": "r", "custom_mask": None})
+    with pytest.raises(ai_helpers.Refused, match="loyalty_id.json is a symlink"):
+        _run(envs, "suggest-treatment", model, class_name="loyalty_id", force=True)
+    assert target.read_text() == "keep"
+
+
+@pytest.mark.parametrize("leaf", ["postcode_area.sql", "postcode_area.json", "postcode_area.passed.json"])
+def test_test_custom_mask_never_reads_writes_or_removes_through_a_symlink(envs, tmp_path, leaf):
+    dev, outside = envs / "dev", _outside(tmp_path)
+    answers = _drafted_mask(envs)
+    path = dev / "drafts" / "custom_masks" / leaf
+    target = outside / leaf
+    target.write_text(path.read_text() if path.exists() else "keep")
+    path.unlink(missing_ok=True)
+    path.symlink_to(target)
+    before = target.read_text()
+    with pytest.raises(ai_helpers.Refused, match=f"{leaf} is a symlink"):
+        ai_helpers.check_custom_mask(dev, "postcode_area", (FakeWarehouse(answers), "wh"))
+    assert target.read_text() == before
+
+
+def test_draft_genie_content_refuses_a_symlinked_capture(envs, tmp_path):
+    dev, outside = envs / "dev", _outside(tmp_path)
+    capture = dev / "agents" / "Payments.space.json"
+    (outside / "c.json").write_text(capture.read_text())
+    capture.unlink()
+    capture.symlink_to(outside / "c.json")
+    with pytest.raises(ai_helpers.Refused, match="Payments.space.json is a symlink"):
+        _run(envs, "draft-genie-content", FakeModel(GENIE_REPLY), space="Payments")
+
+
+def test_drafts_are_staged_so_a_failed_write_changes_nothing(envs, monkeypatch):
+    dev = envs / "dev"
+    _drafted_mask(envs)
+    sql_path, json_path, _ = ai_helpers.mask_paths(dev, "postcode_area")
+    before = (sql_path.read_text(), json_path.read_text())
+    real_fsync, calls = os.fsync, []
+
+    def failing_fsync(fd):
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        real_fsync(fd)
+
+    monkeypatch.setattr(ai_helpers.os, "fsync", failing_fsync)
+    reply = dict(MASK_REPLY, sql=MASK_REPLY["sql"].replace("'**'", "'##'"))
+    with pytest.raises(OSError, match="disk full"):
+        _run(envs, "draft-custom-mask", FakeModel(reply), treatment="postcode_area", type="STRING", force=True)
+    assert (sql_path.read_text(), json_path.read_text()) == before
+    assert sorted(p.name for p in sql_path.parent.iterdir()) == ["postcode_area.json", "postcode_area.sql"]
+
+
+SENTINEL = "SENTINEL-SECRET-4242"
+
+
+def test_draft_genie_content_sends_only_schema_never_existing_text(envs):
+    capture = dict(CAPTURE,
+                   instructions={"text_instructions": [{"content": [f"Customer {SENTINEL} is VIP."]}]},
+                   config={"sample_questions": [{"question": [f"What did {SENTINEL} buy?"]}]})
+    (envs / "dev" / "agents" / "Payments.space.json").write_text(json.dumps(capture))
+    model = FakeModel({"benchmarks": GENIE_REPLY["benchmarks"]})
+    _run(envs, "draft-genie-content", model, space="Payments")
+    (system, prompt), = model.prompts
+    assert SENTINEL not in system + prompt
+    assert "VIP" not in prompt and "buy" not in prompt
+    assert "Payments" not in prompt  # not even the agent's name
+    assert '"customer_id": "BIGINT"' in prompt and "dev_fin.pay.customers" in prompt
+    assert '["instructions", "sample_questions"]' in prompt  # only which parts exist
+
+
+@pytest.mark.parametrize("marker", ["TEAMCITY_VERSION", "TRAVIS", "BITBUCKET_BUILD_NUMBER", "CODEBUILD_BUILD_ID",
+                                    "BUILD_BUILDID", "DRONE", "SEMAPHORE", "APPVEYOR"])
+def test_other_ci_runners_are_refused_too(envs, monkeypatch, marker):
+    monkeypatch.setenv(marker, "1")
+    with pytest.raises(ai_helpers.Refused, match=f"{marker} is set"):
+        ai_helpers.run(_args(envs, "suggest-treatment", class_name="loyalty_id"), client_factory=_no_model)
 
 
 # ── Real make ───────────────────────────────────────────────────────────────
@@ -557,9 +747,10 @@ def test_make_targets_refuse_in_ci(repo, target, extra, ci):
 
 
 @pytest.mark.parametrize("args, message", [
-    (["ENV=prod", "CLASS=loyalty_id"], "ENV=prod is promoted"),
-    (["ENV=staging", "CLASS=loyalty_id"], "ENV=staging is promoted"),
-    (["ENV=dev", "ENV_DIR=../envs/prod", "CLASS=loyalty_id"], "is not envs/dev for ENV=dev"),
+    (["ENV=prod", "CLASS=loyalty_id"], "ENV=prod is not allowed"),
+    (["ENV=staging", "CLASS=loyalty_id"], "ENV=staging is not allowed"),
+    (["ENV=qa", "CLASS=loyalty_id"], "ENV=qa is not allowed (the AI helpers run only in the dev env)"),
+    (["ENV=dev", "ENV_DIR=../envs/prod", "CLASS=loyalty_id"], "is not envs/dev of this checkout"),
     (["ENV=dev"], "CLASS=<class> is required"),
 ])
 def test_make_suggest_treatment_refusals(repo, args, message):
@@ -582,3 +773,22 @@ def test_make_dry_run_runs_no_helper(repo):
     result = _make(repo, "-n", "suggest-treatment", "ENV=dev", "CLASS=loyalty_id")
     assert result.returncode == 0
     assert _model_calls(repo) == [] and not (repo / "aws" / "envs" / "dev" / "drafts").exists()
+
+
+@pytest.mark.parametrize("how", ["command-line", "make -e"])
+def test_make_ci_from_the_command_line_or_make_e_is_refused(repo, how):
+    args = ["suggest-treatment", "ENV=dev", "CLASS=loyalty_id"]
+    if how == "command-line":
+        result = _make(repo, *args, "CI=true")
+    else:
+        result = _make(repo, "-e", *args, ci=("CI", "true"))
+    assert result.returncode != 0 and "never run in CI" in result.stderr
+    assert _model_calls(repo) == []
+
+
+def test_make_refuses_a_redirected_cloud_root(repo, tmp_path):
+    other = tmp_path / "other"
+    shutil.copytree(repo / "aws" / "envs", other / "envs")
+    result = _make(repo, "suggest-treatment", "ENV=dev", "CLASS=loyalty_id", f"CLOUD_ROOT={other}")
+    assert result.returncode != 0 and "is not envs/dev of this checkout" in result.stderr
+    assert _model_calls(repo) == [] and not (other / "envs" / "dev" / "drafts").exists()

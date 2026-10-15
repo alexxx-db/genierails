@@ -549,13 +549,13 @@ materialize-treatment: _guard-workspace-target ## Add TREATMENT=<t>'s mask polic
 
 # Optional AI helpers (scripts/ai_helpers.py, design 18.4 and decision 5): the
 # only commands that call a model. Each writes a draft under envs/<env>/drafts/
-# for review and commit; nothing else reads drafts/. They refuse in CI, in prod
-# and in any promoted env, and the drafting ones need ai_helper_endpoint in the
-# env's env.auto.tfvars. test-custom-mask calls no model: it runs the mask
+# for review and commit; nothing else reads drafts/. They refuse in CI and run
+# only with ENV=dev at this checkout's real envs/dev (GENIERAILS_CLOUD_DIR), and
+# the drafting ones need ai_helper_endpoint in envs/dev/env.auto.tfvars. test-custom-mask calls no model: it runs the mask
 # library's exact-output checks on a draft against the dev SQL warehouse.
 # FORCE=1 replaces an existing, different draft.
 override _AI_HELPERS = python3 "$(SHARED_ROOT)/scripts/ai_helpers.py"
-override _AI_HELPER_ARGS = --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" $(if $(filter 1,$(FORCE)),--force,)
+override _AI_HELPER_ARGS = --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" --cloud-dir "$(GENIERAILS_CLOUD_DIR)" $(if $(filter 1,$(FORCE)),--force,)
 suggest-treatment: _guard-workspace-target ## [AI helper] Draft a treatment suggestion for an unmapped class into envs/<env>/drafts/: CLASS=<class>
 	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) suggest-treatment $(_AI_HELPER_ARGS) --class "$(CLASS)"
 

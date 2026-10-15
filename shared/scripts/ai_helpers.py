@@ -17,8 +17,13 @@
                          with the digests of the files it tested. Calls no model.
 
 These are the only commands that call a model, and only through ModelClient
-below. Every one refuses under CI, in prod and in any promoted env (one with
-promote_from), and writes only under envs/<env>/drafts/. Nothing in GenieRails
+below. Every one refuses under CI and runs only with ENV=dev whose physical
+path is <cloud>/envs/dev; it writes only inside the real envs/dev/drafts/
+(no symlink in any path component, files staged and moved into place). The
+model sees only what a draft needs: class and treatment names, the mask
+library, table names and column types; never data and never an agent's
+existing instructions, questions or benchmarks. Fixture inputs are typed
+literals only, so test-custom-mask never runs SQL a fixture supplies. Nothing in GenieRails
 reads drafts/: generate, rehearse, release, maintain and check never import
 this module, the rehearse fingerprint and make check's scratch copy skip the
 folder, and a draft reaches config only when a person copies it there in a
@@ -55,10 +60,14 @@ from mask_library import load_library, type_family  # noqa: E402
 
 DRAFTS_DIR = "drafts"
 ENDPOINT_KEY = "ai_helper_endpoint"
-# CI providers the applying-target guard knows, plus GitHub's own marker. No
-# opt-out: GENIERAILS_ALLOW_CI_APPLY is for isolated integration tests that
-# apply, and never lets a model run in CI.
-CI_MARKERS = ("TF_BUILD", "GITHUB_ACTIONS", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI")
+# CI providers the applying-target guard knows, plus other common runners'
+# markers (defense in depth; most also set CI). No opt-out:
+# GENIERAILS_ALLOW_CI_APPLY is for isolated integration tests that apply, and
+# never lets a model run in CI.
+CI_MARKERS = ("TF_BUILD", "GITHUB_ACTIONS", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI",
+              "BUILD_BUILDID", "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI", "TEAMCITY_VERSION", "TRAVIS",
+              "BITBUCKET_BUILD_NUMBER", "CODEBUILD_BUILD_ID", "DRONE", "SEMAPHORE", "APPVEYOR")
+HELPER_ENV = "dev"
 SYSTEM_PROMPT = (
     "You draft GenieRails configuration for a person to review before anything uses it. "
     "Reply with exactly one JSON object and nothing else."
@@ -73,6 +82,11 @@ CALLER_FUNCTIONS = ("current_user", "session_user", "user", "is_account_group_me
                     "current_groups", "current_principal")
 NONDETERMINISTIC_FUNCTIONS = ("rand", "randn", "random", "uuid", "now", "current_timestamp",
                               "current_date", "current_timezone", "shuffle")
+# Functions that read secrets, reach the network or other data, or resolve
+# names at run time: never in a mask (ai_* is refused by prefix).
+SIDE_EFFECT_FUNCTIONS = ("secret", "try_secret", "http_request", "read_files", "read_kafka", "read_kinesis",
+                         "read_pubsub", "read_pulsar", "read_statestore", "identifier", "java_method",
+                         "reflect", "try_reflect", "vector_search", "url_decode_to_request")
 MAX_ITEMS = 10
 
 
@@ -98,28 +112,43 @@ def refuse_ci(command: str) -> None:
             "(design decision 5). Run it on your own machine against the dev env.")
 
 
-def helper_env(envs_dir: Path, env: str, env_dir: Path, command: str) -> Path:
-    """The env to draft for: exactly a real envs/<env> that is not prod and not promoted."""
-    from scripts.coverage_fix import promote_source
-    from scripts.saved_settings import _env_name, destination_env_dir
+def helper_env(cloud_dir: Path, envs_dir: Path, env: str, env_dir: Path, command: str) -> Path:
+    """The env to draft for: exactly ENV=dev, whose physical path is <cloud>/envs/dev.
 
-    try:
-        _env_name("ENV", env)
-        path = destination_env_dir(Path(envs_dir), env, Path(env_dir))
-    except ValueError as exc:
-        raise Refused(f"make {command} refused: {exc}") from exc
-    if env in {"account", "data_access"}:
-        raise Refused(f"make {command} refused: ENV={env} is not a workspace env; use ENV=dev.")
-    if not (path / "env.auto.tfvars").is_file():
-        raise Refused(f"make {command} refused: envs/{env}/env.auto.tfvars does not exist; run make setup ENV={env}.")
-    source = promote_source(path)
-    if env == "prod" or source:
-        why = f"its promote_from is {source}" if source else "prod is a promotion target"
-        raise Refused(
-            f"make {command} refused: ENV={env} is promoted ({why}). The AI helpers draft only in the dev "
-            f"env rules are promoted from: run make {command} ENV={source or 'dev'}, review the draft, "
-            "and let promotion carry what you adopt.")
-    return path
+    cloud_dir is the dir the cloud Makefile records from its own location
+    (GENIERAILS_CLOUD_DIR); envs/ and envs/dev must be real directories there,
+    with no symlink and no ENV_DIR or CLOUD_ROOT redirection, and dev must not
+    be a promotion target.
+    """
+    from scripts.coverage_fix import promote_source
+
+    if env != HELPER_ENV:
+        why = "it is promoted" if env == "prod" else "the AI helpers run only in the dev env"
+        raise Refused(f"make {command} refused: ENV={env} is not allowed ({why}). Run make {command} "
+                      f"ENV={HELPER_ENV}, review the draft, and let promotion carry what you adopt.")
+    if not str(cloud_dir or "").strip():
+        raise Refused(f"make {command} refused: run it through the cloud Makefile (aws/ or azure/), "
+                      "which records where envs/ is")
+    cloud = Path(os.path.abspath(cloud_dir))
+    expected_envs, expected_env = cloud / "envs", cloud / "envs" / HELPER_ENV
+    if Path(os.path.abspath(envs_dir)) != expected_envs or Path(os.path.abspath(env_dir)) != expected_env:
+        raise Refused(f"make {command} refused: ENV_DIR={env_dir} is not envs/{HELPER_ENV} of this checkout "
+                      f"({expected_env}); drop ENV_DIR and CLOUD_ROOT")
+    for path in (expected_envs, expected_env):
+        if path.is_symlink() or not path.is_dir():
+            raise Refused(f"make {command} refused: {path} is a symlink or not a directory; the AI helpers "
+                          "write only inside a real envs/dev")
+    if os.path.realpath(expected_env) != os.path.join(os.path.realpath(cloud), "envs", HELPER_ENV):
+        raise Refused(f"make {command} refused: {expected_env} does not resolve to envs/{HELPER_ENV} of this checkout")
+    env_file = expected_env / "env.auto.tfvars"
+    if env_file.is_symlink() or not env_file.is_file():
+        raise Refused(f"make {command} refused: envs/{HELPER_ENV}/env.auto.tfvars is missing or a symlink; "
+                      f"run make setup ENV={HELPER_ENV}.")
+    source = promote_source(expected_env)
+    if source:
+        raise Refused(f"make {command} refused: envs/{HELPER_ENV} is promoted (its promote_from is {source}); "
+                      "the AI helpers draft only in the env rules are promoted from.")
+    return expected_env
 
 
 def _env_cfg(env_dir: Path) -> dict:
@@ -219,16 +248,89 @@ def render(value: dict) -> str:
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
-def write_drafts(files: dict[Path, str], force: bool) -> None:
-    """Write every file or none: an existing, different draft needs FORCE=1."""
-    clash = [p for p, text in files.items() if p.is_file() and p.read_text() != text]
+# ── Contained file access under envs/dev ─────────────────────────────────────
+# helper_env proved envs/dev is a real directory at its physical path. Every
+# path below it that a helper reads, writes or removes must also have no
+# symlink in any component (the rule promote-to and check apply, #88/#119), and
+# writes land only inside the real envs/dev/drafts/.
+
+def _contained(env_dir: Path, path: Path, *, under_drafts: bool, directory: bool = False) -> Path:
+    """path, after refusing a symlink or wrong file type in any component below env_dir."""
+    env_dir, path = Path(env_dir), Path(path)
+    rel = path.relative_to(env_dir)
+    if ".." in rel.parts or (under_drafts and rel.parts[:1] != (DRAFTS_DIR,)):
+        raise Refused(f"{path} is not inside envs/{env_dir.name}/{DRAFTS_DIR if under_drafts else ''}")
+    current = env_dir
+    for i, part in enumerate(rel.parts):
+        current = current / part
+        if current.is_symlink():
+            raise Refused(f"{_rel(env_dir, current)} is a symlink; the AI helpers read and write only real "
+                          f"files inside envs/{env_dir.name}. Replace it with the file or directory it points to.")
+        want_file = i == len(rel.parts) - 1 and not directory
+        if current.exists() and not (current.is_file() if want_file else current.is_dir()):
+            raise Refused(f"{_rel(env_dir, current)} is not a {'regular file' if want_file else 'directory'}")
+    root = os.path.realpath(env_dir / (DRAFTS_DIR if under_drafts else ""))
+    real = os.path.realpath(path)
+    if not (real.startswith(root + os.sep) or (directory and real == root)):
+        raise Refused(f"{path} resolves outside {root}")
+    return path
+
+
+def read_file(env_dir: Path, path: Path, *, under_drafts: bool = True) -> str:
+    """A regular file's text, refusing symlinks (also at open time, O_NOFOLLOW)."""
+    _contained(env_dir, path, under_drafts=under_drafts)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def remove_draft(env_dir: Path, path: Path) -> None:
+    _contained(env_dir, path, under_drafts=True)
+    if path.exists():
+        path.unlink()
+
+
+def _make_dirs(env_dir: Path, folder: Path) -> None:
+    current = Path(env_dir)
+    for part in folder.relative_to(env_dir).parts:
+        current = current / part
+        if not current.exists() and not current.is_symlink():
+            current.mkdir()
+        _contained(env_dir, current, under_drafts=True, directory=True)
+
+
+def write_drafts(env_dir: Path, files: dict[Path, str], force: bool) -> None:
+    """Write every file or none, inside envs/dev/drafts/ only; a changed draft needs FORCE=1.
+
+    Each file is staged beside its destination (created exclusively, never
+    following a link) and moved into place only after every stage succeeded.
+    """
+    for path in files:
+        _contained(env_dir, path, under_drafts=True)
+    clash = [p for p, text in files.items() if p.exists() and read_file(env_dir, p) != text]
     if clash and not force:
         raise Refused(
-            "a draft already exists and would change: " + ", ".join(str(p) for p in clash)
+            "a draft already exists and would change: " + ", ".join(_rel(env_dir, p) for p in clash)
             + ". Review or commit it first, or re-run with FORCE=1 to replace it.")
-    for path, text in files.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for path, text in files.items():
+            _make_dirs(env_dir, path.parent)
+            temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            staged.append((temp, path))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        for temp, path in staged:
+            _contained(env_dir, path, under_drafts=True)  # nothing swapped in a link meanwhile
+        for temp, path in staged:
+            os.replace(temp, path)
+        staged = []
+    finally:
+        for temp, _path in staged:
+            temp.unlink(missing_ok=True)
 
 
 def _rel(env_dir: Path, path: Path) -> str:
@@ -306,7 +408,7 @@ def suggest_treatment(env_dir: Path, class_name: str, client: ModelClient, force
                          "never-raw redaction."),
         }
     path = env_dir / DRAFTS_DIR / "treatments" / f"{label.removeprefix('class.')}.json"
-    write_drafts({path: render(draft)}, force)
+    write_drafts(env_dir, {path: render(draft)}, force)
     return path
 
 
@@ -335,7 +437,7 @@ def _table_columns(env_dir: Path, tables: list[str]) -> dict[str, dict[str, str]
     from governance_policies import column_types_from_ddl
 
     ddl = env_dir / "ddl" / "_fetched.sql"
-    types = column_types_from_ddl(ddl.read_text()) if ddl.is_file() else {}
+    types = column_types_from_ddl(read_file(env_dir, ddl, under_drafts=False)) if ddl.exists() or ddl.is_symlink() else {}
     result = {}
     for table in tables:
         prefix = table.lower() + "."
@@ -373,41 +475,47 @@ def draft_genie_content(env_dir: Path, space: str, client: ModelClient, force: b
         capture = agent_files.capture_path(env_dir, space)
     except agent_files.AgentFileError as exc:
         raise Refused(str(exc)) from exc
-    if not capture.is_file():
+    if not capture.exists() and not capture.is_symlink():
         raise Refused(f"agent {space!r} has no capture ({_rel(env_dir, capture)}); run make capture "
                       f'ENV={env_dir.name} SPACE="{space}" first.')
     try:
-        payload = json.loads(capture.read_text())
+        payload = json.loads(read_file(env_dir, capture, under_drafts=False))
     except json.JSONDecodeError as exc:
         raise Refused(f"{_rel(env_dir, capture)} is not valid JSON: {exc}") from exc
-    have = genie_content(payload if isinstance(payload, dict) else {})
+    payload = payload if isinstance(payload, dict) else {}
+    have = genie_content(payload)
     missing = [part for part, items in have.items() if not items]
     if not missing:
         raise Refused(f"agent {space!r} already has instructions, sample questions and benchmarks; "
                       "nothing to draft (edit them in the dev Genie UI).")
-    tables = agent_files.captured_tables(env_dir, space)
+    tables = sorted({str(t.get("identifier")) for t in ((payload.get("data_sources") or {}).get("tables") or [])
+                     if isinstance(t, dict) and t.get("identifier")})
     if not tables:
         raise Refused(f"agent {space!r} has no tables in its capture; add them in the dev Genie UI and re-capture.")
     shapes = {"instructions": '"instructions": ["<one instruction per item>"]',
               "sample_questions": '"sample_questions": ["<a question a business user would ask>"]',
               "benchmarks": '"benchmarks": [{"question": "<question>", "sql": "<one SELECT over these tables>"}]'}
+    # Schema only: table names and column types, plus which parts exist. The
+    # agent's name and its existing text (instructions, questions, benchmark
+    # SQL) are never sent; they can hold sample values or secrets.
+    present = sorted(set(have) - set(missing))
     prompt = (
-        f"Draft Genie agent content for the agent {space!r}. It reads only these Unity Catalog tables "
+        "Draft Genie agent content for an agent that reads only these Unity Catalog tables "
         f"(columns and types): {json.dumps(_table_columns(env_dir, tables), sort_keys=True)}\n"
-        f"It already has: {json.dumps({k: v for k, v in have.items() if v}, sort_keys=True)}\n"
+        f"Parts it already has (their text is not shown): {json.dumps(present)}\n"
         f"Draft only {', '.join(missing)}, at most {MAX_ITEMS} items each. Never ask for or reveal "
         "individual personal data. Reply as {" + ", ".join(shapes[p] for p in missing) + "}.")
     reply = reply_json(client.complete(SYSTEM_PROMPT, prompt))
     drafted = {part: (_benchmarks(reply) if part == "benchmarks" else _strings(reply, part)) for part in missing}
     draft = {
         "agent": space, "tables": tables, "drafted": drafted,
-        "not_drafted": sorted(set(have) - set(missing)),
+        "not_drafted": present,
         "to_adopt": (f"add what you keep to {space!r} in the dev Genie UI, then make capture ENV={env_dir.name} "
                      f'SPACE="{space}" and open a PR. This draft never changes the agent or its files.'),
         "drafted_by": _drafted_by("draft-genie-content", client),
     }
     path = env_dir / DRAFTS_DIR / "genie" / f"{agent_files.check_name(space)}.json"
-    write_drafts({path: render(draft)}, force)
+    write_drafts(env_dir, {path: render(draft)}, force)
     return path
 
 
@@ -471,8 +579,13 @@ def expression_problems(expression: str) -> list[str]:
     for word in STATEMENT_WORDS:
         if re.search(rf"\b{word}\b", bare):
             problems.append(f"the mask must be an expression over value, not a query or statement ({word.upper()})")
+    if re.search(r"\bai_\w*\s*\(", bare):
+        problems.append("the mask must not call a model: ai_* functions are not allowed")
+    if not expression.isascii():
+        problems.append("the mask must be ASCII (no look-alike letters)")
     for names, rule in ((CALLER_FUNCTIONS, "caller-independent (the tier policies decide who sees which version)"),
-                        (NONDETERMINISTIC_FUNCTIONS, "deterministic")):
+                        (NONDETERMINISTIC_FUNCTIONS, "deterministic"),
+                        (SIDE_EFFECT_FUNCTIONS, "free of secrets, network and data access")):
         for name in names:
             # current_user and the other current_* forms are valid without parentheses.
             pattern = rf"\b{name}\b" if name.startswith(("current_", "session_")) else rf"\b{name}\s*\("
@@ -502,6 +615,28 @@ def _expected_ok(expected, family: str) -> bool:
     return isinstance(expected, str)
 
 
+# A fixture input is data, never SQL: one literal from this grammar, ASCII
+# only (no confusable letters), no identifiers, functions, operators,
+# comments or backslash escapes. CAST(<literal> AS <scalar type>) is allowed
+# so a case can be typed exactly (CAST('NaN' AS DOUBLE), BIGINT bounds).
+_LITERAL_TYPE = (r"(?:STRING|TINYINT|SMALLINT|INT|INTEGER|BIGINT|FLOAT|DOUBLE|DATE|TIMESTAMP|TIMESTAMP_NTZ"
+                 r"|DECIMAL\s*\(\s*\d{1,2}\s*(?:,\s*\d{1,2}\s*)?\))")
+_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?"
+_TEXT = r"'(?:[ !#-&(-\[\]-~]|'')*'"  # printable ASCII; a quote only doubled; no backslash
+_DATE = r"DATE\s*'\d{4}-\d{2}-\d{2}'"
+_TIMESTAMP = r"TIMESTAMP(?:_NTZ)?\s*'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?'"
+_SCALAR = rf"(?:NULL|{_NUMBER}|{_TEXT}|{_DATE}|{_TIMESTAMP})"
+TYPED_LITERAL = re.compile(rf"\s*(?:{_SCALAR}|CAST\s*\(\s*(?:NULL|{_NUMBER}|{_TEXT})\s+AS\s+{_LITERAL_TYPE}\s*\))\s*",
+                           re.IGNORECASE | re.ASCII)
+
+
+def typed_literal(text) -> str | None:
+    """text stripped, if it is exactly one typed SQL literal; else None."""
+    if not isinstance(text, str) or not text.isascii() or not TYPED_LITERAL.fullmatch(text):
+        return None
+    return text.strip()
+
+
 def fixture_problems(fixture, name: str, sql_type: str) -> list[str]:
     if not isinstance(fixture, dict):
         return ["the fixture must be a JSON object"]
@@ -518,9 +653,10 @@ def fixture_problems(fixture, name: str, sql_type: str) -> list[str]:
         if not isinstance(case, dict) or not isinstance(case.get("input"), str) or "expected" not in case:
             problems.append(f"case {i}: needs input (a SQL literal) and expected")
             continue
-        bare = _strip_sql(case["input"]).lower()
-        if ";" in bare or any(re.search(rf"\b{w}\b", bare) for w in STATEMENT_WORDS):
-            problems.append(f"case {i}: input must be one SQL literal, not a query")
+        if typed_literal(case["input"]) is None:
+            problems.append(f"case {i}: input {case['input']!r} must be one typed SQL literal (NULL, a number, "
+                            "'text', DATE'...', TIMESTAMP'...', TIMESTAMP_NTZ'...', or CAST of one of those AS a "
+                            "scalar type); fixtures never run functions, identifiers or queries")
         if not _expected_ok(case["expected"], family):
             problems.append(f"case {i}: expected {case['expected']!r} is not a {family} value or null")
     if not any(isinstance(c, dict) and re.sub(r"\s+", " ", str(c.get("input", "")).strip()).upper()
@@ -573,13 +709,9 @@ def draft_custom_mask(env_dir: Path, name: str, sql_type: str, client: ModelClie
         raise Refused("the model's draft breaks the mask library's rules; nothing was written:\n  - "
                       + "\n  - ".join(problems) + "\nRe-run to retry.")
     sql_path, json_path, passed = mask_paths(env_dir, name)
-    write_drafts({sql_path: _mask_sql(name, sql_type, description, expression), json_path: render(fixture)}, force)
-    passed.unlink(missing_ok=True)  # a new draft has not passed
+    write_drafts(env_dir, {sql_path: _mask_sql(name, sql_type, description, expression), json_path: render(fixture)}, force)
+    remove_draft(env_dir, passed)  # a new draft has not passed
     return sql_path, json_path
-
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _warehouse(env_dir: Path):
@@ -593,22 +725,28 @@ def _warehouse(env_dir: Path):
 
 
 def check_custom_mask(env_dir: Path, name: str, warehouse: tuple | None = None) -> dict:
-    """Exact-output checks for one draft; on a pass, records the digests it tested."""
+    """Exact-output checks for one draft; on a pass, records the digests it tested.
+
+    Only the reviewed mask expression is SQL. Every fixture input must be one
+    typed literal (typed_literal), checked offline and again right before its
+    statement is built, so a fixture can never run a function or query.
+    """
     from scripts.live_mask_library import TO_JSON_OPTIONS, _execute, comparable
 
     name = _mask_name(name)
     sql_path, json_path, passed = mask_paths(env_dir, name)
     for path in (sql_path, json_path):
-        if not path.is_file():
+        if not path.exists() and not path.is_symlink():
             raise Refused(f"{_rel(env_dir, path)} does not exist; run make draft-custom-mask ENV={env_dir.name} "
                           f"TREATMENT={name} TYPE=<sql-type> first.")
-    passed.unlink(missing_ok=True)  # only a run that passes now leaves a record
+    sql_text, json_text = read_file(env_dir, sql_path), read_file(env_dir, json_path)
+    remove_draft(env_dir, passed)  # only a run that passes now leaves a record
     try:
-        fixture = json.loads(json_path.read_text(), parse_float=Decimal)
+        fixture = json.loads(json_text, parse_float=Decimal)
     except json.JSONDecodeError as exc:
         raise Refused(f"{_rel(env_dir, json_path)} is not valid JSON: {exc}") from exc
     sql_type = _mask_type(str(fixture.get("type") or "")) if isinstance(fixture, dict) else "STRING"
-    expression = mask_expression(sql_path.read_text())
+    expression = mask_expression(sql_text)
     problems = expression_problems(expression) + fixture_problems(fixture, name, sql_type)
     if problems:
         return {"passed": False, "cases": 0, "problems": problems, "mismatches": []}
@@ -616,34 +754,42 @@ def check_custom_mask(env_dir: Path, name: str, warehouse: tuple | None = None) 
     typed = typed_expression(expression, sql_type)
     mismatches = []
     for case in fixture["cases"]:
+        literal = typed_literal(case["input"])
+        if literal is None:  # unreachable after fixture_problems; never build a statement from it
+            raise Refused(f"fixture input {case['input']!r} is not one typed SQL literal")
         statement = (f"SELECT to_json(named_struct('v', {typed}), {TO_JSON_OPTIONS}) "
-                     f"FROM (SELECT {case['input']} AS value)")
+                     f"FROM (SELECT {literal} AS value)")
         try:
             rows = _execute(client, warehouse_id, statement)
             actual = json.loads(rows[0][0], parse_float=Decimal).get("v") if rows else "<no row>"
         except Exception as exc:  # a mask that errors fails, like one that returns the wrong value
             actual = f"<error: {exc}>"
         if comparable(actual) != comparable(case["expected"]):
-            mismatches.append({"input": case["input"], "expected": case["expected"], "actual": actual})
+            mismatches.append({"input": literal, "expected": case["expected"], "actual": actual})
     result = {"passed": not mismatches, "cases": len(fixture["cases"]), "problems": [], "mismatches": mismatches}
     if not mismatches:
-        passed.write_text(render({
+        write_drafts(env_dir, {passed: render({
             "treatment": name, "type": sql_type, "cases": len(fixture["cases"]),
-            "sql_sha256": sha256(sql_path), "fixture_sha256": sha256(json_path),
+            "sql_sha256": _digest(sql_text), "fixture_sha256": _digest(json_text),
             "checked": "mask library exact-output rules: one caller-independent, deterministic expression; "
-                       "NULL in gives NULL out; every fixture case exact on the dev SQL warehouse",
-        }))
+                       "NULL in gives NULL out; every fixture input one typed literal; every case exact on the "
+                       "dev SQL warehouse",
+        })}, force=True)
     return result
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def passed_record(env_dir: Path, name: str) -> dict | None:
     """The pass record, only if it matches the draft's current bytes."""
     sql_path, json_path, passed = mask_paths(env_dir, name)
     try:
-        record = json.loads(passed.read_text())
-        return record if record.get("sql_sha256") == sha256(sql_path) and \
-            record.get("fixture_sha256") == sha256(json_path) else None
-    except (OSError, ValueError, AttributeError):
+        record = json.loads(read_file(env_dir, passed))
+        return record if record.get("sql_sha256") == _digest(read_file(env_dir, sql_path)) and \
+            record.get("fixture_sha256") == _digest(read_file(env_dir, json_path)) else None
+    except (OSError, ValueError, AttributeError, Refused):
         return None
 
 
@@ -656,7 +802,7 @@ def _client(env_dir: Path, command: str) -> ModelClient:
 def run(args, client_factory: Callable[[Path, str], ModelClient] = _client) -> int:
     command = args.command
     refuse_ci(command)
-    env_dir = helper_env(args.envs_dir, args.env, args.env_dir, command)
+    env_dir = helper_env(args.cloud_dir, args.envs_dir, args.env, args.env_dir, command)
     if command == "test-custom-mask":
         result = check_custom_mask(env_dir, args.treatment)
         name = _mask_name(args.treatment)
@@ -700,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env", required=True)
     parser.add_argument("--env-dir", type=Path, required=True)
     parser.add_argument("--envs-dir", type=Path, required=True)
+    parser.add_argument("--cloud-dir", default="", help="GENIERAILS_CLOUD_DIR: the dir the cloud Makefile is in")
     parser.add_argument("--class", dest="class_name", default="")
     parser.add_argument("--space", default="")
     parser.add_argument("--treatment", default="")

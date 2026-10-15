@@ -79,7 +79,7 @@ commands that call a model. `generate`, `rehearse`, `release`, `maintain` and
 | Command | Writes (only) |
 |---|---|
 | `make suggest-treatment ENV=dev CLASS=<class>` | `envs/dev/drafts/treatments/<class>.json`: a mask-library treatment for a class nothing maps yet, with the library's partial and full versions, or a pointer to `draft-custom-mask` when none fits |
-| `make draft-genie-content ENV=dev SPACE="<agent>"` | `envs/dev/drafts/genie/<agent>.json`: instructions, sample questions and benchmarks the captured agent doesn't have yet (from its table schema, never data) |
+| `make draft-genie-content ENV=dev SPACE="<agent>"` | `envs/dev/drafts/genie/<agent>.json`: instructions, sample questions and benchmarks the captured agent doesn't have yet. The model sees only table names, column types and which parts already exist; never data, the agent's name or its existing text |
 | `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` | `envs/dev/drafts/custom_masks/<name>.sql` (one expression over `value`) and `<name>.json` (exact-output fixture, always with a NULL case) |
 | `make test-custom-mask ENV=dev TREATMENT=<name>` | `envs/dev/drafts/custom_masks/<name>.passed.json`, only on a pass. Calls no model |
 
@@ -87,10 +87,19 @@ commands that call a model. `generate`, `rehearse`, `release`, `maintain` and
   Databricks model serving endpoint, called with the env's workspace
   credentials). Without it the drafting commands stop with an error naming
   the setting. Promotion never carries it.
-- **Where they run:** only `ENV=<env>` for a real `envs/<env>` that is not
-  prod and has no `promote_from`, and never in CI (`CI`, `GITHUB_ACTIONS`,
-  `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`, `BUILDKITE` or `CIRCLECI` set;
-  `GENIERAILS_ALLOW_CI_APPLY` does not lift this).
+- **Where they run:** only `ENV=dev`, whose physical path must be this
+  checkout's `<cloud>/envs/dev` (no `ENV_DIR` or `CLOUD_ROOT` redirection, no
+  symlinked `envs/` or `envs/dev`, and no `promote_from`). Never in CI: `CI`
+  (`true`, `1` or `yes`, from the environment, the command line or `make -e`)
+  or any of `GITHUB_ACTIONS`, `TF_BUILD`, `BUILD_BUILDID`, `JENKINS_URL`,
+  `GITLAB_CI`, `BUILDKITE`, `CIRCLECI`, `TEAMCITY_VERSION`, `TRAVIS`,
+  `BITBUCKET_BUILD_NUMBER`, `CODEBUILD_BUILD_ID`, `DRONE`, `SEMAPHORE` or
+  `APPVEYOR` set; `GENIERAILS_ALLOW_CI_APPLY` does not lift this.
+- **Files:** they read, write and remove only real files: a symlink in any
+  path component under `envs/dev` (including `drafts/` itself, a folder in it,
+  a draft, or the agent capture they read) is refused. Drafts are staged
+  beside their destination, created exclusively without following links, and
+  moved into place only after every file is staged.
 - **Drafts are never read.** Nothing in GenieRails reads `drafts/`: the
   rehearse fingerprint and `make check`'s scratch copy skip it. A draft takes
   effect only when a person copies it into config in a reviewed PR: a
@@ -98,9 +107,14 @@ commands that call a model. `generate`, `rehearse`, `release`, `maintain` and
   then `make capture`. A changed draft is replaced only with `FORCE=1`.
 - **Custom masks:** `test-custom-mask` runs the mask library's exact-output
   rules on the draft. Offline: one caller-independent, deterministic
-  expression over `value` (no query, statement, `current_user`, group check,
-  randomness or current time), and a fixture with NULL in giving NULL out
-  plus at least two non-null cases. Then every case on the env's
+  ASCII expression over `value` (no query, statement, `current_user`, group
+  check, randomness, current time, `secret`, `http_request`, `ai_*`,
+  `IDENTIFIER`, `read_files` or reflection), and a fixture with NULL in giving
+  NULL out plus at least two non-null cases. Every fixture input must be one
+  typed literal (`NULL`, a number, `'text'`, `DATE'…'`, `TIMESTAMP'…'`,
+  `TIMESTAMP_NTZ'…'`, or `CAST` of a number, text or `NULL` to a scalar
+  type), so a fixture can never run SQL; the reviewed mask is the only SQL
+  that runs. Then every case on the env's
   `sql_warehouse_id`, read-only, wrapped in the library's typed cast and
   rendered in `America/Los_Angeles` like `scripts/live_mask_library.py`. A
   pass records the SHA-256 of the `.sql` and `.json` it tested, so a reviewer
