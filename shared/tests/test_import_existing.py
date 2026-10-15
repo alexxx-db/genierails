@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -7,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from tests import fake_uc
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts/import_existing.sh"
@@ -104,6 +107,7 @@ def test_stale_tag_lookup_fails_closed(
 
 
 def test_deterministic_cleanup_skips_treatments_but_cleans_other_tags(monkeypatch, tmp_path):
+    monkeypatch.setenv("GENIERAILS_IMPORT_SKIP_TREATMENT_TAGS", "true")
     (tmp_path / "abac.auto.tfvars").write_text(
         'tag_assignments = [\n'
         '  { entity_type = "columns", entity_name = "cat.sch.tbl.ssn", tag_key = "gr_treatment", tag_value = "redact__string__12345678" },\n'
@@ -147,7 +151,7 @@ def test_deterministic_import_skips_treatments_including_steady_state_retag(tmp_
         ']\n'
     )
     result = subprocess.run(
-        ["bash", SCRIPT, "--tag-assignments-only", "--dry-run"], cwd=data_access,
+        ["bash", SCRIPT, "--tag-assignments-only", "--dry-run", "--skip-treatment-tags"], cwd=data_access,
         env=os.environ, text=True, capture_output=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -155,9 +159,129 @@ def test_deterministic_import_skips_treatments_including_steady_state_retag(tmp_
     assert 'assignments["tables|cat.sch.tbl|sensitivity|pii"]' in result.stdout
 
 
+STALE_TREATMENT = (
+    'tag_assignments = [\n'
+    '  { entity_type = "columns", entity_name = "cat.sch.tbl.ssn", tag_key = "gr_treatment", tag_value = "redact__string__newvalue" },\n'
+    '  { entity_type = "tables", entity_name = "cat.sch.tbl", tag_key = "sensitivity", tag_value = "pii" },\n'
+    '  { entity_type = "tables", entity_name = "cat.sch.tbl", tag_key = "owner", tag_value = "fin" }\n'
+    ']\n'
+)
+# Live UC: the treatment tag still has its legacy value, sensitivity is stale, owner is current.
+LIVE = {
+    "column_tags": [["cat.sch.tbl.ssn", "gr_treatment", "redact"]],
+    "table_tags": [["cat.sch.tbl", "sensitivity", "public"], ["cat.sch.tbl", "owner", "fin"]],
+    "warehouses": [{"id": "wh", "name": "Shared", "state": "RUNNING"}],
+}
+
+
+def _layer(tmp_path, env_file=None, abac=STALE_TREATMENT):
+    data_access = tmp_path / "env" / "data_access"
+    data_access.mkdir(parents=True)
+    if env_file is not None:
+        (tmp_path / "env" / "env.auto.tfvars").write_text(env_file)
+    (data_access / "abac.auto.tfvars").write_text(abac)
+    return data_access
+
+
+def _run(data_access, fake, *args):
+    return subprocess.run(["bash", SCRIPT, "--tag-assignments-only", *args], cwd=data_access,
+                          env=os.environ | fake, text=True, capture_output=True)
+
+
+@pytest.mark.parametrize("env_file", ["not hcl {\n", 'governance_mode = "determinstic"\n', None],
+                         ids=["unparseable", "unknown-mode", "missing"])
+def test_unreadable_governance_mode_stops_before_any_import_or_unset(tmp_path, env_file):
+    data_access = _layer(tmp_path, env_file)
+    fake = fake_uc.install(tmp_path, LIVE)
+    result = _run(data_access, fake)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "cannot tell who owns gr_treatment tags" in result.stderr
+    assert fake_uc.events(fake) == []  # no SQL, no runner call: nothing imported or cleared
+
+
+def test_a_stale_layer_local_env_file_does_not_hide_a_deterministic_env(tmp_path):
+    """The env-level file decides, never data_access/env.auto.tfvars (a stale copy, not the symlink)."""
+    data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n')
+    (data_access / "env.auto.tfvars").write_text('governance_mode = "legacy"\nsql_warehouse_id = "wh"\n')
+    fake = fake_uc.install(tmp_path, LIVE)
+    result = _run(data_access, fake)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fake_uc.sql_writes(fake) == ["ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')"]
+    imports = fake_uc.runner_imports(fake)
+    assert imports and not [argv for argv in imports if "gr_treatment" in argv[3]]
+
+
+def test_a_missing_governance_mode_is_legacy_as_everywhere_else(tmp_path):
+    data_access = _layer(tmp_path, 'sql_warehouse_id = "wh"\n')
+    fake = fake_uc.install(tmp_path, LIVE)
+    result = _run(data_access, fake)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ALTER TABLE cat.sch.tbl ALTER COLUMN ssn UNSET TAGS ('gr_treatment')" in fake_uc.sql_writes(fake)
+
+
+def _state_bytes(data_access):
+    path = data_access / "terraform.tfstate"
+    return path.read_bytes() if path.exists() else None
+
+
+def test_record_mode_changes_nothing_live_or_in_state(tmp_path):
+    """release-plan: the stale tag and the importable one are recorded, never cleared or imported."""
+    data_access = _layer(tmp_path, 'governance_mode = "deterministic"\nsql_warehouse_id = "wh"\n')
+    fake = fake_uc.install(tmp_path, LIVE)
+    record = tmp_path / "imports.jsonl"
+    result = _run(data_access, fake, "--skip-treatment-tags", f"--record={record}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fake_uc.sql_writes(fake) == [] and fake_uc.runner_imports(fake) == []
+    assert _state_bytes(data_access) is None
+    entries = [json.loads(line) for line in record.read_text().splitlines()]
+    assert entries == [
+        {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "entity_name": "cat.sch.tbl",
+         "tag_key": "sensitivity", "statement": "ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')",
+         "warehouse_id": "wh"},
+        {"kind": "import", "layer": "data_access",
+         "address": 'module.data_access.databricks_entity_tag_assignment.assignments["tables|cat.sch.tbl|owner|fin"]',
+         "id": "tables,cat.sch.tbl,owner"},
+    ]
+
+
+def test_record_mode_refuses_what_it_cannot_verify(tmp_path):
+    abac = ('fgac_policies = [{ name = "mask", catalog = "cat", policy_type = "POLICY_TYPE_COLUMN_MASK" }]\n')
+    data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n', abac)
+    fake = fake_uc.install(tmp_path, LIVE | {"rest_down": True})
+    result = subprocess.run(["bash", SCRIPT, "--fgac-only", "--skip-treatment-tags",
+                             f"--record={tmp_path / 'imports.jsonl'}"], cwd=data_access,
+                            env=os.environ | fake, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "records only imports it verified exist" in result.stderr
+    assert (tmp_path / "imports.jsonl").read_text() == ""
+
+
+def test_apply_recorded_runs_exactly_the_layers_recorded_entries(tmp_path):
+    data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n')
+    fake = fake_uc.install(tmp_path, LIVE)
+    record = tmp_path / "imports.jsonl"
+    entries = [
+        {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "entity_name": "cat.sch.tbl",
+         "tag_key": "sensitivity", "statement": "ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')",
+         "warehouse_id": "wh"},
+        {"kind": "import", "layer": "data_access", "address": 'module.data_access.x.y["k"]', "id": "k-id"},
+        {"kind": "import", "layer": "workspace", "address": 'module.workspace.x.y["w"]', "id": "w-id"},
+    ]
+    record.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    result = _run(data_access, fake, "--skip-treatment-tags", f"--apply-recorded={record}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fake_uc.sql_writes(fake) == ["ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')"]
+    assert [argv[3:] for argv in fake_uc.runner_imports(fake)] == [['module.data_access.x.y["k"]', "k-id"]]
+    # A recorded import that fails fails the release (it was verified to exist).
+    failing = _run(data_access, fake | {"FAKE_UC_FAIL_IMPORT": "1"}, "--skip-treatment-tags",
+                   f"--apply-recorded={record}")
+    assert failing.returncode == 1 and "recorded import(s) failed" in failing.stderr
+
+
 def test_failed_optional_import_continues_and_surfaces_failure(tmp_path):
     data_access = tmp_path / "env" / "data_access"
     data_access.mkdir(parents=True)
+    (tmp_path / "env" / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
     (data_access / "abac.auto.tfvars").write_text(
         'tag_assignments = [\n'
         '  { entity_type = "tables", entity_name = "cat.sch.first", tag_key = "k", tag_value = "v" },\n'

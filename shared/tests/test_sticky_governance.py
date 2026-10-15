@@ -329,6 +329,16 @@ def test_generation_qualified_old_address_is_still_refused(tmp_path):
         check_layout(env, "dev")
 
 
+def test_mixed_legacy_and_generation_qualified_old_addresses_are_refused(tmp_path):
+    env = _env(tmp_path)
+    _state(env, {
+        f"{ORDERS}.ssn": "ssn_last4",
+        f"{CUSTOMERS}.email": "email_partial__string__12345678",
+    }, name="assignments")
+    with pytest.raises(GovernedTablesError, match="old Terraform address"):
+        check_layout(env, "dev")
+
+
 @pytest.mark.parametrize("artifact", ["journal", "adopted"])
 def test_migration_artifact_keeps_old_address_refusal(tmp_path, artifact):
     env = _env(tmp_path)
@@ -343,6 +353,18 @@ def test_migration_artifact_keeps_old_address_refusal(tmp_path, artifact):
         (ledger / "migration.json").write_text('{"status": "adopted"}\n')
     with pytest.raises(GovernedTablesError, match="old Terraform address"):
         check_layout(env, "dev")
+
+
+@pytest.mark.parametrize("artifact", ["journal.json", "migration.json"])
+def test_unreadable_migration_artifact_is_a_clean_error(tmp_path, capsys, artifact):
+    env = _env(tmp_path)
+    _state(env, {f"{ORDERS}.ssn": "ssn_last4"}, name="assignments")
+    ledger = env / "data_access/.policy_generations"
+    ledger.mkdir(parents=True)
+    (ledger / artifact).write_text("not-json\n")
+    assert main(["check-layout", "--env-dir", str(env), "--env-name", "dev"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR:") and "Traceback" not in err
 
 
 @pytest.mark.parametrize("recipe", ["_plan-layer:", "_apply-layer:"])

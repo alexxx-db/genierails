@@ -42,6 +42,8 @@ if "_release-plan-roots" in args:
     (plan_dir / "account.json").write_text('{{"file": "account.tfplan", "changes": false}}')
     (plan_dir / "workspace.tfplan").write_bytes(b"workspace")
     (plan_dir / "workspace.json").write_text('{{"file": "workspace.tfplan", "changes": true}}')
+    if Path({imports!r}).exists():  # imports and stale-tag cleanups import_existing.sh --record found
+        (plan_dir / "imports.jsonl").write_text(Path({imports!r}).read_text())
     da = plan_dir / "data_access"
     da.mkdir()
     (da / "00-grant.tfplan").write_bytes(b"grant")
@@ -73,8 +75,10 @@ class Make:
         self.log = tmp_path / "calls.jsonl"
         self.live = tmp_path / "live.txt"
         self.live.write_text("live-1\n")
+        self.imports = tmp_path / "imports.jsonl"
         self.make = self._write("make-stub", MAKE_STUB.format(python=sys.executable, log=str(self.log), fail=fail,
-                                                              passthrough=list(passthrough)))
+                                                              passthrough=list(passthrough),
+                                                              imports=str(self.imports)))
         self.stubs = {name: self._recorder(name) for name in
                       ("staged", "gate", "runner", "reports", "live", "inventory", "classification", "audit")}
 
@@ -289,6 +293,38 @@ def test_a_phase_manifest_records_the_phase_and_writes_no_release_receipt(make, 
     assert not rg.release_receipts(repo.cloud, "prod")
     assert [r["id"] for r in rg.phase_records(repo.cloud, "prod", repo.head())]
     assert not [c for c in make.calls() if c[0] == "runner"]  # the workspace waits for the last phase
+
+
+def test_an_import_manifest_runs_only_its_recorded_imports_under_the_lock(make, repo):
+    """release-plan recorded imports instead of running them; release runs exactly those, then stops."""
+    entry = {"kind": "import", "layer": "data_access", "address": 'module.data_access.x.y["k"]', "id": "k"}
+    make.imports.write_text(json.dumps(entry) + "\n")
+    manifest = _planned(make)
+    assert json.loads(manifest.read_text())["imports"]["count"] == 1
+    importer = make._recorder("importer")
+    (repo.prod / "data_access").mkdir(exist_ok=True)
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"IMPORT_EXISTING_SCRIPT={importer}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = make.calls()
+    assert [c for c in calls if c[0] == "importer"] == [
+        ["importer", "--skip-treatment-tags", f"--apply-recorded={manifest.parent / 'imports.jsonl'}"]]
+    # Nothing else: no saved plan, no tag-policy sync, no workspace apply, no release receipt.
+    assert not [c for c in calls if c[0] in ("staged", "runner")] and "sync-tags" not in make.names()
+    assert [r["id"] for r in rg.phase_records(repo.cloud, "prod", repo.head())]
+    assert not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
+    assert "make release-plan ENV=prod" in result.stdout
+
+
+def test_an_import_manifest_whose_record_changed_is_refused(make, repo):
+    make.imports.write_text(json.dumps({"kind": "import", "layer": "data_access", "address": "a", "id": "b"}) + "\n")
+    manifest = _planned(make)
+    record = manifest.parent / "imports.jsonl"
+    os.chmod(record, 0o644)
+    record.write_text(json.dumps({"kind": "import", "layer": "data_access", "address": "a", "id": "other"}) + "\n")
+    importer = make._recorder("importer")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"IMPORT_EXISTING_SCRIPT={importer}")
+    assert result.returncode != 0 and "the recorded imports" in result.stderr
+    assert not [c for c in make.calls() if c[0] in ("importer", "staged", "runner")]
 
 
 def test_a_failed_saved_plan_writes_no_release_receipt(make, repo):

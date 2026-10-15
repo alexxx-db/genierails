@@ -614,12 +614,13 @@ def test_saved_plans_take_one_manifest_per_changing_phase(cutover, env_dir, tmp_
 
 def test_make_plan_previews_the_migration_without_moving_anything(env_dir, capsys):
     opt_in(env_dir)
-    before = live_state(env_dir)
+    before = _runtime_bytes(env_dir)
     assert spa.Controller(env_dir, ENV).describe() == 0
     out = capsys.readouterr().out
     assert "migrates from the legacy deployment" in out
     assert "would run: create -> verify-created -> switch -> verify-switched -> grant" in out
-    assert live_state(env_dir) == before and spa.load_journal(env_dir) is None
+    assert _runtime_bytes(env_dir) == before
+    assert spa.load_journal(env_dir) is None and migration.load_record(env_dir) is None
 
 
 # -- release-plan reports --------------------------------------------------------------
