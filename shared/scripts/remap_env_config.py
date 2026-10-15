@@ -87,11 +87,12 @@ def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_column
     if overrides is None:
         return result
     remapped = {}
+    catalog_pairs = {source.lower(): dest for source, dest in pairs.items()}
     for column, rule in overrides.items():
         parts = str(column).split(".")
         if len(parts) != 4:
             raise ValueError(f'column_overrides[{column!r}] must name catalog.schema.table.column')
-        if parts[0] not in pairs:
+        if parts[0].lower() not in catalog_pairs:
             raise ValueError(
                 f'column_overrides[{column!r}] catalog {parts[0]!r} has no DEST_CATALOG_MAP mapping'
             )
@@ -99,8 +100,13 @@ def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_column
             raise ValueError(
                 f'column_overrides[{column!r}] does not name a classified column in generated governance'
             )
-        parts[0] = pairs[parts[0]]
-        remapped[".".join(parts)] = rule
+        parts[0] = catalog_pairs[parts[0].lower()]
+        normalized = ".".join(parts).lower()
+        if normalized in remapped:
+            raise ValueError(
+                f'column_overrides names case-insensitive column {normalized!r} more than once'
+            )
+        remapped[normalized] = rule
     result["column_overrides"] = remapped
     return result
 

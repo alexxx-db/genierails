@@ -26,7 +26,10 @@ import hcl2
 import pytest
 
 import generate_abac
+from deterministic_governance import validate_config
 from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
+from sensitivity_source import ClassificationSource
+from scripts import derive_assignments as derive_script
 from tests.test_check_target import FAKE_TERRAFORM, GITIGNORE, _env, _git, _snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -177,11 +180,14 @@ def _set_dev_override(repo, tmp_path, column="paycat.s.notes.free_text", treatme
     env_file = dev / "env.auto.tfvars"
     env_file.write_text(env_file.read_text() +
                         f'column_overrides = {{ {json.dumps(column)} = {{ treatment = {json.dumps(treatment)} }} }}\n'
-                        'treatment_versions = { phone = { partial = "redacted" } }\n'
+                        'treatment_versions = { phone_partial = { partial = "last4" } }\n'
                         'tag_treatments = { "sensitivity=confidential" = "redact" }\n')
     settings = hcl2.loads(env_file.read_text())
-    classes = CLASSES | {"paycat.s.notes.free_text": ["class.phone_number"]}
-    ddl = DDL + "\nCREATE TABLE paycat.s.notes (free_text STRING);\n"
+    classes = CLASSES | {
+        "paycat.s.notes.free_text": ["class.phone_number"],
+        "paycat.s.notes.callback_number": ["class.phone_number"],
+    }
+    ddl = DDL + "\nCREATE TABLE paycat.s.notes (free_text STRING, callback_number STRING);\n"
     model = build_model(classes, column_types_from_ddl(ddl), settings,
                         deployer_principal=DEPLOYER)
     generate_abac.write_deterministic_model(
@@ -200,16 +206,50 @@ def test_promote_and_prod_live_derivation_honor_remapped_column_override(repo, t
 
     prod = hcl2.loads((_envs(repo) / "prod" / "env.auto.tfvars").read_text())
     assert prod["column_overrides"] == {"ppay.s.notes.free_text": {"treatment": "redact"}}
-    assert prod["treatment_versions"] == {"phone": {"partial": "redacted"}}
+    assert prod["treatment_versions"] == {"phone_partial": {"partial": "last4"}}
     assert prod["tag_treatments"] == {"sensitivity=confidential": "redact"}
+    assert validate_config(prod) == []
 
-    native_prod = {"ppay.s.notes.free_text": ["class.phone_number"]}
-    model = build_model(native_prod, {"ppay.s.notes.free_text": "STRING"}, prod,
+    native_prod = {
+        "ppay.s.notes.free_text": ["class.phone_number"],
+        "ppay.s.notes.callback_number": ["class.phone_number"],
+    }
+    types = {column: "STRING" for column in native_prod}
+    model = build_model(native_prod, types, prod,
                         deployer_principal=DEPLOYER)
     resolved = model.columns["ppay.s.notes.free_text"]
     assert resolved.treatment == "redact"
     assert resolved.partial == "redacted"
     assert resolved.full == "redacted"
+    callback = model.columns["ppay.s.notes.callback_number"]
+    assert callback.treatment == "phone_partial" and callback.partial == "last4"
+
+
+def test_promoted_override_is_honored_by_derive_assignments(repo, tmp_path, monkeypatch):
+    _set_dev_override(repo, tmp_path)
+    _promote_to_prod(repo, tmp_path)
+    prod = _envs(repo) / "prod"
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER))
+    native = ClassificationSource(tag_rows=[
+        ("ppay", "s", "notes", "free_text", "class.phone_number", ""),
+        ("ppay", "s", "notes", "callback_number", "class.phone_number", ""),
+    ])
+    monkeypatch.setattr(derive_script, "_fetch_live_classification_source", lambda *a, **k: native)
+    monkeypatch.setattr(derive_script, "fetched_ddl_text", lambda *a, **k:
+        "CREATE TABLE ppay.s.notes (free_text STRING, callback_number STRING);\n")
+
+    count = derive_script.derive_assignments(
+        prod / "generated" / "abac.auto.tfvars",
+        prod / "auth.auto.tfvars", prod / "env.auto.tfvars",
+        record_governed=False,
+    )
+
+    assert count == 2
+    assignments = hcl2.load((prod / "generated" / "abac.auto.tfvars").open())["tag_assignments"]
+    values = {item["entity_name"]: item["tag_value"] for item in assignments
+              if item.get("tag_key") == "gr_treatment"}
+    assert values["ppay.s.notes.free_text"].startswith("redact__string__")
+    assert values["ppay.s.notes.callback_number"].startswith("phone_partial__string__")
 
 
 def test_promote_refuses_column_override_with_unmappable_catalog(repo, tmp_path):
@@ -230,6 +270,23 @@ def test_promote_refuses_column_override_with_unmappable_catalog(repo, tmp_path)
     assert (prod / "env.auto.tfvars").read_bytes() == before
 
 
+def test_promote_refuses_override_absent_from_generated_classification(repo, tmp_path):
+    dev_env = _envs(repo) / "dev" / "env.auto.tfvars"
+    dev_env.write_text(dev_env.read_text() +
+        'column_overrides = { "paycat.s.t.missing" = { treatment = "redact" } }\n')
+    _commit(repo, "stale override")
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    before = (prod / "env.auto.tfvars").read_bytes()
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    assert result.returncode != 0
+    assert "does not name a classified column in generated governance" in result.stdout + result.stderr
+    assert (prod / "env.auto.tfvars").read_bytes() == before
+
+
 def test_live_derivation_refuses_override_for_column_absent_from_prod():
     settings = hcl2.loads(DEV_ENV +
         'column_overrides = { "paycat.s.t.missing" = { treatment = "redact" } }\n')
@@ -238,6 +295,31 @@ def test_live_derivation_refuses_override_for_column_absent_from_prod():
                        match="absent from the governed DDL.*missing"):
         build_model(CLASSES, column_types_from_ddl(DDL), settings,
                     deployer_principal=DEPLOYER)
+
+
+def test_live_derivation_refuses_override_without_native_class_tag():
+    classes = {"ppay.s.notes.other": ["class.phone_number"]}
+    types = {"ppay.s.notes.other": "STRING", "ppay.s.notes.free_text": "STRING"}
+    settings = {"column_overrides": {
+        "ppay.s.notes.free_text": {"treatment": "redact"},
+    }}
+
+    with pytest.raises(DeterministicGovernanceError,
+                       match=r"no class\.\* tag.*ppay\.s\.notes\.free_text"):
+        build_model(classes, types, settings)
+
+
+def test_live_derivation_normalizes_override_identifier_case():
+    column = "ppay.s.notes.free_text"
+    model = build_model(
+        {column: ["class.phone_number"]}, {column: "STRING"},
+        {"column_overrides": {
+            "PPAY.s.notes.FREE_TEXT": {"treatment": "redact"},
+        }},
+    )
+
+    assert model.columns[column].treatment == "redact"
+    assert model.columns[column].partial == "redacted"
 
 
 # ── N3: the split takes deterministic tag values next to legacy ones ────────

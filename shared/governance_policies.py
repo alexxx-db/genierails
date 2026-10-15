@@ -160,7 +160,7 @@ def resolve_column(
     family = type_family(exact_type)
     names = sorted({c.removeprefix("class.") for c in classes if c})
     known = {name for item in data["treatments"].values() for name in item["classes"]}
-    override = dict((column_overrides or {}).get(column) or {})
+    override = dict((column_overrides or {}).get(column.lower()) or {})
     if "keep_current" in override:
         raise DeterministicGovernanceError(
             f'column_overrides["{column}"].keep_current is not supported by deterministic governance'
@@ -363,7 +363,19 @@ def build_model(
             "remove them for deterministic governance"
         )
     library = load_library()
-    overrides = settings.get("column_overrides") or {}
+    configured_overrides = settings.get("column_overrides") or {}
+    overrides = {}
+    duplicate_overrides = []
+    for column, rule in configured_overrides.items():
+        normalized = column.lower()
+        if normalized in overrides:
+            duplicate_overrides.append(column)
+        overrides[normalized] = rule
+    if duplicate_overrides:
+        raise DeterministicGovernanceError(
+            "column_overrides names the same case-insensitive column more than once: "
+            + ", ".join(sorted(duplicate_overrides))
+        )
     ddl_columns = {column.lower() for column in types_by_column}
     unknown_overrides = sorted(
         column for column in overrides
@@ -373,6 +385,13 @@ def build_model(
         raise DeterministicGovernanceError(
             "column_overrides names column(s) absent from the governed DDL: "
             + ", ".join(unknown_overrides)
+        )
+    classified_columns = {column.lower() for column in classes_by_column}
+    unclassified_overrides = sorted(set(overrides) - classified_columns)
+    if unclassified_overrides:
+        raise DeterministicGovernanceError(
+            "column_overrides names column(s) with no class.* tag in this env: "
+            + ", ".join(unclassified_overrides)
         )
     known = {name for item in library["treatments"].values() for name in item["classes"]}
     columns: dict[str, ColumnTreatment] = {}
