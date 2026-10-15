@@ -416,6 +416,29 @@ Explicit, opt-in commands, never called by `generate`, `rehearse`, `release` or 
 
 Output is written to files for review and committed like any change. A missing model endpoint only disables these helpers.
 
+#### 18.4.1 Adopting a custom mask
+
+An approved custom mask becomes governance config, reviewed like any other governance change. Nothing in governance reads `drafts/`, and adoption calls no model.
+
+- **Where it lives:** one governance-owned file per mask, `envs/<env>/custom_masks/custom_<name>.json`. The class mapping stays in `tag_treatments`.
+  - `never_raw: false` is required. A never-raw class maps to the library's `secret`; there are no custom never-raw masks.
+  - `full` is fixed to the library's `redacted` (`[REDACTED]` or NULL), so tier 3 never meets custom SQL.
+  - `partial` is keyed by column type family. Each entry holds `sql`, `tested_type`, `cases` (literal values only, including NULL in gives NULL out), `tested_sha256`, and the digests of the drafts it came from.
+- **`make adopt-custom-mask ENV=dev TREATMENT=custom_<name>`** refuses in CI, prod and promoted envs, then checks, in order:
+  - the name has the reserved `custom_` prefix, contains no `__`, and isn't a library name;
+  - a `test-custom-mask` pass record exists and its digests match the draft files;
+  - the offline rules pass again: one expression over `value`, no queries, no `current_user` or group checks, no randomness or time, NULL in gives NULL out;
+  - no never-raw class maps to it, and an existing type family isn't replaced without `FORCE=1`.
+
+  It writes the file and prints the `tag_treatments` line to add. It never edits `env.auto.tfvars`.
+- **Governance treats it like a library treatment** through one shared lookup, the library plus the env's adopted masks, used by generate, validate, scaffold and verify-access.
+  - Versioned tag values and staged policy changes come for free, because the generation hash covers the partial SQL.
+  - `apply-account` accepts `custom_*` values by name pattern, since the account tag policy is shared across envs.
+  - Rehearse and release re-run each adopted mask's cases, read-only, on that env's warehouse.
+  - Changing an adopted mask's SQL counts as weakening and needs an ack (`custom_mask_changed`).
+  - `promote-to` copies `custom_masks/` byte for byte, as governance-owned.
+- **Residual risk:** a custom mask is only proven by its written cases. A numeric mask tested on one type is applied to the whole numeric family, where results that don't fit become NULL.
+
 ### 18.5 Docs, organised by persona
 
 ```
@@ -447,7 +470,7 @@ Each playbook follows the champion README's style: the flow in one code block, s
 14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample. Built: every reader (generate, the ACL sidecar, promote) merges `agents/` files, and generate never imports a captured agent's live config into `generated/`; `promote-to` carries agents before the split and prints the changed files by owner; `shared/examples/CODEOWNERS.example`; `tag_treatments` keys are `class.<name>` mapped to mask-library treatments (other tag keys are refused, since this version reads only `class.*` tags), written by `scaffold-treatments` to the env (a promote-to target's source); legacy envs keep their inline agents until the explicit `make split-agent-files`, which refuses any move that would change the plan.
 15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2). Built: an existing job moves from the workspace state to the data_access state before any command on either root (`move_scheduled_job.py`), and the workspace root's `removed` block forgets rather than destroys it.
 16. `make bootstrap-pipelines` (18.2). Built ([cicd.md](../cicd.md#setting-up-the-pipelines)).
-17. Optional AI helpers (18.4).
+17. Optional AI helpers (18.4). Then `make adopt-custom-mask` (18.4.1).
 18. Persona docs (18.5).
 19. Live persona runs, real pipeline runs, and migration of the existing deployments (18.6).
 20. `generate_abac.py` split (18.7).
