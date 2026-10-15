@@ -225,7 +225,8 @@ committed config against empty state, live tags not re-read). It is safe under
 
 Applying targets (`apply`, `apply-governance`, `apply-genie`, `apply-account`,
 `rehearse`, `release-plan`, `release`, `maintain`, `enable-classification`,
-`ungovern`, `detach-agent`, `destroy*`, `import`, `migrate-state`) refuse when they
+`ungovern`, `detach-agent`, `destroy*`, `import`, `migrate-state`,
+`migrate-state-dir`, `policy-abandon`) refuse when they
 detect CI: `CI=true|1|yes`, or `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`,
 `BUILDKITE` or `CIRCLECI` set. The sole exception is exactly
 `make rehearse ENV=dev`, on `<cloud>/envs/dev` itself (not a promote-to

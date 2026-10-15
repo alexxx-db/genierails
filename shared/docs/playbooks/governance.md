@@ -153,7 +153,8 @@ table_readers = {
 ## Row filters
 
 Declared `row_filters` are validated and promoted (groups through
-`group_map`), but not yet compiled into a policy (design rollout step 10):
+`group_map`), but not yet compiled into a policy or function (design
+rollout step 10):
 
 ```hcl
 row_filters = [
@@ -162,9 +163,11 @@ row_filters = [
 ]
 ```
 
-Until then, a row filter is a reviewed rule in `generated/` (a policy in
-`abac.auto.tfvars` and its function in `masking_functions.sql`) that
-`make generate` keeps. Removing or widening one is a weakening.
+Until step 10 ships they live only as declared config in
+`env.auto.tfvars` (and in the promote-to rewrite). `make generate` does
+not emit a row-filter policy in `generated/abac.auto.tfvars` or a
+function in `masking_functions.sql` for them. Removing or widening one
+is still a weakening.
 
 ## Stop governing a table
 
