@@ -439,6 +439,10 @@ def test_promote_to_command_line_overrides_win_over_template_values(promote_clou
     ('promote_from = "dev"\ncatalog_map = { "pay.cat" = "ppay" }\n', "not a valid UC identifier"),
     ('promote_from = "dev"\ncatalog_map = { "other" = "ppay" }\n', "unknown source catalog(s): other"),
     ('promote_from = "dev"\ncatalog_map = { "paycat" = "same", "other" = "same" }\n', "more than one source catalog to: same"),
+    ('promote_from = "dev"\ncatalog_map = { "paycat" = "ppay", "PayCat" = "other" }\n',
+     "source catalogs 'paycat' and 'PayCat', which are the same catalog"),
+    ('promote_from = "dev"\ncatalog_map = { "paycat" = "ppay", "other" = "PPAY" }\n',
+     "more than one source catalog to 'ppay' and 'PPAY', which are the same catalog"),
     ('catalog_map = { "paycat" = "ppay" }\n', "promote_from in envs/prod/env.auto.tfvars is missing"),
 ])
 def test_promote_to_saved_setting_refusals_write_nothing(promote_cloud, settings, message):

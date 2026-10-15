@@ -287,6 +287,38 @@ tag_assignments = [{ entity_type = "columns", entity_name = "cat.sch.people.emai
     assert set(dict(check.expected_tiers).values()) == {"raw", "full"}
 
 
+def _email_partial_tfvars(tmp_path, overrides):
+    tfvars = tmp_path / "abac.auto.tfvars"
+    env = tmp_path / "env.auto.tfvars"
+    tfvars.write_text('''fgac_policies = [{ name = "full", policy_type = "POLICY_TYPE_COLUMN_MASK",
+      to_principals = ["account users"], except_principals = ["raw", "analyst"],
+      match_condition = "hasTagValue('gr_treatment', 'email_partial')",
+      function_catalog = "cat", function_schema = "gov", function_name = "full_email" }]
+tag_assignments = [{ entity_type = "columns", entity_name = "cat.sch.people.email",
+  tag_key = "gr_treatment", tag_value = "email_partial" }]
+''')
+    env.write_text('governance_mode = "deterministic"\n'
+                   'access_tier_groups = ["raw", "analyst", "viewer"]\n'
+                   f"column_overrides = {overrides}\n")
+    return tfvars, env
+
+
+def test_deterministic_spec_matches_mixed_case_column_override_key(tmp_path):
+    """A hand-written mixed-case key is the same UC column; generate honours it."""
+    tfvars, env = _email_partial_tfvars(
+        tmp_path, '{ "CAT.sch.People.EMAIL" = { partial = "raw" } }')
+    check = load_spec_from_tfvars(tfvars, env_file=env, key_column="id").column_masks[0]
+    assert dict(check.expected_tiers)["analyst"] == "raw"
+
+
+def test_deterministic_spec_refuses_case_only_duplicate_override_keys(tmp_path):
+    tfvars, env = _email_partial_tfvars(
+        tmp_path, '{ "cat.sch.people.email" = { partial = "raw" }, '
+                  '"CAT.sch.People.EMAIL" = { partial = "masked" } }')
+    with pytest.raises(ValueError, match="CAT.sch.People.EMAIL and cat.sch.people.email"):
+        load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
+
+
 def test_deterministic_three_tier_never_raw_spec_uses_full_for_unused_partial(tmp_path):
     tfvars = tmp_path / "abac.auto.tfvars"
     env = tmp_path / "env.auto.tfvars"

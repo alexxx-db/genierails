@@ -294,12 +294,28 @@ def catalog_map_dict(value: object) -> dict[str, str]:
             )
         if src in pairs:
             raise ValueError(f"catalog_map maps {src!r} more than once")
+        # UC catalog names ignore case, so promote compares them lowercased.
+        same = next((seen for seen in pairs if seen.lower() == src.lower()), None)
+        if same is not None:
+            raise ValueError(
+                f"catalog_map names source catalogs {same!r} and {src!r}, "
+                "which are the same catalog (UC catalog names ignore case)"
+            )
         pairs[src] = dest
     if not pairs:
         raise ValueError("catalog_map is missing or empty")
     duplicates = sorted({dest for dest in pairs.values() if list(pairs.values()).count(dest) > 1})
     if duplicates:
         raise ValueError(f"catalog_map maps more than one source catalog to: {', '.join(duplicates)}")
+    by_lower: dict[str, list[str]] = {}
+    for dest in dict.fromkeys(pairs.values()):
+        by_lower.setdefault(dest.lower(), []).append(dest)
+    clashes = [names for names in by_lower.values() if len(names) > 1]
+    if clashes:
+        raise ValueError(
+            f"catalog_map maps more than one source catalog to {clashes[0][0]!r} and "
+            f"{clashes[0][1]!r}, which are the same catalog (UC catalog names ignore case)"
+        )
     return pairs
 
 

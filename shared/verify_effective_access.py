@@ -2793,7 +2793,7 @@ def load_spec_from_tfvars(
     governance = {**data, **env_data}
     if _as_str(governance.get("governance_mode")) == "deterministic":
         from deterministic_governance import resolve_precedence
-        from governance_policies import base_treatment
+        from governance_policies import base_treatment, normalize_column_overrides
 
         tiers = _as_list(governance.get("access_tier_groups"))
         raw_exempt = _as_list(governance.get("raw_exempt_principals"))
@@ -2824,6 +2824,9 @@ def load_spec_from_tfvars(
             if _as_str(item.get("entity_type")) == "columns"
             and _as_str(item.get("tag_key")) == "gr_treatment"
         }
+        # Same case-insensitive keys as generate (build_model), so a mixed-case
+        # hand-written key resolves here too; case-only duplicates are refused.
+        column_overrides = normalize_column_overrides(governance.get("column_overrides"))
         memberships: dict[str, tuple[str, ...]] = {group: (group,) for group in tiers}
         memberships.update({principal: (principal,) for principal in raw_exempt})
         memberships[OUT_OF_TIER_PRINCIPAL] = ()
@@ -2833,9 +2836,9 @@ def load_spec_from_tfvars(
         def access_for(column: str, treatment: str, principal: str,
                        groups_for_principal: Sequence[str], *, deployer: bool = False) -> str:
             resolved = resolve_precedence(
-                column=column, treatment=treatment, group=groups_for_principal,
+                column=column.lower(), treatment=treatment, group=groups_for_principal,
                 library_default="partial", access_tier_groups=tiers,
-                column_overrides=governance.get("column_overrides") or {},
+                column_overrides=column_overrides,
                 treatment_versions=governance.get("treatment_versions") or {},
                 tier_access_overrides=governance.get("tier_access_overrides") or {},
                 principal=principal, deployer_principal=principal if deployer else None,

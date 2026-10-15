@@ -8553,7 +8553,8 @@ Before you apply, tune for your business roles, security requirements, and Genie
 
     if not deterministic_mode:
         tuning_path = out_dir / "TUNING.md"
-        tuning_path.write_text(tuning_md)
+        # Exactly one trailing newline: git diff --check flags a trailing blank line.
+        tuning_path.write_text(tuning_md.rstrip("\n") + "\n")
         print(f"  Tuning checklist written to: {tuning_path}")
 
     if sql_block and args.mode == "genie" and not deterministic_mode:

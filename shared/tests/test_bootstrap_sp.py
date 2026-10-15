@@ -372,7 +372,7 @@ def test_dry_run_runs_read_only_preflight_and_makes_no_writes():
     account.service_principals.create.assert_not_called()
     account.service_principal_secrets.create.assert_not_called()
     workspace.grants.update.assert_not_called()
-    assert any("model access CAN_QUERY" in line for line in output)
+    assert any("model access path CAN_QUERY on custom-model" in line for line in output)
     assert output[-1] == "DRY RUN: read-only preflight passed; no changes were made."
 
 
@@ -733,6 +733,84 @@ def test_fmapi_with_inherited_execute_is_unchanged_without_permissions_patch(
     assert function_updates == []
     assert any(line.startswith("UNCHANGED workspace 123: EXECUTE on system.ai.")
                for line in output)
+
+
+def _fmapi_without_caller_authority(workspace):
+    workspace.api_client.do.return_value = _fmapi_endpoint()
+    workspace.metastores.get.return_value = MetastoreInfo(
+        metastore_id="meta-1", owner="joseph@example.com"
+    )
+    workspace.catalogs.get.return_value = CatalogInfo(
+        owner="_workspace_admins_louis_serverless_123"
+    )
+    workspace.functions.get.return_value = SimpleNamespace(owner="System user")
+
+
+def test_fmapi_execute_held_directly_by_caller_is_not_account_users_access():
+    """Only an assignment naming `account users` proves the new SP inherits EXECUTE."""
+    _account, workspace, _workspace_factory, factory = _fake()
+    _fmapi_without_caller_authority(workspace)
+
+    def effective(*, principal, **_kwargs):
+        if principal == "account users":
+            raise PermissionDenied("User does not have READ METADATA on Routine or Model")
+        if principal == "caller@example.com":
+            return {"privilege_assignments": [{
+                "principal": "caller@example.com",
+                "privileges": [{"privilege": "EXECUTE"}],
+            }]}
+        return SimpleNamespace(privilege_assignments=[])
+
+    workspace.grants.get_effective.side_effect = effective
+    with pytest.raises(RuntimeError, match="lacks effective MANAGE"):
+        bootstrap(
+            _cfg(model_endpoint="databricks-claude-sonnet-4-6", dry_run=True,
+                 target_catalog="existing_catalog"),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+
+@pytest.mark.parametrize("failing", ["account users", "caller@example.com"])
+def test_fmapi_non_permission_effective_lookup_failure_stops_preflight(failing):
+    """Only PERMISSION_DENIED falls through to the next read-only check."""
+    _account, workspace, _workspace_factory, factory = _fake()
+    workspace.api_client.do.return_value = _fmapi_endpoint()
+
+    def effective(*, principal, **_kwargs):
+        if principal == "account users" and failing == "caller@example.com":
+            raise PermissionDenied("User does not have READ METADATA on Routine or Model")
+        if principal == failing:
+            raise RuntimeError("upstream request timed out")
+        return SimpleNamespace(privilege_assignments=[])
+
+    workspace.grants.get_effective.side_effect = effective
+    with pytest.raises(RuntimeError, match=r"preflight failed .*upstream request timed out"):
+        bootstrap(
+            _cfg(model_endpoint="databricks-claude-sonnet-4-6", dry_run=True,
+                 target_catalog="existing_catalog"),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+
+def test_dry_run_states_model_access_once_per_workspace():
+    _account, workspace, _workspace_factory, factory = _fake(existing=True)
+    workspace.api_client.do.return_value = _fmapi_endpoint()
+    workspace.grants.get_effective.return_value = {"privilege_assignments": [{
+        "principal": "account users", "privileges": [{"privilege": "EXECUTE"}],
+    }]}
+    output = []
+    assert bootstrap(
+        _cfg(model_endpoint="databricks-claude-sonnet-4-6", dry_run=True,
+             target_catalog="existing_catalog"),
+        client_factory=factory, emit=output.append,
+    ) == 0
+    mentions = [line for line in output if "UC EXECUTE (inherited)" in line]
+    assert mentions == [
+        "PLAN RESOLVED workspace 123: model access UNCHANGED via UC EXECUTE (inherited) "
+        "on databricks-claude-sonnet-4-6"
+    ]
 
 
 def test_fmapi_caller_effective_lookup_failure_is_actionable():
@@ -1131,6 +1209,36 @@ def test_existing_sp_and_grants_are_not_duplicated():
     account.api_client.do.assert_not_called()
     account.access_control.update_rule_set.assert_not_called()
     assert any("OAuth secret unchanged" in line for line in output)
+
+
+def test_existing_workspace_admin_assignment_is_unchanged():
+    account, _workspace, _workspace_factory, factory = _fake(existing=True)
+    account.workspace_assignment.list.return_value = [SimpleNamespace(
+        principal=SimpleNamespace(principal_id=42),
+        permissions=[WorkspacePermission.ADMIN],
+    )]
+    output = []
+    assert bootstrap(_cfg(), client_factory=factory, emit=output.append) == 0
+    account.workspace_assignment.list.assert_called_once_with(workspace_id=123)
+    account.workspace_assignment.update.assert_not_called()
+    assert "UNCHANGED workspace 123: ADMIN (already granted)" in output
+    assert not any("GRANTED workspace 123: ADMIN" in line for line in output)
+
+
+def test_workspace_user_assignment_is_upgraded_to_admin():
+    account, _workspace, _workspace_factory, factory = _fake(existing=True)
+    account.workspace_assignment.list.return_value = [
+        SimpleNamespace(principal=SimpleNamespace(principal_id=42),
+                        permissions=[WorkspacePermission.USER]),
+        SimpleNamespace(principal=SimpleNamespace(principal_id=7),
+                        permissions=[WorkspacePermission.ADMIN]),
+    ]
+    output = []
+    assert bootstrap(_cfg(), client_factory=factory, emit=output.append) == 0
+    account.workspace_assignment.update.assert_called_once_with(
+        workspace_id=123, principal_id=42, permissions=[WorkspacePermission.ADMIN],
+    )
+    assert "GRANTED workspace 123: ADMIN" in output
 
 
 def _sp_catalog_effective(sp_privileges, caller_privileges=()):
