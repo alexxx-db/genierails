@@ -60,7 +60,7 @@ def _text(value: str, what: str) -> str:
 def _tag_key(value: object) -> str:
     if not isinstance(value, str) or not TAG_KEY_RE.fullmatch(value):
         raise Invalid(f"tag key {value!r} is not a plain tag key")
-    if value == TREATMENT_TAG:
+    if value.casefold() == TREATMENT_TAG:  # Unity Catalog tag keys are case-insensitive
         raise Invalid(f"{TREATMENT_TAG} tags belong to the staged policy controller; a recorded entry never touches them")
     return value
 
@@ -81,6 +81,26 @@ def unset_sql(entity_type: str, entity_name: str, tag_key: str) -> str:
     table = ".".join(f"`{p}`" for p in parts[:3])
     column = f" ALTER COLUMN `{parts[3]}`" if entity_type == "columns" else ""
     return f"ALTER TABLE {table}{column} UNSET TAGS ('{tag_key}')"
+
+
+def run_cleanups(cleanups: list[dict], warehouse_id: str, statements) -> int:
+    """Run checked cleanups through ``statements`` (an SDK statement_execution); returns how many failed.
+
+    Each statement is rebuilt here: the entry's stored ``statement`` is never read.
+    """
+    failed = 0
+    for entry in cleanups:
+        resp = statements.execute_statement(
+            statement=unset_sql(entry["entity_type"], entry["entity_name"], entry["tag_key"]),
+            warehouse_id=warehouse_id, wait_timeout="30s")
+        raw_state = getattr(getattr(resp, "status", None), "state", None)
+        state = raw_state.value if hasattr(raw_state, "value") else str(raw_state or "")
+        if "SUCCEEDED" in state:
+            print(f"  Cleared tag {entry['tag_key']} on {entry['entity_name']}")
+        else:
+            failed += 1
+            print(f"  ✗ Could not clear {entry['tag_key']} on {entry['entity_name']} ({state})", file=sys.stderr)
+    return failed
 
 
 def cleanup_entry(entity_type: str, entity_name: str, tag_key: str, warehouse_id: str) -> dict:

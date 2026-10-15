@@ -299,7 +299,7 @@ for ta in cfg.get('tag_assignments', []):
     ename = ta.get('entity_name', '')
     tkey  = ta.get('tag_key', '')
     tval  = ta.get('tag_value', '')
-    if etype and ename and tkey and tval and not (skip_treatments and tkey == 'gr_treatment'):
+    if etype and ename and tkey and tval and not (skip_treatments and tkey.lower() == 'gr_treatment'):
         desired.append((etype, ename, tkey, tval))
 
 if not desired:
@@ -434,7 +434,7 @@ skip_treatments = os.environ.get('GENIERAILS_IMPORT_SKIP_TREATMENT_TAGS') == 'tr
 if skip_treatments:
     # The staged policy controller owns treatment retags. Clearing one here
     # creates an unmasked interval, including from read-only release-plan.
-    tag_assignments = [ta for ta in tag_assignments if ta.get('tag_key') != 'gr_treatment']
+    tag_assignments = [ta for ta in tag_assignments if str(ta.get('tag_key', '')).lower() != 'gr_treatment']
 if not tag_assignments:
     sys.exit(0)
 
@@ -865,19 +865,7 @@ w = WorkspaceClient(
     host=_str(auth.get('databricks_workspace_host', '')) or os.environ.get('DATABRICKS_HOST', ''),
     client_id=_str(auth.get('databricks_client_id', '')) or os.environ.get('DATABRICKS_CLIENT_ID', ''),
     client_secret=_str(auth.get('databricks_client_secret', '')) or os.environ.get('DATABRICKS_CLIENT_SECRET', ''))
-failed = 0
-warehouse_id = import_record.configured_warehouse(env_root)
-for entry in cleanups:
-    resp = w.statement_execution.execute_statement(
-        statement=import_record.unset_sql(entry['entity_type'], entry['entity_name'], entry['tag_key']),
-        warehouse_id=warehouse_id, wait_timeout='30s')
-    raw_state = getattr(getattr(resp, 'status', None), 'state', None)
-    state = raw_state.value if hasattr(raw_state, 'value') else str(raw_state or '')
-    if 'SUCCEEDED' in state:
-        print(f"  Cleared tag {entry['tag_key']} on {entry['entity_name']}")
-    else:
-        failed += 1
-        print(f"  ✗ Could not clear {entry['tag_key']} on {entry['entity_name']} ({state})", file=sys.stderr)
+failed = import_record.run_cleanups(cleanups, import_record.configured_warehouse(env_root), w.statement_execution)
 sys.exit(1 if failed else 0)
 PYEOF
 }
