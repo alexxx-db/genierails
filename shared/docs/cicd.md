@@ -71,6 +71,9 @@ integration tests; never set it on a deployment job.
 - Protect the prod environment (the samples use `production` on GitHub and
   `genierails-prod` on Azure DevOps): required reviewers, no self-approval,
   `main` only.
+- On GitHub, the prod release-plan job runs in the `production-plan`
+  environment (`main` only, no reviewer), so the prod read-only SP trusts
+  only that job and the `production-maintain` one, not every workflow on `main`.
 
 ## Setting up the pipelines
 
@@ -91,7 +94,7 @@ instead of `REPO`. Pass `CI=` on the command line; a runner's `CI=true` is refus
 | It does | Details |
 |---|---|
 | Creates or reuses the env's **read-only SP** | `genierails-<env>-readonly` (`READONLY_SP_NAME=`), workspace `USER` access, no secret |
-| Adds **OIDC federation** for each pipeline identity | read-only SP: the PR check, plus for prod the release-plan and maintain jobs; dev deployer SP (`deployer_principal_id`): the dev rehearsal. The prod deployer is not federated while prod releases run on the deployment machine |
+| Adds **OIDC federation** for each pipeline identity | read-only SP: the PR check, plus for prod the release-plan and maintain jobs (on GitHub, each under its own environment: `production-plan` and `production-maintain`, main only, no reviewer); dev deployer SP (`deployer_principal_id`): the dev rehearsal. The prod deployer is not federated while prod releases run on the deployment machine |
 | Grants the **section 17 privileges**, nothing more | `USE CATALOG`, `USE SCHEMA`, `BROWSE` on the env's catalogs (default: the catalogs of its committed `uc_tables`; `CATALOGS=` overrides); read on `system.information_schema` (only when not already inherited); `CAN_VIEW` on the agents (dev: the committed IDs; prod: `GENIE_SPACE_IDS=`, from the release receipt); `CAN_USE` on `WAREHOUSE_ID` when given (prod maintain's drift audit needs one) |
 | **Prints** the repo settings | repo variables (or the `genierails-ids` variable group), environments with required reviewers, branch protection, the Azure DevOps pipeline names the federation subjects use, and a `CODEOWNERS` that matches the [persona split](design/deterministic-governance.md#181-personas-and-the-files-each-owns) (`GOVERNANCE_OWNERS=`, `AGENT_OWNERS=`) |
 
@@ -105,7 +108,11 @@ instead of `REPO`. Pass `CI=` on the command line; a runner's `CI=true` is refus
 - **It never writes to the repo and never makes or prints a secret.** Every
   value it prints is an ID. Apply the printed settings yourself; the remote
   state roles (`DEV_STATE_*`) and service connection are yours to create.
-- It never revokes: a read-only SP that is a workspace admin gets a warning.
+- **It never revokes or downgrades, so it refuses instead** while the
+  read-only SP is a workspace `ADMIN`, or holds more than `CAN_VIEW` on an
+  agent (`CAN_RUN`, `CAN_EDIT`, `CAN_MANAGE`) or more than `CAN_USE` on the
+  warehouse (`CAN_MANAGE`, `IS_OWNER`) directly. Lower it to `USER`,
+  `CAN_VIEW` or `CAN_USE` by hand and re-run.
 
 ## Pipeline samples: where each command runs
 

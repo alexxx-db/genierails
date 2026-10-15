@@ -59,9 +59,10 @@ SYSTEM_GRANTS = (
     ("catalog", "system", ("USE_CATALOG",)),
     ("schema", "system.information_schema", ("USE_SCHEMA", "SELECT")),
 )
-# Any of these already gives the access asked for.
-GENIE_VIEW_LEVELS = {"CAN_VIEW", "CAN_RUN", "CAN_EDIT", "CAN_MANAGE"}
-WAREHOUSE_USE_LEVELS = {"CAN_USE", "CAN_MANAGE", "IS_OWNER"}
+# A direct ACL above the read-only level makes the SP more than read-only:
+# refused, never downgraded automatically.
+GENIE_TOO_STRONG = {"CAN_RUN", "CAN_EDIT", "CAN_MANAGE"}
+WAREHOUSE_TOO_STRONG = {"CAN_MANAGE", "IS_OWNER"}
 # Read-only SPs never need more than workspace USER.
 WORKSPACE_PERMISSION = "USER"
 
@@ -135,8 +136,8 @@ def identities(cfg: Config, host: str) -> dict[str, list[Identity]]:
                     "deployer": [ident("dev rehearsal (dev-rehearse.yml)", "environment:dev")]}
         return {"readonly": [
             pr,
-            # The release-plan job runs on workflow_run from main, outside an environment.
-            ident("prod release plan (prod-release.yml)", "ref:refs/heads/main"),
+            # Its own environment, so no other workflow on main can mint this token.
+            ident("prod release plan (prod-release.yml)", "environment:production-plan"),
             ident("prod maintain (prod-maintain.yml)", "environment:production-maintain"),
         ], "deployer": []}
 
@@ -217,7 +218,8 @@ def _list_policies(account: Any, sp: Any, who: str) -> list[Any]:
             f"admin. Nothing was changed. Cause: {_error_details(exc)}") from exc
 
 
-def _acl_levels(acl: Any, principals: set[str]) -> set[str]:
+def _acl_levels(acl: Any, principals: set[str], direct_only: bool = False) -> set[str]:
+    """Permission levels the principals hold; direct_only skips inherited ones."""
     levels: set[str] = set()
     for entry in _value(acl, "access_control_list") or []:
         principal = next((_value(entry, name) for name in (
@@ -226,7 +228,8 @@ def _acl_levels(acl: Any, principals: set[str]) -> set[str]:
             continue
         levels.add(str(_value(entry, "permission_level") or "").upper())
         levels.update(str(_value(item, "permission_level") or "").upper()
-                      for item in _value(entry, "all_permissions") or [])
+                      for item in _value(entry, "all_permissions") or []
+                      if not (direct_only and _value(item, "inherited")))
     return levels - {""}
 
 
@@ -274,9 +277,10 @@ class Preflight:
                              if str(_value(_value(a, "principal"), "principal_id")) == sp_id), None)
             levels = {str(getattr(p, "value", p)).upper() for p in _value(assigned, "permissions") or []}
             if "ADMIN" in levels:
-                self.emit(f"WARNING: {cfg.readonly_name} is a workspace ADMIN in workspace "
-                          f"{cfg.workspace_id}, so it isn't read-only; bootstrap-pipelines never "
-                          "revokes access, remove ADMIN by hand")
+                raise Refused(
+                    f"{cfg.readonly_name} is a workspace ADMIN in workspace {cfg.workspace_id}, "
+                    "so it is not read-only. Demote it to USER by hand (bootstrap-pipelines "
+                    "never revokes), then re-run. Nothing was changed.")
         self.steps.append(Step("workspace access", f"workspace {cfg.workspace_id}",
                                WORKSPACE_PERMISSION, assigned is not None, self._assign))
 
@@ -400,12 +404,12 @@ class Preflight:
 
         for space_id in cfg.genie_space_ids:
             self._acl_step(f"genie/{space_id}", f"agent {space_id}", "CAN_VIEW",
-                           GENIE_VIEW_LEVELS, caller, principals, is_admin)
+                           GENIE_TOO_STRONG, caller, principals, is_admin)
         if cfg.warehouse_id:
             self._acl_step(f"warehouses/{cfg.warehouse_id}", f"warehouse {cfg.warehouse_id}",
-                           "CAN_USE", WAREHOUSE_USE_LEVELS, caller, principals, is_admin)
+                           "CAN_USE", WAREHOUSE_TOO_STRONG, caller, principals, is_admin)
 
-    def _acl_step(self, path: str, target: str, level: str, enough: set[str],
+    def _acl_step(self, path: str, target: str, level: str, too_strong: set[str],
                   caller: str, principals: set[str], is_admin: bool) -> None:
         try:
             acl = self.workspace.api_client.do("GET", f"/api/2.0/permissions/{path}")
@@ -413,7 +417,14 @@ class Preflight:
             raise Refused(f"cannot read the permissions of {target}. Nothing was changed. "
                           f"Cause: {_error_details(exc)}") from exc
         client_id = self.client_id()
-        done = bool(client_id) and bool(_acl_levels(acl, {client_id.casefold()}) & enough)
+        direct = _acl_levels(acl, {client_id.casefold()}, direct_only=True) if client_id else set()
+        if direct & too_strong:
+            raise Refused(
+                f"{self.cfg.readonly_name} has {' + '.join(sorted(direct & too_strong))} on "
+                f"{target}, so it is not read-only. Lower it to {level} by hand "
+                "(bootstrap-pipelines never downgrades), then re-run. Nothing was changed.")
+        # Only the exact read-only level counts as done.
+        done = level in direct
         if not done and not is_admin and "CAN_MANAGE" not in _acl_levels(acl, principals) \
                 and "IS_OWNER" not in _acl_levels(acl, principals):
             raise Refused(f"caller {caller!r} cannot grant {level} on {target}: not a workspace "
@@ -540,6 +551,8 @@ def settings(cfg: Config, client_id: str | None, host: str) -> list[str]:
         out += ["", f'Environment "production": required reviewers {gov} (governance code '
                 "owners); prevent self-review; deployment branches: main only.",
                 "  PROD_DEPLOYER_CLIENT_ID: not used in v1; add it here only once prod releases in CI.",
+                "", 'Environment "production-plan": deployment branches: main only; no reviewer '
+                "(the prod release-plan job; only it can use the prod read-only SP from main).",
                 "", 'Environment "production-maintain": deployment branches: main only; no '
                 "reviewer (the schedule is never held for approval).",
                 "", "Branch protection on main (no direct pushes, including admins):",

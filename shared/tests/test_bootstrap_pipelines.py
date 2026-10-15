@@ -17,13 +17,14 @@ from scripts.bootstrap_pipelines import Config, Refused, bootstrap_pipelines
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOYER = "5a7e0000-0000-0000-0000-00000000beef"
 SECRET = "dapi-super-secret-value"
+READONLY_APP = "00000000-0000-0000-0000-0000000000aa"
 
 
 class FakeDatabricks:
     """A stateful account + workspace: what one run creates the next run sees."""
 
     def __init__(self, *, caller_owns=True, account_admin=True, inherited_system=True,
-                 deployer=True):
+                 deployer=True, readonly_permission=None, readonly_acls=None):
         self.writes: list[tuple] = []
         self.sps: list[SimpleNamespace] = []
         if deployer:
@@ -36,6 +37,17 @@ class FakeDatabricks:
             "genie/space-1": [{"user_name": "caller@example.com", "permission_level": "CAN_MANAGE"}],
             "warehouses/wh-1": [{"user_name": "caller@example.com", "permission_level": "CAN_MANAGE"}],
         }
+        if readonly_permission:
+            # An existing read-only SP, already assigned to the workspace.
+            from databricks.sdk.service.iam import WorkspacePermission
+
+            self.sps.append(SimpleNamespace(id="55", application_id=READONLY_APP,
+                                            display_name="genierails-dev-readonly"))
+            self.assignments.append(SimpleNamespace(
+                principal=SimpleNamespace(principal_id=55),
+                permissions=[WorkspacePermission[readonly_permission]]))
+        for path, entries in (readonly_acls or {}).items():
+            self.acls[path] = self.acls[path] + entries
         if inherited_system:
             self.grants[("catalog", "system", "account users")] = {"USE_CATALOG"}
             self.grants[("schema", "system.information_schema", "account users")] = {
@@ -168,7 +180,7 @@ def test_prod_federates_every_readonly_pipeline_identity_but_not_the_deployer():
     out = _run(_cfg(env="prod", catalogs=("prod_cat",), genie_space_ids=()), fake)
     subjects = {w[2] for w in fake.writes if w[0] == "federate"}
     assert subjects == {"repo:acme/governance:pull_request",
-                        "repo:acme/governance:ref:refs/heads/main",
+                        "repo:acme/governance:environment:production-plan",
                         "repo:acme/governance:environment:production-maintain"}
     assert not [w for w in fake.writes if w[0] == "federate" and w[1] == 7]
     assert any("prod deployer is not federated" in line for line in out)
@@ -361,3 +373,67 @@ def test_make_target_passes_plan_and_writes_nothing_to_the_repo(tmp_path, monkey
     assert args[args.index("--env") + 1] == "prod"
     assert args[args.index("--catalogs") + 1] == "prod_cat"
     assert subprocess.run(status, capture_output=True, text=True).stdout == before
+
+
+# ── review fixes: no main-wide subject, refuse more-than-read-only access ──
+
+def test_no_prod_identity_trusts_every_job_on_main():
+    for env in ("dev", "prod"):
+        subjects = {i.subject for role in bp.identities(_cfg(env=env), "https://h").values()
+                    for i in role}
+        assert not [s for s in subjects if ":ref:" in s], subjects
+    assert "repo:acme/governance:environment:production-plan" in {
+        i.subject for i in bp.identities(_cfg(env="prod"), "https://h")["readonly"]}
+
+
+@pytest.mark.parametrize("cloud", ["aws", "azure"])
+def test_prod_release_plan_job_runs_in_production_plan_environment(cloud):
+    import yaml
+
+    workflow = yaml.safe_load((REPO_ROOT / cloud / ".github/workflows/prod-release.yml").read_text())
+    job = workflow["jobs"]["release-plan"]
+    assert job["environment"] == "production-plan"
+    assert job["permissions"]["id-token"] == "write"
+    printed = "\n".join(bp.settings(_cfg(cloud=cloud, env="prod"), "c", "https://h"))
+    assert 'Environment "production-plan": deployment branches: main only; no reviewer' in printed
+
+
+def test_refuses_while_the_readonly_sp_is_a_workspace_admin():
+    fake = FakeDatabricks(readonly_permission="ADMIN")
+    with pytest.raises(Refused, match="ADMIN.*not read-only.*Demote it to USER.*Nothing was changed"):
+        bootstrap_pipelines(_cfg(), client_factory=fake.factory, emit=lambda _l: None)
+    with pytest.raises(Refused, match="not read-only"):
+        bootstrap_pipelines(_cfg(dry_run=True), client_factory=fake.factory, emit=lambda _l: None)
+    assert fake.writes == []
+    # USER is exactly read-only: kept, not refused.
+    fake = FakeDatabricks(readonly_permission="USER")
+    out = _run(_cfg(), fake)
+    assert not [w for w in fake.writes if w[0] in ("create sp", "assign")]
+    assert "UNCHANGED workspace access workspace 123: USER" in out
+
+
+@pytest.mark.parametrize("path, level", [
+    ("genie/space-1", "CAN_RUN"), ("genie/space-1", "CAN_EDIT"), ("genie/space-1", "CAN_MANAGE"),
+    ("warehouses/wh-1", "CAN_MANAGE"), ("warehouses/wh-1", "IS_OWNER"),
+])
+def test_refuses_a_stronger_direct_acl_instead_of_counting_it_done(path, level):
+    fake = FakeDatabricks(readonly_permission="USER", readonly_acls={
+        path: [{"service_principal_name": READONLY_APP, "permission_level": level}]})
+    with pytest.raises(Refused, match=f"has {level} on .*not read-only.*by hand.*Nothing was changed"):
+        bootstrap_pipelines(_cfg(), client_factory=fake.factory, emit=lambda _l: None)
+    assert fake.writes == []
+
+
+def test_only_the_exact_read_only_level_counts_as_done():
+    # Inherited (not direct) CAN_MANAGE is not refused, but doesn't count either:
+    # the direct CAN_VIEW is still granted. A direct CAN_USE on the warehouse is done.
+    fake = FakeDatabricks(readonly_permission="USER", readonly_acls={
+        "genie/space-1": [{"service_principal_name": READONLY_APP, "all_permissions": [
+            {"permission_level": "CAN_MANAGE", "inherited": True}]}],
+        "warehouses/wh-1": [{"service_principal_name": READONLY_APP,
+                             "permission_level": "CAN_USE"}],
+    })
+    out = _run(_cfg(), fake)
+    assert ("acl", "genie/space-1", "CAN_VIEW") in fake.writes
+    assert not [w for w in fake.writes if w[:2] == ("acl", "warehouses/wh-1")]
+    assert "UNCHANGED grant warehouse wh-1: CAN_USE" in out
