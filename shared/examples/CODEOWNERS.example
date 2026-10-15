@@ -22,13 +22,19 @@
 
 # Every env file is governance-owned unless a later rule says otherwise:
 # env.auto.tfvars, generated/, ack.txt (and the layer files of legacy envs).
-**/envs/                        @your-org/governance-engineers
-**/envs/*/ack.txt               @your-org/governance-engineers
+# Each rule is anchored to the repo root and names a supported cloud tree, so
+# no other directory called envs/ matches.
+/aws/envs/                      @your-org/governance-engineers
+/azure/envs/                    @your-org/governance-engineers
+/aws/envs/*/ack.txt             @your-org/governance-engineers
+/azure/envs/*/ack.txt           @your-org/governance-engineers
 
 # Agents: one settings file and one captured config per agent, in every env.
-**/envs/*/agents/               @your-org/data-citizens
+/aws/envs/*/agents/             @your-org/data-citizens
+/azure/envs/*/agents/           @your-org/data-citizens
 # Per-agent owners (optional): name each agent's team, e.g.
-# **/envs/*/agents/Sales.*      @your-org/sales-analysts
+# /aws/envs/*/agents/Sales.*    @your-org/sales-analysts
+# /azure/envs/*/agents/Sales.*  @your-org/sales-analysts
 
 # Pipelines and repo settings.
 /.github/                       @your-org/platform

@@ -46,6 +46,7 @@ ROOT = base.ROOT
 SHARED = base.SHARED
 BASE_COMMIT = "16c9797a5030e80a8fe0c79eb60c29ad12218407"  # origin/main before step 14
 CODEOWNERS = SHARED / "examples" / "CODEOWNERS.example"
+CLOUDS = ("aws", "azure")
 DATA_CITIZENS, GOVERNANCE = "@your-org/data-citizens", "@your-org/governance-engineers"
 
 DEV_ENV = f'''governance_mode = "deterministic"
@@ -276,6 +277,36 @@ def test_the_sample_codeowners_splits_data_citizens_from_governance_engineers():
                  "aws/envs/prod/ack.txt", "azure/envs/dev/generated/governed_tables.json",
                  "aws/envs/prod/abac.auto.tfvars", "shared/mask_library.json"):
         assert owners(path) == [GOVERNANCE], path
+
+
+def _codeowners_patterns() -> tuple[list[str], list[str]]:
+    """The sample's active rule patterns, and those of its commented example rules."""
+    active, examples = [], []
+    for line in CODEOWNERS.read_text().splitlines():
+        if line.startswith("#"):
+            example = re.match(r"#\s*(\S+)\s+@", line)
+            if example:
+                examples.append(example.group(1))
+        elif line.strip():
+            active.append(line.split()[0])
+    return active, examples
+
+
+def test_every_sample_codeowners_rule_is_anchored_to_a_supported_cloud_tree():
+    active, examples = _codeowners_patterns()
+    assert examples, "the sample's optional per-agent example is gone"
+    for pattern in active + examples:
+        assert pattern.startswith("/") and "**" not in pattern, pattern
+        assert pattern.split("/")[1] in ("shared", ".github", *CLOUDS), pattern
+    for cloud in CLOUDS:
+        for pattern in (f"/{cloud}/envs/", f"/{cloud}/envs/*/agents/", f"/{cloud}/envs/*/ack.txt"):
+            assert pattern in active, pattern
+        assert f"/{cloud}/envs/*/agents/Sales.*" in examples, cloud
+    # A directory that only happens to be called envs/ is not an env.
+    for path in ("tools/envs/dev/agents/Payments.auto.tfvars", "aws/sub/envs/dev/agents/Payments.auto.tfvars",
+                 "shared/tests/fixtures/envs/dev/agents/Payments.auto.tfvars"):
+        assert owners(path) != [DATA_CITIZENS], path
+    assert owners("shared/tests/fixtures/envs/dev/agents/Payments.auto.tfvars") == [GOVERNANCE]
 
 
 # ── Customer class mappings: the env's tag_treatments ───────────────────────

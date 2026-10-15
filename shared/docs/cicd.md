@@ -67,8 +67,9 @@ integration tests; never set it on a deployment job.
 - CODEOWNERS splits approvals by persona (design 18.1): the governance team
   owns `/shared/` and every env file (`env.auto.tfvars`, `generated/`,
   `ack.txt`, and legacy envs' layer files), and the data citizens own
-  `**/envs/*/agents/`, listed after the env-wide rule because the last match
-  wins. Start from
+  `/aws/envs/*/agents/` and `/azure/envs/*/agents/`, listed after the
+  env-wide rules because the last match wins. Every rule is anchored to the
+  repo root, so no other `envs/` directory matches. Start from
   [`shared/examples/CODEOWNERS.example`](../examples/CODEOWNERS.example) and
   turn on "Require review from Code Owners". An agent-only promotion PR then
   touches only `agents/` files and needs no governance approval; `make

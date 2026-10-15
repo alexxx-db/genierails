@@ -29,7 +29,12 @@
   `"sensitivity=confidential"`) are now refused: they were accepted but never
   applied, so the columns stayed unmasked by them. Also refused: remapping a
   class the mask library already maps, and a value that isn't a library
-  treatment.
+  treatment. **Migration:** a deterministic env that committed such a key now
+  fails `make validate` and every command that builds its policies (such as
+  `make generate` and `make release`), naming the key. Delete the entry (it
+  never masked anything), or tag the column with a `class.*` tag and map that
+  (`make scaffold-treatments ENV=<env> TREATMENT=<treatment>`), and review the
+  resulting governance diff.
 - **`make scaffold-treatments` in a deterministic env** needs `TREATMENT=`; it
   no longer writes REVIEW stubs into `shared/` for those envs (legacy envs are
   unchanged).
