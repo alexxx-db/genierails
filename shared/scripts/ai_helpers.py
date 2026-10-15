@@ -440,9 +440,19 @@ def mask_paths(env_dir: Path, name: str) -> tuple[Path, Path, Path]:
 
 
 def _strip_sql(body: str) -> str:
-    """The expression without comments and string literals, for the token rules."""
-    without_comments = "\n".join(line.split("--", 1)[0] for line in body.splitlines())
-    return re.sub(r"'(?:[^'\\]|\\.)*'", "''", without_comments)
+    """The expression's tokens without comments and string literals, for the token rules.
+
+    It uses the same fail-closed tokenizer as generation, so a '--' or '/*'
+    inside a literal can't hide what follows it. SQL that can't be tokenized
+    (an open literal or comment) keeps a ';', which every rule refuses.
+    """
+    from sql_tokenizer import SqlTokenizeError, sql_tokens
+
+    try:
+        tokens = sql_tokens(body)
+    except SqlTokenizeError:
+        return ";"
+    return " ".join("''" if token[:1] in {"'", '"', "$"} else token.lower() for token in tokens)
 
 
 def mask_expression(sql_text: str) -> str:
@@ -457,7 +467,7 @@ def expression_problems(expression: str) -> list[str]:
     bare = _strip_sql(expression).lower()
     problems = []
     if ";" in bare:
-        problems.append("the mask must be one expression (no ';')")
+        problems.append("the mask must be one expression (no ';', and every literal and comment closed)")
     for word in STATEMENT_WORDS:
         if re.search(rf"\b{word}\b", bare):
             problems.append(f"the mask must be an expression over value, not a query or statement ({word.upper()})")
@@ -487,7 +497,7 @@ def _expected_ok(expected, family: str) -> bool:
     if expected is None:
         return True
     if family == "NUMERIC":
-        return isinstance(expected, (int, float, str)) and not isinstance(expected, bool) and \
+        return isinstance(expected, (int, float, Decimal, str)) and not isinstance(expected, bool) and \
             (not isinstance(expected, str) or re.fullmatch(r"-?\d+(\.\d+)?", expected) is not None)
     return isinstance(expected, str)
 

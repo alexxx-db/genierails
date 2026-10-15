@@ -251,6 +251,10 @@ def test_draft_custom_mask_writes_the_sql_and_its_exact_output_fixture(envs):
     ("(SELECT max(region) FROM dev_fin.pay.customers)", "not a query or statement"),
     ("value; DROP TABLE x", "one expression"),
     ("'[REDACTED]'", "must read the column as value"),
+    # A '--' or '/*' inside a literal can't hide what follows it.
+    ("concat(value, '--') || current_user()", "caller-independent"),
+    ("concat(value, '/*') || is_member('t1') || '*/'", "caller-independent"),
+    ("concat(value, 'open", "every literal and comment closed"),
 ])
 def test_draft_custom_mask_refuses_sql_that_breaks_the_library_rules(envs, sql, message):
     with pytest.raises(ai_helpers.Refused, match=re.escape(message)):
@@ -346,6 +350,19 @@ def test_test_custom_mask_numeric_uses_try_cast_and_exact_decimals(envs):
     warehouse = FakeWarehouse({k: (Decimal(str(v)) if v is not None else None) for k, v in answers.items()})
     assert ai_helpers.check_custom_mask(dev, "postcode_area", (warehouse, "wh"))["passed"] is True
     assert all("TRY_CAST((round(" in s for _w, s in warehouse.statements)
+
+
+def test_test_custom_mask_compares_decimal_fixture_values_exactly(envs):
+    reply = {"description": "one decimal place", "sql": "round(try_cast(value AS DECIMAL(38, 18)), 1)",
+             "cases": [{"input": "CAST(1.25 AS DOUBLE)", "expected": 1.3}, {"input": "CAST(-1.25 AS DOUBLE)", "expected": -1.3}]}
+    answers = _drafted_mask(envs, reply, "DOUBLE")
+    warehouse = FakeWarehouse({k: (Decimal(str(v)) if v is not None else None) for k, v in answers.items()})
+    assert ai_helpers.check_custom_mask(envs / "dev", "postcode_area", (warehouse, "wh"))["passed"] is True
+    answers["CAST(1.25 AS DOUBLE)"] = 1.2
+    warehouse = FakeWarehouse({k: (Decimal(str(v)) if v is not None else None) for k, v in answers.items()})
+    result = ai_helpers.check_custom_mask(envs / "dev", "postcode_area", (warehouse, "wh"))
+    assert result["passed"] is False and result["problems"] == []
+    assert [m["input"] for m in result["mismatches"]] == ["CAST(1.25 AS DOUBLE)"]
 
 
 def test_test_custom_mask_needs_a_warehouse_and_a_draft(envs):

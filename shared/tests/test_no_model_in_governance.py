@@ -29,7 +29,6 @@ from pathlib import Path
 
 import pytest
 
-import generate_abac
 from scripts import ai_helpers
 from scripts.release_gate import env_fingerprint
 from tests.test_check_target import _commit, _make as _check_make, _state, promoted, repo  # noqa: F401 (fixtures)
@@ -145,9 +144,9 @@ def test_the_parser_finds_the_ai_helpers_from_their_own_targets():
     for target in AI_TARGETS:
         reached, text = _closure(target)
         assert SHARED / "scripts" / "ai_helpers.py" in _scripts_run(text), target
-    # And it follows nested make calls and prerequisites.
-    reached, _ = _closure("release")
-    assert {"_release-manifest", "_guard-not-ci-apply"} <= reached or "_guard-not-ci-apply" in reached
+    # It follows prerequisites, nested $(MAKE) calls and the targets a script runs.
+    assert {"_guard-not-ci-apply", "_release-manifest", "derive-assignments", "apply", "verify-access"} <= _closure("release")[0]
+    assert {"validate", "promote", "coverage-gate", "plan", "promote-to"} <= _closure("check")[0]
 
 
 @pytest.mark.parametrize("target", GOVERNANCE_TARGETS)
@@ -298,7 +297,6 @@ def test_deterministic_generate_never_loads_the_model_client(env_dir, monkeypatc
     _write_drafts(env_dir)
     _generate(env_dir, monkeypatch)
     assert (env_dir / "generated" / "abac.auto.tfvars").is_file()
-    assert generate_abac.PROVIDERS  # the legacy providers exist, and the fixture forbids every one
 
 
 def _stub_make(tmp_path):
