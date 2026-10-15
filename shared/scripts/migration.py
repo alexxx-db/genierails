@@ -327,6 +327,21 @@ def revocations(env_dir: Path, env: str, generation: Mapping, cfg: Mapping) -> d
     return out
 
 
+def without_revoked(weak, env: str, revoked: Mapping[str, str]):
+    """The weakening result minus each lost SELECT a revocation already reports.
+
+    Here the after side is the committed config, so a table missing from its
+    table_readers is a known revocation (<env>:revoke:<table>:<principal>), not
+    unknown data. Any missing-reader weakening without that revoke key stays.
+    """
+    from weakening import CheckResult
+
+    def kept(items):
+        return tuple(w for w in items if not (w.category == "missing_table_readers_after"
+                                              and f"{env}:revoke:{w.object_name}:{w.principal}" in revoked))
+    return CheckResult(kept(weak.all_weakenings), kept(weak.acknowledged), kept(weak.unacknowledged))
+
+
 def proposed_table_readers(generation: Mapping) -> dict[str, list[str]]:
     readers: dict[str, list[str]] = {}
     for key in (generation.get("legacy") or {}).get("grants") or []:
@@ -389,8 +404,8 @@ def analyze(env_dir: Path, env: str, generation: Mapping, *, desired_abac: Path 
     keys = {e.key for e in entries}
     before, after = legacy_view(generation), rg._desired(env_dir, desired_abac)
     states = rg.governance_states(before, after)
-    weak = check_weakenings(*states, env, keys)
     revoked = revocations(env_dir, env, generation, cfg)
+    weak = without_revoked(check_weakenings(*states, env, keys), env, revoked)
     problems = shape_problems(generation) + frozen_problems(generation, desired_cfg)
     undeterministic = sorted({v for v in after["tags"].values() if not parse_treatment_value(v)})
     if undeterministic:
@@ -569,10 +584,19 @@ def report(env_dir: Path, env: str, *, desired_abac: Path | None = None) -> tupl
         lines.append(f"  Not in access_tier_groups or raw_exempt_principals, so they can't be readers: "
                      f"{', '.join(outside)}. Add each to a tier (or raw_exempt_principals), or leave it out and "
                      "acknowledge its revocation.")
+    if not deterministic(env_dir) and (cfg.get("promote_from") or env_dir.name == "prod"):
+        source = str(cfg.get("promote_from") or "dev")
+        lines += ["", f"Next: opt {source} in first. Then set governance_mode = \"deterministic\" and deployer_principal_id in",
+                  f"  envs/{env}/env.auto.tfvars (and group_map if {env}'s group names differ), run make",
+                  f"  rebuild-governed-tables ENV={env}, then make promote-to ENV={env}: it brings access_tier_groups and,",
+                  f"  where {env} has none yet, table_readers (compare them with the proposal above) and each agent's",
+                  f"  acl_groups from {source}. Then re-run make migrate-plan ENV={env} for the column-by-column comparison",
+                  "  and the refusals."]
+        return lines, data | {"ok": False, "ready": False}
     if not deterministic(env_dir):
         lines += ["", f"Next: set governance_mode = \"deterministic\", deployer_principal_id and access_tier_groups in envs/{env}/env.auto.tfvars,",
                   f"  add the table_readers above, run make rebuild-governed-tables ENV={env} (the first deterministic",
-                  "  generate refuses without it), then make generate (the promotion, for a promoted env), then re-run",
+                  "  generate refuses without it), then make generate, then re-run",
                   f"  make migrate-plan ENV={env} for the column-by-column comparison and the refusals."]
         return lines, data | {"ok": False, "ready": False}
 
