@@ -446,14 +446,19 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	fi
 
 # Agents (scripts/agent_ownership.py, design section 5). capture is authoring:
-# one read-only GET, writes only envs/dev/agents/<agent>.space.json; no
-# governance drafting, no model call, no Terraform state. A plain generate
+# one read-only GET, writes only envs/dev/agents/<agent>.space.json and, in a
+# deterministic env, the agent tables in generated/governed_tables.json (so a
+# table change is a governance-owned diff, design 18.1); no governance
+# drafting, no model call, no Terraform state written. A plain generate
 # captures only agents with no capture yet (import-new) and never re-captures.
 override _AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
 capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/dev/agents/<agent>.space.json: SPACE="<agent>" (read-only)
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
 	@if [ "$(ENV)" != "$(DEFAULT_ENV)" ]; then echo "ERROR: capture runs only with ENV=$(DEFAULT_ENV); promote-to carries agents to $(ENV)." >&2; exit 1; fi
 	@$(_DRY_RUN_GUARD); $(_AGENT_OWNERSHIP) capture --env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)"
+	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars")" = 1 ]; then \
+		$(_STICKY) record --env-dir "$(ENV_DIR)" --config "$(ENV_DIR)/generated/abac.auto.tfvars"; \
+	fi
 
 # Step 2 of removing an agent (operations stage). Step 1, a released PR with
 # acl_groups = [] and detached = true, revoked CAN_RUN; this only forgets the
@@ -1313,6 +1318,9 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 		--destination "$$dest_dir/generated/expected_classification.json" --catalog-map "$$map" || exit 1; \
 	if [ -f "$$src_dir/generated/abac.auto.tfvars" ]; then \
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
+	fi; \
+	if [ "$$($(_IS_DETERMINISTIC) "$$dest_dir/env.auto.tfvars")" = 1 ]; then \
+		$(_STICKY) record --if-agent-files --env-dir "$$dest_dir" --config "$$dest_dir/generated/abac.auto.tfvars" || exit 1; \
 	fi; \
 	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" changes --from "$$txn_dir/snapshot" || exit 1; \
 	$(_PROMOTION_TXN_COMMIT); \

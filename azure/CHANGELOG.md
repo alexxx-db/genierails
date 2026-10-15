@@ -12,6 +12,17 @@
   promotion changes only `agents/` files and needs no governance approval.
   `shared/examples/CODEOWNERS.example` is a sample that gives `agents/` to
   data citizens and the rest of `envs/` and `shared/` to governance engineers.
+- **Governance sees every agent table change** (design 18.1): an agent owns
+  its table list, and `generated/governed_tables.json` now also lists each
+  file-defined agent's tables (`agent_tables`). `make generate`, `make
+  capture` and `make promote-to` rewrite it, so adding or removing a table,
+  even one with no classified column, is a diff in a governance-owned file,
+  and `make check` fails while it is stale. It grants nothing; `SELECT` still
+  comes only from `table_readers`. A table only an agent file lists is no
+  longer copied into the promoted env's `env.auto.tfvars` `uc_tables`. Envs
+  whose agents are all inline keep their record as it was. **Upgrade:** an
+  env with agent files fails `make check` until you run `make generate`
+  (and `make promote-to` for its targets) and commit the result.
 - **`make split-agent-files ENV=<env>`**: the explicit migration that moves an
   env's inline `genie_spaces` into `agents/<agent>.auto.tfvars`. It refuses,
   writing nothing, any move that would change what Terraform plans. Envs that

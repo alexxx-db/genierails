@@ -6,15 +6,22 @@
 # after the env-wide governance rule.
 #
 #   Governance engineer: treatments, tag_treatments, tiers, group_map,
-#     table_readers, row filters, uc_tables, ungovern, acknowledgements
-#     -> envs/<env>/env.auto.tfvars, envs/<env>/generated/, envs/<env>/ack.txt
-#   Data citizen: curates an agent in the dev UI, captures it, promotes it
-#     -> envs/<env>/agents/<agent>.*
+#     table_readers, row filters, top-level uc_tables, ungovern,
+#     acknowledgements, and approving the governed-table set
+#     -> envs/<env>/env.auto.tfvars, envs/<env>/generated/ (including
+#        governed_tables.json), envs/<env>/ack.txt
+#   Data citizen: curates an agent in the dev UI (including its tables),
+#     captures it, promotes it -> envs/<env>/agents/<agent>.*
 #
-# An agent-only change (make capture, then make promote-to) touches only
-# agents/ files, so it needs only its agent's owners; a change that touches
-# governance needs a governance owner. make promote-to prints which kind of
-# files it changed. One team doing both can own both sets.
+# An agent owns its table list, but governance approves every table an agent
+# adds: make generate, make capture and make promote-to record each agent's
+# tables in envs/<env>/generated/governed_tables.json (governance-owned), and
+# make check fails while that record is stale. So an agent-only change that
+# keeps its tables (make capture, then make promote-to) touches only agents/
+# files and needs only its agent's owners; one that adds or removes a table
+# also needs a governance owner. Access stays governance-only: SELECT comes
+# only from table_readers in env.auto.tfvars. make promote-to prints which kind
+# of files it changed. One team doing both can own both sets.
 
 # GenieRails itself: product code and mappings change every env's generated
 # output (an upgrade is a governance change).

@@ -57,18 +57,29 @@ require only the owners of what changed:
 
 | Persona | Files |
 |---|---|
-| Governance engineer (treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, `uc_tables`, `ungovern`) | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/`, `envs/<env>/ack.txt` |
-| Data citizen (curates an agent in the dev UI, captures it, promotes it) | `envs/<env>/agents/<agent>.auto.tfvars` (`genie_space_id`, `acl_groups`, `detached`, `delete`) and `envs/<env>/agents/<agent>.space.json` |
+| Governance engineer (treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, top-level `uc_tables`, `ungovern`; approves the governed-table set) | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/` (including `governed_tables.json`), `envs/<env>/ack.txt` |
+| Data citizen (curates an agent in the dev UI, including its tables, captures it, promotes it) | `envs/<env>/agents/<agent>.auto.tfvars` (`genie_space_id`, `acl_groups`, `uc_tables`, `detached`, `delete`) and `envs/<env>/agents/<agent>.space.json` |
 
 - `env.auto.tfvars` holds only governance and env-owned settings; agent
   settings live only in `agents/` files, so an agent-only PR never touches a
   governance file. Customer class mappings are the env's `tag_treatments`
   (`make scaffold-treatments ENV=<env> TREATMENT=<name>` writes them), never
   `shared/`, which is GenieRails product code.
+- An agent's table list is agent-owned, and governance approves the result:
+  `make generate`, `make capture` and `make promote-to` record every
+  file-defined agent's tables under `agent_tables` in
+  `generated/governed_tables.json` (commit it). So an agent change that adds
+  or removes a table, even one with no classified column, always changes that
+  governance-owned file, and `make check` fails while it is stale. It grants
+  nothing: `SELECT` comes only from `table_readers`, and `CAN_RUN` is refused
+  while an `acl_groups` group can't read one of the agent's tables
+  ([access.md](access.md)).
 - `make promote-to` writes agent output under `envs/<target>/agents/` and
   governance output under `envs/<target>/generated/` and
   `envs/<target>/env.auto.tfvars`, and prints which kind it changed. An
-  agent-only promotion (capture, then promote) changes only `agents/` files.
+  agent-only promotion (capture, then promote) changes only `agents/` files;
+  one that changes an agent's tables also changes
+  `envs/<target>/generated/governed_tables.json`, never `env.auto.tfvars`.
 - [`shared/examples/CODEOWNERS.example`](../examples/CODEOWNERS.example) is a
   sample with both rules; copy it to `.github/CODEOWNERS` and use your teams.
 

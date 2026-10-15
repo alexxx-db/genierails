@@ -256,6 +256,99 @@ def test_promote_refuses_agents_a_legacy_target_still_keeps_inline(promoted, tmp
     assert base._state(promoted) == before, "prod's own acl_groups are never replaced silently"
 
 
+
+# ── An agent owns its table list; governance sees every change to it ────────
+# generated/governed_tables.json (governance-owned) lists each file-defined
+# agent's tables, so a table an agent adds, even one with no classified
+# column, is a governance diff; make check fails while the record is stale.
+
+PLAIN = "paycat.s.plain"  # no classified column, so generate writes no tag for it
+
+
+def _add_table(env_dir: Path, table: str) -> None:
+    """The data citizen adds a table to the agent in the dev UI, then make capture."""
+    path = env_dir / "agents" / "Payments.space.json"
+    payload = json.loads(path.read_text())
+    payload["data_sources"]["tables"].append({"identifier": table})
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _governed(env_dir: Path) -> dict:
+    return json.loads((env_dir / "generated" / "governed_tables.json").read_text())
+
+
+def test_an_agent_adding_a_table_with_no_classified_column_changes_governed_tables_json(promoted, tmp_path):
+    dev = base._envs(promoted) / "dev"
+    assert _governed(dev) == {"tables": ["paycat.s.t"], "agent_tables": {"Payments": ["paycat.s.t"]}}
+    _add_table(dev, PLAIN)
+
+    _record(dev)  # what make generate and make capture run after writing
+
+    assert _governed(dev) == {"tables": ["paycat.s.t"], "agent_tables": {"Payments": [PLAIN, "paycat.s.t"]}}
+    assert _changed(promoted) == ["aws/envs/dev/agents/Payments.space.json",
+                                  "aws/envs/dev/generated/governed_tables.json"]
+    assert owners("aws/envs/dev/generated/governed_tables.json") == [GOVERNANCE]
+    dry = subprocess.run(["make", "-n", "--no-print-directory", "-C", str(promoted / "aws"), "capture",
+                          "ENV=dev", "SPACE=Payments"], capture_output=True, text=True)
+    assert "sticky_governance.py\" record --env-dir" in dry.stdout, dry.stdout + dry.stderr
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_fails_while_governed_tables_json_is_stale(promoted, tmp_path, ci):
+    dev = base._envs(promoted) / "dev"
+    _add_table(dev, PLAIN)
+    base._commit(promoted, "agent adds a table; governed_tables.json not regenerated")
+    before = base._state(promoted)
+
+    stale = base._make(promoted, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert stale.returncode != 0, stale.stdout + stale.stderr
+    assert "generated/governed_tables.json" in stale.stderr, stale.stdout + stale.stderr
+    assert base._state(promoted) == before
+    _record(dev)
+    base._commit(promoted, "regenerated")
+    current = base._make(promoted, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+    assert current.returncode == 0, current.stdout + current.stderr
+
+
+def test_an_agent_only_change_adding_a_table_changes_only_agent_and_governance_owned_generated_files(
+        promoted, tmp_path):
+    dev = base._envs(promoted) / "dev"
+    _add_table(dev, PLAIN)
+    _record(dev)
+    assert _changed(promoted) == ["aws/envs/dev/agents/Payments.space.json",
+                                  "aws/envs/dev/generated/governed_tables.json"]
+    base._commit(promoted, "data citizen: Payments reads paycat.s.plain")
+
+    result = base._make(promoted, tmp_path, "promote-to", "ENV=prod")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    changed = _changed(promoted)
+    assert changed == ["aws/envs/prod/agents/Payments.space.json",
+                       "aws/envs/prod/generated/governed_tables.json"], changed
+    assert _governed(base._envs(promoted) / "prod")["agent_tables"] == {"Payments": ["ppay.s.plain", "ppay.s.t"]}
+    assert owners(changed[1]) == [GOVERNANCE], "the governance-owned record routes the PR to governance"
+    assert "It changes governance files: a governance owner approves the PR." in result.stdout
+    base._commit(promoted, "promotion PR")
+    check = base._make(promoted, tmp_path, "promote-to", "ENV=prod", "CHECK=1")
+    assert check.returncode == 0, check.stdout + check.stderr
+
+
+def test_an_agent_only_change_adding_a_table_grants_no_select_and_no_can_run(promoted, tmp_path):
+    dev = base._envs(promoted) / "dev"
+    _add_table(dev, PLAIN)
+    _record(dev)
+
+    from table_readers import access_problems, describe
+    problems = access_problems(dev)
+    assert problems and all(PLAIN in problem for problem in problems), problems
+    assert {group for group in base.TIERS if any(group in problem for problem in problems)} == set(base.TIERS)
+    assert f"  {PLAIN}: (none)" in describe(dev), "no table_readers entry covers it, so no SELECT"
+    refused = subprocess.run([sys.executable, str(SHARED / "table_readers.py"), "check", "--env-dir", str(dev),
+                              "--command-name", "make release"], capture_output=True, text=True)
+    assert refused.returncode == 1 and "CAN_RUN would be granted" in refused.stderr, refused.stderr
+    assert "table_readers" not in _governed(dev), "the record grants nothing"
+
 def test_the_promotion_report_classifies_every_env_path():
     assert promotion_txn.owner("agents/Sales.auto.tfvars") == promotion_txn.AGENT
     assert promotion_txn.owner("agents/Sales.space.json") == promotion_txn.AGENT
@@ -586,6 +679,24 @@ def test_after_split_agent_files_terraform_sees_exactly_the_same_agents(console_
     assert agent_files.names(env) and hcl2.loads((env / "env.auto.tfvars").read_text())["genie_spaces"] == []
     for layer, expr in (("workspace", WORKSPACE_EXPR), ("data_access", DATA_ACCESS_EXPR)):
         assert _console(console_shared, env, layer, expr) == inline[layer], layer
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_terraform_plans_no_select_for_a_table_an_agent_file_adds(console_shared, tmp_path):
+    env = _console_env(tmp_path, 'governance_mode = "deterministic"\n'
+                                 'access_tier_groups = ["dev_ops", "dev_analysts"]\n'
+                                 'table_readers = { "cat.sch.orders" = ["dev_ops"] }\n')
+    (env / "agents").mkdir()
+    agent = env / "agents" / "Payments.auto.tfvars"
+    agent.write_text('genie_space_id = "01f0aa0000000001"\nacl_groups = ["dev_ops"]\nuc_tables = ["cat.sch.orders"]\n')
+    expr = "jsonencode(module.data_access.access_config.grant_keys)"
+    assert _console(console_shared, env, "data_access", expr) == ["cat.sch.orders|dev_ops"]
+
+    agent.write_text(agent.read_text().replace('["cat.sch.orders"]', '["cat.sch.orders", "cat.sch.plain"]'))
+
+    assert _console(console_shared, env, "data_access", expr) == ["cat.sch.orders|dev_ops"]
+    readers = _console(console_shared, env, "data_access", "jsonencode(module.data_access.access_config.readers)")
+    assert readers == {"cat.sch.orders": ["dev_ops"], "cat.sch.plain": []}, "governed, but nobody reads it"
 
 
 # The legacy layout is untouched: promote-to with step 14 writes the very

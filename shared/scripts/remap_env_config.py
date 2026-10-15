@@ -588,6 +588,18 @@ def main():
     )
 
     remapped_effective_tables = [remap_table(table) for table in tables_to_write]
+    # A table only an agent file lists stays in that agent's file (agent-owned,
+    # design 18.1; agent_promote.py carries it), so an agent's table change
+    # never rewrites the destination's governance-owned env.auto.tfvars.
+    # Terraform and every reader merge the agent files back in.
+    from agent_files import AgentFileError, load_all as _load_agent_files
+    try:
+        file_tables = {t for agent in _load_agent_files(Path(source_env_dir)) for t in agent["uc_tables"]}
+    except AgentFileError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    env_tables = set(cfg.get("uc_tables") or []) | set(space_tables) | set(discovered_tables)
+    top_level_tables = [remap_table(t) for t in tables_to_write if t not in file_tables or t in env_tables]
     stale_discovered = [
         table for table in dest_discovered if table not in remapped_effective_tables
     ]
@@ -770,7 +782,7 @@ def main():
     lines.append("]")
     lines.append("")
     lines.append("uc_tables = [")
-    for table in remapped_effective_tables:
+    for table in top_level_tables:
         lines.append(f'  "{table}",')
     lines.append("]")
     lines.append("")
