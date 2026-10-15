@@ -28,6 +28,9 @@ name: GenieRails prod release (aws)
 #
 # Settings: the "production" environment requires a reviewer from the
 # governance code owners, prevents self-review and deploys only from main.
+# The "production-plan" environment deploys only from main and has no
+# reviewer; the prod read-only SP's federation policy names it
+# (make bootstrap-pipelines prints these settings).
 # Auth: OIDC workload identity federation, no PATs or secrets. Repository
 # variables (IDs, not credentials) for the read-only plan job:
 #   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
@@ -82,6 +85,9 @@ jobs:
     needs: scope
     if: needs.scope.outputs.prod == 'true'
     runs-on: ubuntu-latest
+    # Its own environment (main only, no reviewer): the prod read-only SP
+    # trusts only this environment's OIDC subject, not every job on main.
+    environment: production-plan
     permissions:
       contents: read
       actions: read
