@@ -42,7 +42,7 @@ read-only SP that already holds more than it should. Fix that and re-run.
 | Stage | Where | Command | Changes Databricks? |
 |---|---|---|---|
 | 1. Author | a person's machine | `make capture ENV=dev SPACE="<agent>"`, `make generate ENV=dev`, `make scaffold-treatments`, `make promote-to ENV=prod`; commit, open a PR | no |
-| 2. PR check | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` | no |
+| 2. PR check | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` or `shared/**` | no |
 | 3. Dev rehearsal | dev pipeline, each merge to `main`, in order | `make rehearse ENV=dev` | dev |
 | 4. Prod release | deployment machine in v1, after stage 3 passes on the commit | `make release-plan ENV=prod`, approve its manifest, `make release ENV=prod MANIFEST=<manifest>` ([release gating](#release-gating-deterministic-envs)) | prod |
 | 5. Keep protected | deployment machine in v1, on a schedule, at the last released commit | `make maintain ENV=prod` | prod, governance only |
@@ -201,9 +201,9 @@ The samples run from `aws/` or `azure/`.
 
 | Stage | Sample | Trigger | Runs in CI in v1 |
 |---|---|---|---|
-| 2. PR check | `pr-check.yml` | every PR to `main`; make it required and require up-to-date branches (Azure Repos: a build-validation policy that re-runs when the target branch changes) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` |
-| 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check) | `make check ENV=dev`, then `make rehearse ENV=dev` (once dev has remote state) |
-| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only for a commit touching `envs/prod/**` or `shared/**` (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; no run is cancelled | `make check ENV=prod` on that commit, then the approval gate; the applying steps are marked `REQUIRES PROD REMOTE STATE` and only report the commit to release on the deployment machine |
+| 2. PR check | `pr-check.yml` | every PR to `main`; make it required and require up-to-date branches (Azure Repos: a build-validation policy that re-runs when the target branch changes) | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` or `shared/**` (the prod release counts both) |
+| 3. Dev rehearsal | `dev-rehearse.yml` | merge to `main` that touches the cloud dir or `shared/`; one run per commit, in order, never cancelled (GitHub: a queue job and no concurrency group; Azure DevOps: `batch: false`, `lockBehavior: sequential` and an Exclusive Lock check); a run stops only when a newer `main` commit changes the same paths, whose own run rehearses it, so a later README or pipeline-only commit never strands a rehearsal | `make check ENV=dev`, then `make rehearse ENV=dev` (once dev has remote state) |
+| 4. Prod release | `prod-release.yml` | dev pipeline success on `main`, only when `envs/prod/**` or `shared/**` changed since the last successful prod release run (the commit GitHub or Azure DevOps records for it, `head_sha` or `sourceVersion`, never a run title; no such ancestor: always), so a change in an earlier skipped commit is never dropped (GitHub `workflow_run`; Azure DevOps pipeline-resource trigger); a protected environment with a required approval; no run is cancelled | `make check ENV=prod` on that commit, then the approval gate; the applying steps are marked `REQUIRES PROD REMOTE STATE` and only report the commit to release on the deployment machine |
 | 5. Keep protected | `prod-maintain.yml` | a schedule (GitHub: its own concurrency group, never the release's) | `make audit-schema ENV=prod` (read-only drift audit) |
 
 **Auth.** Every Databricks credential is a service principal through OIDC
