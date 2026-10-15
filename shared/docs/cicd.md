@@ -64,10 +64,18 @@ integration tests; never set it on a deployment job.
 - Make the PR check a required status check and require branches to be up to
   date, so a PR is re-checked against the latest `main` before it can merge.
   No direct pushes to `main`, including admins.
-- CODEOWNERS patterns are anchored at the repo root. Make the governance team
-  own `/aws/envs/prod/`, `/azure/envs/prod/`, `/aws/envs/account/`,
-  `/azure/envs/account/`, `**/envs/*/generated/`, `**/envs/*/data_access/` and
-  `/shared/`, and turn on "Require review from Code Owners".
+- CODEOWNERS splits approvals by persona (design 18.1): the governance team
+  owns `/shared/` and every env file (`env.auto.tfvars`, `generated/`,
+  `ack.txt`, and legacy envs' layer files), and the data citizens own
+  `**/envs/*/agents/`, listed after the env-wide rule because the last match
+  wins. Start from
+  [`shared/examples/CODEOWNERS.example`](../examples/CODEOWNERS.example) and
+  turn on "Require review from Code Owners". An agent-only promotion PR then
+  touches only `agents/` files and needs no governance approval; `make
+  promote-to` prints which kind of files it changed. An env whose agents are
+  still inline in `env.auto.tfvars` (the legacy layout) needs a governance
+  approval for every agent change until `make split-agent-files` moves them
+  ([version-control.md](version-control.md#who-owns-which-file)).
 - Protect the prod environment (the samples use `production` on GitHub and
   `genierails-prod` on Azure DevOps): required reviewers, no self-approval,
   `main` only.

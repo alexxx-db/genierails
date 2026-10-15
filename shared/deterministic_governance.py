@@ -345,6 +345,8 @@ def validate_config(
                     errors.append(f"agent {name} acl_groups must not contain duplicates")
             if "delete" in space and not isinstance(space["delete"], bool):
                 errors.append(f"agent {name} delete must be a boolean")
+    from governance_policies import tag_treatment_errors
+    errors.extend(tag_treatment_errors(cfg.get("tag_treatments")))
     from table_readers import validation_errors as table_readers_errors
     errors.extend(table_readers_errors(cfg))
     from group_map import validation_errors as group_map_errors

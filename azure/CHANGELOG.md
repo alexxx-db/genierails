@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Persona file ownership** (design 18.1): agent settings live only in
+  `envs/<env>/agents/` files and every reader merges them (`generate`, the
+  Genie ACL sidecar, `promote`), so an env with its agents in files promotes;
+  `generate` never imports a captured agent's live config into `generated/`.
+  `make promote-to` prints the files it changed by owner: an agent-only
+  promotion changes only `agents/` files and needs no governance approval.
+  `shared/examples/CODEOWNERS.example` is a sample that gives `agents/` to
+  data citizens and the rest of `envs/` and `shared/` to governance engineers.
+- **`make split-agent-files ENV=<env>`**: the explicit migration that moves an
+  env's inline `genie_spaces` into `agents/<agent>.auto.tfvars`. It refuses,
+  writing nothing, any move that would change what Terraform plans. Envs that
+  don't run it keep working unchanged; `make promote-to` refuses while the
+  target still keeps inline an agent the source has in a file.
+- **`tag_treatments`** (deterministic envs): `"class.<name>" = "<treatment>"`
+  maps a customer class to a mask-library treatment in the env's own
+  `env.auto.tfvars`; promotion carries it. `make scaffold-treatments
+  ENV=<env> TREATMENT=<treatment>` writes it (for a promote-to target, in its
+  source env) and never changes `shared/`.
+
+### Changed
+
+- **`tag_treatments` keys other than `class.<name>`** (for example
+  `"sensitivity=confidential"`) are now refused: they were accepted but never
+  applied, so the columns stayed unmasked by them. Also refused: remapping a
+  class the mask library already maps, and a value that isn't a library
+  treatment.
+- **`make scaffold-treatments` in a deterministic env** needs `TREATMENT=`; it
+  no longer writes REVIEW stubs into `shared/` for those envs (legacy envs are
+  unchanged).
+
 ### Removed
 
 - **`make certify`**: removed. It had become an alias for `make release`, which

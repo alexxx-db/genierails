@@ -1,0 +1,34 @@
+# Sample CODEOWNERS for a GenieRails customer repo (design section 18.1).
+#
+# Copy to .github/CODEOWNERS (GitHub) or adapt for your Git host, replace the
+# @your-org/... teams with your own, and turn on "Require review from Code
+# Owners" for main. The last matching pattern wins, so the agent rule comes
+# after the env-wide governance rule.
+#
+#   Governance engineer: treatments, tag_treatments, tiers, group_map,
+#     table_readers, row filters, uc_tables, ungovern, acknowledgements
+#     -> envs/<env>/env.auto.tfvars, envs/<env>/generated/, envs/<env>/ack.txt
+#   Data citizen: curates an agent in the dev UI, captures it, promotes it
+#     -> envs/<env>/agents/<agent>.*
+#
+# An agent-only change (make capture, then make promote-to) touches only
+# agents/ files, so it needs only its agent's owners; a change that touches
+# governance needs a governance owner. make promote-to prints which kind of
+# files it changed. One team doing both can own both sets.
+
+# GenieRails itself: product code and mappings change every env's generated
+# output (an upgrade is a governance change).
+/shared/                        @your-org/governance-engineers
+
+# Every env file is governance-owned unless a later rule says otherwise:
+# env.auto.tfvars, generated/, ack.txt (and the layer files of legacy envs).
+**/envs/                        @your-org/governance-engineers
+**/envs/*/ack.txt               @your-org/governance-engineers
+
+# Agents: one settings file and one captured config per agent, in every env.
+**/envs/*/agents/               @your-org/data-citizens
+# Per-agent owners (optional): name each agent's team, e.g.
+# **/envs/*/agents/Sales.*      @your-org/sales-analysts
+
+# Pipelines and repo settings.
+/.github/                       @your-org/platform

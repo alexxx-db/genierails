@@ -343,6 +343,13 @@ def load_auth_config(
     if env_file is None:
         env_file = auth_file.parent / "env.auto.tfvars"
     env_cfg = _load_tfvars(env_file, "environment", strict=strict_env)
+    # Agent settings live in agents/<agent>.auto.tfvars (design 18.1); every
+    # reader sees the same genie_spaces as Terraform does.
+    from agent_files import AgentFileError, with_agents
+    try:
+        env_cfg = with_agents(env_file, env_cfg)
+    except AgentFileError as exc:
+        raise ValueError(str(exc)) from exc
     placeholder = placeholder_error(env_cfg, env_file)
     if placeholder:
         raise ValueError(placeholder)
@@ -4216,7 +4223,8 @@ def autofix_acl_groups(
     # Try to get uc_tables per space from env.auto.tfvars
     if env_tfvars_path and env_tfvars_path.exists():
         try:
-            env_cfg = hcl2.loads(env_tfvars_path.read_text())
+            from agent_files import with_agents
+            env_cfg = with_agents(env_tfvars_path, hcl2.loads(env_tfvars_path.read_text()))
             configured_spaces = env_cfg.get("genie_spaces") or []
             has_configured_spaces = bool(configured_spaces)
             tiers = env_cfg.get("access_tier_groups") or []
@@ -4436,7 +4444,8 @@ def reject_unowned_draft_acls(
         return
     try:
         cfg = hcl2.loads(tfvars_path.read_text())
-        env_cfg = hcl2.loads(env_tfvars_path.read_text())
+        from agent_files import with_agents
+        env_cfg = with_agents(env_tfvars_path, hcl2.loads(env_tfvars_path.read_text()))
     except Exception as exc:
         raise ValueError(f"Cannot inspect legacy Genie ACLs: invalid HCL: {exc}") from exc
 
@@ -8142,6 +8151,11 @@ def main():
             genie_spaces_cfg = [target_space_cfg]
         if genie_spaces_cfg:
             discovered_from_api: list[str] = []
+            # A captured agent's config and tables are in git
+            # (agents/<agent>.space.json); its live config is never imported
+            # into generated/, so agent content stays out of governance files.
+            from agent_files import captured_names
+            captured_agents = captured_names(auth_file.parent)
 
             for space in genie_spaces_cfg:
                 space_tables = space.get("uc_tables") or []
@@ -8152,7 +8166,7 @@ def main():
                 agent_name = space_name
                 exposed_tables = list(space_tables)
 
-                if space_id:
+                if space_id and space_name not in captured_agents:
                     # Always query the API for existing spaces to get config.
                     # Tables are also discovered here if uc_tables is not set.
                     # When uc_tables IS set, use quick_check_only to skip long

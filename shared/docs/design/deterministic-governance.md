@@ -443,7 +443,7 @@ Each playbook follows the champion README's style: the flow in one code block, s
 
 ### 18.8 Rollout (continues section 16)
 
-14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample.
+14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample. Built: every reader (generate, the ACL sidecar, promote) merges `agents/` files, and generate never imports a captured agent's live config into `generated/`; `promote-to` carries agents before the split and prints the changed files by owner; `shared/examples/CODEOWNERS.example`; `tag_treatments` keys are `class.<name>` mapped to mask-library treatments (other tag keys are refused, since this version reads only `class.*` tags), written by `scaffold-treatments` to the env (a promote-to target's source); legacy envs keep their inline agents until the explicit `make split-agent-files`, which refuses any move that would change the plan.
 15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2). Built: an existing job moves from the workspace state to the data_access state before any command on either root (`move_scheduled_job.py`), and the workspace root's `removed` block forgets rather than destroys it.
 16. `make bootstrap-pipelines` (18.2).
 17. Optional AI helpers (18.4).

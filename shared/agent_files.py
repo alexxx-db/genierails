@@ -194,6 +194,23 @@ def merged_config(env_dir: Path, cfg: dict | None = None) -> dict:
     return cfg
 
 
+def with_agents(env_file: Path, cfg: dict) -> dict:
+    """``cfg`` (loaded from ``env_file``) with the env's agent files merged in.
+
+    Only an env's own env.auto.tfvars gets the merge; any other file, or an
+    env without agent files, is returned unchanged.
+    """
+    env_file = Path(env_file)
+    if env_file.name != "env.auto.tfvars" or not names(env_file.parent):
+        return cfg
+    return merged_config(env_file.parent, cfg)
+
+
+def captured_names(env_dir: Path) -> set[str]:
+    """Agents whose config is in git (agents/<agent>.space.json): the capture, not the live agent, is their source."""
+    return {name for name in names(env_dir) if capture_path(env_dir, name).is_file()}
+
+
 def _space_entry(agent: dict) -> dict:
     entry = {
         "name": agent["name"],
@@ -274,9 +291,169 @@ def write_tfvars(env_dir: Path, layer: str, out: Path) -> bool:
     return True
 
 
+# ── make split-agent-files: move inline genie_spaces into agent files ───────
+#
+# The explicit, reviewed migration from the legacy layout (every agent inline
+# in env.auto.tfvars) to the persona layout (design 18.1: agent settings only
+# in agents/ files, so an agent-only PR never touches a governance file).
+# Nothing else moves this; an env that never runs it keeps working as it is.
+
+SPLIT_KEYS = {"name", "genie_space_id", "acl_groups", "uc_tables", "sql_warehouse_id"}
+SPLIT_COMMENT = "# Agents: one file each in agents/<agent>.auto.tfvars (moved there by make split-agent-files)."
+
+
+def _top_level_list(text: str, key: str) -> tuple[int, int] | None:
+    """(start, end) of a top-level ``key = [ ... ]`` assignment, string-aware, or None."""
+    match = re.search(rf"^{re.escape(key)}\s*=\s*\[", text, re.MULTILINE)
+    if not match:
+        return None
+    depth, quoted, escaped = 0, False, False
+    for index in range(match.end() - 1, len(text)):
+        char = text[index]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                return match.start(), end + (1 if text[end:end + 1] == "\n" else 0)
+    return None
+
+
+def _render_agent(space: dict) -> str:
+    lines = [f"# {space['name']}: moved from env.auto.tfvars genie_spaces by make split-agent-files.",
+             f"genie_space_id = {json.dumps(str(space.get('genie_space_id') or ''))}"]
+    if space.get("acl_groups") is not None:
+        lines.append("acl_groups     = [" + ", ".join(json.dumps(g) for g in space["acl_groups"]) + "]")
+    if space.get("uc_tables"):
+        lines.append("uc_tables      = [" + ", ".join(json.dumps(t) for t in space["uc_tables"]) + "]")
+    if str(space.get("sql_warehouse_id") or ""):
+        lines.append(f"sql_warehouse_id = {json.dumps(str(space['sql_warehouse_id']))}")
+    return "\n".join(lines) + "\n"
+
+
+def _as_terraform(space: dict) -> dict:
+    """A genie_spaces entry as Terraform types it (optional attributes defaulted)."""
+    return {
+        "name": str(space.get("name") or ""),
+        "genie_space_id": str(space.get("genie_space_id") or ""),
+        "sql_warehouse_id": str(space.get("sql_warehouse_id") or ""),
+        "uc_tables": list(space.get("uc_tables") or []),
+        "acl_groups": space.get("acl_groups"),
+        "delete": bool(space.get("delete", False)),
+    }
+
+
+def split_problems(env_dir: Path, spaces: list) -> list[str]:
+    problems = []
+    keys: dict[str, list[str]] = {}
+    for name in names(env_dir):
+        keys.setdefault(space_key(name), []).append(name)
+    for index, space in enumerate(spaces):
+        if not isinstance(space, dict):
+            problems.append(f"genie_spaces[{index}] is not an object")
+            continue
+        name = str(space.get("name") or "")
+        label = f"genie_spaces[{index}] ({name or space.get('genie_space_id') or 'no name'})"
+        if not name:
+            problems.append(
+                f"{label} has no name. Its Terraform key is its genie_space_id, and an agent file is "
+                "keyed by its name, so moving it would replace the agent; set name only together with "
+                "a terraform state mv to the new key, or keep it inline")
+            continue
+        try:
+            check_name(name)
+        except AgentFileError as exc:
+            problems.append(f"{label}: {exc}")
+            continue
+        extra = sorted(set(space) - SPLIT_KEYS - {"delete"})
+        if extra:
+            problems.append(f"{label} sets {', '.join(extra)}, which agent files don't hold; keep it inline")
+        if space.get("delete"):
+            problems.append(f"{label} has delete = true; release the delete (or undo it) before moving the agent")
+        acl = space.get("acl_groups")
+        if acl is not None and (not isinstance(acl, list) or not all(isinstance(g, str) and g for g in acl)):
+            problems.append(f"{label}: acl_groups must be a list of group names")
+        tables = space.get("uc_tables") or []
+        if not isinstance(tables, list) or not all(isinstance(t, str) and t for t in tables):
+            problems.append(f"{label}: uc_tables must be a list of table names")
+        if str(space.get("genie_space_id") or "").strip() and promoted(env_dir):
+            problems.append(
+                f"{label} has a genie_space_id, which a promoted env keeps in its Terraform state, "
+                f"never in git; move it to .genie_space_id_{space_key(name)} first")
+        if settings_path(env_dir, name).exists() or capture_path(env_dir, name).exists():
+            problems.append(f"{label}: {AGENTS_DIR}/{name}.* already exists")
+        keys.setdefault(space_key(name), []).append(name)
+    for key, owners in sorted(keys.items()):
+        if len(owners) > 1:
+            problems.append(f"agents {', '.join(repr(o) for o in owners)} share the Terraform key {key!r}; "
+                            "give them distinct names first")
+    return problems
+
+
+def split(env_dir: Path) -> list[str]:
+    """Move every inline genie_spaces entry into agents/<name>.auto.tfvars.
+
+    Refuses, writing nothing, unless every entry can move with exactly the
+    same Terraform input (same key, ID, tables, warehouse and acl_groups);
+    after writing it re-reads both layouts and puts everything back if the
+    merged agents differ. Returns the agents moved.
+    """
+    env_dir = Path(env_dir)
+    env_file = env_dir / "env.auto.tfvars"
+    text = env_file.read_text()
+    before = _load_hcl(env_file)
+    spaces = before.get("genie_spaces") or []
+    if not spaces:
+        return []
+    problems = split_problems(env_dir, spaces)
+    span = _top_level_list(text, "genie_spaces")
+    if span is None and not problems:
+        problems.append("genie_spaces is not a top-level list in env.auto.tfvars; move the agents by hand")
+    if problems:
+        raise AgentFileError(f"{env_file}: nothing was moved:\n  - " + "\n  - ".join(problems))
+    expected = sorted((_as_terraform(s) for s in merged_config(env_dir, before).get("genie_spaces") or []),
+                      key=lambda s: s["name"])
+    folder = agents_dir(env_dir)
+    created_dir = not folder.exists()
+    written = []
+    try:
+        folder.mkdir(exist_ok=True)
+        for space in spaces:
+            path = settings_path(env_dir, space["name"])
+            path.write_text(_render_agent(space))
+            written.append(path)
+        env_file.write_text(text[:span[0]] + SPLIT_COMMENT + "\ngenie_spaces = []\n" + text[span[1]:])
+        after = _load_hcl(env_file)
+        same_settings = ({k: v for k, v in after.items() if k != "genie_spaces"}
+                         == {k: v for k, v in before.items() if k != "genie_spaces"})
+        moved = sorted((_as_terraform(s) for s in merged_config(env_dir).get("genie_spaces") or []),
+                       key=lambda s: s["name"])
+        if not same_settings or moved != expected:
+            raise AgentFileError(f"{env_file}: the moved agents would not match the inline ones; nothing was moved")
+    except BaseException:
+        env_file.write_text(text)
+        for path in written:
+            path.unlink(missing_ok=True)
+        if created_dir and folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+        raise
+    return [space["name"] for space in spaces]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("tfvars", "validate"))
+    parser.add_argument("command", choices=("tfvars", "validate", "split"))
     parser.add_argument("--env-dir", type=Path, required=True,
                         help="envs/<env> (the workspace env dir, not data_access/)")
     parser.add_argument("--layer", choices=("workspace", "data_access"), default="workspace")
@@ -285,6 +462,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "validate":
             merged_config(args.env_dir)
+            return 0
+        if args.command == "split":
+            moved = split(args.env_dir)
+            env = args.env_dir.name
+            if not moved:
+                print(f"envs/{env}/env.auto.tfvars has no inline genie_spaces; nothing to move.")
+                return 0
+            for name in moved:
+                print(f"  moved {name!r} -> envs/{env}/{AGENTS_DIR}/{name}{SETTINGS_SUFFIX}")
+            print(f"  envs/{env}/env.auto.tfvars: genie_spaces = [] (every other setting unchanged)")
+            print("Terraform gets the same agents (same keys, IDs, tables, warehouses and acl_groups), so "
+                  f"make plan ENV={env} shows no change. Review the diff, commit envs/{env}/env.auto.tfvars "
+                  f"and envs/{env}/{AGENTS_DIR}/ in one PR.")
             return 0
         if args.var_file is None:
             parser.error("tfvars needs --var-file")
