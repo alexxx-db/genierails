@@ -296,13 +296,14 @@ def test_legacy_env_has_no_governed_set_and_no_layout_check(tmp_path, monkeypatc
 
 def test_old_address_tags_are_refused_with_state_mv_commands(tmp_path, capsys):
     env = _env(tmp_path)
-    _state(env, {f"{ORDERS}.ssn": "ssn_last4"}, name="assignments")
+    value = "ssn_last4__string__12345678"
+    _state(env, {f"{ORDERS}.ssn": value}, name="assignments")
     assert main(["check-layout", "--env-dir", str(env), "--env-name", "dev"]) == 1
     err = capsys.readouterr().err
     assert "nothing was planned or applied" in err
     assert (
         "data_access dev state-mv "
-        "'module.data_access.databricks_entity_tag_assignment.assignments[\"columns|prod.sales.orders.ssn|gr_treatment|ssn_last4\"]' "
+        f"'module.data_access.databricks_entity_tag_assignment.assignments[\"columns|prod.sales.orders.ssn|gr_treatment|{value}\"]' "
         "'module.data_access.databricks_entity_tag_assignment.treatment[\"columns|prod.sales.orders.ssn|gr_treatment\"]'"
     ) in err
     assert f"ENVS_DIR={env.resolve().parent} " in err
@@ -314,8 +315,60 @@ def test_new_address_tags_pass_the_layout_check(tmp_path):
     check_layout(env, "dev")
 
 
+def test_pending_legacy_migration_defers_layout_check(tmp_path, capsys):
+    env = _env(tmp_path)
+    _state(env, {f"{ORDERS}.ssn": "ssn_last4"}, name="assignments")
+    check_layout(env, "dev")
+    assert "staged controller adopts them" in capsys.readouterr().out
+
+
+def test_generation_qualified_old_address_is_still_refused(tmp_path):
+    env = _env(tmp_path)
+    _state(env, {f"{ORDERS}.ssn": "ssn_last4__string__12345678"}, name="assignments")
+    with pytest.raises(GovernedTablesError, match="old Terraform address"):
+        check_layout(env, "dev")
+
+
+def test_mixed_legacy_and_generation_qualified_old_addresses_are_refused(tmp_path):
+    env = _env(tmp_path)
+    _state(env, {
+        f"{ORDERS}.ssn": "ssn_last4",
+        f"{CUSTOMERS}.email": "email_partial__string__12345678",
+    }, name="assignments")
+    with pytest.raises(GovernedTablesError, match="old Terraform address"):
+        check_layout(env, "dev")
+
+
+@pytest.mark.parametrize("artifact", ["journal", "adopted"])
+def test_migration_artifact_keeps_old_address_refusal(tmp_path, artifact):
+    env = _env(tmp_path)
+    _state(env, {f"{ORDERS}.ssn": "ssn_last4"}, name="assignments")
+    ledger = env / "data_access/.policy_generations"
+    ledger.mkdir(parents=True)
+    if artifact == "journal":
+        (ledger / "journal.json").write_text(json.dumps({
+            "version": 1, "active": "x", "pending": [], "transition": None, "history": []
+        }))
+    else:
+        (ledger / "migration.json").write_text('{"status": "adopted"}\n')
+    with pytest.raises(GovernedTablesError, match="old Terraform address"):
+        check_layout(env, "dev")
+
+
+@pytest.mark.parametrize("artifact", ["journal.json", "migration.json"])
+def test_unreadable_migration_artifact_is_a_clean_error(tmp_path, capsys, artifact):
+    env = _env(tmp_path)
+    _state(env, {f"{ORDERS}.ssn": "ssn_last4"}, name="assignments")
+    ledger = env / "data_access/.policy_generations"
+    ledger.mkdir(parents=True)
+    (ledger / artifact).write_text("not-json\n")
+    assert main(["check-layout", "--env-dir", str(env), "--env-name", "dev"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR:") and "Traceback" not in err
+
+
 @pytest.mark.parametrize("recipe", ["_plan-layer:", "_apply-layer:"])
-def test_data_access_plan_and_apply_run_the_layout_check(recipe):
+def test_data_access_plan_and_apply_prepare_after_the_layout_check(recipe):
     text = (SHARED / "Makefile.shared").read_text()
     body = text[text.index(f"\n{recipe}"):]
     body = body[:body.index("\n\n")]

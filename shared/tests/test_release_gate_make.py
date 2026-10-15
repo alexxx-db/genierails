@@ -42,6 +42,8 @@ if "_release-plan-roots" in args:
     (plan_dir / "account.json").write_text('{{"file": "account.tfplan", "changes": false}}')
     (plan_dir / "workspace.tfplan").write_bytes(b"workspace")
     (plan_dir / "workspace.json").write_text('{{"file": "workspace.tfplan", "changes": true}}')
+    if Path({imports!r}).exists():  # imports and stale-tag cleanups import_existing.sh --record found
+        (plan_dir / "imports.jsonl").write_text(Path({imports!r}).read_text())
     da = plan_dir / "data_access"
     da.mkdir()
     (da / "00-grant.tfplan").write_bytes(b"grant")
@@ -73,8 +75,10 @@ class Make:
         self.log = tmp_path / "calls.jsonl"
         self.live = tmp_path / "live.txt"
         self.live.write_text("live-1\n")
+        self.imports = tmp_path / "imports.jsonl"
         self.make = self._write("make-stub", MAKE_STUB.format(python=sys.executable, log=str(self.log), fail=fail,
-                                                              passthrough=list(passthrough)))
+                                                              passthrough=list(passthrough),
+                                                              imports=str(self.imports)))
         self.stubs = {name: self._recorder(name) for name in
                       ("staged", "gate", "runner", "reports", "live", "inventory", "classification", "audit")}
 
@@ -289,6 +293,88 @@ def test_a_phase_manifest_records_the_phase_and_writes_no_release_receipt(make, 
     assert not rg.release_receipts(repo.cloud, "prod")
     assert [r["id"] for r in rg.phase_records(repo.cloud, "prod", repo.head())]
     assert not [c for c in make.calls() if c[0] == "runner"]  # the workspace waits for the last phase
+
+
+CLASSIFICATION_IMPORT = {"kind": "import", "layer": "data_access", "id": "catalogs/cat/config",
+                         "address": 'module.data_access.databricks_data_classification_catalog_config.classification["cat"]'}
+CLEANUP = {"kind": "cleanup", "layer": "data_access", "entity_type": "tables", "entity_name": "cat.sch.t",
+           "tag_key": "sensitivity", "statement": "ALTER TABLE `cat`.`sch`.`t` UNSET TAGS ('sensitivity')",
+           "warehouse_id": "wh"}
+# What an import-only manifest must never carry: it skips the agent preflight, tag sync and verification.
+FORGED = {
+    "treatment-cleanup": CLEANUP | {"entity_type": "columns", "entity_name": "cat.sch.t.ssn", "tag_key": "gr_treatment",
+                                    "statement": "ALTER TABLE `cat`.`sch`.`t` ALTER COLUMN `ssn` UNSET TAGS ('gr_treatment')"},
+    "treatment-cleanup-upper": CLEANUP | {"entity_type": "columns", "entity_name": "cat.sch.t.ssn", "tag_key": "GR_TREATMENT",
+                                          "statement": "ALTER TABLE `cat`.`sch`.`t` ALTER COLUMN `ssn` UNSET TAGS ('GR_TREATMENT')"},
+    "treatment-tag-import-mixed-case": CLASSIFICATION_IMPORT | {
+        "address": 'module.data_access.databricks_entity_tag_assignment.assignments["columns|cat.sch.t.ssn|Gr_Treatment|redact"]',
+        "id": "columns,cat.sch.t.ssn,Gr_Treatment"},
+    "arbitrary-sql": CLEANUP | {"statement": "GRANT SELECT ON CATALOG cat TO `account users`"},
+    "unsupported-address": CLASSIFICATION_IMPORT | {"address": 'module.data_access.databricks_grant.anything["cat"]'},
+    "foreign-warehouse": CLEANUP | {"warehouse_id": "someone-elses"},
+}
+
+
+@pytest.mark.parametrize("forged", FORGED, ids=list(FORGED))
+def test_release_plan_refuses_a_record_entry_it_never_writes(make, repo, forged):
+    make.imports.write_text(json.dumps(CLASSIFICATION_IMPORT) + "\n" + json.dumps(FORGED[forged]) + "\n")
+    assert make("rehearse", "dev").returncode == 0
+    result = make("release-plan", "prod")
+    assert result.returncode != 0
+    assert "entry 2:" in result.stderr and "never records" in result.stderr
+    assert not rg.manifests_dir(repo.cloud, "prod").exists() or not list(rg.manifests_dir(repo.cloud, "prod").iterdir())
+
+
+@pytest.mark.parametrize("forged", FORGED, ids=list(FORGED))
+def test_an_import_manifest_with_an_entry_release_plan_never_records_is_refused(make, repo, forged):
+    """A manifest whose record and hash agree (forged, or written before the check) still runs nothing."""
+    make.imports.write_text(json.dumps(CLASSIFICATION_IMPORT) + "\n")
+    manifest = _planned(make)
+    record = manifest.parent / "imports.jsonl"
+    entries = [CLASSIFICATION_IMPORT, FORGED[forged]]
+    for path in (record, manifest):
+        os.chmod(path, 0o644)
+    record.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    body = json.loads(manifest.read_text())
+    body["imports"] |= {"count": 2, "sha256": rg.sha256_file(record), "entries": entries}
+    manifest.write_text(json.dumps(body))
+    importer = make._recorder("importer")
+    (repo.prod / "data_access").mkdir(exist_ok=True)
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"IMPORT_EXISTING_SCRIPT={importer}")
+    assert result.returncode != 0 and "entry 2:" in result.stderr and "never records" in result.stderr
+    assert not [c for c in make.calls() if c[0] in ("importer", "staged", "runner")]
+    assert not rg.phase_records(repo.cloud, "prod", repo.head())
+
+
+def test_an_import_manifest_runs_only_its_recorded_imports_under_the_lock(make, repo):
+    """release-plan recorded imports instead of running them; release runs exactly those, then stops."""
+    make.imports.write_text(json.dumps(CLASSIFICATION_IMPORT) + "\n")
+    manifest = _planned(make)
+    assert json.loads(manifest.read_text())["imports"]["count"] == 1
+    importer = make._recorder("importer")
+    (repo.prod / "data_access").mkdir(exist_ok=True)
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"IMPORT_EXISTING_SCRIPT={importer}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = make.calls()
+    assert [c for c in calls if c[0] == "importer"] == [
+        ["importer", "--skip-treatment-tags", f"--apply-recorded={manifest.parent / 'imports.jsonl'}"]]
+    # Nothing else: no saved plan, no tag-policy sync, no workspace apply, no release receipt.
+    assert not [c for c in calls if c[0] in ("staged", "runner")] and "sync-tags" not in make.names()
+    assert [r["id"] for r in rg.phase_records(repo.cloud, "prod", repo.head())]
+    assert not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
+    assert "make release-plan ENV=prod" in result.stdout
+
+
+def test_an_import_manifest_whose_record_changed_is_refused(make, repo):
+    make.imports.write_text(json.dumps(CLASSIFICATION_IMPORT) + "\n")
+    manifest = _planned(make)
+    record = manifest.parent / "imports.jsonl"
+    os.chmod(record, 0o644)
+    record.write_text(json.dumps(CLASSIFICATION_IMPORT | {"id": "catalogs/other/config"}) + "\n")
+    importer = make._recorder("importer")
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", f"IMPORT_EXISTING_SCRIPT={importer}")
+    assert result.returncode != 0 and "the recorded imports" in result.stderr
+    assert not [c for c in make.calls() if c[0] in ("importer", "staged", "runner")]
 
 
 def test_a_failed_saved_plan_writes_no_release_receipt(make, repo):

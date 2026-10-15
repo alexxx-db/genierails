@@ -106,6 +106,11 @@ approved state moves, which `release MANIFEST=` runs before stopping; the next
 `release-plan` plans **create** against the moved state. In dev, `rehearse`
 adopts and runs every phase in one go.
 
+The old-Terraform-address layout guard defers only for this untouched pending
+legacy migration; the staged controller owns both the state moves and every
+deterministic `gr_treatment` retag. `make plan` may describe the same pending
+migration without a lock, but all mutation remains behind the env lock.
+
 In prod each changing phase is one `release-plan` manifest and approval, with
 release-plan's provenance (clean checkout on freshly fetched `origin/main`, a
 matching passing dev receipt, not older than the last release unless
