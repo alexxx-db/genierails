@@ -13,6 +13,7 @@ make migrate-plan ENV=prod        # 1. read-only dry run on the live env; propos
 #    table_readers and each agent's acl_groups; then
 make rebuild-governed-tables ENV=dev   # 2a. writes generated/governed_tables.json (commit it)
 make generate ENV=dev                  # 2b. dev: the deterministic draft (no model is called)
+make promote ENV=dev                   # 2b.i. refresh split files before `make check ENV=dev`
 #    prod: in envs/prod/env.auto.tfvars set governance_mode = "deterministic"
 #    and deployer_principal_id (prod's own deployer SP) yourself (and group_map
 #    if prod's group names differ); promote-to never sets either. Then:
@@ -37,6 +38,10 @@ In prod, step 2d brings the rest of the opt-in from dev: `access_tier_groups`
 always, and, where prod has none yet, `table_readers` and each agent's
 `acl_groups` (group names through prod's `group_map`). Values prod already has
 are kept, so review the promotion's diff and its printed differences.
+
+`generate` owns `generated/`; during this legacy transition the existing split
+files are still separate promotion outputs. Run `make promote ENV=dev` after
+`make generate ENV=dev` so `make check ENV=dev` compares current split files.
 
 `make rebuild-governed-tables ENV=<env>` writes the record from the deployed
 treatment tags and the generated or promoted config. It is local and changes
