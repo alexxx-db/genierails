@@ -230,6 +230,21 @@ def check_layout(env_dir: Path, env_name: str, tag_key: str | None = None) -> No
     old = [(key, column) for name, key, column in _state_tags(env_dir, tag_key) if name == "assignments"]
     if not old:
         return
+    # The staged controller deliberately adopts an untouched legacy deployment
+    # from this old address.  This guard runs before that controller (and before
+    # its read-only description in `make plan`), so exempt only that exact case.
+    from governance_policies import parse_treatment_value
+    from scripts import migration
+
+    record = migration.load_record(env_dir)
+    legacy_values = [str(key).rsplit("|", 1)[-1] for key, _column in old]
+    if (migration.pending(env_dir) and not migration.adopted(record)
+            and all(not parse_treatment_value(value) for value in legacy_values)):
+        print(
+            f"NOTE: {len(old)} legacy treatment tag(s) are pending migration; "
+            "the staged controller adopts them under the environment lock."
+        )
+        return
     prefix = shlex.join([
         f"ENVS_DIR={Path(env_dir).resolve().parent}", str(SHARED / "scripts" / "terraform_layer.sh"),
         "data_access", env_name, "state-mv",

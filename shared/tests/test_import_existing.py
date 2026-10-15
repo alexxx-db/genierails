@@ -103,6 +103,58 @@ def test_stale_tag_lookup_fails_closed(
     assert sum(statement.startswith("ALTER TABLE") for statement in calls) == expected_unsets
 
 
+def test_deterministic_cleanup_skips_treatments_but_cleans_other_tags(monkeypatch, tmp_path):
+    (tmp_path / "abac.auto.tfvars").write_text(
+        'tag_assignments = [\n'
+        '  { entity_type = "columns", entity_name = "cat.sch.tbl.ssn", tag_key = "gr_treatment", tag_value = "redact__string__12345678" },\n'
+        '  { entity_type = "tables", entity_name = "cat.sch.tbl", tag_key = "sensitivity", tag_value = "pii" }\n'
+        ']\n'
+    )
+    (tmp_path / "env.auto.tfvars").write_text(
+        'governance_mode = "deterministic"\nsql_warehouse_id = "wh"\n'
+    )
+    calls = []
+
+    class Execution:
+        def execute_statement(self, *, statement, **_kwargs):
+            calls.append(statement)
+            if statement.startswith("SELECT"):
+                return _response(_State.SUCCEEDED, "old")
+            return _response(_State.SUCCEEDED, statement_id="unset")
+
+    client = SimpleNamespace(statement_execution=Execution())
+    sdk = types.ModuleType("databricks.sdk")
+    sdk.WorkspaceClient = lambda **_kwargs: client
+    sql = types.ModuleType("databricks.sdk.service.sql")
+    sql.StatementState = _State
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.service.sql", sql)
+    monkeypatch.chdir(tmp_path)
+    exec(compile(_cleanup_python(), str(SCRIPT), "exec"), {"__name__": "__main__"})
+
+    alters = [statement for statement in calls if statement.startswith("ALTER TABLE")]
+    assert alters == ["ALTER TABLE cat.sch.tbl UNSET TAGS ('sensitivity')"]
+
+
+def test_deterministic_import_skips_treatments_including_steady_state_retag(tmp_path):
+    data_access = tmp_path / "env" / "data_access"
+    data_access.mkdir(parents=True)
+    (tmp_path / "env" / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    (data_access / "abac.auto.tfvars").write_text(
+        'tag_assignments = [\n'
+        '  { entity_type = "columns", entity_name = "cat.sch.tbl.ssn", tag_key = "gr_treatment", tag_value = "redact__string__newvalue" },\n'
+        '  { entity_type = "tables", entity_name = "cat.sch.tbl", tag_key = "sensitivity", tag_value = "pii" }\n'
+        ']\n'
+    )
+    result = subprocess.run(
+        ["bash", SCRIPT, "--tag-assignments-only", "--dry-run"], cwd=data_access,
+        env=os.environ, text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "gr_treatment" not in result.stdout
+    assert 'assignments["tables|cat.sch.tbl|sensitivity|pii"]' in result.stdout
+
+
 def test_failed_optional_import_continues_and_surfaces_failure(tmp_path):
     data_access = tmp_path / "env" / "data_access"
     data_access.mkdir(parents=True)

@@ -222,13 +222,22 @@ def _str(v): return (v[0] if isinstance(v, list) else v or '').strip()
 with open('abac.auto.tfvars') as f:
     cfg = hcl2.load(f)
 
+env_cfg = {}
+for fname in ['env.auto.tfvars', '../env.auto.tfvars']:
+    if os.path.exists(fname):
+        try:
+            with open(fname) as f: env_cfg = hcl2.load(f)
+        except Exception: pass
+        break
+deterministic = _str(env_cfg.get('governance_mode', 'legacy')) == 'deterministic'
+
 desired = []
 for ta in cfg.get('tag_assignments', []):
     etype = ta.get('entity_type', '')
     ename = ta.get('entity_name', '')
     tkey  = ta.get('tag_key', '')
     tval  = ta.get('tag_value', '')
-    if etype and ename and tkey and tval:
+    if etype and ename and tkey and tval and not (deterministic and tkey == 'gr_treatment'):
         desired.append((etype, ename, tkey, tval))
 
 if not desired:
@@ -343,6 +352,11 @@ for fname in ['env.auto.tfvars', '../env.auto.tfvars']:
         break
 
 tag_assignments = cfg.get('tag_assignments', [])
+deterministic = _str(env_cfg.get('governance_mode', 'legacy')) == 'deterministic'
+if deterministic:
+    # The staged policy controller owns treatment retags. Clearing one here
+    # creates an unmasked interval, including from read-only release-plan.
+    tag_assignments = [ta for ta in tag_assignments if ta.get('tag_key') != 'gr_treatment']
 if not tag_assignments:
     sys.exit(0)
 
