@@ -786,6 +786,11 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     keys = {e.key for e in entries}
     before, after = _deployed(env_dir), _desired(env_dir)
     weak = check_weakenings(*governance_states(before, after), env, keys)
+    # A migration from legacy: its revocations (and, once adopted, every
+    # acknowledgement the adoption accepted, so none turns stale).
+    migrated, unacked_revocations = migration.accounted(env_dir, env)
+    if migration.baseline(env_dir) is not None:  # each lost SELECT is reported once, as its revocation
+        weak = migration.without_revoked(weak, env, migrated)
     tables = newly_covered(before, after)
     reader_reports, reader_checks, reader_consequences = [], [], {}
     if tables:
@@ -808,9 +813,6 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         rollbacks[rollback["key"]] = rollback["consequence"]
     from scripts.agent_ownership import delete_consequences
 
-    # A migration from legacy: its revocations (and, once adopted, every
-    # acknowledgement the adoption accepted, so none turns stale).
-    migrated, unacked_revocations = migration.accounted(env_dir, env)
     deletes = delete_consequences(env_dir, env)
     consequences = merge_consequences(weak.consequences, reader_consequences, group_consequences, rollbacks,
                                       migrated, deletes)

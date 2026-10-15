@@ -68,10 +68,10 @@ always exits 1, after writing the proposal and printing the opt-in steps.
 | Refused | To accept it |
 |---|---|
 | a weakening (a principal sees more than today) | `<env>:weaken:<column>:<principal>` in `envs/<env>/ack.txt` |
-| a revoked `SELECT` | `<env>:revoke:<catalog.schema.table>:<principal>` |
+| a revoked `SELECT` | `<env>:revoke:<catalog.schema.table>:<principal>`, one line per principal, also when the config drops the table from `table_readers` altogether (never a `weaken` line) |
 | a revoked `CAN_RUN` | `<env>:revoke:<agent key>:<group>` (the key the report prints) |
 | a legacy row filter missing or changed | none: legacy row filters stay frozen until declared `row_filters` replace them |
-| a mask GenieRails didn't create | none: remove it |
+| a mask GenieRails didn't create | none: remove it. If the inventory can't run (for example, no `generated/governed_tables.json`), migrate-plan names the reason instead: fix that and re-run |
 | an agent without `acl_groups`, a legacy generated config, a legacy mask not on `gr_treatment` | fix the config |
 
 The same checks run again when the cutover starts (rehearse, release-plan), so
