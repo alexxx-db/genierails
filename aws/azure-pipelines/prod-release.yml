@@ -72,20 +72,24 @@ stages:
           - checkout: self
             fetchDepth: 0
 
-          # A succeeded run either found no prod change in its range or was
-          # approved, so everything up to its commit is covered. The newest
-          # such commit that is an ancestor of this one is the base.
+          # genierails-release-base-v2: a succeeded run either found no prod
+          # change in its range or was approved, so everything up to its
+          # commit (sourceVersion, which the check below pins to the dev
+          # commit) is covered. The base is the newest such ancestor of this
+          # commit. Runs from before this check (their file lacks the marker
+          # above) never count.
           - script: |
               if [ "$(Build.SourceVersion)" != "$(resources.pipeline.dev.sourceCommit)" ]; then
                 echo "##[error]checked out $(Build.SourceVersion), but dev rehearsed $(resources.pipeline.dev.sourceCommit)"
                 exit 1
               fi
               builds="$(curl -fsS -H "Authorization: Bearer $SYSTEM_ACCESSTOKEN" \
-                "$(System.CollectionUri)$(System.TeamProjectId)/_apis/build/builds?definitions=$(System.DefinitionId)&resultFilter=succeeded&statusFilter=completed&queryOrder=finishTimeDescending&\$top=100&api-version=7.1")" || exit $?
-              released="$(printf '%s' "$builds" | python3 -c 'import json, sys; print("\n".join(b["sourceVersion"] for b in json.load(sys.stdin)["value"]))')" || exit $?
+                "$(System.CollectionUri)$(System.TeamProjectId)/_apis/build/builds?definitions=$(System.DefinitionId)&branchName=refs/heads/main&resultFilter=succeeded&statusFilter=completed&queryOrder=finishTimeDescending&\$top=100&api-version=7.1")" || exit $?
+              released="$(printf '%s' "$builds" | python3 -c 'import json, sys; print("\n".join(b["sourceVersion"] for b in json.load(sys.stdin)["value"] if b.get("result") == "succeeded" and b.get("sourceBranch") == "refs/heads/main"))')" || exit $?
               base=""
               for sha in $released; do
-                if [ "$sha" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+                if [ "$sha" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$sha" HEAD 2>/dev/null \
+                    && git show "$sha:./azure-pipelines/prod-release.yml" 2>/dev/null | grep -qF genierails-release-base-v2; then
                   base="$sha"
                   break
                 fi

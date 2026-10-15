@@ -275,11 +275,13 @@ def test_samples_pin_the_sdk_and_terraform_the_repository_ci_uses():
             if pinned.get("TERRAFORM_VERSION") != version:
                 problems.append(f"{path.relative_to(ROOT)}: TERRAFORM_VERSION {pinned}")
     sdk = set()
-    for path in [*GITHUB_SAMPLES, *ADO_SAMPLES]:
+    # The repository's own CI installs the SDK only where it needs it.
+    repo_ci = ROOT / ".github/workflows/ci.yml"
+    for path in [*GITHUB_SAMPLES, *ADO_SAMPLES, repo_ci]:
         for line in path.read_text().splitlines():
             if "pip install" in line:
                 specs = re.findall(r"databricks-sdk[^\s']*", line)
-                if not specs:
+                if not specs and path != repo_ci:
                     problems.append(f"{path.relative_to(ROOT)}: no databricks-sdk: {line.strip()}")
                 sdk.update(specs)
                 if "databricks-sdk" in line and not re.search(r"'databricks-sdk==\d+\.\d+\.\d+'", line):
