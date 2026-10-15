@@ -1,6 +1,6 @@
 name: GenieRails prod maintain (aws)
 
-# Stage 5, "Keep protected", of shared/docs/cicd.md: on a schedule. Copy to
+# Stage 5, "Keep protected", of shared/docs/pipelines.md: on a schedule. Copy to
 # .github/workflows/ at the repository root.
 #
 #   make maintain ENV=prod     at the last released commit

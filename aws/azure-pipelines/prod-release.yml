@@ -1,6 +1,6 @@
 # GenieRails prod release (aws), Azure DevOps.
 #
-# Stage 4, "Prod release", of shared/docs/cicd.md. It starts only when the
+# Stage 4, "Prod release", of shared/docs/pipelines.md. It starts only when the
 # Rehearse stage of the dev pipeline ("genierails-dev-aws") succeeds on main,
 # and releases only a commit that touches envs/prod/** or shared/** (a
 # product or mapping change can change prod's generated output).

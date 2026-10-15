@@ -1,6 +1,6 @@
 # GenieRails PR check (azure), Azure DevOps.
 #
-# Stage 2, "PR check", of shared/docs/cicd.md: read-only, on every pull
+# Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull
 # request. Create a pipeline from this file. For Azure Repos, add it to the
 # main branch policy as a required build validation (the pr: block below only
 # applies to GitHub and Bitbucket repos), and set the policy to re-run when

@@ -48,7 +48,7 @@ access_tier_groups = ["payments_ops", "regional_analysts", "viewers"]
 
 Every mode of `make generate` (full, `MODE=genie`, `MODE=governance`, `SPACE=...`) reads `access_tier_groups`. Alternatively leave it unset and pass `GENERATE_ARGS='--groups "payments_ops,regional_analysts,viewers"'` once; the first explicit `--groups` is saved to `access_tier_groups`. A later `--groups` that differs is used for that run only, with a warning — it never rewrites the saved order.
 
-To import the agent without drafting governance (for example a [self-service Genie](self-service-genie.md) team), run `make generate ENV=dev MODE=genie`. It skips governance generation, so native classification does not need to have finished.
+To import the agent without drafting governance (legacy envs, for example a [genie-only](legacy-mode.md#genie-only) team), run `make generate ENV=dev MODE=genie`. It skips governance generation, so native classification does not need to have finished.
 
 Generation writes the aggregate table list to the tool-owned
 `envs/dev/data_access/discovered_uc_tables.auto.tfvars`. Terraform automatically

@@ -1,6 +1,6 @@
 name: GenieRails prod release (aws)
 
-# Stage 4, "Prod release", of shared/docs/cicd.md. Copy to .github/workflows/
+# Stage 4, "Prod release", of shared/docs/pipelines.md. Copy to .github/workflows/
 # at the repository root. It starts only when the dev pipeline ("GenieRails
 # dev (aws)") succeeds on main, and only for a commit that touches envs/prod/**
 # or shared/** (a product or mapping change can change prod's generated output).

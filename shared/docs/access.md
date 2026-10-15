@@ -41,7 +41,7 @@ table_readers = {
 derived ACL in `generated/` never counts). They live in the agent's own
 file, `envs/<env>/agents/<agent>.auto.tfvars`, owned by its data citizens;
 `table_readers` stays in the governance-owned `env.auto.tfvars`
-([version-control.md](version-control.md#who-owns-which-file)). An env whose
+([who owns which file](pipelines.md#who-owns-which-file)). An env whose
 agents are still inline in `genie_spaces` keeps working; `make
 split-agent-files` moves them. An agent without `acl_groups`
 stops the run; `[]` means nobody. `make generate`, `make rehearse` and

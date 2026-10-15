@@ -1,6 +1,6 @@
 name: GenieRails PR check (azure)
 
-# Stage 2, "PR check", of shared/docs/cicd.md: read-only, on every pull request.
+# Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull request.
 # Copy this file to .github/workflows/ at the repository root. On main, make
 # this job a required status check and require branches to be up to date
 # before merging, so every open PR re-runs against the latest main.

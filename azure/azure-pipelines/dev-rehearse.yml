@@ -1,7 +1,7 @@
 # GenieRails dev (azure), Azure DevOps. Name the pipeline "genierails-dev-azure":
 # the prod pipeline triggers on it by that name.
 #
-# Stage 3, "Dev rehearsal", of shared/docs/cicd.md: on every merge to main that
+# Stage 3, "Dev rehearsal", of shared/docs/pipelines.md: on every merge to main that
 # touches code, governance or envs/**. Every commit gets its own run
 # (batch: false), runs queue in commit order and none is ever cancelled:
 # lockBehavior: sequential plus an Exclusive Lock check on the
@@ -63,7 +63,7 @@ stages:
                       exit 1
                     fi
                     test -f envs/dev/remote_state.hcl && test -f envs/account/remote_state.hcl || {
-                      echo "##[error]commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/cicd.md)"
+                      echo "##[error]commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/pipelines.md)"
                       exit 1
                     }
                   displayName: Refuse an obsolete commit; require remote state

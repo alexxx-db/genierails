@@ -1,6 +1,6 @@
 # GenieRails prod maintain (aws), Azure DevOps.
 #
-# Stage 5, "Keep protected", of shared/docs/cicd.md: on a schedule.
+# Stage 5, "Keep protected", of shared/docs/pipelines.md: on a schedule.
 #
 #   make maintain ENV=prod     at the last released commit
 #

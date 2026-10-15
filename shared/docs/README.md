@@ -1,29 +1,36 @@
 # GenieRails Documentation
 
-New here? Start with the **[Dev-to-Prod Walkthrough](../examples/dev_to_prod/)** — the canonical end-to-end guide (native classification → coverage check → safe dev→prod promotion). The full reference is grouped below.
+New here? Pick a path in the [project overview](../../README.md#pick-your-path): **govern and promote agents** starts with the **[Dev-to-Prod Walkthrough](../examples/dev_to_prod/)**; **govern tables only** starts with [Govern tables only](playbooks/governance.md#govern-tables-only).
 
-### Guides
-- **[Dev-to-Prod Walkthrough](../examples/dev_to_prod/)** — the canonical end-to-end walkthrough.
+### Start
+- **[Dev-to-Prod Walkthrough](../examples/dev_to_prod/)** — the champion flow: one agent, end to end.
 - **[Import a Genie Agent from UI into Code](import-genie-agent-from-ui.md)** — import a UI-built Genie agent, then govern it via the walkthrough.
 - **[Quickstart](quickstart.md)** — create a Genie agent from scratch.
-- **[Playbook](playbook.md)** — after your first deployment: add agents, promote, overlays, advanced scenarios.
+
+### Playbooks, by persona
+- **[Agents](playbooks/agents.md)** — data citizen: add, update, promote and remove an agent.
+- **[Governance](playbooks/governance.md)** — governance engineer: masks, classes, tiers, `table_readers`, row filters, `ungovern`, acknowledgements.
+- **[One team doing both](playbooks/one-team.md)** — both kinds of change in one PR.
 
 ### Set up & operate
 - **[Prerequisites](prerequisites.md)** — OS, Python, Terraform, network, Databricks account, cloud credentials.
+- **[Pipelines](pipelines.md)** — what to commit, CODEOWNERS, `bootstrap-pipelines`, OIDC, the GitHub Actions and Azure DevOps samples.
+- **[Deployment machine](deployment-machine.md)** — releasing prod in v1: persistent checkout, `GENIERAILS_STATE_DIR`, locks, `release-plan` and `release MANIFEST=`.
 - **[Architecture](architecture.md)** — layers, artifact ownership, config files, Genie agent lifecycle.
-- **[Version Control & Standalone Terraform](version-control.md)** — what to commit, version pinning, running Terraform directly.
-- **[CI/CD](cicd.md)** — which stage runs in CI and which on the deployment machine.
+- **[Access](access.md)** — `table_readers`, `acl_groups`, `group_map`, the deployer SP.
+- **[Scheduled governance](scheduled-governance.md)** — the opt-in read-only scheduled job.
 
 ### Customize
-- **[Country & Region Overlays](country-overlays.md)** — region-specific PII governance (ANZ, India, Southeast Asia).
-- **[Industry Overlays](industry-overlays.md)** — industry-specific masking and access patterns.
-- **[Central Governance / Self-Service Genie](self-service-genie.md)** — central ABAC team + BU teams self-serve agents.
-- **[Advanced Usage](advanced.md)** — IdP-synced groups, ABAC-only mode, masking-UDF reuse, brownfield migration.
+- **[Advanced Usage](advanced.md)** — IdP-synced groups, independent environments, masking-UDF reuse.
+- **[Mask library reference](../REFERENCE.md)** — every treatment and `tag_treatments`.
 
 ### Verify & troubleshoot
 - **[Effective-Access Verification](effective-access-verification.md)** — prove masking/row filters take effect by querying as per-tier principals.
 - **[Integration Testing](integration-testing.md)** — unit tests, integration scenarios, test data.
 - **[Troubleshooting](troubleshooting.md)** — imports, provider quirks, common errors.
+
+### Legacy mode
+- **[Legacy mode](legacy-mode.md)** — the older AI-drafted mode, as a migration source only; [migrating](legacy-migration.md). Legacy-only: [country](country-overlays.md) and [industry](industry-overlays.md) overlays.
 
 ---
 
