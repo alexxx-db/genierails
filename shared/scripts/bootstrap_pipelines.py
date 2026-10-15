@@ -218,8 +218,7 @@ def _list_policies(account: Any, sp: Any, who: str) -> list[Any]:
             f"admin. Nothing was changed. Cause: {_error_details(exc)}") from exc
 
 
-def _acl_levels(acl: Any, principals: set[str], direct_only: bool = False) -> set[str]:
-    """Permission levels the principals hold; direct_only skips inherited ones."""
+def _acl_levels(acl: Any, principals: set[str]) -> set[str]:
     levels: set[str] = set()
     for entry in _value(acl, "access_control_list") or []:
         principal = next((_value(entry, name) for name in (
@@ -228,9 +227,37 @@ def _acl_levels(acl: Any, principals: set[str], direct_only: bool = False) -> se
             continue
         levels.add(str(_value(entry, "permission_level") or "").upper())
         levels.update(str(_value(item, "permission_level") or "").upper()
-                      for item in _value(entry, "all_permissions") or []
-                      if not (direct_only and _value(item, "inherited")))
+                      for item in _value(entry, "all_permissions") or [])
     return levels - {""}
+
+
+def _effective_grants(acl: Any, sources: dict[str, str]) -> list[tuple[str, str]]:
+    """(level, where it comes from) for every ACL entry of the given principals.
+
+    sources maps a casefolded principal (the SP, or a group it is in) to a
+    label; inherited levels also name the parent object they come from.
+    """
+    grants: list[tuple[str, str]] = []
+    for entry in _value(acl, "access_control_list") or []:
+        principal = next((_value(entry, name) for name in (
+            "user_name", "group_name", "service_principal_name") if _value(entry, name)), None)
+        label = sources.get(str(principal).casefold())
+        if label is None:
+            continue
+        if _value(entry, "permission_level"):
+            grants.append((str(_value(entry, "permission_level")).upper(), label))
+        for item in _value(entry, "all_permissions") or []:
+            level = str(_value(item, "permission_level") or "").upper()
+            if not level:
+                continue
+            parents = [str(p) for p in _value(item, "inherited_from_object") or []]
+            inherited = (f"inherited from {', '.join(parents)}" if parents
+                         else "inherited" if _value(item, "inherited") else "")
+            # The SP's own entry is direct unless the level comes from a parent object.
+            where = (inherited or label) if label == "directly" else ", ".join(
+                filter(None, (label, inherited)))
+            grants.append((level, where))
+    return grants
 
 
 class Preflight:
@@ -417,14 +444,20 @@ class Preflight:
             raise Refused(f"cannot read the permissions of {target}. Nothing was changed. "
                           f"Cause: {_error_details(exc)}") from exc
         client_id = self.client_id()
-        direct = _acl_levels(acl, {client_id.casefold()}, direct_only=True) if client_id else set()
-        if direct & too_strong:
+        sources = {group.casefold(): f"via group {group!r}" for group in self._sp_groups()}
+        if client_id:
+            sources[client_id.casefold()] = "directly"
+        # Effective access: direct, through a group, or inherited from a parent object.
+        effective = _effective_grants(acl, sources)
+        stronger = sorted({f"{lvl} ({where})" for lvl, where in effective if lvl in too_strong})
+        if stronger:
             raise Refused(
-                f"{self.cfg.readonly_name} has {' + '.join(sorted(direct & too_strong))} on "
-                f"{target}, so it is not read-only. Lower it to {level} by hand "
-                "(bootstrap-pipelines never downgrades), then re-run. Nothing was changed.")
-        # Only the exact read-only level counts as done.
-        done = level in direct
+                f"{self.cfg.readonly_name} effectively has {'; '.join(stronger)} on {target}, "
+                f"so it is not read-only. Remove that grant by hand (from the SP, group or "
+                f"parent object named) so it has at most {level}; bootstrap-pipelines never "
+                "downgrades or revokes. Nothing was changed.")
+        # Only the exact read-only level, granted directly, counts as done.
+        done = (level, "directly") in effective
         if not done and not is_admin and "CAN_MANAGE" not in _acl_levels(acl, principals) \
                 and "IS_OWNER" not in _acl_levels(acl, principals):
             raise Refused(f"caller {caller!r} cannot grant {level} on {target}: not a workspace "
@@ -437,6 +470,31 @@ class Preflight:
                                          "permission_level": level}]})
 
         self.steps.append(Step("grant", target, level, done, apply))
+
+    def _sp_groups(self) -> set[str]:
+        """Workspace groups the read-only SP is in; fails closed when unreadable."""
+        if hasattr(self, "_groups"):
+            return self._groups
+        groups = {"users"}  # every workspace member is in it, including a new SP
+        if self.readonly is not None:
+            client_id = self.client_id()
+            try:
+                found = list(self.workspace.service_principals.list(
+                    filter=f'applicationId eq "{client_id}"', attributes="groups"))
+            except Exception as exc:
+                raise Refused(
+                    f"cannot read the group memberships of {self.cfg.readonly_name}, so its "
+                    "effective permissions are unknown. Nothing was changed. "
+                    f"Cause: {_error_details(exc)}") from exc
+            for sp in found:
+                groups.update(str(_value(g, "display")) for g in _value(sp, "groups") or []
+                              if _value(g, "display"))
+        if "admins" in {g.casefold() for g in groups}:
+            raise Refused(
+                f"{self.cfg.readonly_name} is in the workspace 'admins' group, so it is not "
+                "read-only. Remove it from 'admins' by hand, then re-run. Nothing was changed.")
+        self._groups = groups
+        return groups
 
     # ── writes, used only after the preflight passed ──
 

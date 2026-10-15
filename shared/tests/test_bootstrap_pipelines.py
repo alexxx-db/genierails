@@ -24,8 +24,10 @@ class FakeDatabricks:
     """A stateful account + workspace: what one run creates the next run sees."""
 
     def __init__(self, *, caller_owns=True, account_admin=True, inherited_system=True,
-                 deployer=True, readonly_permission=None, readonly_acls=None):
+                 deployer=True, readonly_permission=None, readonly_acls=None,
+                 readonly_groups=(), groups_unreadable=False):
         self.writes: list[tuple] = []
+        self.readonly_groups, self.groups_unreadable = readonly_groups, groups_unreadable
         self.sps: list[SimpleNamespace] = []
         if deployer:
             self.sps.append(SimpleNamespace(id="7", application_id=DEPLOYER,
@@ -133,9 +135,17 @@ class FakeDatabricks:
             catalogs=SimpleNamespace(get=lambda name: SimpleNamespace(
                 owner="metastore-admins" if name == "system" else owner)),
             schemas=SimpleNamespace(get=lambda name: SimpleNamespace(owner="metastore-admins")),
+            service_principals=SimpleNamespace(list=self._workspace_sps),
             grants=Grants(),
             api_client=ApiClient(),
         )
+
+    def _workspace_sps(self, filter, attributes):
+        if self.groups_unreadable:
+            raise PermissionDenied("cannot read service principals")
+        app = re.fullmatch(r'applicationId eq "(.*)"', filter).group(1)
+        return [SimpleNamespace(groups=[SimpleNamespace(display=g) for g in self.readonly_groups])
+                for sp in self.sps if sp.application_id == app]
 
     def factory(self, _cfg):
         return self.account, lambda host, index=0: self.workspace
@@ -419,21 +429,64 @@ def test_refuses_while_the_readonly_sp_is_a_workspace_admin():
 def test_refuses_a_stronger_direct_acl_instead_of_counting_it_done(path, level):
     fake = FakeDatabricks(readonly_permission="USER", readonly_acls={
         path: [{"service_principal_name": READONLY_APP, "permission_level": level}]})
-    with pytest.raises(Refused, match=f"has {level} on .*not read-only.*by hand.*Nothing was changed"):
+    with pytest.raises(Refused, match=f"has {level} \\(directly\\) on .*not read-only.*by hand.*Nothing was changed"):
         bootstrap_pipelines(_cfg(), client_factory=fake.factory, emit=lambda _l: None)
     assert fake.writes == []
 
 
-def test_only_the_exact_read_only_level_counts_as_done():
-    # Inherited (not direct) CAN_MANAGE is not refused, but doesn't count either:
-    # the direct CAN_VIEW is still granted. A direct CAN_USE on the warehouse is done.
-    fake = FakeDatabricks(readonly_permission="USER", readonly_acls={
-        "genie/space-1": [{"service_principal_name": READONLY_APP, "all_permissions": [
-            {"permission_level": "CAN_MANAGE", "inherited": True}]}],
-        "warehouses/wh-1": [{"service_principal_name": READONLY_APP,
-                             "permission_level": "CAN_USE"}],
-    })
-    out = _run(_cfg(), fake)
-    assert ("acl", "genie/space-1", "CAN_VIEW") in fake.writes
-    assert not [w for w in fake.writes if w[:2] == ("acl", "warehouses/wh-1")]
-    assert "UNCHANGED grant warehouse wh-1: CAN_USE" in out
+INHERITED = [
+    # (path, too-strong level, how it reaches the SP, expected source in the message)
+    ("genie/space-1", "CAN_MANAGE", "parent", "inherited from /directories/42"),
+    ("genie/space-1", "CAN_MANAGE", "group", "via group 'data-eng'"),
+    ("genie/space-1", "CAN_EDIT", "group", "via group 'data-eng'"),
+    ("genie/space-1", "CAN_RUN", "users", "via group 'users'"),
+    ("warehouses/wh-1", "CAN_MANAGE", "parent", "inherited from /sql/warehouses"),
+    ("warehouses/wh-1", "IS_OWNER", "group", "via group 'data-eng'"),
+    ("warehouses/wh-1", "CAN_MANAGE", "users", "via group 'users'"),
+]
+
+
+def _inherited_acl(level, how, parent):
+    if how == "parent":
+        return {"service_principal_name": READONLY_APP, "all_permissions": [
+            {"permission_level": level, "inherited": True, "inherited_from_object": [parent]}]}
+    group = "users" if how == "users" else "data-eng"
+    return {"group_name": group, "all_permissions": [{"permission_level": level, "inherited": False}]}
+
+
+@pytest.mark.parametrize("path, level, how, source", INHERITED)
+def test_refuses_stronger_effective_access_and_names_its_source(path, level, how, source):
+    parent = "/directories/42" if path.startswith("genie") else "/sql/warehouses"
+    fake = FakeDatabricks(readonly_permission="USER", readonly_groups=("data-eng",),
+                          readonly_acls={path: [_inherited_acl(level, how, parent)]})
+    with pytest.raises(Refused) as refused:
+        bootstrap_pipelines(_cfg(dry_run=True), client_factory=fake.factory, emit=lambda _l: None)
+    message = str(refused.value)
+    assert f"effectively has {level} ({source})" in message
+    assert "Remove that grant by hand" in message and "Nothing was changed" in message
+    with pytest.raises(Refused):
+        bootstrap_pipelines(_cfg(), client_factory=fake.factory, emit=lambda _l: None)
+    assert fake.writes == []
+    # The exact read-only level by the same route still passes; only a direct
+    # grant counts as done, so the SP gets its own.
+    exact = "CAN_VIEW" if path.startswith("genie") else "CAN_USE"
+    fake = FakeDatabricks(readonly_permission="USER", readonly_groups=("data-eng",),
+                          readonly_acls={path: [_inherited_acl(exact, how, parent)]})
+    _run(_cfg(), fake)
+    assert ("acl", path, exact) in fake.writes
+    assert any(f"UNCHANGED grant {'agent space-1' if path.startswith('genie') else 'warehouse wh-1'}"
+               f": {exact}" in line for line in _run(_cfg(), fake))
+
+
+def test_refuses_when_effective_permissions_cannot_be_read():
+    fake = FakeDatabricks(readonly_permission="USER", groups_unreadable=True)
+    with pytest.raises(Refused, match="cannot read the group memberships.*Nothing was changed"):
+        bootstrap_pipelines(_cfg(), client_factory=fake.factory, emit=lambda _l: None)
+    assert fake.writes == []
+
+
+def test_refuses_a_readonly_sp_in_the_admins_group():
+    fake = FakeDatabricks(readonly_permission="USER", readonly_groups=("admins",))
+    with pytest.raises(Refused, match="'admins' group.*not read-only.*Nothing was changed"):
+        bootstrap_pipelines(_cfg(), client_factory=fake.factory, emit=lambda _l: None)
+    assert fake.writes == []

@@ -109,10 +109,13 @@ instead of `REPO`. Pass `CI=` on the command line; a runner's `CI=true` is refus
   value it prints is an ID. Apply the printed settings yourself; the remote
   state roles (`DEV_STATE_*`) and service connection are yours to create.
 - **It never revokes or downgrades, so it refuses instead** while the
-  read-only SP is a workspace `ADMIN`, or holds more than `CAN_VIEW` on an
-  agent (`CAN_RUN`, `CAN_EDIT`, `CAN_MANAGE`) or more than `CAN_USE` on the
-  warehouse (`CAN_MANAGE`, `IS_OWNER`) directly. Lower it to `USER`,
-  `CAN_VIEW` or `CAN_USE` by hand and re-run.
+  read-only SP is a workspace `ADMIN` or in the `admins` group, or
+  effectively holds more than `CAN_VIEW` on an agent (`CAN_RUN`, `CAN_EDIT`,
+  `CAN_MANAGE`) or more than `CAN_USE` on the warehouse (`CAN_MANAGE`,
+  `IS_OWNER`): directly, through one of its groups (including `users`), or
+  inherited from a parent object. The message names where the grant comes
+  from; remove it by hand and re-run. If the SP's group memberships or the
+  object's permissions can't be read, it refuses too.
 
 ## Pipeline samples: where each command runs
 
