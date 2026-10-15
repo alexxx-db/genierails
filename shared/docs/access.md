@@ -38,7 +38,12 @@ table_readers = {
 ## `acl_groups` and the agent check
 
 `acl_groups` on each agent are the only source of `CAN_RUN` (a drafted or
-derived ACL in `generated/` never counts). An agent without `acl_groups`
+derived ACL in `generated/` never counts). They live in the agent's own
+file, `envs/<env>/agents/<agent>.auto.tfvars`, owned by its data citizens;
+`table_readers` stays in the governance-owned `env.auto.tfvars`
+([version-control.md](version-control.md#who-owns-which-file)). An env whose
+agents are still inline in `genie_spaces` keeps working; `make
+split-agent-files` moves them. An agent without `acl_groups`
 stops the run; `[]` means nobody. `make generate`, `make rehearse` and
 `make release` refuse while any `acl_groups` group can't read one of the
 agent's tables through `table_readers`, naming the table and the group.

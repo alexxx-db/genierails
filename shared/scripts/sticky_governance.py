@@ -7,6 +7,13 @@ Only names are stored: treatments are always re-derived from current tags, so
 a stale or hand-edited record can neither keep an old tag nor weaken a mask,
 and a missing record is refused (make rebuild-governed-tables) unless the env
 is fresh. Only ``make ungovern`` takes a table out of the set.
+
+The record also lists, under ``agent_tables``, the tables of every agent kept
+in an agents/ file (design 18.1). The data citizen owns an agent's table list;
+this governance-owned record is rewritten from it on every generate, capture
+and promote-to, so any agent change to its tables, even one with no classified
+column, is a diff in a governance-owned file, and make check fails while it is
+stale. Nothing reads it to grant access: SELECT comes only from table_readers.
 """
 
 from __future__ import annotations
@@ -198,10 +205,44 @@ def rebuild(env_dir: Path) -> list[str]:
     return tables
 
 
+def agent_tables(env_dir: Path) -> dict[str, list[str]]:
+    """Each file-defined agent's tables (agents/<agent>.*), fully qualified."""
+    from agent_files import AgentFileError, load_all
+    try:
+        agents = load_all(Path(env_dir))
+    except AgentFileError as exc:
+        raise GovernedTablesError(str(exc)) from exc
+    catalog = str(_load_hcl(Path(env_dir) / "env.auto.tfvars").get("uc_catalog") or "").strip()
+    found = {}
+    for agent in agents:
+        tables = []
+        for table in agent["uc_tables"]:
+            parts = table.strip().split(".")
+            tables.append(".".join([catalog] + parts if len(parts) == 2 and catalog else parts))
+        found[agent["name"]] = _unique(tables)
+    return found
+
+
+def _records_agents(env_dir: Path, agents: dict) -> bool:
+    """Whether the record lists agent tables: the env has agent files, or its record already does."""
+    if agents:
+        return True
+    try:
+        return "agent_tables" in json.loads((Path(env_dir) / MANIFEST).read_text())
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def save_governed_tables(env_dir: Path, tables: Iterable[str]) -> None:
     path = Path(env_dir) / MANIFEST
+    record = {"tables": _unique(tables)}
+    # An env whose agents are all inline (the legacy layout) keeps the record
+    # it had: their tables are already in the governance-owned env.auto.tfvars.
+    agents = agent_tables(env_dir)
+    if _records_agents(env_dir, agents):
+        record["agent_tables"] = dict(sorted(agents.items()))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"tables": _unique(tables)}, indent=2) + "\n")
+    path.write_text(json.dumps(record, indent=2) + "\n")
 
 
 def record(env_dir: Path, assignments: Iterable[dict], tag_key: str | None = None) -> list[str]:
@@ -320,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
     rec = sub.add_parser("record", help="add tables tagged in --config to the governed set")
     rec.add_argument("--env-dir", type=Path, required=True)
     rec.add_argument("--config", type=Path, required=True)
+    rec.add_argument("--if-agent-files", action="store_true",
+                     help="only in an env whose agents are in agents/ files (promote-to's target)")
     rebuilt = sub.add_parser("rebuild", help="rewrite the record from history, state and config")
     rebuilt.add_argument("--env-dir", type=Path, required=True)
     layout = sub.add_parser("check-layout", help="refuse treatment tags still at the old state address")
@@ -332,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "record":
-            record(args.env_dir, _load_hcl(args.config).get("tag_assignments") or [])
+            if not args.if_agent_files or _records_agents(args.env_dir, agent_tables(args.env_dir)):
+                record(args.env_dir, _load_hcl(args.config).get("tag_assignments") or [])
         elif args.command == "rebuild":
             rebuild(args.env_dir)
         elif args.command == "check-layout":

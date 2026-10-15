@@ -104,6 +104,18 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
     source_agents = agent_files.load_all(source_dir)
     if not source_agents:
         return []
+    # A target still in the legacy layout keeps these agents inline, with its
+    # own (env-owned) acl_groups; carrying them as files would replace those
+    # silently. Moving them is the explicit, reviewed make split-agent-files.
+    inline = {agent_files.space_key(str(space.get("name") or ""))
+              for space in agent_files._load_hcl(dest_dir / "env.auto.tfvars").get("genie_spaces") or []
+              if isinstance(space, dict) and space.get("name")}
+    clash = sorted(agent["name"] for agent in source_agents if agent_files.space_key(agent["name"]) in inline)
+    if clash:
+        raise AgentFileError(
+            f"{dest_dir.name} still has {', '.join(repr(n) for n in clash)} inline in env.auto.tfvars "
+            f"genie_spaces, while {source_dir.name} keeps them in agents/ files. Run make split-agent-files "
+            f"ENV={dest_dir.name}, review and commit it, then promote again; nothing was changed")
     warehouses = warehouse_map(source_dir, dest_dir)
     folder = agent_files.agents_dir(dest_dir)
     folder.mkdir(parents=True, exist_ok=True)

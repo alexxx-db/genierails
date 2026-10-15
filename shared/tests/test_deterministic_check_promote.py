@@ -182,7 +182,7 @@ def _set_dev_override(repo, tmp_path, column="paycat.s.notes.free_text", treatme
     env_file.write_text(env_file.read_text() +
                         f'column_overrides = {{ {json.dumps(column)} = {{ treatment = {json.dumps(treatment)} }} }}\n'
                         'treatment_versions = { phone_partial = { partial = "last4" } }\n'
-                        'tag_treatments = { "sensitivity=confidential" = "redact" }\n')
+                        'tag_treatments = { "class.loyalty_id" = "redact" }\n')
     settings = hcl2.loads(env_file.read_text())
     classes = CLASSES | {
         "paycat.s.notes.free_text": ["class.phone_number"],
@@ -208,7 +208,7 @@ def test_promote_and_prod_live_derivation_honor_remapped_column_override(repo, t
     prod = hcl2.loads((_envs(repo) / "prod" / "env.auto.tfvars").read_text())
     assert prod["column_overrides"] == {"ppay.s.notes.free_text": {"treatment": "redact"}}
     assert prod["treatment_versions"] == {"phone_partial": {"partial": "last4"}}
-    assert prod["tag_treatments"] == {"sensitivity=confidential": "redact"}
+    assert prod["tag_treatments"] == {"class.loyalty_id": "redact"}
     assert validate_config(prod) == []
 
     native_prod = {

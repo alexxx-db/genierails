@@ -1,0 +1,47 @@
+# Sample CODEOWNERS for a GenieRails customer repo (design section 18.1).
+#
+# Copy to .github/CODEOWNERS (GitHub) or adapt for your Git host, replace the
+# @your-org/... teams with your own, and turn on "Require review from Code
+# Owners" for main. The last matching pattern wins, so the agent rule comes
+# after the env-wide governance rule.
+#
+#   Governance engineer: treatments, tag_treatments, tiers, group_map,
+#     table_readers, row filters, top-level uc_tables, ungovern,
+#     acknowledgements, and approving the governed-table set
+#     -> envs/<env>/env.auto.tfvars, envs/<env>/generated/ (including
+#        governed_tables.json), envs/<env>/ack.txt
+#   Data citizen: curates an agent in the dev UI (including its tables),
+#     captures it, promotes it -> envs/<env>/agents/<agent>.*
+#
+# An agent owns its table list, but governance approves every table an agent
+# adds: make generate, make capture and make promote-to record each agent's
+# tables in envs/<env>/generated/governed_tables.json (governance-owned), and
+# make check fails while that record is stale. So an agent-only change that
+# keeps its tables (make capture, then make promote-to) touches only agents/
+# files and needs only its agent's owners; one that adds or removes a table
+# also needs a governance owner. Access stays governance-only: SELECT comes
+# only from table_readers in env.auto.tfvars. make promote-to prints which kind
+# of files it changed. One team doing both can own both sets.
+
+# GenieRails itself: product code and mappings change every env's generated
+# output (an upgrade is a governance change).
+/shared/                        @your-org/governance-engineers
+
+# Every env file is governance-owned unless a later rule says otherwise:
+# env.auto.tfvars, generated/, ack.txt (and the layer files of legacy envs).
+# Each rule is anchored to the repo root and names a supported cloud tree, so
+# no other directory called envs/ matches.
+/aws/envs/                      @your-org/governance-engineers
+/azure/envs/                    @your-org/governance-engineers
+/aws/envs/*/ack.txt             @your-org/governance-engineers
+/azure/envs/*/ack.txt           @your-org/governance-engineers
+
+# Agents: one settings file and one captured config per agent, in every env.
+/aws/envs/*/agents/             @your-org/data-citizens
+/azure/envs/*/agents/           @your-org/data-citizens
+# Per-agent owners (optional): name each agent's team, e.g.
+# /aws/envs/*/agents/Sales.*    @your-org/sales-analysts
+# /azure/envs/*/agents/Sales.*  @your-org/sales-analysts
+
+# Pipelines and repo settings.
+/.github/                       @your-org/platform

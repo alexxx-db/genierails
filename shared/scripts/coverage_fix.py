@@ -4,7 +4,8 @@
 A class.* tag no rule maps (a "coverage gap") is fixed one of two ways:
 
   a) reuse an existing treatment: make scaffold-treatments TREATMENT=<name>
-     maps the class to it in shared/treatment_config.json;
+     maps the class to it in shared/treatment_config.json (in a deterministic
+     env, to a mask-library treatment in the env's tag_treatments);
   b) a new kind of mask: make scaffold-treatments adds a REVIEW stub, and in a
      promoted env make materialize-treatment carries its mask through dev.
 
@@ -249,9 +250,11 @@ def fix_lines(
     """
     from treatment_derivation import load_treatment_config
 
-    config = config or load_treatment_config()
     source = promote_source(env_dir)
     rerun = rerun_command(env_name, bool(source))
+    if _deterministic(env_dir):
+        return deterministic_fix_lines(env_name, env_dir, source, rerun)
+    config = config or load_treatment_config()
     sql_path = env_dir / "generated" / "masking_functions.sql"
     sql_text = sql_path.read_text() if sql_path.is_file() else ""
     lines = [
@@ -278,6 +281,31 @@ def fix_lines(
         lines.append(
             "       commit shared/treatment_config.json and shared/tag_vocabulary_registry.json"
         )
+    return lines
+
+
+def _deterministic(env_dir: Path) -> bool:
+    path = env_dir / "env.auto.tfvars"
+    try:
+        return path.is_file() and hcl2.loads(path.read_text()).get("governance_mode") == "deterministic"
+    except Exception:
+        return False
+
+
+def deterministic_fix_lines(env_name: str, env_dir: Path, source: str, rerun: str) -> list[str]:
+    """Deterministic envs: a class mapping is env governance config (tag_treatments), never shared/."""
+    owner = source if source and (env_dir.parent / source / "env.auto.tfvars").is_file() else env_name
+    lines = [
+        f"  How to fix (a governance change in envs/{owner}/env.auto.tfvars; shared/ is product code):",
+        f"    make scaffold-treatments ENV={env_name} TREATMENT=<mask-library treatment>",
+        f'       maps each unmapped class to it in tag_treatments ("class.<name>" = "<treatment>");',
+        "       TREATMENT=redact keeps full redaction for every masked tier",
+    ]
+    if owner != env_name:
+        lines.append(f"       then commit envs/{owner}/env.auto.tfvars, make rehearse ENV={owner}, "
+                     f"make promote-to ENV={env_name}, {rerun}")
+    else:
+        lines.append(f"       then make generate ENV={env_name} and {rerun}; commit envs/{env_name}/")
     return lines
 
 

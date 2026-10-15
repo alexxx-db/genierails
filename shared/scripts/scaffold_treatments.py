@@ -4,6 +4,12 @@
 With --treatment, map each unmapped class.* to that existing treatment instead
 (no new treatment, UDF or vocabulary entry), refusing before any write when the
 treatment is unknown or its UDF can't take the column's data type.
+
+Deterministic envs (design 18.1): a customer class mapping is governance
+config, never product code. --treatment names a mask-library treatment and
+the mapping is written to tag_treatments in the env's env.auto.tfvars (for a
+promote-to target, in the env it is promoted from, so the promotion carries
+it); shared/ is never changed.
 """
 
 from __future__ import annotations
@@ -305,6 +311,166 @@ def scaffold(
     return actions
 
 
+# ── Deterministic envs: tag_treatments in the env, never shared/ ─────────────
+
+TAG_TREATMENTS_COMMENT = (
+    "# Customer class mappings (class.<name> = a mask-library treatment). Governance-owned;\n"
+    "# written by make scaffold-treatments TREATMENT=<name>, carried by make promote-to.\n"
+)
+
+
+def is_deterministic(env_file: Path) -> bool:
+    try:
+        cfg = hcl2.loads(env_file.read_text()) if env_file.is_file() else {}
+    except Exception:  # an unreadable config is not opted in
+        return False
+    return cfg.get("governance_mode", "legacy") == "deterministic"
+
+
+def _offline_markers(tfvars_path: Path) -> list[tuple[str, str, str]]:
+    """Unmapped-class markers in generated/ and, after a stopped release, its runtime overlay."""
+    found = []
+    for path in (tfvars_path, tfvars_path.parent / ".runtime" / tfvars_path.name):
+        if path.is_file():
+            found.extend((m.group(1).strip(), m.group(2).lower(), m.group(3).lower())
+                         for m in MARKER_RE.finditer(path.read_text()))
+    return sorted(set(found))
+
+
+def _live_deterministic_markers(auth_path: Path, env_path: Path, tag_treatments: dict) -> list[tuple[str, str, str]]:
+    """class.* tags on the governed set that neither the mask library nor tag_treatments maps."""
+    from governance_policies import with_tag_treatments
+    from mask_library import load_library
+
+    runtime = load_auth_config(auth_path, env_path)
+    declared = list(runtime.get("uc_tables") or [])
+    for space in runtime.get("genie_spaces") or []:
+        declared.extend(space.get("declared_footprint") or space.get("uc_tables") or [])
+    discovered, _agents = load_discovered_footprint(env_path.parent)
+    declared.extend(discovered)
+    from scripts.sticky_governance import load_governed_tables
+    declared.extend(load_governed_tables(env_path.parent))
+    table_refs = footprint_table_refs(discover_agent_footprint(declared_footprint=declared))
+    native = _fetch_live_classification_source(table_refs, runtime, require_native=True)
+    if native is None or not native.has_native_data():
+        return []
+    library = with_tag_treatments(load_library(), tag_treatments)
+    known = {name for item in library["treatments"].values() for name in item["classes"]}
+    return sorted(
+        (column, f"class.{semantic}", semantic)
+        for column, classes in native.classes_by_column().items()
+        for semantic in (c.removeprefix("class.") for c in classes) if semantic not in known
+    )
+
+
+def mapping_env_dir(env_dir: Path) -> Path:
+    """Where an env's tag_treatments live: the env itself, or for a promote-to
+    target the env it is promoted from (promote-to rewrites the target's copy)."""
+    import agent_files
+    from scripts.coverage_fix import promote_source
+
+    if not agent_files.promoted(env_dir):
+        return env_dir
+    source = promote_source(env_dir) or "dev"
+    source_dir = env_dir.parent / source
+    if not (source_dir / "env.auto.tfvars").is_file():
+        raise ValueError(
+            f"{env_dir.name} is promoted from {source}, so its tag_treatments come from "
+            f"envs/{source}/env.auto.tfvars, which does not exist")
+    return source_dir
+
+
+def render_tag_treatments(mapping: dict[str, str]) -> str:
+    body = "".join(f"  {json.dumps(key)} = {json.dumps(value)}\n" for key, value in sorted(mapping.items()))
+    return TAG_TREATMENTS_COMMENT + "tag_treatments = {\n" + body + "}\n"
+
+
+def write_tag_treatments(env_file: Path, mapping: dict[str, str]) -> None:
+    """Replace env_file's tag_treatments with ``mapping``, leaving every other setting as it was."""
+    from generate_abac import remove_hcl_top_level_block
+
+    text = env_file.read_text()
+    before = hcl2.loads(text)
+    kept = remove_hcl_top_level_block(text.replace(TAG_TREATMENTS_COMMENT, ""), "tag_treatments").rstrip()
+    updated = (kept + "\n\n" if kept else "") + render_tag_treatments(mapping)
+    after = hcl2.loads(updated)
+    expected = {key: value for key, value in before.items() if key != "tag_treatments"}
+    if {key: value for key, value in after.items() if key != "tag_treatments"} != expected \
+            or after.get("tag_treatments") != mapping:
+        raise ValueError(f"could not rewrite tag_treatments in {env_file} safely; nothing was changed. "
+                         f"Add {json.dumps(mapping)} to its tag_treatments by hand")
+    env_file.write_text(updated)
+
+
+def map_deterministic(
+    tfvars_path: Path, env_dir: Path, treatment: str, *,
+    auth_path: Path | None = None, env_path: Path | None = None,
+) -> dict:
+    """Map every unmapped class.* to a mask-library treatment in the env's tag_treatments."""
+    from governance_policies import tag_treatment_errors
+    from mask_library import load_library
+
+    library = load_library()
+    if not treatment:
+        raise ValueError(
+            "deterministic envs map a new class to a mask-library treatment; nothing was changed. "
+            "Run make scaffold-treatments ENV=<env> TREATMENT=<treatment>, e.g. TREATMENT=redact "
+            f"(full redaction for every masked tier). Treatments: {', '.join(sorted(library['treatments']))}")
+    if treatment not in library["treatments"]:
+        raise ValueError(
+            f"TREATMENT={treatment} is not a mask-library treatment; nothing was changed. "
+            f"Treatments: {', '.join(sorted(library['treatments']))}")
+    target_dir = mapping_env_dir(env_dir)
+    target_file = target_dir / "env.auto.tfvars"
+    existing = dict(hcl2.loads(target_file.read_text()).get("tag_treatments") or {})
+    markers = _offline_markers(tfvars_path)
+    live = False
+    if not markers and auth_path is not None and env_path is not None:
+        own = dict(hcl2.loads(env_path.read_text()).get("tag_treatments") or {}) if env_path.is_file() else {}
+        markers = _live_deterministic_markers(auth_path, env_path, own)
+        live = True
+    labels = sorted({label for _, label, _ in markers})
+    already = sorted((label, existing[label]) for label in labels if label in existing)
+    added = [label for label in labels if label not in existing]
+    mapping = {**existing, **{label: treatment for label in added}}
+    errors = tag_treatment_errors(mapping, library)
+    if errors:
+        raise ValueError("refusing to map; nothing was changed:\n  - " + "\n  - ".join(errors))
+    if added:
+        write_tag_treatments(target_file, mapping)
+    item = library["treatments"][treatment]
+    return {
+        "treatment": treatment, "labels": added, "already": already, "live": live,
+        "columns": sorted({(column, label) for column, label, _ in markers if label in added}),
+        "types": item["types"], "target": target_dir, "env_dir": env_dir,
+    }
+
+
+def _print_deterministic(result: dict, env_name: str) -> None:
+    from scripts.coverage_fix import promote_source
+
+    for label, value in result["already"]:
+        print(f"UNCHANGED {label} is already mapped to {value} in tag_treatments")
+    if not result["labels"]:
+        print("No unmapped class.* tags to map; nothing changed.")
+        return
+    target = result["target"]
+    rel = f"envs/{target.name}/env.auto.tfvars"
+    for label in result["labels"]:
+        print(f"MAPPED {label} -> {result['treatment']} (mask library; partial and full versions as shipped)")
+    for column, label in result["columns"]:
+        print(f"  {column} ({label})")
+    print(f"Changed: {rel} tag_treatments (a governance file; shared/ is unchanged).")
+    print(f"  Column types outside {', '.join(result['types'])} get the treatment's full version.")
+    source = promote_source(result["env_dir"])
+    if target != result["env_dir"]:
+        print(f"Next: commit {rel}, then make generate ENV={target.name}, make rehearse ENV={target.name}, "
+              f"make promote-to ENV={env_name} (it carries tag_treatments), {rerun_command(env_name, True)}")
+    else:
+        print(f"Next: make generate ENV={env_name}, then {rerun_command(env_name, bool(source))}; "
+              f"commit {rel} and envs/{env_name}/generated/")
+
+
 def _live_column_types(auth_path: Path, env_path: Path, columns: list[str]) -> dict[str, str]:
     """Data types of ``columns`` read from Unity Catalog (as make generate does)."""
     import contextlib
@@ -485,6 +651,17 @@ def main() -> int:
     args = parser.parse_args()
     env_dir = args.tfvars.resolve().parent.parent
     env_name = args.env_name or env_dir.name
+    if args.env_file is not None and is_deterministic(args.env_file):
+        try:
+            result = map_deterministic(
+                args.tfvars, env_dir, args.treatment.strip(),
+                auth_path=args.auth_file, env_path=args.env_file,
+            )
+        except (RuntimeError, FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        _print_deterministic(result, env_name)
+        return 0
     try:
         additions = scaffold(
             args.tfvars, args.sql, args.treatment_config, args.tag_vocabulary,
