@@ -23,7 +23,7 @@ import time
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from governance_policies import FAILSAFE_TREATMENT, parse_treatment_value
+from governance_policies import FAILSAFE_TREATMENT, is_never_raw, parse_treatment_value
 
 
 DESIGN_SOURCE = "shared/docs/design/deterministic-governance.md"
@@ -36,7 +36,7 @@ PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
 E2E_REMOTE = "genierails-e2e"
 E2E_BRANCH_PREFIX = "genierails-e2e/"
 MAX_RELEASE_PHASES = 8
-ANOTHER_RELEASE_PHASE = re.compile(r"(?:Release phase applied|need another release-plan)", re.I)
+ANOTHER_RELEASE_PHASE = re.compile(r"(?:Release phase applied|needs? another release-plan)", re.I)
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genierails-e2e@localhost",
                 "GIT_COMMITTER_NAME": "genierails-e2e", "GIT_COMMITTER_EMAIL": "genierails-e2e@localhost"}
 # Targets that apply to a workspace/account: the checkout must be clean and
@@ -80,6 +80,7 @@ class Scenario:
     pass_criteria: tuple[str, ...]
     restore: tuple[str, ...]
     requires: tuple[str, ...] = ()
+    known_failure: str | None = None
 
 
 def mk(name: str, target: str, env: str | None = None, *,
@@ -109,6 +110,17 @@ REFUSALS = {
     "tamper": r"(make release refused: \S+ no longer matches|is not a release manifest|is a manifest for \S+, not)",
     "stale": r"committed files differ from what the commit regenerates",
 }
+REFUSAL_SOURCE_ANCHORS: Mapping[str, tuple[str, str]] = {
+    REFUSALS["covered"]: ("shared/scripts/sticky_governance.py", "refusing to ungovern"),
+    REFUSALS["plan_provenance"]: ("shared/scripts/release_gate.py", "release-plan refused:"),
+    REFUSALS["release_provenance"]: ("shared/scripts/release_gate.py", "make release refused:"),
+    REFUSALS["maintain_provenance"]: ("shared/scripts/release_gate.py", "make maintain refused"),
+    REFUSALS["ci"]: ("shared/Makefile.shared", "applying targets cannot run in CI"),
+    REFUSALS["weakening"]: ("shared/Makefile.shared", "refused by the reader or weakening check"),
+    REFUSALS["detach"]: ("shared/scripts/agent_ownership.py", "not found: detach-agent works on an agent file"),
+    REFUSALS["tamper"]: ("shared/scripts/release_gate.py", "no longer matches:"),
+    REFUSALS["stale"]: ("shared/scripts/check_env.py", "committed files differ from what the commit regenerates"),
+}
 CI_ENV = {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": None}
 
 
@@ -128,8 +140,8 @@ DAY2 = (
 
 
 def _scenario(key: str, title: str, pre: Sequence[str], lead: Sequence[Step], passed: Sequence[str],
-              restore: Sequence[str], requires: Sequence[str] = ()) -> Scenario:
-    return Scenario(key, title, tuple(pre), tuple(lead), tuple(passed), tuple(restore), tuple(requires))
+              restore: Sequence[str], requires: Sequence[str] = (), known_failure: str | None = None) -> Scenario:
+    return Scenario(key, title, tuple(pre), tuple(lead), tuple(passed), tuple(restore), tuple(requires), known_failure)
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -246,11 +258,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         "Reviewed pending legacy migration fixture exists in dev and prod.",
         "Expected to fail on main until fix/migration-adopt-order lands (layout guard order and deterministic import).",
     ), (
+        mk("Review dev migration mapping", "migrate-plan", "dev"),
+        mk("Review prod migration mapping", "migrate-plan", "prod"),
         mk("Rehearse dev adoption", "rehearse", "dev"),
         mk("Plan prod adopt-only release", "release-plan", "prod"),
         mk("Apply prod adopt-only release", "release", "prod", args=("MANIFEST={manifest}",)),
     ), ("Legacy values are adopted into deterministic values without weaker protection or raw exposure.",),
-       ("Forward-release the pinned baseline through the same bounded staged lifecycle.",)),
+       ("Forward-release the pinned baseline through the same bounded staged lifecycle.",),
+       known_failure="fix/migration-adopt-order"),
 )
 
 # Explicit top-level snapshot components each scenario is allowed to change.
@@ -625,6 +640,19 @@ def governance_only_env(cloud_root: Path, env: str) -> bool:
             and not list((path.parent / "agents").glob("*.auto.tfvars")))
 
 
+def deterministic_env(cloud_root: Path, env: str | None) -> bool:
+    if not env: return False
+    path = cloud_root / "envs" / env / "env.auto.tfvars"
+    return path.is_file() and _load_hcl(path).get("governance_mode") == "deterministic"
+
+
+def import_unset_treatment(output: str) -> bool:
+    return bool(re.search(
+        r"(?im)(?:Cleared tag gr_treatment|gr_treatment.*(?:clearing tag|UNSET TAGS)|UNSET TAGS.*gr_treatment)",
+        output,
+    ))
+
+
 def parse_manifest(output: str) -> str:
     matches = re.findall(r"(?m)Manifest \(immutable\):\s*(\S+)", output) or re.findall(r"MANIFEST=(\S+)", output)
     if not matches: raise RuntimeError("release-plan succeeded but printed no manifest path")
@@ -636,6 +664,24 @@ def parse_manifest(output: str) -> str:
 
 def release_needs_another_phase(output: str) -> bool:
     return bool(ANOTHER_RELEASE_PHASE.search(output))
+
+
+def refusal_found_in_source(repo_root: Path, pattern: str) -> bool:
+    anchor = REFUSAL_SOURCE_ANCHORS.get(pattern)
+    if not anchor: return False
+    path, tail = anchor
+    source = repo_root / path
+    return source.is_file() and tail in source.read_text(encoding="utf-8", errors="replace")
+
+
+def parse_migration_mappings(output: str) -> dict[str, tuple[str, str]]:
+    mappings: dict[str, tuple[str, str]] = {}
+    for location, old, new in re.findall(r"(?m)^\s+(\S+\.\S+\.\S+\.\S+):\s+(\S+)\s+->\s+(\S+)\s*$", output):
+        if old != "untagged" and parse_treatment_value(new):
+            mappings[location] = (old, new)
+    if not mappings:
+        raise RuntimeError("migrate-plan printed no reviewed legacy-to-deterministic column mapping")
+    return mappings
 
 
 def scenario_plan(scenario: Scenario, targets: set[str]) -> list[dict[str, Any]]:
@@ -805,7 +851,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             location = ".".join(str(row.get(k)) for k in ("catalog_name", "schema_name", "table_name", "column_name"))
             tag, value = str(row.get("tag_name")), str(row.get("tag_value"))
             parsed = parse_treatment_value(value) if tag == "gr_treatment" else None
-            result["columns"][(location, tag)] = (parsed[0], parsed[1]) if parsed else value
+            result["columns"][(location, tag)] = (parsed[0], parsed[1], value) if parsed else value
         for row in evidence.get("mask_functions") or []:
             name = str(row.get("routine_name"))
             normalized = _normalized_mask(name)
@@ -816,16 +862,25 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 mask = policy.get("column_mask") or policy.get("row_filter") or {}
                 function = str(mask.get("function_name") or "")
                 normalized = _normalized_mask(function.rsplit(".", 1)[-1])
-                key = (f"{entry.get('table')} {catalog} {normalized[0]}__{normalized[2]}" if normalized
-                       else f"{entry.get('table')} {policy.get('name')}")
-                result["policies"][key] = {"function": normalized or function,
-                                           "to": set(policy.get("to_principals") or []),
-                                           "except": set(policy.get("except_principals") or [])}
+                key = ((str(entry.get("table")), str(catalog), *normalized) if normalized
+                       else (str(entry.get("table")), str(catalog), str(policy.get("name"))))
+                fact = {"function": {normalized or (function,)},
+                        "to": set(policy.get("to_principals") or []),
+                        "except": set(policy.get("except_principals") or [])}
+                prior = result["policies"].get(key)
+                if prior:
+                    prior["function"].update(fact["function"])
+                    prior["to"].intersection_update(fact["to"])
+                    prior["except"].update(fact["except"])
+                else:
+                    result["policies"][key] = fact
         for kind in ("catalog_grants", "schema_grants", "table_grants"):
             for row in evidence.get(kind) or []:
                 securable = ".".join(str(row[k]) for k in ("table_catalog", "table_schema", "table_name",
                                                            "catalog_name", "schema_name") if row.get(k))
                 result["grants"].add(f"{row.get('grantee')} {row.get('privilege_type')} {securable}")
+    for fact in result["policies"].values():
+        fact["function"] = tuple(sorted(fact["function"]))
     return result
 
 
@@ -835,10 +890,12 @@ def _normalized_mask(name: str) -> tuple[str, str, str] | None:
     return (parsed[0], parsed[1], match.group(2)) if parsed and match else None
 
 
-def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, include_grants: bool = False) -> dict[str, list[str]]:
+def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, include_grants: bool = False,
+                    allowed_adoptions: Mapping[str, tuple[str, str]] | None = None) -> dict[str, list[str]]:
     """What is weaker in ``current``: a column untagged, a mask or policy gone,
     a principal newly exempted or no longer covered, and (optionally) a grant added."""
     before, after = _protection(baseline), _protection(current)
+    allowed_adoptions = allowed_adoptions or {}
     weaker: dict[str, list[str]] = {}
     lost_columns = []
     for key, was in sorted(before["columns"].items()):
@@ -847,37 +904,61 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
             display = "__".join(was) if isinstance(was, tuple) else was
             lost_columns.append(f"{key[0]} {key[1]}={display}")
         elif key[1] == "gr_treatment":
-            # Generation hashes are intentionally ignored. Legacy -> deterministic
-            # adoption is safe when it retains the treatment; the reverse is not.
-            if isinstance(was, tuple) and not isinstance(now, tuple):
+            was_raw = was[2] if isinstance(was, tuple) else was
+            now_raw = now[2] if isinstance(now, tuple) else now
+            adoption = allowed_adoptions.get(key[0]) == (was_raw, now_raw)
+            # A reviewed cutover may replace only the exact pair migrate-plan
+            # printed. Never-raw -> weaker remains forbidden regardless.
+            if is_never_raw(was_raw) and not is_never_raw(now_raw):
+                lost_columns.append(f"{key[0]} gr_treatment never-raw {was_raw} -> {now_raw}")
+            elif adoption:
+                pass
+            elif isinstance(was, tuple) and not isinstance(now, tuple):
                 lost_columns.append(f"{key[0]} gr_treatment became legacy ({now})")
-            elif isinstance(now, tuple) and now[0] == FAILSAFE_TREATMENT and was != now:
+            elif isinstance(now, tuple) and now[0] == FAILSAFE_TREATMENT and was[:2] != now[:2]:
                 lost_columns.append(f"{key[0]} gr_treatment became fail-safe ({now[0]})")
-            elif isinstance(was, tuple) and isinstance(now, tuple) and was != now:
-                lost_columns.append(f"{key[0]} gr_treatment {was} -> {now}")
-            elif not isinstance(was, tuple) and isinstance(now, tuple) and was != now[0]:
+            elif isinstance(was, tuple) and isinstance(now, tuple) and was[:2] != now[:2]:
+                lost_columns.append(f"{key[0]} gr_treatment {was[:2]} -> {now[:2]}")
+            elif not isinstance(was, tuple) and isinstance(now, tuple):
+                lost_columns.append(f"{key[0]} gr_treatment {was} -> {now[:2]}")
+            elif not isinstance(was, tuple) and not isinstance(now, tuple) and was != now:
                 lost_columns.append(f"{key[0]} gr_treatment {was} -> {now}")
         elif was != now:
             lost_columns.append(f"{key[0]} {key[1]}={was}: changed to {now}")
     if lost_columns: weaker["columns"] = lost_columns
-    lost_masks = sorted(before["masks"] - after["masks"])
+    adoption_values = {old for old, _new in allowed_adoptions.values()}
+    adoption_values_by_table: dict[str, set[str]] = {}
+    for location, (old, _new) in allowed_adoptions.items():
+        adoption_values_by_table.setdefault(location.rsplit(".", 1)[0], set()).add(old)
+    lost_masks = sorted(mask for mask in before["masks"] - after["masks"]
+                        if not any(re.search(rf"(?:^|_)({re.escape(old)})(?:_|$)", mask) for old in adoption_values))
     if lost_masks: weaker["masks"] = lost_masks
     policies = []
     for key, was in sorted(before["policies"].items()):
+        label = f"{key[0]} {key[2]}" if len(key) == 3 else " ".join((key[0], *key[2:]))
         now = after["policies"].get(key)
-        if now is None: policies.append(f"{key}: removed")
-        elif now["function"] != was["function"]: policies.append(f"{key}: function {was['function']} -> {now['function']}")
-        else:
-            policies += [f"{key}: no longer applies to {p}" for p in sorted(was["to"] - now["to"])]
-            policies += [f"{key}: newly exempts {p}" for p in sorted(now["except"] - was["except"])]
+        table_adoptions = adoption_values_by_table.get(key[0], set())
+        legacy_replaced = len(key) == 3 and any(old in " ".join(str(part) for part in key)
+            or any(old in ".".join(fn) for fn in was["function"]) for old in table_adoptions)
+        if now is None and not legacy_replaced: policies.append(f"{label}: removed")
+        elif now is not None and now["function"] != was["function"]:
+            policies.append(f"{label}: function {sorted(was['function'])} -> {sorted(now['function'])}")
+        elif now is not None:
+            policies += [f"{label}: no longer applies to {p}" for p in sorted(was["to"] - now["to"])]
+            policies += [f"{label}: newly exempts {p}" for p in sorted(now["except"] - was["except"])]
     if policies: weaker["policies"] = policies
     widened = sorted(after["grants"] - before["grants"])
     if include_grants and widened: weaker["widened_grants"] = widened
     return weaker
 
 
-def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
-    return {env: weak for env in sorted(baseline) if (weak := protection_diff(baseline[env], current.get(env, {}), **kwargs))}
+def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any], *,
+                         allowed_adoptions: Mapping[str, Mapping[str, tuple[str, str]]] | None = None,
+                         **kwargs: Any) -> dict[str, Any]:
+    adoptions = allowed_adoptions or {}
+    return {env: weak for env in sorted(baseline)
+            if (weak := protection_diff(baseline[env], current.get(env, {}),
+                                        allowed_adoptions=adoptions.get(env), **kwargs))}
 
 
 def unexpected_changes(scenario: str, before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, list[str]]:
@@ -925,19 +1006,28 @@ def _restore_baseline(runner: CommandRunner, repo: Checkout, targets: set[str], 
     repo.forward_fix()
     result = runner.run(("make", "rehearse", "ENV=dev"), f"{label}-restore-rehearse")
     if result.returncode: raise RuntimeError("baseline restore rehearse failed")
+    if deterministic_env(runner.cwd, "dev") and import_unset_treatment(result.stdout):
+        raise RuntimeError("baseline restore rehearse attempted to clear gr_treatment")
     for phase in range(1, MAX_RELEASE_PHASES + 1):
+        repo.verify(f"{label}-restore-phase-{phase}")
         plan = runner.run(("make", "release-plan", "ENV=prod"), f"{label}-restore-release-plan-{phase}")
         if plan.returncode: raise RuntimeError("baseline restore release-plan failed")
+        if deterministic_env(runner.cwd, "prod") and import_unset_treatment(plan.stdout):
+            raise RuntimeError("baseline restore release-plan attempted to clear gr_treatment")
         manifest = parse_manifest(plan.stdout)
         result = runner.run(("make", "release", "ENV=prod", f"MANIFEST={manifest}"),
                             f"{label}-restore-release-{phase}")
         if result.returncode: raise RuntimeError("baseline restore release failed")
+        if deterministic_env(runner.cwd, "prod") and import_unset_treatment(result.stdout):
+            raise RuntimeError("baseline restore release attempted to clear gr_treatment")
         if not release_needs_another_phase(plan.stdout + "\n" + result.stdout):
             break
     else:
         raise RuntimeError(f"baseline restore exceeded {MAX_RELEASE_PHASES} release phases")
     result = runner.run(("make", "maintain", "ENV=prod"), f"{label}-restore-maintain")
     if result.returncode: raise RuntimeError("baseline restore maintain failed")
+    if deterministic_env(runner.cwd, "prod") and import_unset_treatment(result.stdout):
+        raise RuntimeError("baseline restore maintain attempted to clear gr_treatment")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -994,15 +1084,12 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
         target_text = cloud_makefile.read_text(encoding="utf-8") + "\n" + (
             repo_root / "shared" / "Makefile.shared").read_text(encoding="utf-8")
         targets = set(re.findall(r"^([a-zA-Z0-9][\w.-]*):(?:\s|$)", target_text, re.M))
-        source_text = "\n".join(path.read_text(encoding="utf-8", errors="replace")
-                                 for path in sorted((repo_root / "shared").rglob("*"))
-                                 if path.is_file() and path.suffix in (".py", ".sh", ".shared"))
         for scenario in selected:
             plan = scenario_plan(scenario, targets)
             gates = [step.human_prompt for step in scenario.steps if step.human_prompt]
             missing_values = unresolved_values(scenario, values)
             refusals = [{"step": step.name, "pattern": step.refusal,
-                         "found_in_source": bool(step.refusal and re.search(step.refusal, source_text))}
+                         "found_in_source": bool(step.refusal and refusal_found_in_source(repo_root, step.refusal))}
                         for step in scenario.steps if step.expect_failure]
             would_not_run = [x["skip_reason"] for x in plan if x["status"] == "skip"]
             would_not_run += ["human UI gate requires typed confirmation"] if gates else []
@@ -1010,12 +1097,14 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             would_not_run += [f"refusal pattern not found in source: {x['pattern']}"
                               for x in refusals if not x["found_in_source"]]
             payload = {"scenario": scenario.key, "status": "dry-run", "cloud": args.cloud,
+                       "known_failure": scenario.known_failure,
                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                        "target_source": str(cloud_makefile), "steps": plan, "snapshot_diff": {},
                        "human_gates": gates, "missing_values": missing_values,
                        "refusal_patterns": refusals, "would_not_run": would_not_run}
             write_report(reports, scenario, payload)
-            print(f"[{scenario.key}] {scenario.title}" + (" — NOT RUN live (see report)" if payload["would_not_run"] else ""))
+            known = f" — KNOWN FAILURE until {scenario.known_failure}" if scenario.known_failure else ""
+            print(f"[{scenario.key}] {scenario.title}{known}" + (" — NOT RUN live (see report)" if payload["would_not_run"] else ""))
             for item in payload["steps"]:
                 suffix = f" — SKIP ({item['skip_reason']})" if item["status"] == "skip" else ""
                 print(f"  {item['command'] or ('[' + item['action'] + ']' if item['action'] else '[human pause]')}{suffix}")
@@ -1073,7 +1162,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                 status = "NOT RUN" if blocked else "ERROR"
                 failed |= status == "ERROR"
                 write_report(reports, scenario, {"scenario": scenario.key, "status": status, "cloud": args.cloud,
-                    "commit": args.commit, "blocked_by": blocked,
+                    "commit": args.commit, "known_failure": scenario.known_failure, "blocked_by": blocked,
                     "error": f"unresolved placeholder(s): {', '.join(missing_values)}" if missing_values and not blocked else None,
                     "steps": plan, "snapshot_diff": {}}, runner.secrets)
                 continue
@@ -1089,6 +1178,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             mutated = False
             stop = False
             confirmations: list[dict[str, str]] = []
+            allowed_adoptions: dict[str, dict[str, tuple[str, str]]] = {}
             try:
                 # Pin: every scenario starts at exactly the requested commit.
                 repo.switch(repo.baseline, f"{scenario.key}-pin")
@@ -1124,6 +1214,9 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         ok = result.returncode != 0 and bool(step.refusal and re.search(step.refusal, result.stdout))
                         if not ok: item["assertion"] = "nonzero exit and the expected refusal message are both required"
                     else: ok = result.returncode == 0
+                    if applying and deterministic_env(cloud_root, step.env) and import_unset_treatment(result.stdout):
+                        ok = False
+                        item["assertion"] = "deterministic apply attempted to clear gr_treatment"
                     item["status"] = "passed" if ok else "ERROR"
                     step_after = capture() if step_before is not None else None
                     if step.expect_failure and step_before is not None and step_after is not None:
@@ -1135,11 +1228,16 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         successful_step_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
                         if step.target == "release-plan" and release_plan_workspace_diff(step_before, step_after):
                             item["status"] = "ERROR"; item["assertion"] = "successful release-plan changed the snapshot"; ok = False
-                        weak_step = protection_diff_envs(step_before, step_after)
+                        weak_step = protection_diff_envs(step_before, step_after, allowed_adoptions=allowed_adoptions)
                         if weak_step and scenario.key not in WEAKENING_EXPECTED:
-                            item["status"] = "ERROR"; item["assertion"] = f"successful apply weakened protection: {weak_step}"; ok = False
+                            item["status"] = "ERROR"
+                            if "assertion" not in item:
+                                item["assertion"] = f"successful apply weakened protection: {weak_step}"
+                            ok = False
                     if not ok: raise RuntimeError(f"step did not satisfy its contract: {step.name}")
                     if step.expect_failure: mutated = prior_mutated
+                    if scenario.key == "migration-cutover" and step.target == "migrate-plan":
+                        allowed_adoptions[step.env or "prod"] = parse_migration_mappings(result.stdout)
                     if step.target == "release-plan" and not step.expect_failure:
                         manifest = parse_manifest(result.stdout)
                         release_plan_output = result.stdout
@@ -1147,6 +1245,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         phase_output = release_plan_output + "\n" + result.stdout
                         for phase in range(2, MAX_RELEASE_PHASES + 1):
                             if not release_needs_another_phase(phase_output): break
+                            repo.verify(f"{label}-phase-{phase}")
                             repo.require_clean(f"{label}-phase-{phase}")
                             phase_before = capture()
                             plan_result = runner.run(("make", "release-plan", "ENV=prod"),
@@ -1164,7 +1263,11 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             phase_after = capture()
                             successful_step_diffs.append({"step": f"{step.name} phase {phase}", "env": "prod",
                                                           "diff": snapshot_diff(phase_plan_after, phase_after)})
-                            weak_phase = protection_diff_envs(phase_plan_after, phase_after)
+                            if deterministic_env(cloud_root, "prod") and import_unset_treatment(
+                                    plan_result.stdout + "\n" + phase_release.stdout):
+                                raise RuntimeError(f"release phase {phase} attempted to clear gr_treatment")
+                            weak_phase = protection_diff_envs(phase_plan_after, phase_after,
+                                                              allowed_adoptions=allowed_adoptions)
                             if weak_phase and scenario.key not in WEAKENING_EXPECTED:
                                 raise RuntimeError(f"release phase {phase} weakened protection: {weak_phase}")
                             phase_output = plan_result.stdout + "\n" + phase_release.stdout
@@ -1174,7 +1277,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     if applying: repo.require_clean(f"after-{label}")
                 after = capture()
                 if scenario.key not in WEAKENING_EXPECTED:
-                    weak = protection_diff_envs(before, after)
+                    weak = protection_diff_envs(before, after, allowed_adoptions=allowed_adoptions)
                     if weak: raise RuntimeError(f"protection became weaker: {weak}")
                 unexpected = unexpected_changes(scenario.key, before, after)
                 if unexpected: raise RuntimeError(f"unexpected snapshot components changed: {unexpected}")
@@ -1200,14 +1303,20 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         repo.reset()
                         repo.switch(repo.baseline, f"{scenario.key}-restored")
                         restored = capture()
-                        weak_restore = protection_diff_envs(before, restored, include_grants=True)
+                        weak_restore = protection_diff_envs(before, restored, include_grants=True,
+                                                            allowed_adoptions=allowed_adoptions)
                         if weak_restore:
                             scenario_status = "RESTORE FAILED"; failed = True
                             error_message = "; ".join(filter(None, (error_message, f"protection not restored: {weak_restore}")))
                 except BaseException as exc:
                     scenario_status = "RESTORE FAILED"; failed = True; stop = True
                     error_message = "; ".join(filter(None, (error_message, f"restore: {type(exc).__name__}: {exc}")))
+                if scenario.known_failure and scenario_status == "ERROR":
+                    scenario_status = f"ERROR (expected until {scenario.known_failure})"
+                    error_message = "; ".join(filter(None, (error_message,
+                        f"known failure: expected until {scenario.known_failure}")))
                 payload = {"scenario": scenario.key, "status": scenario_status, "error": error_message,
+                           "known_failure": scenario.known_failure,
                            "cloud": args.cloud, "commit": args.commit, "steps": plan, "confirmations": confirmations,
                            "before": before, "after": after, "restored": restored, "restored_lifecycle": mutated,
                            "snapshot_diff": snapshot_diff(before, after) if before and after else {},

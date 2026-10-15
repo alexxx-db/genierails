@@ -138,8 +138,9 @@ def live_args(tmp_path, scenario, *extra):
 
 
 def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False, refuse=None,
-                    drift_after_make=False, on_make=None, staged_release=False):
-    state = {"makes": 0, "releases": 0}
+                    drift_after_make=False, on_make=None, staged_release=False,
+                    staged_releases=None, migrate_rc=0, import_unset=False):
+    state = {"makes": 0, "releases": 0, "plans": 0}
 
     def run(argv, **kwargs):
         argv = list(argv); calls.append((argv, kwargs.get("env", {})))
@@ -166,11 +167,20 @@ def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False,
             state["makes"] += 1
             if on_make: on_make(argv)
             if "release-plan" in argv:
-                text = "ok\n" if no_manifest else "  Manifest (immutable): /tmp/approved.json\n"
+                state["plans"] += 1
+                text = "ok\n" if no_manifest else f"  Manifest (immutable): /tmp/approved-{state['plans']}.json\n"
+            if "migrate-plan" in argv:
+                text = ("=== Migration dry run\n"
+                        "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+                        "Result: ready\n")
+                rc = migrate_rc
             if argv[1:2] == ["release"]:
                 state["releases"] += 1
-                if staged_release and state["releases"] == 1:
+                phase_count = 1 if staged_release else staged_releases
+                if phase_count is not None and state["releases"] <= phase_count:
                     text = "=== Release phase applied; need another release-plan\n"
+            if import_unset:
+                text += "  Cleared tag gr_treatment on cat.s.t.ssn\n"
             if "ungovern" in argv and unrelated:
                 rc, text = 2, "unrelated syntax error\n"
             if refuse and refuse[0](argv):
@@ -368,12 +378,17 @@ def test_agent_ids_include_hcl_state_and_id_file(tmp_path):
 
 # Blocker 4: restore after every scenario, on errors and signals; weaker = failure.
 def test_exception_writes_report_and_attempts_public_restore(tmp_path, live):
-    class Boom(FakeSnapshots): mode = "boom"
+    class Boom(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            if self.n == 5:  # after the first make has started, so restore is mandatory
+                raise RuntimeError("snapshot exploded")
+            return snapshot()
     calls = live()
     assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=Boom) == 1
     report = json.loads((tmp_path / "reports" / "s4.json").read_text())
     assert report["status"] in ("ERROR", "RESTORE FAILED")
-    assert not makes(calls)  # the new pre-command snapshot failed; no mutation occurred
+    assert [a[1] for a in makes(calls)][-4:] == ["rehearse", "release-plan", "release", "maintain"]
 
 
 def test_sigterm_mid_step_restores_writes_partial_report_and_stops(tmp_path, live):
@@ -790,8 +805,11 @@ def test_d2_ci_scenario_needs_no_value_and_omits_allowed_dev_rehearse():
 def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
     calls = live(staged_release=True)
     assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 0
-    targets = [argv[1] for argv in makes(calls)]
-    assert targets[:5] == ["rehearse", "release-plan", "release", "release-plan", "release"]
+    commands = makes(calls)
+    assert [argv[1] for argv in commands[:7]] == [
+        "migrate-plan", "migrate-plan", "rehearse", "release-plan", "release", "release-plan", "release"]
+    manifests = [next(a for a in argv if a.startswith("MANIFEST=")) for argv in commands if argv[1] == "release"]
+    assert manifests[:2] == ["MANIFEST=/tmp/approved-1.json", "MANIFEST=/tmp/approved-2.json"]
 
 
 def test_d4_snapshot_query_includes_deterministic_masks():
@@ -828,6 +846,41 @@ def test_d5_generation_changes_normalize_but_legacy_and_failsafe_are_weaker():
     assert "columns" in driver.protection_diff(old, legacy)
     failsafe = _deterministic_snapshot("unmapped_redact__string__33333333")
     assert "columns" in driver.protection_diff(old, failsafe)
+    downgrade = _deterministic_snapshot("ssn__string__44444444")
+    assert "columns" in driver.protection_diff(old, downgrade)
+    legacy_old = _deterministic_snapshot("masked_ssn")
+    legacy_new = _deterministic_snapshot("public")
+    assert "columns" in driver.protection_diff(legacy_old, legacy_new)
+
+
+def _two_type_policy_snapshot(*, exempt_int=False, include_int=True):
+    snap = _deterministic_snapshot("unmapped_redact__string__11111111")
+    policies = snap["uc"]["cat"]["abac_policies"][0]["policies"]
+    if include_int:
+        policies.append({"name": "int", "to_principals": ["account users"],
+            "except_principals": ["analysts"] if exempt_int else [],
+            "column_mask": {"function_name": "cat.s.gr_mask_unmapped_redact__int__22222222_full"}})
+    return snap
+
+
+def test_d5_policy_types_do_not_collide_on_exemption_or_removal():
+    before = _two_type_policy_snapshot()
+    exempted = driver.protection_diff(before, _two_type_policy_snapshot(exempt_int=True))
+    assert any("newly exempts analysts" in item for item in exempted["policies"])
+    removed = driver.protection_diff(before, _two_type_policy_snapshot(include_int=False))
+    assert any("unmapped_redact int full: removed" in item for item in removed["policies"])
+
+
+def test_migration_mapping_allows_only_exact_reviewed_adoption_and_never_raw_stays_safe():
+    before = _deterministic_snapshot("masked_email")
+    after = _deterministic_snapshot("email_partial__string__11111111")
+    exact = {"cat.s.t.ssn": ("masked_email", "email_partial__string__11111111")}
+    assert driver.protection_diff(before, after, allowed_adoptions=exact) == {}
+    wrong = {"cat.s.t.ssn": ("masked_email", "email_partial__string__99999999")}
+    assert "columns" in driver.protection_diff(before, after, allowed_adoptions=wrong)
+    never_raw = _deterministic_snapshot("secret")
+    unsafe = {"cat.s.t.ssn": ("secret", "email_partial__string__11111111")}
+    assert "columns" in driver.protection_diff(never_raw, after, allowed_adoptions=unsafe)
 
 
 def test_d6_prod_keyed_agent_id_files_are_snapshotted(tmp_path):
@@ -850,12 +903,43 @@ def test_d8_dry_run_reports_values_gates_refusals_and_cloud_entrypoint(tmp_path)
     assert report["refusal_patterns"] and report["refusal_patterns"][0]["found_in_source"]
 
 
+def test_d8_refusal_discovery_does_not_scan_tests_or_the_driver(tmp_path):
+    fake = tmp_path / "repo"
+    for relative in ("shared/tests/test_fake.py", "shared/scripts/e2e/driver.py"):
+        path = fake / relative; path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not found: detach-agent works on an agent file\n")
+    assert not driver.refusal_found_in_source(fake, driver.REFUSALS["detach"])
+
+
 def test_d9_migration_is_read_only_and_cutover_is_explicit():
     assert driver.ALLOWED_CHANGES["migration"] == frozenset()
     assert "migration" not in driver.WEAKENING_EXPECTED
     cutover = next(s for s in driver.SCENARIOS if s.key == "migration-cutover")
-    assert [s.target for s in cutover.steps] == ["rehearse", "release-plan", "release"]
+    assert [s.target for s in cutover.steps] == ["migrate-plan", "migrate-plan", "rehearse", "release-plan", "release"]
     assert "fix/migration-adopt-order" in " ".join(cutover.preconditions)
+    assert cutover.known_failure == "fix/migration-adopt-order"
+
+
+def test_migration_cutover_known_failure_is_visible_and_still_fails(tmp_path, live):
+    refused = {"done": False}
+    def first_rehearse(argv):
+        match = argv[1:2] == ["rehearse"] and not refused["done"]
+        refused["done"] |= match
+        return match
+    calls = live(refuse=(first_rehearse, "engine migration order failure\n"))
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
+    assert report["known_failure"] == "fix/migration-adopt-order"
+    assert report["status"] == "ERROR (expected until fix/migration-adopt-order)"
+    assert any(argv[1] == "rehearse" for argv in makes(calls))
+
+
+def test_migration_cutover_known_failure_is_in_dry_run_json_and_stdout(tmp_path, capsys):
+    assert driver.main(["--cloud", "aws", "--repo", str(ROOT), "--dry-run",
+        "--scenarios", "migration-cutover", "--reports", str(tmp_path)]) == 0
+    report = json.loads((tmp_path / "migration-cutover.json").read_text())
+    assert report["known_failure"] == "fix/migration-adopt-order"
+    assert "KNOWN FAILURE until fix/migration-adopt-order" in capsys.readouterr().out
 
 
 def test_d10_s14_is_blocked_unless_dev_is_governance_only(tmp_path):
@@ -875,3 +959,81 @@ def test_d12_readme_prepares_both_environments():
     text = (ROOT / "shared/scripts/e2e/README.md").read_text()
     assert "make setup ENV=dev GITIGNORE=customer" in text
     assert "make setup ENV=prod GITIGNORE=customer" in text
+
+
+def test_phase_bound_is_an_error_after_eight_releases(tmp_path, live):
+    live(staged_releases=8)
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
+    assert report["status"] == "ERROR (expected until fix/migration-adopt-order)"
+    assert "release exceeded 8 phases" in report["error"]
+
+
+def test_unbounded_restore_is_restore_failed(tmp_path, live):
+    live(staged_releases=100)
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert report["status"] == "RESTORE FAILED"
+    assert "restore exceeded 8 release phases" in report["error"]
+
+
+def test_restore_runs_n_fresh_plan_release_pairs(tmp_path, live):
+    calls = live(staged_releases=2)
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 0
+    restore = [argv for argv in makes(calls) if argv[1] in ("release-plan", "release")]
+    assert [argv[1] for argv in restore] == ["release-plan", "release"] * 3
+    manifests = [next(a for a in argv if a.startswith("MANIFEST=")) for argv in restore if argv[1] == "release"]
+    assert manifests == [f"MANIFEST=/tmp/approved-{i}.json" for i in range(1, 4)]
+
+
+def test_successful_release_plan_that_drops_tag_is_error(tmp_path, live):
+    state = {"weak": False}
+    def on_make(argv):
+        if argv[1] == "release-plan" and not state["weak"]: state["weak"] = True
+        elif argv[1] == "rehearse": state["weak"] = False
+    class Dynamic(FakeSnapshots):
+        def capture(self, env): return snapshot(tags=() if state["weak"] and env == "prod" else (("t", "ssn", "class.ssn"),))
+    live(on_make=on_make)
+    assert driver.main(live_args(tmp_path, "s5", "--value", "treatment=reviewed"), snapshot_factory=Dynamic) == 1
+    report = json.loads((tmp_path / "reports/s5.json").read_text())
+    assert report["steps"][0]["assertion"] == "successful release-plan changed the snapshot"
+
+
+def test_successful_apply_that_weakens_is_error(tmp_path, live):
+    state = {"weak": False, "first": True}
+    def on_make(argv):
+        if argv[1] == "maintain" and state["first"]:
+            state.update(weak=True, first=False)
+        elif argv[1] == "rehearse": state["weak"] = False
+    class Dynamic(FakeSnapshots):
+        def capture(self, env): return snapshot(masks=() if state["weak"] and env == "prod" else ("mask_ssn",))
+    live(on_make=on_make)
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=Dynamic) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert "successful apply weakened protection" in report["steps"][0]["assertion"]
+
+
+def test_migrate_plan_exit_one_with_report_is_ok_but_exit_two_is_error(tmp_path, live):
+    live(migrate_rc=1)
+    assert driver.main(live_args(tmp_path, "migration"), snapshot_factory=FakeSnapshots) == 0
+    assert json.loads((tmp_path / "reports/migration.json").read_text())["status"] == "passed"
+
+    other = tmp_path / "other"; calls = []
+    # A second isolated fake avoids sharing the live fixture's call log only;
+    # the runner itself is fully reconstructed by main.
+    live(migrate_rc=2)
+    assert driver.main(live_args(other, "migration"), snapshot_factory=FakeSnapshots) == 1
+    assert json.loads((other / "reports/migration.json").read_text())["status"] == "ERROR"
+
+
+def test_deterministic_apply_log_that_clears_gr_treatment_is_error(tmp_path, live):
+    checkout = tmp_path / "checkout/aws/envs/prod"; checkout.mkdir(parents=True)
+    (checkout / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    live(import_unset=True)
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert report["steps"][0]["assertion"] == "deterministic apply attempted to clear gr_treatment"
+
+
+def test_another_phase_signal_accepts_needs_form():
+    assert driver.release_needs_another_phase("adoption needs another release-plan")
