@@ -330,7 +330,8 @@ def _load_tfvars(path: Path, label: str, *, strict: bool = False) -> dict:
 
 
 def load_auth_config(
-    auth_file: Path, env_file: Path | None = None, *, strict_env: bool = False
+    auth_file: Path, env_file: Path | None = None, *, strict_env: bool = False,
+    allow_access_tier_placeholders: bool = False,
 ) -> dict:
     """Load config from auth + env tfvars files. Merges both; env overrides auth.
 
@@ -339,7 +340,6 @@ def load_auth_config(
     is set, relative uc_tables entries are expanded into full 3-part refs before being
     returned so the rest of the script does not need to know about the split.
     """
-    cfg = _load_tfvars(auth_file, "credentials")
     if env_file is None:
         env_file = auth_file.parent / "env.auto.tfvars"
     env_cfg = _load_tfvars(env_file, "environment", strict=strict_env)
@@ -350,9 +350,15 @@ def load_auth_config(
         env_cfg = with_agents(env_file, env_cfg)
     except AgentFileError as exc:
         raise ValueError(str(exc)) from exc
-    placeholder = placeholder_error(env_cfg, env_file)
+    placeholder = placeholder_error(
+        env_cfg, env_file, allow_access_tier_placeholders=allow_access_tier_placeholders
+    )
     if placeholder:
         raise ValueError(placeholder)
+    # Only read credentials after the committed config has passed the
+    # placeholder preflight; no credential or account API should be touched
+    # for an unfilled template.
+    cfg = _load_tfvars(auth_file, "credentials")
     cfg.update(env_cfg)
 
     # Combine uc_catalog + relative uc_tables into full 3-part refs when the new
@@ -7877,7 +7883,8 @@ def main():
 
     try:
         auth_cfg = load_auth_config(
-            auth_file, strict_env=not args.tables and not args.dry_run
+            auth_file, strict_env=not args.tables and not args.dry_run,
+            allow_access_tier_placeholders=bool(args.groups or args.create_groups),
         )
     except ValueError as e:
         print(f"ERROR: {e}")

@@ -6,8 +6,7 @@ Take a Genie agent you've curated in **dev** and ship it to **prod** with its se
 
 ```bash
 # dev
-make setup ENV=dev          # then copy the template; set governance_mode = "deterministic",
-                            #   deployer_principal_id, genie_space_id and access_tier_groups
+make setup ENV=dev          # copy the template; set deployer_principal_id, agent ID, and groups
 #   Catalog Explorer: turn on Data classification, review detections, enable auto-tagging
 make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
 make rehearse ENV=dev       # applies in dev and proves the masks work
@@ -35,6 +34,7 @@ cd genierails/aws           # or: cd genierails/azure — every make command run
 |---|---|
 | The [prerequisites](../../docs/prerequisites.md) | Tools, a deploying service principal (`make bootstrap-sp`), IdP-synced groups |
 | Your Genie **Agent ID** | Genie UI → open the agent → **Configure** → *About this agent*. *No agent yet?* Use the [sample environment](SAMPLE_ENV.md) |
+| Deploying SP application ID | The `databricks_client_id` from each env's `auth.auto.tfvars`; it is committed as `deployer_principal_id` (not secret) |
 | Access-tier groups | Your existing groups, most- to least-privileged, e.g. `payments_ops`, `regional_analysts`, `viewers`. Order matters: a tier listed above a masked tier also gets the agent and sees those columns unmasked |
 | Dev and prod catalog names | e.g. `dev_finance` and `prod_finance` |
 
@@ -47,8 +47,9 @@ cd genierails/aws           # or: cd genierails/azure — every make command run
 make setup ENV=dev
 cp ../shared/examples/dev_to_prod/env.auto.tfvars.example envs/dev/env.auto.tfvars
 ```
-Fill in `envs/dev/auth.auto.tfvars` (service principal and workspace). In `envs/dev/env.auto.tfvars`, replace `<your-genie-space-id>` with your Agent ID and set:
+Fill in `envs/dev/auth.auto.tfvars` (service principal and workspace). The template starts new champions with `governance_mode = "deterministic"`; existing env files are not changed. In `envs/dev/env.auto.tfvars`, replace the agent, deployer, and group placeholders:
 ```hcl
+deployer_principal_id = "<the dev auth.auto.tfvars databricks_client_id>"
 access_tier_groups = ["payments_ops", "regional_analysts", "viewers"]
 ```
 
@@ -76,7 +77,7 @@ make rehearse ENV=dev
 ```bash
 make setup ENV=prod
 ```
-Fill in `envs/prod/auth.auto.tfvars`, and in `envs/prod/env.auto.tfvars` set:
+Fill in `envs/prod/auth.auto.tfvars`, replace its `deployer_principal_id` and `access_tier_groups` placeholders, and set:
 ```hcl
 catalog_map = { "dev_finance" = "prod_finance" }   # dev catalog = prod catalog
 ```

@@ -75,7 +75,7 @@ def test_customer_opt_in_is_sticky_idempotent_and_keeps_user_lines(cloud, tmp_pa
     assert text.startswith(USER_LINES)
     assert text.count(cg.BEGIN) == 1 and text.endswith(cg.END + "\n")
     assert f"+++ b/{cloud}/.gitignore" in first.stdout and "+!/envs/" in first.stdout
-    assert "/envs/dev/data_access/" not in text  # dev is legacy: its layer files are committed
+    assert "/envs/dev/data_access/" in text  # new workspace envs are deterministic
 
     again = _setup(cloud, cloud_root, "ENV=dev", "GITIGNORE=customer")
     assert again.returncode == 0 and gitignore.read_text() == text
@@ -86,13 +86,14 @@ def test_customer_opt_in_is_sticky_idempotent_and_keeps_user_lines(cloud, tmp_pa
     gitignore.write_text(text + "my-notes.txt\n")
     assert _setup(cloud, cloud_root, "ENV=prod").returncode == 0
     env_file = cloud_root / "envs/prod/env.auto.tfvars"
-    env_file.write_text(env_file.read_text() + '\ngovernance_mode = "deterministic"\n')
+    assert 'governance_mode       = "deterministic"' in env_file.read_text()
     refreshed = _setup(cloud, cloud_root, "ENV=prod")
     assert refreshed.returncode == 0, refreshed.stdout + refreshed.stderr
     new = gitignore.read_text()
     assert new.startswith(USER_LINES) and new.endswith("my-notes.txt\n")
-    assert "+/envs/prod/data_access/" in refreshed.stdout
-    assert "/envs/account/abac.auto.tfvars" not in new  # dev (legacy) still commits it
+    assert "/envs/prod/data_access/" in new
+    assert f"{cloud}/.gitignore: up to date" in refreshed.stdout
+    assert "/envs/account/abac.auto.tfvars" in new  # new dev is deterministic
 
     assert _setup(cloud, cloud_root, "ENV=prod", "GITIGNORE=off").returncode == 0
     assert gitignore.read_text() == new
@@ -207,7 +208,9 @@ def test_git_status_ignores_every_runtime_file_and_tracks_every_committed_one(
     for env, mode in envs.items():
         assert _setup(cloud, cloud_root, f"ENV={env}").returncode == 0
         env_file = cloud_root / "envs" / env / "env.auto.tfvars"
-        env_file.write_text(env_file.read_text() + f'\ngovernance_mode = "{mode}"\n')
+        env_file.write_text(env_file.read_text().replace(
+            'governance_mode       = "deterministic"', f'governance_mode       = "{mode}"'
+        ))
     result = _setup(cloud, cloud_root, "ENV=prod", "GITIGNORE=customer")
     assert result.returncode == 0, result.stdout + result.stderr
 

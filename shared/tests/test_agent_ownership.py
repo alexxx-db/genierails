@@ -391,6 +391,108 @@ def test_promote_keeps_agents_only_in_the_target(tmp_path, capsys):
     assert "Legacy: only in prod; kept" in capsys.readouterr().out
 
 
+def test_promote_preserves_a_detached_target_agent(tmp_path):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "agents").mkdir()
+    settings = prod / "agents" / "Sales.auto.tfvars"
+    settings.write_text('genie_space_id = ""\nacl_groups = []\ndetached = true\n')
+
+    with pytest.raises(AgentFileError, match="committed detached"):
+        agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert agent_files.load(prod, "Sales")["detached"] is True
+    assert agent_files.load(prod, "Sales")["acl_groups"] == []
+
+
+def test_promote_refuses_a_committed_detached_tombstone_without_receipts(tmp_path, monkeypatch):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+    monkeypatch.setattr(ownership, "load_receipt", lambda *_: pytest.fail("promotion read a receipt"))
+    before = {p.relative_to(prod): p.read_bytes() for p in prod.rglob("*") if p.is_file()}
+
+    with pytest.raises(AgentFileError, match="committed detached"):
+        agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert {p.relative_to(prod): p.read_bytes() for p in prod.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("source_name", ["sales", "SALES", "Sales-"])
+def test_promote_matches_detached_tombstones_by_space_key(tmp_path, source_name):
+    dev, prod = _promote_envs(tmp_path)
+    source_settings = dev / "agents" / "Sales.auto.tfvars"
+    source_capture = dev / "agents" / "Sales.space.json"
+    source_settings.rename(dev / "agents" / f"{source_name}.auto.tfvars")
+    source_capture.rename(dev / "agents" / f"{source_name}.space.json")
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+
+    with pytest.raises(AgentFileError, match="committed detached"):
+        agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+
+def test_promote_keeps_removed_capture_for_detached_source(tmp_path):
+    dev, prod = _promote_envs(tmp_path)
+    (dev / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = "dev-id"\nacl_groups = []\ndetached = true\n'
+    )
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert not (prod / "agents" / "Sales.space.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ["active", "deleted"])
+def test_governance_tombstone_refuses_agent_only_revival(tmp_path, mutation):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "agents").mkdir()
+    settings = prod / "agents" / "Sales.auto.tfvars"
+    settings.write_text('genie_space_id = ""\nacl_groups = []\ndetached = true\n')
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+    if mutation == "active":
+        settings.write_text('genie_space_id = ""\nacl_groups = ["anyone"]\n')
+    else:
+        settings.unlink()
+
+    with pytest.raises(AgentFileError, match="governance-reviewed PR"):
+        agent_promote.promote(dev, prod, {})
+
+
+def test_removing_governance_tombstone_allows_revival(tmp_path):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "ack.txt").write_text("")
+
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert agent_files.load(prod, "Sales")["acl_groups"] == ["sales_analysts"]
+
+
+def test_gap3_promote_checks_tombstone_when_source_has_no_agents(tmp_path):
+    dev = _env(tmp_path)
+    prod = _env(tmp_path, name="prod", Sales='genie_space_id = ""\nacl_groups = ["anyone"]\n')
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+
+    with pytest.raises(AgentFileError, match="governance-reviewed PR"):
+        agent_promote.promote(dev, prod, {})
+
+
+def test_gap2_release_plan_enforces_tombstone_without_capture(tmp_path):
+    prod = _env(tmp_path, name="prod", Sales='genie_space_id = ""\nacl_groups = ["anyone"]\n')
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+
+    with pytest.raises(ownership.AgentError, match="still retired"):
+        ownership.check_detach_acks(prod, "prod")
+
+
 # ── Prod ownership ───────────────────────────────────────────────────────────
 
 def _prod(tmp_path, settings='genie_space_id = ""\nacl_groups = ["a"]\n', payload=None) -> Path:
@@ -777,6 +879,42 @@ def test_the_release_receipt_records_each_agents_id_and_detach_state(tmp_path, m
     assert "prod-9" not in repo.git("show", "HEAD:aws/envs/prod/agents/Sales.auto.tfvars")
 
 
+def test_detached_receipt_tombstone_survives_the_next_real_receipt(tmp_path, monkeypatch):
+    from scripts import release_gate as rg
+
+    prod = _deterministic_prod(
+        tmp_path, monkeypatch, 'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+    stamps = iter(["2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z",
+                   "2026-01-01T00:00:02Z", "2026-01-01T00:00:02Z"])
+    monkeypatch.setattr(rg, "_now", lambda: next(stamps))
+    first = ownership.receipt_agents(prod)
+    _step9_receipt(prod, "c1", first)
+    (prod / "agents" / "Sales.auto.tfvars").unlink()
+    (prod / "agents" / "Sales.space.json").unlink()
+    second = ownership.receipt_agents(prod)
+    _step9_receipt(prod, "c2", second)
+
+    assert ownership.load_receipt(prod, "prod")["agents"]["Sales"]["lifecycle"] == "detached"
+
+
+def test_release_plan_refuses_old_receipt_reactivation_without_governance_ack(tmp_path, monkeypatch):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    _step9_receipt(prod, "c1", {"Sales": _released(detached=True, lifecycle="detached")})
+
+    with pytest.raises(ownership.AgentError, match="revive-agent:sales"):
+        ownership.plan(prod, "prod", tmp_path / "plan")
+
+
+def test_gap1_old_receipt_requires_ack_for_uncaptured_agent(tmp_path, monkeypatch):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    (prod / "agents" / "Sales.space.json").unlink()
+    _step9_receipt(prod, "c1", {"Sales": _released(detached=True, lifecycle="detached")})
+
+    with pytest.raises(ownership.AgentError, match="revive-agent:sales"):
+        ownership.check_detach_acks(prod, "prod")
+
+
 def test_release_plan_records_what_release_will_push_with_the_overwrite_report(tmp_path, monkeypatch, capsys):
     prod = _deterministic_prod(tmp_path, monkeypatch)
     (prod / "agents" / "New.auto.tfvars").write_text('acl_groups = ["a"]\n')
@@ -890,7 +1028,8 @@ def test_a_manifest_without_an_agent_plan_is_refused_when_agents_are_captured(tm
 def test_the_release_targets_carry_agents_through_the_manifest():
     makefile = (SHARED / "Makefile.shared").read_text()
     plan = makefile[makefile.index("\nrelease-plan:"):makefile.index("\n_release-plan-roots:")]
-    order = [plan.index(s) for s in ("$(_AGENT_OWNERSHIP) check-deletes", "_ENV_LOCK,release-plan",
+    order = [plan.index(s) for s in ("$(_AGENT_OWNERSHIP) check-deletes", "$(_AGENT_OWNERSHIP) check-detach",
+                                     "_ENV_LOCK,release-plan",
                                      "$(_AGENT_OWNERSHIP) restore-ids",
                                      "$(_AGENT_OWNERSHIP) guard-removals", "_release-plan-roots",
                                      "$(_AGENT_OWNERSHIP) plan", "manifest-write")]
@@ -919,7 +1058,7 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     calls = make.calls()
     agent_calls = [c[1] for c in calls if c[0] == "agents"]
-    assert agent_calls == ["check-deletes", "restore-ids", "guard-removals", "plan"]
+    assert agent_calls == ["check-deletes", "check-detach", "restore-ids", "guard-removals", "plan"]
     manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
     assert json.loads(manifest.read_text())["agents"] == {"agents": {}}
     make.reset()
@@ -934,6 +1073,37 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     first = flat.index("agents")
     assert first < flat.index("sync-tags") and first < flat.index("staged") and first < flat.index("runner")
     assert flat.index("runner") < len(flat) - flat[::-1].index("agents") - 1 < flat.index("verify-access")
+
+
+def test_make_release_plan_refuses_revived_tombstone_before_lock_or_plan(tmp_path, monkeypatch):
+    from scripts import release_gate as rg
+    from tests.test_release_gate import Repo
+    from tests.test_release_gate_make import Make, _no_lock
+
+    repo = Repo(tmp_path, monkeypatch)
+    repo.commit({
+        "aws/envs/prod/agents/Retired.auto.tfvars":
+            'genie_space_id = ""\nacl_groups = ["anyone"]\n',
+        "aws/envs/prod/ack.txt": "prod:detached-agent:retired\n",
+    })
+    make = Make(tmp_path, repo)
+    calls = make._recorder("agents")
+    real = SHARED / "scripts" / "agent_ownership.py"
+    wrapper = make._write(
+        "agents-wrapper",
+        f'#!/bin/sh\nif [ "$1" = check-detach ]; then exec {sys.executable} {real} "$@"; fi\n'
+        f'exec {calls} "$@"\n',
+    )
+    assert make("rehearse", "dev").returncode == 0
+    make.reset()
+
+    result = make("release-plan", "prod", stubs={"agent_ownership.py": str(wrapper)})
+
+    assert result.returncode != 0 and "still retired" in result.stderr, result.stdout + result.stderr
+    assert _no_lock(repo, "prod")
+    assert not rg.manifests_dir(repo.cloud, "prod").exists()
+    assert "_release-plan-roots" not in make.names()
+    assert not any(call[0] == "runner" and "plan" in call for call in make.calls())
 
 
 def test_make_release_fails_without_a_receipt_when_the_agent_push_fails(tmp_path, monkeypatch):
