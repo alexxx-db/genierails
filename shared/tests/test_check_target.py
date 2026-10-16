@@ -412,6 +412,28 @@ def test_id_only_agent_without_committed_tables_fails_closed_even_with_local_dis
     _assert_read_only(champion, before)
 
 
+def test_promotion_itself_refuses_the_ignored_discovery_without_the_committed_entry(champion, tmp_path):
+    # No scratch copy here: the ignored file is on disk where remap reads.
+    dev = _envs(champion) / "dev"
+    (dev / "generated" / "governed_tables.json").write_text(json.dumps({"tables": ["paycat.s.t"]}, indent=2) + "\n")
+    _commit(champion, "record without agent tables")
+    assert (dev / "data_access" / "discovered_uc_tables.auto.tfvars").is_file()
+    refusal = ("ERROR: no tables found for agent s1: envs/dev/generated/governed_tables.json has no "
+               "agent_tables entry for it; run `make generate ENV=dev` and commit generated/")
+    dest = tmp_path / "remap-dest"
+    dest.mkdir()
+
+    direct = subprocess.run([sys.executable, str(SHARED / "scripts" / "remap_env_config.py"), str(dev), str(dest),
+                             "paycat=ppay"], text=True, capture_output=True, env=_env(tmp_path))
+    before = _baseline(champion)
+    promote = _make(champion, tmp_path, "promote-to", "ENV=prod")
+
+    assert direct.returncode != 0 and refusal in direct.stdout, direct.stdout + direct.stderr
+    assert not (dest / "env.auto.tfvars").exists()
+    assert promote.returncode != 0 and refusal in promote.stdout, promote.stdout + promote.stderr
+    _assert_read_only(champion, before)
+
+
 LOCAL_ONLY = {
     # git-ignored: make generate's discovery, with a table the commit never saw
     "ignored": ("dev/data_access/discovered_uc_tables.auto.tfvars",

@@ -61,7 +61,19 @@ def _env(tmp_path, text, discovered=None, name="dev"):
         (env / "data_access" / "discovered_uc_tables.auto.tfvars").write_text(
             "discovered_uc_tables = " + json.dumps(tables) + "\n"
             "discovered_table_agents = {\n" + "".join(f"  {json.dumps(t)} = {json.dumps(o)}\n" for t, o in owners.items()) + "}\n")
+        if 'governance_mode = "deterministic"' in text:
+            _commit_attribution(env, discovered)
     return env
+
+
+def _commit_attribution(env, discovered):
+    """What make generate commits after discovery: each ID-only agent's tables under its ID."""
+    spaces = hcl2.loads((env / "env.auto.tfvars").read_text()).get("genie_spaces") or []
+    agent_tables = {s["genie_space_id"]: sorted(discovered[s.get("name") or s["genie_space_id"]])
+                    for s in spaces if s.get("genie_space_id") and not s.get("uc_tables")
+                    and (s.get("name") or s["genie_space_id"]) in discovered}
+    (env / "generated" / "governed_tables.json").write_text(json.dumps(
+        {"tables": sorted({t for ts in discovered.values() for t in ts}), "agent_tables": agent_tables}))
 
 
 AGENT_ENV = '''governance_mode = "deterministic"
@@ -139,6 +151,64 @@ def test_a_deterministic_agent_without_acl_groups_stops_the_run(tmp_path):
     assert tr.access_problems(env) == ["agent Sales has no acl_groups: list the groups that may run it ([] means nobody)"]
     env = _env(tmp_path, 'governance_mode = "deterministic"\ngenie_spaces = [{ name = "Sales", uc_tables = ["cat.sch.t"], acl_groups = [] }]\n')
     assert tr.access_problems(env) == []
+
+
+# An agent known only by ID: a clean clone has only the committed record.
+ID_ONLY_ENV = ('governance_mode = "deterministic"\naccess_tier_groups = ["raw", "partial", "full"]\n'
+               'genie_spaces = [{ genie_space_id = "s1", acl_groups = ["raw"] }]\n'
+               'table_readers = { "paycat.s.t" = ["raw"] }\n')
+ID_ONLY_REFUSAL = ("agent Payments: generated/governed_tables.json has no agent_tables entry for genie_space_id s1; "
+                   "run make generate ENV=dev and commit generated/")
+
+
+def _id_only(tmp_path, agent_tables):
+    env = _env(tmp_path, ID_ONLY_ENV)
+    (env / "generated" / "abac.auto.tfvars").write_text('genie_space_id_to_name = { s1 = "Payments" }\n')
+    record = {"tables": ["paycat.s.t"]} | ({"agent_tables": agent_tables} if agent_tables is not None else {})
+    (env / "generated" / "governed_tables.json").write_text(json.dumps(record))
+    return env
+
+
+def test_clean_clone_id_only_agent_takes_its_tables_from_the_committed_record(tmp_path):
+    env = _id_only(tmp_path, {"s1": ["paycat.s.t"]})
+    assert not (env / "data_access" / "discovered_uc_tables.auto.tfvars").exists()
+
+    assert tr.agents(env) == [{"name": "Payments", "acl_groups": ["raw"], "tables": ["paycat.s.t"]}]
+    assert tr.access_problems(env) == []
+    assert tr.main(["check", "--env-dir", str(env), "--command-name", "make release"]) == 0
+    resolved = ac.agent_tables(env, {"s1": {"name": "Payments", "groups": ["raw"], "tables": []}})
+    assert resolved["s1"]["tables"] == ["paycat.s.t"]
+
+
+def test_clean_clone_reads_the_record_not_a_stale_local_discovery(tmp_path):
+    env = _id_only(tmp_path, {"s1": ["paycat.s.t"]})
+    (env / "data_access" / "discovered_uc_tables.auto.tfvars").write_text(
+        'discovered_uc_tables = ["paycat.s.other"]\n'
+        'discovered_table_agents = { "paycat.s.other" = ["Payments"] }\n')
+
+    assert tr.agents(env)[0]["tables"] == ["paycat.s.t"]
+    assert tr.access_problems(env) == []
+
+
+@pytest.mark.parametrize("agent_tables", [None, {}, {"other": ["paycat.s.t"]}])
+@pytest.mark.parametrize("local_discovery", [False, True])
+def test_id_only_agent_without_a_committed_entry_is_refused(tmp_path, agent_tables, local_discovery):
+    env = _id_only(tmp_path, agent_tables)
+    if local_discovery:
+        # The ignored file on a laptop can't stand in for the committed record.
+        (env / "data_access" / "discovered_uc_tables.auto.tfvars").write_text(
+            'discovered_uc_tables = ["paycat.s.t"]\n'
+            'discovered_table_agents = { "paycat.s.t" = ["Payments"] }\n')
+
+    assert tr.access_problems(env) == [ID_ONLY_REFUSAL]
+    assert tr.main(["check", "--env-dir", str(env), "--command-name", "make release"]) == 1
+    assert ac.agent_tables(env, {"s1": {"name": "Payments", "groups": ["raw"], "tables": []}})["s1"]["tables"] == []
+
+
+def test_legacy_id_only_agent_still_takes_the_discovered_tables(tmp_path):
+    env = _env(tmp_path, 'genie_spaces = [{ name = "Sales", genie_space_id = "space-1", acl_groups = ["raw"] }]\n',
+               {"Sales": ["cat.sch.t"]})
+    assert tr.agents(env)[0]["tables"] == ["cat.sch.t"]
 
 
 def test_legacy_envs_are_not_refused_on_table_readers(tmp_path):
@@ -389,8 +459,8 @@ def test_run_is_a_no_op_for_legacy_envs(tmp_path):
 
 
 def test_run_adds_the_tables_generate_attributed_to_agents_known_by_id(tmp_path):
-    env = _env(tmp_path, AGENT_ENV, {"A": ["cat.sch.t"]})
-    value = {"fingerprint": "fp", "inputs": {"agents": {"a": {"name": "A", "groups": ["partial"], "tables": []}}}}
+    env = _env(tmp_path, AGENT_ENV, {"Sales": ["cat.sch.t"]})
+    value = {"fingerprint": "fp", "inputs": {"agents": {"sales": {"name": "Sales", "groups": ["partial"], "tables": []}}}}
     seen = []
 
     class Live(_FakeLive):

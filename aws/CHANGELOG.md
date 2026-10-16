@@ -88,8 +88,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A Genie agent configured only by `genie_space_id` promotes from a clean
   clone**: `make generate` (and `capture`) now also record such an agent's
   discovered tables in the committed `generated/governed_tables.json`, under
-  `agent_tables` keyed by its `genie_space_id`. `make promote-to` and
-  `make check` read them from there for a deterministic source, never from the
+  `agent_tables` keyed by its `genie_space_id`. `make promote-to`,
+  `make check` and the access and coverage checks of `make rehearse`,
+  `release-plan` and `release` read them from there in a deterministic env,
+  never from the
   git-ignored `data_access/discovered_uc_tables.auto.tfvars` or the Genie API,
   so CI and a fresh clone no longer fail with `no tables found for agent`.
   Without that entry they refuse with `run make generate ENV=dev and commit
