@@ -201,6 +201,7 @@ locals {
   # never needs it.
   agent_coverage_file = "${var.env_dir}/.agent_coverage.json"
   _discovered_file    = "${var.env_dir}/data_access/discovered_uc_tables.auto.tfvars"
+  _governed_file      = "${var.env_dir}/generated/governed_tables.json"
   deployment_binding = sha256(jsonencode({
     workspace_host = lower(trimsuffix(trimspace(var.databricks_workspace_host), "/"))
     workspace_id   = trimspace(var.databricks_workspace_id)
@@ -209,13 +210,16 @@ locals {
     version    = 1
     deployment = local.deployment_binding
     max_age    = var.coverage_gate_max_age
-    # Tables of agents known only by ID come from make generate's discovery.
+    # Tables of agents known only by ID come from make generate's discovery
+    # (legacy) or its committed record, keyed by genie_space_id (deterministic).
     discovered = fileexists(local._discovered_file) ? filesha256(local._discovered_file) : ""
+    committed  = fileexists(local._governed_file) ? filesha256(local._governed_file) : ""
     agents = {
       for key, space in local.merged_spaces : key => {
-        name   = space.name
-        groups = sort(distinct(space.config.acl_groups))
-        tables = sort(distinct(local._space_tables[key]))
+        name           = space.name
+        genie_space_id = space.genie_space_id
+        groups         = sort(distinct(space.config.acl_groups))
+        tables         = sort(distinct(local._space_tables[key]))
       }
     }
   }

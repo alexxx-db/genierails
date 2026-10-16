@@ -176,7 +176,7 @@ def test_clean_clone_id_only_agent_takes_its_tables_from_the_committed_record(tm
     assert tr.agents(env) == [{"name": "Payments", "acl_groups": ["raw"], "tables": ["paycat.s.t"]}]
     assert tr.access_problems(env) == []
     assert tr.main(["check", "--env-dir", str(env), "--command-name", "make release"]) == 0
-    resolved = ac.agent_tables(env, {"s1": {"name": "Payments", "groups": ["raw"], "tables": []}})
+    resolved = ac.agent_tables(env, {"s1": {"name": "Payments", "genie_space_id": "s1", "groups": ["raw"], "tables": []}})
     assert resolved["s1"]["tables"] == ["paycat.s.t"]
 
 
@@ -202,7 +202,48 @@ def test_id_only_agent_without_a_committed_entry_is_refused(tmp_path, agent_tabl
 
     assert tr.access_problems(env) == [ID_ONLY_REFUSAL]
     assert tr.main(["check", "--env-dir", str(env), "--command-name", "make release"]) == 1
-    assert ac.agent_tables(env, {"s1": {"name": "Payments", "groups": ["raw"], "tables": []}})["s1"]["tables"] == []
+    assert ac.agent_tables(env, {"s1": {"name": "Payments", "genie_space_id": "s1", "groups": ["raw"], "tables": []}})["s1"]["tables"] == []
+
+
+SAME_NAME_ENV = ('governance_mode = "deterministic"\naccess_tier_groups = ["raw", "partial", "full"]\n'
+                 'genie_spaces = [\n'
+                 '  { name = "Same", genie_space_id = "id-1", acl_groups = ["raw"] },\n'
+                 '  { name = "Same", genie_space_id = "id-2", acl_groups = ["raw"] },\n'
+                 ']\n'
+                 'table_readers = { "cat.s.*" = ["raw"] }\n')
+# Terraform keys colliding names apart (the second gets "--<genie_space_id>").
+SAME_NAME_INPUTS = {"same": {"name": "Same", "genie_space_id": "id-1", "groups": ["raw"], "tables": []},
+                    "same--id-2": {"name": "Same", "genie_space_id": "id-2", "groups": ["raw"], "tables": []}}
+
+
+def _same_name(tmp_path, agent_tables):
+    env = _env(tmp_path, SAME_NAME_ENV)
+    tables = sorted({t for ts in agent_tables.values() for t in ts})
+    (env / "generated" / "governed_tables.json").write_text(json.dumps({"tables": tables, "agent_tables": agent_tables}))
+    return env
+
+
+def test_agents_sharing_a_name_each_get_their_own_committed_tables(tmp_path):
+    env = _same_name(tmp_path, {"id-1": ["cat.s.one"], "id-2": ["cat.s.two"]})
+
+    assert [a["tables"] for a in tr.agents(env)] == [["cat.s.one"], ["cat.s.two"]]
+    assert tr.access_problems(env) == []
+    resolved = ac.agent_tables(env, SAME_NAME_INPUTS)
+    assert {key: agent["tables"] for key, agent in resolved.items()} == {
+        "same": ["cat.s.one"], "same--id-2": ["cat.s.two"]}
+
+
+def test_agent_sharing_a_name_without_its_own_committed_entry_is_refused(tmp_path):
+    env = _same_name(tmp_path, {"id-1": ["cat.s.one"]})
+
+    assert [a["tables"] for a in tr.agents(env)] == [["cat.s.one"], []]
+    assert tr.access_problems(env) == [
+        "agent Same: generated/governed_tables.json has no agent_tables entry for genie_space_id id-2; "
+        "run make generate ENV=dev and commit generated/"]
+    resolved = ac.agent_tables(env, SAME_NAME_INPUTS)
+    assert resolved["same"]["tables"] == ["cat.s.one"] and resolved["same--id-2"]["tables"] == []
+    results = ac.evaluate(resolved, _snapshot())
+    assert results["same--id-2"]["status"] == "fail"
 
 
 def test_legacy_id_only_agent_still_takes_the_discovered_tables(tmp_path):
@@ -460,7 +501,7 @@ def test_run_is_a_no_op_for_legacy_envs(tmp_path):
 
 def test_run_adds_the_tables_generate_attributed_to_agents_known_by_id(tmp_path):
     env = _env(tmp_path, AGENT_ENV, {"Sales": ["cat.sch.t"]})
-    value = {"fingerprint": "fp", "inputs": {"agents": {"sales": {"name": "Sales", "groups": ["partial"], "tables": []}}}}
+    value = {"fingerprint": "fp", "inputs": {"agents": {"sales": {"name": "Sales", "genie_space_id": "space-1", "groups": ["partial"], "tables": []}}}}
     seen = []
 
     class Live(_FakeLive):
