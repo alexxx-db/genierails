@@ -103,7 +103,8 @@ def snapshot(masks=("mask_ssn",), tags=(("t", "ssn", "class.ssn"),), grants=(), 
     return {"uc": {"cat": {
         "governed_tags": [{"catalog_name": "cat", "schema_name": "s", "table_name": t, "column_name": c,
                            "tag_name": "pii", "tag_value": v} for t, c, v in tags],
-        "mask_functions": [{"routine_catalog": "cat", "routine_schema": "s", "routine_name": m} for m in masks],
+        "mask_functions": [{"routine_catalog": "cat", "routine_schema": "s", "routine_name": m,
+                            "definition_hash": f"hash:{m}"} for m in masks],
         "abac_policies": [{"table": "cat.s.t", "policies": [{"name": "mask_ssn_p", "to_principals": ["account users"],
                            "except_principals": list(policy_except), "column_mask": {"function_name": "cat.s.mask_ssn"}}]}],
         "table_grants": [{"grantee": g, "privilege_type": "SELECT", "table_catalog": "cat", "table_schema": "s",
@@ -459,15 +460,14 @@ def test_live_snapshot_read_failures_are_errors_not_data(tmp_path, monkeypatch):
         driver.LiveSnapshotProvider(cloud, state).client("dev")
 
 
-def test_mask_snapshot_query_uses_portable_prefix_predicates(monkeypatch, tmp_path):
+def test_policy_function_snapshot_filters_names_in_python(monkeypatch, tmp_path):
     pytest.importorskip("hcl2")
     cloud = _env_files(tmp_path); seen = {}
     _fake_sdk(monkeypatch, seen)
     driver.LiveSnapshotProvider(cloud, tmp_path / "state").capture("prod")
     mask_sql = next(sql for sql in seen["statements"] if "information_schema.routines" in sql)
-    assert "startswith(routine_name, 'mask_')" in mask_sql
-    assert "startswith(routine_name, 'gr_mask_')" in mask_sql
-    assert " ESCAPE " not in mask_sql
+    assert "routine_definition" in mask_sql
+    assert "startswith" not in mask_sql and " LIKE " not in mask_sql and " ESCAPE " not in mask_sql
 
 
 def test_agent_ids_include_hcl_state_and_id_file(tmp_path):
@@ -545,6 +545,7 @@ def azure_legacy_mid_migration_snapshot(*, treatment="redact", policy_except=())
             "routine_catalog": catalog,
             "routine_schema": "dev_to_prod_demo",
             "routine_name": "mask_redact",
+            "definition_hash": "hash:mask_redact",
         }],
         "abac_policies": [{"table": table, "policies": [{
             "name": f"{catalog}_gr_mask_{catalog}_redact",
@@ -570,19 +571,71 @@ def test_unchanged_azure_legacy_never_raw_snapshot_is_not_weaker():
 def test_azure_legacy_never_raw_policy_gaining_exception_is_weaker():
     baseline = azure_legacy_mid_migration_snapshot()
     current = azure_legacy_mid_migration_snapshot(policy_except=("payments_ops",))
-    assert driver.protection_diff(baseline, current)["policies"] == [
+    assert driver.protection_diff(baseline, current) == {"policies": [
         "louis_serverless.dev_to_prod_demo.payments "
         "louis_serverless_gr_mask_louis_serverless_redact: newly exempts payments_ops"
-    ]
+    ]}
+
+
+def test_azure_legacy_policy_dropping_matched_value_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot(treatment="email_partial")
+    current["uc"]["louis_serverless"]["governed_tags"][0]["tag_value"] = "redact"
+    assert driver.protection_diff(baseline, current) == {"policies": [
+        "louis_serverless.dev_to_prod_demo.payments "
+        "louis_serverless_gr_mask_louis_serverless_redact: no longer matches redact"
+    ]}
+
+
+def test_live_policy_mask_function_definition_change_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    current["uc"]["louis_serverless"]["mask_functions"][0]["definition_hash"] = "changed"
+    assert driver.protection_diff(baseline, current) == {"masks": [
+        "louis_serverless.dev_to_prod_demo.mask_redact: definition changed"
+    ]}
+
+
+def test_live_policy_missing_definition_hash_is_weaker_when_snapshot_has_hashes():
+    baseline = snapshot(masks=("mask_ssn", "mask_other"))
+    current = snapshot(masks=("mask_ssn", "mask_other"))
+    current["uc"]["cat"]["mask_functions"][0].pop("definition_hash")
+    assert driver.protection_diff(baseline, current) == {"masks": [
+        "cat.s.mask_ssn: definition unreadable"
+    ]}
+
+
+def test_live_row_filter_function_definition_change_is_weaker():
+    baseline = snapshot(masks=("filter_restricted",), tags=())
+    baseline["uc"]["cat"]["abac_policies"][0]["policies"] = [{
+        "name": "restricted_rows",
+        "to_principals": ["account users"],
+        "except_principals": [],
+        "row_filter": {"function_name": "cat.s.filter_restricted"},
+    }]
+    current = json.loads(json.dumps(baseline))
+    current["uc"]["cat"]["mask_functions"][0]["definition_hash"] = "changed"
+    assert driver.protection_diff(baseline, current) == {"masks": [
+        "cat.s.filter_restricted: definition changed"
+    ]}
+
+
+def test_old_reports_without_definition_hashes_do_not_gain_findings():
+    baseline = snapshot()
+    current = snapshot()
+    for report in (baseline, current):
+        for routine in report["uc"]["cat"]["mask_functions"]:
+            routine.pop("definition_hash")
+    assert driver.protection_diff(baseline, current) == {}
 
 
 def test_azure_legacy_never_raw_replaced_by_raw_capable_treatment_is_weaker():
     baseline = azure_legacy_mid_migration_snapshot()
     current = azure_legacy_mid_migration_snapshot(treatment="email_partial")
-    assert driver.protection_diff(baseline, current)["columns"] == [
+    assert driver.protection_diff(baseline, current) == {"columns": [
         "louis_serverless.dev_to_prod_demo.payments.cvv "
         "gr_treatment never-raw redact -> email_partial"
-    ]
+    ]}
 
 
 def test_widened_grant_after_restore_fails(tmp_path, live):
@@ -978,7 +1031,9 @@ def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
 def test_d4_snapshot_query_includes_deterministic_masks():
     class Statement:
         def execute_statement(self, *, statement, **_):
-            assert "startswith(routine_name, 'gr_mask_')" in statement if "routines" in statement else True
+            if "routines" in statement:
+                assert "routine_definition" in statement
+                assert "startswith" not in statement and " LIKE " not in statement
             cols = [SimpleNamespace(name=n) for n in ("table_catalog", "table_schema", "table_name")]
             rows = [["cat", "s", "t"]] if "information_schema.tables" in statement else []
             return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
@@ -987,6 +1042,86 @@ def test_d4_snapshot_query_includes_deterministic_masks():
     client = SimpleNamespace(statement_execution=Statement(),
                              policies=SimpleNamespace(list_policies=lambda *_a, **_k: []))
     driver._sql_snapshots(client, "wh", "cat")
+
+
+@pytest.mark.parametrize("definition", [None, ""])
+def test_mask_snapshot_fails_closed_when_definition_is_unreadable(definition):
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type",
+                         "routine_definition")
+                rows = [["cat", "s", "mask_ssn", "FUNCTION", definition]]
+            elif "information_schema.tables" in statement:
+                names = ("table_catalog", "table_schema", "table_name")
+                rows = [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(
+                    columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: []))
+    with pytest.raises(RuntimeError, match=r"cat\.s\.mask_ssn: policy function definition is unreadable"):
+        driver._sql_snapshots(client, "wh", "cat")
+
+
+@pytest.mark.parametrize("routine_rows", [
+    pytest.param([], id="no-visible-routines"),
+    pytest.param([["cat", "s", "mask_other", "FUNCTION", "RETURN 'masked'"]],
+                 id="partial-routine-inventory"),
+])
+def test_policy_function_missing_from_routines_fails_closed(routine_rows):
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type",
+                         "routine_definition")
+                rows = routine_rows
+            elif "information_schema.tables" in statement:
+                names = ("table_catalog", "table_schema", "table_name")
+                rows = [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(
+                    columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    policy = SimpleNamespace(as_dict=lambda: {
+        "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: [policy]))
+    with pytest.raises(RuntimeError, match=r"cat\.s\.secure_rows: policy function definition is unreadable"):
+        driver._sql_snapshots(client, "wh", "cat")
+
+
+def test_mask_snapshot_hashes_definition_without_persisting_body():
+    body = "RETURN 'redacted'"
+
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type",
+                         "routine_definition")
+                rows = [["cat", "s", "secure_rows", "FUNCTION", body]]
+            elif "information_schema.tables" in statement:
+                names = ("table_catalog", "table_schema", "table_name")
+                rows = [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(
+                    columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    row_policy = SimpleNamespace(as_dict=lambda: {
+        "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: [row_policy]))
+    routine = driver._sql_snapshots(client, "wh", "cat")["mask_functions"][0]
+    assert routine["routine_name"] == "secure_rows"
+    assert routine["definition_hash"] == driver.hashlib.sha256(body.encode()).hexdigest()
+    assert "routine_definition" not in routine
 
 
 def _deterministic_snapshot(value, *, policy_value=None):
@@ -1145,7 +1280,10 @@ def test_migration_inherited_legacy_policy_on_untagged_table_is_excused_but_shar
     assert driver.protection_diff(before, after, allowed_adoptions=adoption) == {}
     # cat.s.u still masks with the legacy function: dropping it is a loss.
     after["uc"]["cat"]["abac_policies"].append({"table": "cat.s.u", "policies": [dict(legacy)]})
-    assert driver.protection_diff(before, after, allowed_adoptions=adoption) == {"masks": ["cat.s.mask_masked_email"]}
+    assert driver.protection_diff(before, after, allowed_adoptions=adoption) == {"masks": [
+        "cat.s.mask_masked_email",
+        "cat.s.mask_masked_email: definition unreadable",
+    ]}
 
 
 def test_migration_legacy_match_value_must_be_the_adopted_old_value():
