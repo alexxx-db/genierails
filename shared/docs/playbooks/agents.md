@@ -8,7 +8,8 @@ can read each table ([who owns which file](../pipelines.md#who-owns-which-file))
 
 ```bash
 # dev: curate the agent in the Genie UI, then
-make capture ENV=dev SPACE="Sales"     # writes envs/dev/agents/Sales.space.json, nothing else
+make capture ENV=dev SPACE="Sales"     # writes envs/dev/agents/Sales.space.json (deterministic mode also refreshes
+                                       #   the agent's tables in generated/governed_tables.json)
 make generate ENV=dev                  # only if its tables changed: their masks and the governed-table record
 make check ENV=dev                     # the PR check, locally
 git add envs/dev/ && git commit        # open a PR; after merge the dev pipeline rehearses it
@@ -125,7 +126,7 @@ make detach-agent ENV=prod SPACE="<agent>"   # forgets it from Terraform state; 
 | `not captured in dev yet` during `promote-to` | `make capture ENV=dev SPACE="<agent>"` first |
 | a field the Genie API rejects fails the release | fix it in the dev UI, capture, promote again; nothing is skipped silently |
 
-> **Optional AI helpers (coming in #150).** `make draft-genie-content SPACE=<agent>`
-> will draft instructions, sample questions and benchmarks for an agent that
-> has none, for you to review and commit. It isn't on `main` yet, and never
-> runs in CI or prod.
+> **Optional AI helper.** `make draft-genie-content ENV=dev SPACE=<agent>`
+> drafts instructions, sample questions and benchmarks for an agent that has
+> none, under `envs/dev/drafts/`, for you to review and commit. It's dev-only,
+> sends the model only schema, and never runs in CI or prod.
