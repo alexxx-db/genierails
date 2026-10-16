@@ -293,6 +293,35 @@ def test_s13_sets_ci_unsets_override_and_passes_on_exact_refusals(tmp_path, live
     assert report["status"] == "passed" and report["restored_lifecycle"] is False
 
 
+def test_missed_read_only_refusal_never_runs_applying_restore(tmp_path, live):
+    calls = live()  # The first s13 refusal unexpectedly exits zero.
+    assert driver.main(live_args(tmp_path, "s13"), snapshot_factory=FakeSnapshots) == 1
+    assert [argv[1] for argv in makes(calls)] == ["release-plan"]
+    assert json.loads((tmp_path / "reports/s13.json").read_text())["restored_lifecycle"] is False
+
+
+def test_read_only_drift_reports_manual_restore_and_stops(tmp_path, live):
+    class Drift(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            return snapshot(grants=("unexpected",) if self.n > 4 else ())
+    calls = live()
+    assert driver.main(live_args(tmp_path, "s13,migration"), snapshot_factory=Drift) == 1
+    report = json.loads((tmp_path / "reports/s13.json").read_text())
+    assert report["status"] == "RESTORE NEEDED"
+    assert report["manual_restore_commands"] == [
+        "make rehearse ENV=dev",
+        "make release-plan ENV=prod",
+        "make release ENV=prod MANIFEST=<path-from-release-plan>",
+        "make maintain ENV=prod",
+    ]
+    assert report["snapshot_diff"]
+    markdown = (tmp_path / "reports/s13.md").read_text()
+    assert "Manual restore required" in markdown and '"unexpected"' in markdown
+    assert [argv[1] for argv in makes(calls)] == ["release-plan"]
+    assert not (tmp_path / "reports/migration.json").exists()
+
+
 def test_missing_release_plan_manifest_errors_before_release(tmp_path, live, monkeypatch):
     calls = live(no_manifest=True)
     monkeypatch.setattr(driver, "governance_only_env", lambda *_: True)

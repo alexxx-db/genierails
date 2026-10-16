@@ -36,6 +36,12 @@ PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
 E2E_REMOTE = "genierails-e2e"
 E2E_BRANCH_PREFIX = "genierails-e2e/"
 MAX_RELEASE_PHASES = 8
+MANUAL_RESTORE_COMMANDS = (
+    "make rehearse ENV=dev",
+    "make release-plan ENV=prod",
+    "make release ENV=prod MANIFEST=<path-from-release-plan>",
+    "make maintain ENV=prod",
+)
 ANOTHER_RELEASE_PHASE = re.compile(r"(?:Release phase applied|needs? another release-plan)", re.I)
 IMPORT_UNSET_LOG = re.compile(
     r"(?im)(?:Cleared tag gr_treatment|gr_treatment.*(?:clearing tag|UNSET TAGS)|UNSET TAGS.*gr_treatment)"
@@ -75,6 +81,7 @@ class Step:
     action: str | None = None
     value: str | None = None
     assertions: tuple[str, ...] = ()
+    refusal_in_ci: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +94,7 @@ class Scenario:
     restore: tuple[str, ...]
     requires: tuple[str, ...] = ()
     known_failure: str | None = None
+    read_only: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,11 +107,11 @@ class Adoption:
 def mk(name: str, target: str, env: str | None = None, *,
        args: Sequence[str] = (), fail: bool = False, refusal: str | None = None,
        extra_env: Mapping[str, str | None] | None = None,
-       assertions: Sequence[str] = ()) -> Step:
+       assertions: Sequence[str] = (), refusal_in_ci: bool = True) -> Step:
     command = ("make", target) + ((f"ENV={env}",) if env else ()) + tuple(args)
     return Step(name, command, env, target, expect_failure=fail, refusal=refusal,
                 extra_env=tuple((extra_env or {}).items()),
-                assertions=tuple(assertions))
+                assertions=tuple(assertions), refusal_in_ci=refusal_in_ci)
 
 
 def action(name: str, kind: str, value: str | None = None) -> Step:
@@ -153,8 +161,10 @@ DAY2 = (
 
 
 def _scenario(key: str, title: str, pre: Sequence[str], lead: Sequence[Step], passed: Sequence[str],
-              restore: Sequence[str], requires: Sequence[str] = (), known_failure: str | None = None) -> Scenario:
-    return Scenario(key, title, tuple(pre), tuple(lead), tuple(passed), tuple(restore), tuple(requires), known_failure)
+              restore: Sequence[str], requires: Sequence[str] = (), known_failure: str | None = None,
+              read_only: bool = False) -> Scenario:
+    return Scenario(key, title, tuple(pre), tuple(lead), tuple(passed), tuple(restore), tuple(requires),
+                    known_failure, read_only)
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -202,18 +212,18 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Gap is reported and every principal sees never-raw redaction; new access is blocked.",),
         ("Promote a reviewed mapping or remove the fixture tag/column; prove no stale fail-safe policy.",)),
     _scenario("s6", "table_readers widening requires acknowledgement", ("Prepare a prod-owned reader widening with stale coverage and no matching ack.",),
-        (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", fail=True, refusal=REFUSALS["weakening"]),
+        (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", fail=True, refusal=REFUSALS["weakening"], refusal_in_ci=False),
          action("Write exact reviewed acknowledgement", "add_ack", "ack_entry"),
          action("Commit and merge acknowledgement on the driver's local main", "local_merge")) + DAY2,
         ("Negative plan creates no applicable manifest; exact reviewed ack permits only the named grant.",),
         ("Revert reader and acknowledgement through lifecycle; verify only GenieRails-owned SELECT is revoked.",)),
     _scenario("s7", "Detach agent", ("A is released, detached=true and acl_groups=[] have been released.",),
-        (mk("Refuse wrong commit/agent", "detach-agent", "prod", args=("SPACE={wrong_agent}",), fail=True, refusal=REFUSALS["detach"]),
+        (mk("Refuse wrong commit/agent", "detach-agent", "prod", args=("SPACE={wrong_agent}",), fail=True, refusal=REFUSALS["detach"], refusal_in_ci=False),
          mk("Detach A state only", "detach-agent", "prod", args=("SPACE={agent_a}",))) + DAY2[:2],
         ("Only A resource addresses leave state; live space, conversations, grants and masks remain.",),
         ("Use documented adoption/reattachment; otherwise retain disposable agent for explicit cleanup.",)),
     _scenario("s8", "Stop governing a table", ("Disposable table is in governed list; prepare each covering-source negative case.",),
-        (mk("Refuse while covered", "ungovern", "dev", args=("TABLE={table}", "YES=1"), fail=True, refusal=REFUSALS["covered"]),
+        (mk("Refuse while covered", "ungovern", "dev", args=("TABLE={table}", "YES=1"), fail=True, refusal=REFUSALS["covered"], refusal_in_ci=False),
          mk("Edit governed list", "ungovern", "dev", args=("TABLE={uncovered_table}", "YES=1")), AUTHOR_MERGE) + DAY2,
         ("Every coverage source is named/refused; only reviewed lifecycle removes policies/tags.",),
         ("Re-add via uc_tables/agent/readers and lifecycle, or drop disposable table.",)),
@@ -223,16 +233,18 @@ SCENARIOS: tuple[Scenario, ...] = (
     _scenario("s10", "Stale promotion PR refusal", ("Create promotion at M1, advance main to M2 and leave promotion stale.",),
         (mk("Refuse stale generated output", "promote-to", "prod", args=("CHECK=1",), fail=True, refusal=REFUSALS["stale"]),
          mk("Refuse stale prod check", "check", "prod", fail=True, refusal=REFUSALS["stale"])),
-        ("Scratch regeneration differs and checks fail without workspace mutation.",), ("Delete simulator branches/worktrees.",)),
+        ("Scratch regeneration differs and checks fail without workspace mutation.",), ("Delete simulator branches/worktrees.",),
+        read_only=True),
     _scenario("s11", "Release refuses unrehearsed or older commit", ("Fixture receipts model U, N and ancestor O around last release R.",),
         (action("Checkout unrehearsed U", "checkout_value", "u"),
-         mk("Refuse candidate provenance", "release-plan", "prod", fail=True, refusal=REFUSALS["plan_provenance"]),
+         mk("Refuse candidate provenance", "release-plan", "prod", fail=True, refusal=REFUSALS["plan_provenance"], refusal_in_ci=False),
          action("Checkout older O", "checkout_value", "o"),
-         mk("Refuse foreign manifest", "release", "prod", args=("MANIFEST={manifest}",), fail=True, refusal=REFUSALS["release_provenance"])),
-        ("Unrehearsed, dirty, off-main, older and mismatched-manifest cases refuse with no mutation.",), ("Remove negative-case branches only.",)),
+         mk("Refuse foreign manifest", "release", "prod", args=("MANIFEST={manifest}",), fail=True, refusal=REFUSALS["release_provenance"], refusal_in_ci=False)),
+        ("Unrehearsed, dirty, off-main, older and mismatched-manifest cases refuse with no mutation.",), ("Remove negative-case branches only.",),
+        read_only=True),
     _scenario("s12", "Maintain refuses off released commit", ("Release receipt points to R while main is R+1.",),
         (action("Checkout R+1", "checkout_value", "r_plus_1"),
-         mk("Refuse R+1", "maintain", "prod", fail=True, refusal=REFUSALS["maintain_provenance"]),
+         mk("Refuse R+1", "maintain", "prod", fail=True, refusal=REFUSALS["maintain_provenance"], refusal_in_ci=False),
          action("Checkout exact release R", "checkout_value", "r"), mk("Maintain exact R", "maintain", "prod")),
         ("Off-receipt/dirty/digest mismatch refuse before mutation; exact R is governance-only.",), ("Return persistent checkout to requested commit.",)),
     _scenario("s13", "CI apply guard", ("No authorized pipeline provenance; CI=true is set by the scenario fixture.",),
@@ -245,7 +257,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         (mk("Refuse CI release", "release", "prod", args=("MANIFEST=/tmp/genierails-ci-guard-fixture.json",),
             fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),) +
         (mk("Refuse CI account apply", "apply-account", fail=True, refusal=REFUSALS["ci"], extra_env=CI_ENV),),
-        ("Every unauthorized apply fails with zero API calls and unchanged state/locks; authoring/check remain usable.",), ("Unset CI markers.",)),
+        ("Every unauthorized apply fails with zero API calls and unchanged state/locks; authoring/check remain usable.",), ("Unset CI markers.",),
+        read_only=True),
     _scenario("s14", "Governance-only environment", ("Test env has prefixed uc_tables, no agent files/IDs, initially no table_readers.",),
         (mk("Setup", "setup", "dev"), mk("Generate governance only", "generate", "dev"), AUTHOR_MERGE) + DAY2,
         ("No Genie resource/CAN_RUN is created; first run grants no SELECT, reviewed second run grants only table_readers.",),
@@ -260,13 +273,13 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Overwrite report names drift; config equals Git after remap; ID/conversations remain; no recreation.",),
         ("Restore desired content via dev UI, capture and lifecycle.",)),
     _scenario("manifest", "Manifest tamper and concurrency refusals", ("Disposable fixtures and an approved manifest exist.",),
-        (mk("Refuse tampered manifest", "release", "prod", args=("MANIFEST={tampered_manifest}",), fail=True, refusal=REFUSALS["tamper"]),),
+        (mk("Refuse tampered manifest", "release", "prod", args=("MANIFEST={tampered_manifest}",), fail=True, refusal=REFUSALS["tamper"], refusal_in_ci=False),),
         ("Commit, plan bytes, serial, live snapshot and kept-name changes each invalidate the old manifest; locks serialize applies.",),
-        ("Remove each external grant/mask through its owning fixture immediately.",)),
+        ("Remove each external grant/mask through its owning fixture immediately.",), read_only=True),
     _scenario("migration", "Legacy migration operations", ("Reviewed report-only legacy fixture and revocation report exist.",),
         (mk("Migration report", "migrate-plan", "prod"),),
         ("Every column/reader consequence and proposed table_readers entry is reported without mutation.",),
-        ("Nothing to restore; migrate-plan is report-only.",)),
+        ("Nothing to restore; migrate-plan is report-only.",), read_only=True),
     _scenario("migration-cutover", "Legacy migration cutover", (
         "Reviewed pending legacy migration fixture exists in dev and prod.",
     ), (
@@ -745,8 +758,13 @@ def write_report(out: Path, scenario: Scenario, payload: Mapping[str, Any], secr
         lines.append(f"- `{item['status']}` {item['name']}: {item.get('command') or item.get('action') or 'human gate'} ({detail})")
     lines += ["", "## Pass criteria", ""] + [f"- {x}" for x in scenario.pass_criteria]
     lines += ["", "## Restore", ""] + [f"- {x}" for x in scenario.restore]
+    if clean.get("manual_restore_commands"):
+        lines += ["", "## Manual restore required", ""]
+        lines += [f"- `{command}`" for command in clean["manual_restore_commands"]]
     diff = clean.get("snapshot_diff", {})
     lines += ["", "## Snapshot comparison", "", f"Changed top-level components: {', '.join(diff) if diff else 'none'}", ""]
+    if diff:
+        lines += ["```json", json.dumps(diff, indent=2, sort_keys=True, default=str), "```", ""]
     (out / f"{scenario.key}.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1288,6 +1306,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             manifest = values.get("manifest", "")
             release_plan_output = ""
             mutated = False
+            restored_lifecycle = False
+            manual_restore_commands: list[str] = []
             stop = False
             confirmations: list[dict[str, str]] = []
             allowed_adoptions: dict[str, dict[str, Adoption]] = {}
@@ -1317,7 +1337,10 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     # held with an unchanged snapshot takes the assumption back.
                     prior_mutated = mutated
                     mutated |= applying or step.target == "ungovern"
-                    result = runner.run(argv2, f"{label}-{step.name}", dict(step.extra_env))
+                    step_env = dict(step.extra_env)
+                    if step.expect_failure and step.refusal and step.refusal_in_ci:
+                        step_env = {**CI_ENV, **step_env}
+                    result = runner.run(argv2, f"{label}-{step.name}", step_env)
                     item["exit_code"] = result.returncode
                     if step.target == "migrate-plan" and not step.expect_failure:
                         ok = result.returncode in (0, 1) and "=== Migration dry run" in result.stdout and "Result:" in result.stdout
@@ -1406,8 +1429,19 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     if before:
                         if not after:
                             after = capture()
-                        if mutated:
+                        read_only_diff = snapshot_diff(before, after) if scenario.read_only else {}
+                        if scenario.read_only and read_only_diff:
+                            scenario_status = "RESTORE NEEDED"
+                            failed = True
+                            stop = True
+                            manual_restore_commands = list(MANUAL_RESTORE_COMMANDS)
+                            error_message = "; ".join(filter(None, (
+                                error_message,
+                                "read-only/refusal-only scenario changed the snapshot; no automatic apply was attempted",
+                            )))
+                        elif mutated and not scenario.read_only:
                             _restore_baseline(runner, repo, targets, scenario.key)
+                            restored_lifecycle = True
                         elif repo.main_tip != repo.baseline:
                             # An unreleased local merge must not leak into the
                             # next scenario's main.
@@ -1417,7 +1451,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         restored = capture()
                         weak_restore = protection_diff_envs(before, restored, include_grants=True,
                                                             allowed_adoptions=allowed_adoptions)
-                        if weak_restore:
+                        if weak_restore and not scenario.read_only:
                             scenario_status = "RESTORE FAILED"; failed = True
                             error_message = "; ".join(filter(None, (error_message, f"protection not restored: {weak_restore}")))
                 except BaseException as exc:
@@ -1434,7 +1468,9 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                 payload = {"scenario": scenario.key, "status": scenario_status, "error": error_message,
                            "known_failure": scenario.known_failure,
                            "cloud": args.cloud, "commit": args.commit, "steps": plan, "confirmations": confirmations,
-                           "before": before, "after": after, "restored": restored, "restored_lifecycle": mutated,
+                           "before": before, "after": after, "restored": restored,
+                           "restored_lifecycle": restored_lifecycle,
+                           "manual_restore_commands": manual_restore_commands,
                            "snapshot_diff": snapshot_diff(before, after) if before and after else {},
                            "refusal_snapshot_diffs": refusal_diffs,
                            "successful_step_snapshot_diffs": successful_step_diffs}
