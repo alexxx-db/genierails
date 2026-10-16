@@ -9,8 +9,9 @@ promote-check  make promote-to ENV=<env> CHECK=1: rerun promote-to from the
                committed files and fail if its output differs.
 
 Every step runs make in a scratch copy of the cloud dir. The copy holds the
-env files a commit carries, never credentials, Terraform state or runtime
-records, so steps can't read live prod or prod state, and whatever they write
+env files git tracks, never git-ignored or untracked files, credentials,
+Terraform state or runtime records, so a local-only file can't change the
+result, steps can't read live prod or prod state, and whatever they write
 lands in the scratch dir, which is deleted afterwards. Nothing under envs/ is
 written, no Databricks write API is called and no applying target runs, so
 both commands are safe under CI=true and never trip the CI apply guard.
@@ -131,11 +132,38 @@ def _assert_contained(root: Path) -> None:
             raise CheckFailed(f"scratch copy path {path} is a symlink or resolves outside {real_root}")
 
 
-def _ignore_runtime(envs: Path):
-    def ignore(directory: str, names: list[str]) -> set[str]:
-        base = Path(directory).relative_to(envs)
-        return {name for name in names if _not_copied(base / name) or _is_scaffold_link(envs, base / name)}
-    return ignore
+def _tracked_env_files(envs: Path) -> list[Path]:
+    """Every file git tracks under envs/, relative to it (working-tree content).
+
+    Git-ignored and untracked files never reach the copy, so a local-only file
+    (such as the ignored discovery file make generate writes) can't make the
+    check pass on a laptop and fail in CI, or the other way round.
+    """
+    try:
+        listed = subprocess.run(["git", "-C", str(envs), "ls-files", "-z", "--", "."],
+                                capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = (getattr(exc, "stderr", None) or b"").decode(errors="replace").strip()
+        raise CheckFailed(f"cannot list the files git tracks under {envs}: {detail or exc}; "
+                          "make check runs in a git checkout") from exc
+    files = [Path(os.fsdecode(raw)) for raw in listed.split(b"\0") if raw]
+    if not files and any(envs.iterdir()):
+        raise CheckFailed(f"git tracks no file under {envs} (is envs/ git-ignored?); make check reads only "
+                          "committed env files. Commit envs/ (make setup ENV=<env> GITIGNORE=customer "
+                          "writes a .gitignore that keeps runtime files out).")
+    return files
+
+
+def _copy_tracked_envs(source: Path, dest: Path) -> None:
+    """Copy the tracked env files, minus runtime files and the scaffold link."""
+    dest.mkdir()
+    for rel in _tracked_env_files(source):
+        src = source / rel
+        if _not_copied(rel) or _is_scaffold_link(source, rel) or not src.is_file():
+            continue  # a tracked file deleted in the working tree is not copied either
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
 
 
 def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
@@ -153,7 +181,7 @@ def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
 
 
 class Scratch:
-    """A throwaway cloud dir whose envs/ copies the real one minus runtime files."""
+    """A throwaway cloud dir whose envs/ copies the tracked env files minus runtime files."""
 
     def __init__(self, cloud_dir: Path, makefile: Path, make_bin: str):
         self.real_envs = cloud_dir / "envs"
@@ -166,8 +194,7 @@ class Scratch:
             shutil.copyfile(makefile, self.cloud / "Makefile")
             self.envs = self.cloud / "envs"
             if self.real_envs.is_dir():
-                shutil.copytree(self.real_envs, self.envs, symlinks=False,
-                                ignore=_ignore_runtime(self.real_envs))
+                _copy_tracked_envs(self.real_envs, self.envs)
             else:
                 self.envs.mkdir()
             _assert_contained(self.root)

@@ -5,6 +5,12 @@ Reads source env.auto.tfvars, remaps catalog names, and writes dest env.auto.tfv
 When genie_space_id is set but uc_tables/name are missing, queries the Genie API
 to discover them (using include_serialized_space=true).
 
+A deterministic source is promoted from committed files only: an agent
+configured only by genie_space_id takes its tables from the agent_tables entry
+make generate commits in generated/governed_tables.json. The git-ignored
+discovery file and the Genie API are never read, so a clean clone or CI
+promotes exactly what a laptop does.
+
 Usage:
     python remap_env_config.py <source_env_dir> <dest_env_dir> <catalog_map>
 
@@ -29,6 +35,7 @@ from scripts.footprint import (
     resolve_footprint,
 )
 from scripts.remap_generated_config import remap_hcl
+from scripts.sticky_governance import committed_agent_tables
 from deployer_identity import (DeployerIdentityError as _DeployerIdentityError,
                                promotion_deployers as _promotion_deployers,
                                validation_errors as _deployer_errors)
@@ -268,8 +275,12 @@ def main():
     try:
         cfg = load_hcl(Path(source_env_dir) / "env.auto.tfvars")
         spaces = cfg.get("genie_spaces", [])
-        effective_tables = resolve_footprint(source_env_dir)
-        discovered_tables, discovered_agents = load_discovered_footprint(source_env_dir)
+        pure = cfg.get("governance_mode") == "deterministic"
+        effective_tables = resolve_footprint(source_env_dir, discovered=not pure)
+        discovered_tables, discovered_agents = (
+            ([], {}) if pure else load_discovered_footprint(source_env_dir)
+        )
+        committed_agents = committed_agent_tables(Path(source_env_dir)) if pure else {}
     except FootprintError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
@@ -309,13 +320,28 @@ def main():
             if canonical_name:
                 space["name"] = canonical_name
 
-    # Enrich spaces from persisted discovery first; query the API only as a
-    # last resort when a configured space still has no attributable tables.
+    # A deterministic source takes an ID-only agent's tables from the committed
+    # record, or refuses. A legacy one enriches spaces from persisted discovery
+    # first and queries the API only as a last resort.
     api_resolved_tables: list[str] = []
     for space in spaces:
         space_id = _str(space.get("genie_space_id", ""))
         name = _str(space.get("name", ""))
         uc_tables = space.get("uc_tables") or []
+
+        if not uc_tables and pure:
+            uc_tables = list(committed_agents.get(space_id) or [])
+            if uc_tables:
+                space["uc_tables"] = uc_tables
+                effective_tables.extend(t for t in uc_tables if t not in effective_tables)
+                print(f"  Resolved {len(uc_tables)} committed table(s) for {name or space_id}")
+            else:
+                print(
+                    f"ERROR: no tables found for agent {space_id or name or '<unknown>'}: "
+                    f"envs/{source_env}/generated/governed_tables.json has no agent_tables "
+                    f"entry for it; run `make generate ENV={source_env}` and commit generated/"
+                )
+                sys.exit(1)
 
         if not uc_tables and name:
             uc_tables = [
@@ -331,7 +357,7 @@ def main():
             uc_tables = list(discovered_tables)
             space["uc_tables"] = uc_tables
 
-        if space_id and (not name or not uc_tables):
+        if space_id and not pure and (not name or not uc_tables):
             print(f"  Querying Genie agent {space_id} for name/tables...")
             api_title, api_tables = _discover_from_genie_api(space_id, auth_cfg)
             if not name and api_title:

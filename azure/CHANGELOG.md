@@ -62,6 +62,22 @@
   no longer writes REVIEW stubs into `shared/` for those envs (legacy envs are
   unchanged).
 
+### Fixed
+
+- **A Genie agent configured only by `genie_space_id` promotes from a clean
+  clone**: `make generate` (and `capture`) now also record such an agent's
+  discovered tables in the committed `generated/governed_tables.json`, under
+  `agent_tables` keyed by its `genie_space_id`. `make promote-to` and
+  `make check` read them from there for a deterministic source, never from the
+  git-ignored `data_access/discovered_uc_tables.auto.tfvars` or the Genie API,
+  so CI and a fresh clone no longer fail with `no tables found for agent`.
+  Without that entry they refuse with `run make generate ENV=dev and commit
+  generated/`. `make check` and `make promote-to CHECK=1` now copy only the
+  env files git tracks into their scratch copy, so an ignored or untracked
+  local file can't change their result. Legacy envs and inline agents that
+  list `uc_tables` are unchanged. **Upgrade:** for an env whose agent is given
+  by ID only, run `make generate ENV=dev` and commit `generated/`.
+
 ### Removed
 
 - **`make certify`**: removed. It had become an alias for `make release`, which

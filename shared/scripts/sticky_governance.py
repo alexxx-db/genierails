@@ -14,6 +14,12 @@ this governance-owned record is rewritten from it on every generate, capture
 and promote-to, so any agent change to its tables, even one with no classified
 column, is a diff in a governance-owned file, and make check fails while it is
 stale. Nothing reads it to grant access: SELECT comes only from table_readers.
+
+An inline agent configured only by genie_space_id is listed under that ID.
+Its tables come from the discovery make generate writes to the git-ignored
+data_access/discovered_uc_tables.auto.tfvars; this record is the committed
+copy promote-to reads, so a clean clone or CI promotes the same tables. With
+no discovery present, the committed entry is kept as is.
 """
 
 from __future__ import annotations
@@ -34,7 +40,8 @@ SHARED = Path(__file__).resolve().parents[1]
 if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
 
-from scripts.footprint import FootprintError, load_env_config, resolve_footprint  # noqa: E402
+from scripts.footprint import (FootprintError, load_discovered_footprint, load_env_config,  # noqa: E402
+                               resolve_footprint)
 from scripts.state_layout import state_json  # noqa: E402
 
 MANIFEST = Path("generated/governed_tables.json")
@@ -205,8 +212,55 @@ def rebuild(env_dir: Path) -> list[str]:
     return tables
 
 
+def committed_agent_tables(env_dir: Path) -> dict[str, list[str]]:
+    """The agent_tables the record holds now ({} when it has none)."""
+    try:
+        raw = json.loads((Path(env_dir) / MANIFEST).read_text())
+    except (OSError, ValueError):
+        return {}
+    value = raw.get("agent_tables") if isinstance(raw, dict) else None
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: list(tables) for key, tables in value.items()
+        if isinstance(tables, list) and all(isinstance(t, str) and _is_table(t) for t in tables)
+    }
+
+
+def _id_only_tables(env_dir: Path, catalog: str) -> dict[str, list[str]]:
+    """genie_space_id -> tables of each inline agent configured without uc_tables."""
+    cfg = _load_hcl(Path(env_dir) / "env.auto.tfvars")
+    spaces = [s for s in cfg.get("genie_spaces") or [] if isinstance(s, dict)]
+    id_only = [s for s in spaces if str(s.get("genie_space_id") or "").strip() and not s.get("uc_tables")]
+    if not id_only:
+        return {}
+    id_to_name = _load_hcl(Path(env_dir) / "generated/abac.auto.tfvars").get("genie_space_id_to_name") or {}
+    try:
+        discovered, owners = load_discovered_footprint(env_dir)
+    except FootprintError as exc:
+        raise GovernedTablesError(str(exc)) from exc
+    committed = committed_agent_tables(env_dir)
+    found = {}
+    for space in id_only:
+        space_id = str(space["genie_space_id"]).strip()
+        names = {space_id, str(space.get("name") or id_to_name.get(space_id) or "").strip()} - {""}
+        tables = [table for table, agents in owners.items() if names & set(agents or [])]
+        if not tables and not owners and len(spaces) == 1:
+            tables = discovered  # single-agent discovery records no attribution
+        qualified = []
+        for table in tables:
+            parts = table.strip().split(".")
+            qualified.append(".".join([catalog] + parts if len(parts) == 2 and catalog else parts))
+        if qualified:
+            found[space_id] = _unique(qualified)
+        elif committed.get(space_id):
+            found[space_id] = committed[space_id]
+    return found
+
+
 def agent_tables(env_dir: Path) -> dict[str, list[str]]:
-    """Each file-defined agent's tables (agents/<agent>.*), fully qualified."""
+    """Each file-defined agent's tables (agents/<agent>.*) by name, and each
+    ID-only inline agent's by genie_space_id, fully qualified."""
     from agent_files import AgentFileError, load_all
     try:
         agents = load_all(Path(env_dir))
@@ -220,6 +274,7 @@ def agent_tables(env_dir: Path) -> dict[str, list[str]]:
             parts = table.strip().split(".")
             tables.append(".".join([catalog] + parts if len(parts) == 2 and catalog else parts))
         found[agent["name"]] = _unique(tables)
+    found.update(_id_only_tables(env_dir, catalog))
     return found
 
 
@@ -236,7 +291,7 @@ def _records_agents(env_dir: Path, agents: dict) -> bool:
 def save_governed_tables(env_dir: Path, tables: Iterable[str]) -> None:
     path = Path(env_dir) / MANIFEST
     record = {"tables": _unique(tables)}
-    # An env whose agents are all inline (the legacy layout) keeps the record
+    # An env whose agents are all inline with listed uc_tables keeps the record
     # it had: their tables are already in the governance-owned env.auto.tfvars.
     agents = agent_tables(env_dir)
     if _records_agents(env_dir, agents):

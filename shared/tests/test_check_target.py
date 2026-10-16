@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import hcl2
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +48,13 @@ MASKING_SQL = '''USE CATALOG paycat;
 USE SCHEMA s;
 CREATE OR REPLACE FUNCTION mask_account_number(v STRING) RETURNS STRING RETURN CONCAT('****', RIGHT(v, 4));
 '''
-GITIGNORE = "auth.auto.tfvars\n*.tfstate*\n.terraform/\n.*.json\n!.genie_space_id\nclassification.auto.tfvars\n"
+GITIGNORE = ("auth.auto.tfvars\n*.tfstate*\n.terraform/\n.*.json\n!.genie_space_id\nclassification.auto.tfvars\n"
+             "discovered_uc_tables.auto.tfvars\n")
+# The champion template: the agent is given by ID only, and make generate
+# discovers its tables into the git-ignored data_access file.
+CHAMPION_ENV = DEV_ENV.replace(', uc_tables = ["paycat.s.t"]', "")
+DISCOVERED = ('discovered_uc_tables = ["paycat.s.t"]\n'
+              'discovered_table_agents = { "paycat.s.t" = ["Payments"] }\n')
 
 
 def _b64(value):
@@ -97,13 +104,20 @@ def _snapshot(envs):
 @pytest.fixture
 def repo(tmp_path):
     """A committed dev env: generate output plus the split promote writes."""
+    return _build(tmp_path, DEV_ENV)
+
+
+def _build(tmp_path, dev_env, discovered=None):
     repo = tmp_path / "repo"
     dev = repo / "aws" / "envs" / "dev"
     (dev / "generated").mkdir(parents=True)
     (repo / "aws" / "envs" / "account").mkdir()
     shutil.copy2(ROOT / "aws" / "Makefile", repo / "aws" / "Makefile")
     (repo / "shared").symlink_to(SHARED)
-    (dev / "env.auto.tfvars").write_text(DEV_ENV)
+    (dev / "env.auto.tfvars").write_text(dev_env)
+    if discovered:
+        (dev / "data_access").mkdir()
+        (dev / "data_access" / "discovered_uc_tables.auto.tfvars").write_text(discovered)
     (dev / "generated" / "abac.auto.tfvars").write_text(DEV_GENERATED)
     (dev / "generated" / "masking_functions.sql").write_text(MASKING_SQL)
     (repo / ".gitignore").write_text(GITIGNORE)
@@ -112,12 +126,18 @@ def repo(tmp_path):
     (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
     (bin_dir / "terraform").chmod(0o755)
     assert _make(repo, tmp_path, "promote", "ENV=dev").returncode == 0
-    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
-                    "--env-dir", str(dev), "--config", str(dev / "generated" / "abac.auto.tfvars")], check=True)
+    _record(dev)
     _git(repo, "init", "-q")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "dev")
     return repo
+
+
+def _record(env_dir):
+    """What make generate (dev) or a release (prod) leaves in generated/governed_tables.json."""
+    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
+                    "--env-dir", str(env_dir), "--config", str(env_dir / "generated" / "abac.auto.tfvars")],
+                   check=True)
 
 
 def _commit(repo, message):
@@ -127,6 +147,10 @@ def _commit(repo, message):
 
 @pytest.fixture
 def promoted(repo, tmp_path):
+    return _promote(repo, tmp_path)
+
+
+def _promote(repo, tmp_path):
     prod = _envs(repo) / "prod"
     prod.mkdir()
     (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n'
@@ -325,6 +349,118 @@ def test_promote_check_never_reads_prod_state_or_credentials(promoted, tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
     _assert_read_only(promoted, before)
+
+
+# -- Only committed files decide the result -----------------------------------
+
+def _assert_check_prod_passes_offline(result):
+    # Steps 1-5 pass offline; the plan (6) needs prod's live classification config.
+    out = result.stdout + result.stderr
+    assert "OK: promote-to ENV=prod CHECK=1: committed files match." in out, out
+    assert "OK: generated files (envs/prod): committed files match." in out, out
+    assert "--- check 6/6: plan ---" in out, out
+    assert result.returncode == 0 or "=== make check ENV=prod: FAILED (plan) ===" in out, out
+
+
+@pytest.fixture
+def champion(tmp_path):
+    """Dev configured by agent ID only, generated with the ignored discovery present, promoted, committed."""
+    repo = _promote(_build(tmp_path, CHAMPION_ENV, DISCOVERED), tmp_path)
+    _record(_envs(repo) / "prod")
+    _commit(repo, "prod governed tables")
+    ignored = _envs(repo) / "dev" / "data_access" / "discovered_uc_tables.auto.tfvars"
+    assert "!!" in _git(repo, "status", "--porcelain", "--ignored", str(ignored))
+    return repo
+
+
+def test_generate_commits_the_id_only_agents_tables(champion):
+    manifest = json.loads((_envs(champion) / "dev" / "generated" / "governed_tables.json").read_text())
+    assert manifest["agent_tables"] == {"s1": ["paycat.s.t"]}
+    prod = hcl2.loads((_envs(champion) / "prod" / "env.auto.tfvars").read_text())
+    assert [space["uc_tables"] for space in prod["genie_spaces"]] == [["ppay.s.t"]]
+
+
+def test_clean_clone_of_an_id_only_agent_passes_check_and_promote_check_in_ci(champion, tmp_path):
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(champion), str(clone)], check=True, capture_output=True)
+    assert not (_envs(clone) / "dev" / "data_access" / "discovered_uc_tables.auto.tfvars").exists()
+    before = _baseline(clone)
+
+    promote = _make(clone, tmp_path, "promote-to", "ENV=prod", "CHECK=1", CI="true")
+    check = _make(clone, tmp_path, "check", "ENV=prod", CI="true")
+
+    assert promote.returncode == 0, promote.stdout + promote.stderr
+    assert "Resolved 1 committed table(s) for Payments" in promote.stdout
+    _assert_check_prod_passes_offline(check)
+    _assert_read_only(clone, before)
+
+
+def test_id_only_agent_without_committed_tables_fails_closed_even_with_local_discovery(champion, tmp_path):
+    # The commit predates the attribution; the ignored discovery is still on disk.
+    manifest = _envs(champion) / "dev" / "generated" / "governed_tables.json"
+    manifest.write_text(json.dumps({"tables": ["paycat.s.t"]}, indent=2) + "\n")
+    _commit(champion, "record without agent tables")
+    assert (_envs(champion) / "dev" / "data_access" / "discovered_uc_tables.auto.tfvars").is_file()
+    before = _baseline(champion)
+
+    for target in (["promote-to", "ENV=prod", "CHECK=1"], ["check", "ENV=prod"]):
+        result = _make(champion, tmp_path, *target, CI="true")
+        out = result.stdout + result.stderr
+        assert result.returncode != 0, out
+        assert ("ERROR: no tables found for agent s1: envs/dev/generated/governed_tables.json has no "
+                "agent_tables entry for it; run `make generate ENV=dev` and commit generated/") in out
+    _assert_read_only(champion, before)
+
+
+LOCAL_ONLY = {
+    # git-ignored: make generate's discovery, with a table the commit never saw
+    "ignored": ("dev/data_access/discovered_uc_tables.auto.tfvars",
+                'discovered_uc_tables = ["paycat.s.extra"]\n'
+                'discovered_table_agents = { "paycat.s.extra" = ["Payments"] }\n', "paycat.s.extra"),
+    # untracked: an agent capture nobody has added yet
+    "untracked": ("dev/agents/Stray.space.json", "not json", "Stray"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(LOCAL_ONLY))
+def test_local_only_files_cannot_change_the_result(promoted, tmp_path, kind):
+    _record(_envs(promoted) / "prod")
+    _commit(promoted, "prod governed tables")
+    rel, content, marker = LOCAL_ONLY[kind]
+    path = _envs(promoted) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    status = _git(promoted, "status", "--porcelain", "--ignored", str(path))
+    assert status.startswith("!!" if kind == "ignored" else "??"), status
+    before = _baseline(promoted)
+
+    promote = _make(promoted, tmp_path, "promote-to", "ENV=prod", "CHECK=1", CI="true")
+    check_prod = _make(promoted, tmp_path, "check", "ENV=prod", CI="true")
+    check_dev = _make(promoted, tmp_path, "check", "ENV=dev", CI="true")
+
+    assert promote.returncode == 0, promote.stdout + promote.stderr
+    _assert_check_prod_passes_offline(check_prod)
+    assert check_dev.returncode == 0, check_dev.stdout + check_dev.stderr
+    for result in (promote, check_prod, check_dev):
+        assert marker not in result.stdout + result.stderr
+    _assert_read_only(promoted, before)
+
+
+def test_check_outside_a_git_checkout_is_refused(repo, tmp_path):
+    shutil.rmtree(repo / ".git")
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+    assert result.returncode != 0
+    assert "cannot list the files git tracks under" in result.stderr
+    assert "make check runs in a git checkout" in result.stderr
+
+
+def test_check_of_untracked_envs_is_refused(repo, tmp_path):
+    _git(repo, "rm", "-r", "-q", "--cached", "aws/envs")
+    (repo / ".gitignore").write_text(GITIGNORE + "envs/\n")
+    _commit(repo, "envs ignored, as in the GenieRails repo itself")
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+    assert result.returncode != 0
+    assert "(is envs/ git-ignored?); make check reads only committed env files" in result.stderr
 
 
 def test_check_prod_runs_promote_check(promoted, tmp_path):
