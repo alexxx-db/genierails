@@ -126,6 +126,5 @@ Copy these into your `envs/` directory structure and run `make apply ENV=dev`.
 
 ## Next steps
 
-- [Promote dev to prod](../../docs/playbook.md#promote-dev--prod) — replicate governance to production with catalog remapping
-- [Version control your configs](../../docs/version-control.md) — what to commit and how to manage changes
-- [CI/CD integration](../../docs/cicd.md) — automate validation and deployment
+- [Dev-to-Prod Walkthrough](../dev_to_prod/README.md) — promote to production with catalog remapping
+- [Pipelines](../../docs/pipelines.md) — what to commit, CODEOWNERS and CI

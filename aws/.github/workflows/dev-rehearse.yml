@@ -1,6 +1,6 @@
 name: GenieRails dev (aws)
 
-# Stage 3, "Dev rehearsal", of shared/docs/cicd.md: on every merge to main that
+# Stage 3, "Dev rehearsal", of shared/docs/pipelines.md: on every merge to main that
 # touches code, governance or envs/**. Copy to .github/workflows/ at the
 # repository root.
 #
@@ -15,14 +15,18 @@ name: GenieRails dev (aws)
 #
 # Both dev and the read-only account plan use shared, locked remote state;
 # the runner's GENIERAILS_STATE_DIR holds only throwaway runtime files. A run
-# whose commit is no longer the head of main stops (the newer run rehearses
-# it), so re-running an old run never applies older code after newer.
+# stops when a newer main commit changes aws/ or shared/ (that commit's own
+# run rehearses both), so re-running an old run never applies older code
+# after newer. A newer commit outside those paths (README, .github/) starts
+# no run of its own, so it never stops this one.
 # The CI guard's only customer-pipeline exception is this exact command.
 #
-# Auth: OIDC workload identity federation, no PATs or secrets. The "dev"
-# environment holds the dev deployer service principal's IDs as variables:
-#   DATABRICKS_ACCOUNT_ID  DEV_DEPLOYER_CLIENT_ID
-#   DEV_DATABRICKS_WORKSPACE_ID  DEV_DATABRICKS_WORKSPACE_HOST
+# Auth: OIDC workload identity federation, no PATs or secrets. Variables
+# (IDs, not credentials) where make bootstrap-pipelines prints them.
+# Repository variables:
+#   DATABRICKS_ACCOUNT_ID  DEV_DATABRICKS_WORKSPACE_ID  DEV_DATABRICKS_WORKSPACE_HOST
+# The "dev" environment's variables (the dev deployer and dev state role):
+#   DEV_DEPLOYER_CLIENT_ID  DEV_STATE_ROLE_ARN  DEV_STATE_REGION
 
 on:
   push:
@@ -70,28 +74,32 @@ jobs:
       id-token: write
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
-      GENIERAILS_STATE_DIR: ${{ runner.temp }}/genierails-state
 
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
 
+      # The runner context is not available in a job-level env.
+      - name: Use the runner's temp dir for runtime files
+        run: echo "GENIERAILS_STATE_DIR=$RUNNER_TEMP/genierails-state" >> "$GITHUB_ENV"
+
       # A re-run of an older run keeps its run_number, so the queue alone
       # would let it apply older code after a newer commit rehearsed: only
-      # the head of main rehearses.
+      # the newest main commit that changes this workflow's paths rehearses.
       - name: Refuse an obsolete commit
         run: |
           git fetch --no-tags origin main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
-            echo "::error::${{ github.sha }} is no longer the head of main; the newer commit's run rehearses it."
+          newest="$(git log -1 --format=%H FETCH_HEAD -- . ../shared)" || exit $?
+          if [ "$(git rev-parse HEAD)" != "$newest" ]; then
+            echo "::error::${{ github.sha }} is obsolete: main's newer commit $newest changes aws/ or shared/, and its run rehearses it."
             exit 1
           fi
 
       - name: Require locked remote state for dev and account
         run: |
           test -f envs/dev/remote_state.hcl && test -f envs/account/remote_state.hcl || {
-            echo "::error::commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/cicd.md)"
+            echo "::error::commit envs/dev/remote_state.hcl and envs/account/remote_state.hcl (shared/docs/pipelines.md)"
             exit 1
           }
 
@@ -100,10 +108,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
+        run: pip install 'python-hcl2>=7.3.1,<8' 'databricks-sdk==0.150.0' pytest
 
-      - uses: hashicorp/setup-terraform@v3
+      # Pinned by commit (v3.1.2), with the Terraform the repository's CI tests.
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
+          terraform_version: "1.11.4"
           terraform_wrapper: false
 
       - uses: aws-actions/configure-aws-credentials@v4

@@ -1,0 +1,131 @@
+# Agents playbook (data citizen)
+
+You curate a Genie agent in the dev UI and ship it to prod. You own
+`envs/<env>/agents/<agent>.*`; governance owns everything else, including who
+can read each table ([who owns which file](../pipelines.md#who-owns-which-file)).
+
+## The whole flow
+
+```bash
+# dev: curate the agent in the Genie UI, then
+make capture ENV=dev SPACE="Sales"     # writes envs/dev/agents/Sales.space.json, nothing else
+make generate ENV=dev                  # only if its tables changed: their masks and the governed-table record
+make check ENV=dev                     # the PR check, locally
+git add envs/dev/ && git commit        # open a PR; after merge the dev pipeline rehearses it
+
+# prod
+make promote-to ENV=prod               # carries the capture to envs/prod/agents/
+make check ENV=prod
+git add envs/prod/ && git commit       # the promotion PR; after merge and rehearse, the operator releases
+```
+
+## Before you start
+
+- Run `make` from `aws/` (or `azure/`).
+- The envs are deterministic: `governance_mode = "deterministic"` in
+  `envs/dev/env.auto.tfvars`. No such line means legacy: see
+  [legacy mode](../legacy-mode.md) to migrate first.
+- Your agents are in `agents/` files. Still inline in `genie_spaces`? Ask
+  governance to run [`make split-agent-files`](../pipelines.md#who-owns-which-file).
+
+## Add an agent
+
+1. **Create its file**, `envs/dev/agents/<agent>.auto.tfvars` (the file name is
+   the agent's name):
+   ```hcl
+   genie_space_id = "01ef0000000000000000000000000000"   # Genie UI > agent > Configure > About this agent
+   acl_groups     = ["payments_ops", "regional_analysts"]   # who gets CAN_RUN; [] means nobody
+   ```
+2. **Import it.** `make generate ENV=dev`. It captures the agent to
+   `agents/<agent>.space.json`, records its tables in
+   `generated/governed_tables.json`, and proposes a `table_readers` entry
+   (filled with `acl_groups`) for each of its tables that nothing covers yet.
+   The proposal is governance's to approve in the same PR.
+3. **Check and open a PR.** `make check ENV=dev`; commit `envs/dev/`.
+   **Pass looks like:** `=== make check ENV=dev: passed ===`.
+4. **Merge.** The dev pipeline runs `make rehearse ENV=dev` (until dev has
+   remote state, the operator runs it). **Pass looks like:** `ALL EFFECTIVE`.
+5. **[Promote](#promote-to-prod).**
+
+## Update an agent
+
+GenieRails never overwrites a dev agent's config, so curate freely in the UI.
+Nothing reaches git until you capture it.
+
+1. **Capture.** `make capture ENV=dev SPACE="<agent>"`. **Pass looks like:**
+   `Captured: <agent> (<id>) -> agents/<agent>.space.json` (or `Unchanged`).
+2. **Tables changed?** Run `make generate ENV=dev` too, so the PR shows the new
+   tables' masks. A table change also changes `generated/governed_tables.json`,
+   so the PR needs a governance approval; one that keeps the tables doesn't.
+3. **Check, PR, merge, [promote](#promote-to-prod).**
+
+Agent B's unfinished UI edits stay in dev: capture is per agent, and prod B
+keeps its last captured version.
+
+## Promote to prod
+
+1. **Promote.** `make promote-to ENV=prod`. It rewrites
+   `envs/prod/agents/<agent>.space.json` from the dev capture (catalogs and the
+   warehouse remapped), and prints the changed files by owner. The first time,
+   it also seeds `envs/prod/agents/<agent>.auto.tfvars` with dev's `acl_groups`
+   and an empty `genie_space_id` (prod's ID lives in prod's state and release
+   receipt). Later promotions keep prod's file and print how its `acl_groups`
+   differ from dev's.
+2. **Check and open the promotion PR.** `make check ENV=prod`; commit
+   `envs/prod/`. It can carry the dev change too, in one PR.
+3. **Merge.** After the dev rehearsal passes on the merge commit, the operator
+   runs `make release-plan ENV=prod`, gets the manifest approved, and runs
+   `make release ENV=prod MANIFEST=<manifest>` ([deployment machine](../deployment-machine.md#release-prod)).
+   **Pass looks like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
+
+Every release replaces the prod agent's config with the capture in git and
+prints a field-level report of what it overwrote. It never recreates the agent
+or changes its ID, so conversations stay. Never edit a prod agent in the UI.
+
+## Change who can run an agent in prod
+
+Edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`: prod owns it and
+`promote-to` never overwrites it. If a new group can't read the agent's tables,
+governance adds it to `table_readers` in the same PR. Then PR, merge, rehearse
+(a no-op that writes a receipt) and release.
+
+## Remove an agent
+
+The agent and its conversations stay; only `CAN_RUN` goes.
+
+```bash
+# 1. PR: in envs/prod/agents/<agent>.auto.tfvars (and the same in envs/dev/agents/)
+#      acl_groups = []
+#      detached   = true
+#    merge, rehearse, release  ->  CAN_RUN revoked
+# 2. the operator, at that released commit:
+make detach-agent ENV=prod SPACE="<agent>"   # forgets it from Terraform state; deletes nothing
+```
+
+- **Pass looks like:** `Detached <agent>: N state address(es) removed; the
+  agent and its conversations stay.`
+- Table access is unchanged, because it belongs to `table_readers`. Masks stay
+  until governance runs `make ungovern`.
+- **Keep both agent files**, detached. While dev still has the agent, the next
+  `promote-to` would seed a fresh, active prod file if prod's were gone.
+  Removing an agent that is still in state from config is refused.
+- `make detach-agent` needs a release receipt, so it runs in prod, not dev.
+- **To delete the agent instead** (and its conversations): set `delete = true`
+  and add the committed line `prod:delete-agent:<key>` to `envs/prod/ack.txt`
+  (governance-owned), in one PR.
+
+## If it stops
+
+| Message | What to do |
+|---|---|
+| a group in `acl_groups` can't read one of the agent's tables | governance adds it to `table_readers` (an exact entry, or `catalog.schema.*`), in your PR |
+| the agent has no `acl_groups` | set it; `[]` means nobody |
+| `make generate` stops: no `class.*` tags yet | classification hasn't finished for a new table; wait for the scan and auto-tagging in Catalog Explorer, re-run |
+| `make check` says `governed_tables.json` differs | run `make capture` (or `make generate ENV=dev`) again and commit the result |
+| `not captured in dev yet` during `promote-to` | `make capture ENV=dev SPACE="<agent>"` first |
+| a field the Genie API rejects fails the release | fix it in the dev UI, capture, promote again; nothing is skipped silently |
+
+> **Optional AI helpers (coming in #150).** `make draft-genie-content SPACE=<agent>`
+> will draft instructions, sample questions and benchmarks for an agent that
+> has none, for you to review and commit. It isn't on `main` yet, and never
+> runs in CI or prod.
