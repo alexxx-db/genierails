@@ -445,7 +445,8 @@ class LiveSnapshotProvider:
             if isinstance(space, Mapping) and space.get("sql_warehouse_id")), None)
         if not warehouse: raise RuntimeError(f"{env}: env.auto.tfvars has no sql_warehouse_id")
         if not catalogs: raise RuntimeError(f"{env}: no governed catalogs could be resolved")
-        sql = {catalog: _sql_snapshots(client, str(warehouse), catalog) for catalog in catalogs}
+        sql = {catalog: _sql_snapshots(client, str(warehouse), catalog, self.secret_values)
+               for catalog in catalogs}
         spaces = _agent_ids(env_dir, config, self.state_dir / env, self.cloud_root)
         agents: list[dict[str, Any]] = []
         for name, space_id in spaces:
@@ -465,19 +466,20 @@ def _norm_host(host: str) -> str:
     return host if host.startswith("https://") else "https://" + host.removeprefix("http://")
 
 
-def _sql_snapshots(client: Any, warehouse: str, catalog: str) -> Mapping[str, Any]:
+def _sql_snapshots(client: Any, warehouse: str, catalog: str,
+                   secrets: Iterable[str] = ()) -> Mapping[str, Any]:
     queries = {
         "catalog_grants": f"SELECT * FROM system.information_schema.catalog_privileges WHERE catalog_name = '{_sql_lit(catalog)}'",
         "schema_grants": f"SELECT * FROM system.information_schema.schema_privileges WHERE catalog_name = '{_sql_lit(catalog)}'",
         "table_grants": f"SELECT * FROM system.information_schema.table_privileges WHERE table_catalog = '{_sql_lit(catalog)}'",
         "governed_tags": f"SELECT * FROM system.information_schema.column_tags WHERE catalog_name = '{_sql_lit(catalog)}'",
-        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND (routine_name LIKE 'mask\\_%' ESCAPE '\\' OR routine_name LIKE 'gr\\_mask\\_%' ESCAPE '\\')",
+        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND (startswith(routine_name, 'mask_') OR startswith(routine_name, 'gr_mask_'))",
         "tables": f"SELECT table_catalog,table_schema,table_name FROM system.information_schema.tables WHERE table_catalog = '{_sql_lit(catalog)}' AND table_schema <> 'information_schema'",
     }
     out: dict[str, Any] = {}
     for name, statement in queries.items():
         response = client.statement_execution.execute_statement(warehouse_id=warehouse, statement=statement, wait_timeout="50s")
-        _require_succeeded(response, name)
+        _require_succeeded(response, name, secrets)
         columns = [c.name for c in (response.manifest.schema.columns or [])]
         rows = list(response.result.data_array or [])
         next_index = getattr(response.result, "next_chunk_index", None)
@@ -508,10 +510,19 @@ def _sql_lit(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _require_succeeded(response: Any, label: str) -> None:
+def _require_succeeded(response: Any, label: str, secrets: Iterable[str] = ()) -> None:
     state = getattr(getattr(response, "status", None), "state", None)
     if str(getattr(state, "value", state)).upper() != "SUCCEEDED":
-        raise RuntimeError(f"{label} snapshot query did not succeed (state={state})")
+        error = getattr(getattr(response, "status", None), "error", None)
+        details = error.as_dict() if hasattr(error, "as_dict") else error
+        if isinstance(details, Mapping):
+            code = details.get("error_code") or details.get("code") or "unknown"
+            message = details.get("message") or "unavailable"
+        else:
+            code = getattr(error, "error_code", None) or getattr(error, "code", None) or "unknown"
+            message = getattr(error, "message", None) or (str(error) if error else "unavailable")
+        safe = redact_text(f"code={code}, message={message}", secrets).replace("\n", " ").strip()
+        raise RuntimeError(f"{label} snapshot query did not succeed (state={state}; {safe})")
     if getattr(response, "result", None) is None or getattr(response, "manifest", None) is None:
         raise RuntimeError(f"{label} snapshot query returned no result")
 

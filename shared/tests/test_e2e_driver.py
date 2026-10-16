@@ -306,6 +306,7 @@ def test_missing_release_plan_manifest_errors_before_release(tmp_path, live, mon
 def _fake_sdk(monkeypatch, seen, *, resolved_host=None, tables=(("prodcat", "s", "t"),)):
     class Statement:
         def execute_statement(self, *, statement, **kwargs):
+            seen.setdefault("statements", []).append(statement)
             rows = [list(t) for t in tables] if "information_schema.tables" in statement else []
             cols = ["table_catalog", "table_schema", "table_name"]
             return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="s",
@@ -361,11 +362,25 @@ def test_live_snapshot_read_failures_are_errors_not_data(tmp_path, monkeypatch):
     response = SimpleNamespace(status=SimpleNamespace(state="FAILED"), result=None, manifest=None)
     with pytest.raises(RuntimeError, match="did not succeed"):
         driver._require_succeeded(response, "tags")
+    response.status.error = SimpleNamespace(error_code="BAD_REQUEST", message="bad SQL containing actual-secret")
+    with pytest.raises(RuntimeError, match=r"code=BAD_REQUEST.*bad SQL containing <redacted>"):
+        driver._require_succeeded(response, "tags", secrets={"actual-secret"})
     state = tmp_path / "state"; state.mkdir(); (state / "x.tfstate").write_text("{not json")
     with pytest.raises(RuntimeError, match="Terraform serial"):
         driver._state_serials(state)
     with pytest.raises(RuntimeError, match="missing authentication file"):
         driver.LiveSnapshotProvider(cloud, state).client("dev")
+
+
+def test_mask_snapshot_query_uses_portable_prefix_predicates(monkeypatch, tmp_path):
+    pytest.importorskip("hcl2")
+    cloud = _env_files(tmp_path); seen = {}
+    _fake_sdk(monkeypatch, seen)
+    driver.LiveSnapshotProvider(cloud, tmp_path / "state").capture("prod")
+    mask_sql = next(sql for sql in seen["statements"] if "information_schema.routines" in sql)
+    assert "startswith(routine_name, 'mask_')" in mask_sql
+    assert "startswith(routine_name, 'gr_mask_')" in mask_sql
+    assert " ESCAPE " not in mask_sql
 
 
 def test_agent_ids_include_hcl_state_and_id_file(tmp_path):
@@ -819,7 +834,7 @@ def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
 def test_d4_snapshot_query_includes_deterministic_masks():
     class Statement:
         def execute_statement(self, *, statement, **_):
-            assert "gr\\_mask\\_%" in statement if "routines" in statement else True
+            assert "startswith(routine_name, 'gr_mask_')" in statement if "routines" in statement else True
             cols = [SimpleNamespace(name=n) for n in ("table_catalog", "table_schema", "table_name")]
             rows = [["cat", "s", "t"]] if "information_schema.tables" in statement else []
             return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
