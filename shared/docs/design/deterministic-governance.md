@@ -320,7 +320,7 @@ Every step keeps `main` working and ships its own live test on AWS and Azure whe
 6. **Policy changes and tier moves:** the staged-apply protocol and its verification.
 7. **Reader and weakening checks** with committed, scoped acknowledgements (`ack.txt`).
 8. **Access:** `SELECT` only from `table_readers`, `CAN_RUN` only from `acl_groups`; per-agent files; the agent-readability check and the proposed `table_readers` in `generate`. Built (except per-agent files, which move to step 11 with capture), extended with the live agent coverage check that replaces the `CAN_RUN` gate's dependence on data_access state, and `group_map` (decision 8) ([access.md](../access.md)).
-9. **Release gating, then migration:** the rehearse receipt and `release` attestation first (built: rehearse receipts, `release-plan` and `release MANIFEST=`, the release receipt and `maintain` gating, the runtime overlay of section 9; [cicd.md](../cicd.md#release-gating-deterministic-envs)); then the migration dry run, revocation list, frozen AI row filters, tag state moves and staged cutover.
+9. **Release gating, then migration:** the rehearse receipt and `release` attestation first (built: rehearse receipts, `release-plan` and `release MANIFEST=`, the release receipt and `maintain` gating, the runtime overlay of section 9; [pipelines.md](../pipelines.md#release-gating-deterministic-envs)); then the migration dry run, revocation list, frozen AI row filters, tag state moves and staged cutover.
 10. **Declared row filters.**
 11. **Capture and prod ownership:** `make capture`, JSON-aware remap, prod IDs in state and the release receipt, overwrite report, two-step detach.
 12. **Pipelines:** `make check`; per-commit receipts; remote state for dev and the dev pipeline; GitHub Actions and Azure DevOps samples for each stage in section 17. The prod pipeline stays on the deployment machine until remote state for prod exists.
@@ -333,7 +333,7 @@ One command per stage. People run the authoring commands on their own machine; p
 | Stage | Where | Command | Changes Databricks? |
 |---|---|---|---|
 | **1. Author** | a person's machine | `make capture ENV=dev SPACE="<agent>"` (agent), `make generate ENV=dev` (governance), `make scaffold-treatments` (new class), `make promote-to ENV=prod` (promotion); commit, open a PR | no; files only |
-| **2. PR check** | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` | no |
+| **2. PR check** | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` or `shared/**` | no |
 | **3. Dev rehearsal** | **dev pipeline**, every merge to `main` that touches code, governance or `envs/**`; every commit gets its own run, in order | `make rehearse ENV=dev` | dev only |
 | **4. Prod release** | **prod pipeline**, when stage 3 **succeeds** on a commit that touches `envs/prod/**`: `make release-plan ENV=prod` publishes the approval manifest; after a required approval, `make release ENV=prod MANIFEST=<manifest>` applies it | `release-plan`, then `release` | prod |
 | **5. Keep protected** | **prod pipeline**, on a schedule, checked out at the last released commit (read from the release receipt) | `make maintain ENV=prod` | prod, governance only |
@@ -386,7 +386,7 @@ Agreed in design discussion after the rollout above was set. It starts once roll
 |---|---|---|
 | **Champion** (first deployment) | one agent, end to end | everything, once |
 | **Data citizen** | curates an agent in the dev UI (including which tables it reads), captures it, promotes it | `envs/<env>/agents/<agent>.*` |
-| **Governance engineer** | treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, top-level `uc_tables`, `ungovern`; approves every change to the governed-table set | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/` (including `governed_tables.json`), `ack.txt` |
+| **Governance engineer** | treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, top-level `uc_tables`, `ungovern`; approves every change to the governed-table set | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/` (including `governed_tables.json`), `ack.txt`, `envs/<env>/custom_masks/` |
 | **One team doing both** (small or medium company) | both kinds of change, often in one PR | both sets |
 
 - `env.auto.tfvars` holds only governance and env-owned settings. Agent settings live only in `agents/` files (section 5), so an agent-only PR never touches `env.auto.tfvars`.
@@ -403,7 +403,7 @@ Agreed in design discussion after the rollout above was set. It starts once roll
 
 ### 18.3 First deployment in git
 
-- `make setup` writes the section 9 `.gitignore`. It writes it only into a customer repo: `GITIGNORE=customer` opts in once, then every `make setup` refreshes its managed block in `<cloud>/.gitignore`; the GenieRails repo never has the block, so `make setup` never changes it there ([version-control.md](../version-control.md#setting-up-git-tracking)).
+- `make setup` writes the section 9 `.gitignore`. It writes it only into a customer repo: `GITIGNORE=customer` opts in once, then every `make setup` refreshes its managed block in `<cloud>/.gitignore`; the GenieRails repo never has the block, so `make setup` never changes it there ([pipelines.md](../pipelines.md#setting-up-git-tracking)).
 - The champion walkthrough ends with a commit step: what to `git add`, and opening the first PR.
 
 ### 18.4 Optional AI helpers (decision 5)
@@ -416,21 +416,44 @@ Explicit, opt-in commands, never called by `generate`, `rehearse`, `release` or 
 
 Output is written to files for review and committed like any change. A missing model endpoint only disables these helpers.
 
+#### 18.4.1 Adopting a custom mask
+
+An approved custom mask becomes governance config, reviewed like any other governance change. Nothing in governance reads `drafts/`, and adoption calls no model. `make adopt-custom-mask` is an **authoring** command (it writes committed files); `generate`, `rehearse`, `release` and `maintain` never call it.
+
+- **Where it lives:** one governance-owned file per mask, `envs/<env>/custom_masks/custom_<name>.json` (governance owns this path under CODEOWNERS with the rest of `envs/`; see 18.1). The class mapping stays in `tag_treatments`.
+  - `never_raw: false` is required. A never-raw class maps to the library's `secret`; there are no custom never-raw masks. Custom treatments use the ordinary EXCEPT lists, so tier 1, `raw_exempt_principals` and the deployer see raw — never map secret-like data to a custom mask.
+  - `full` is fixed to the library's `redacted` (`[REDACTED]` or NULL), so the full version (tier 3 and anyone outside the tiers) never meets custom SQL.
+  - `partial` is keyed by column type family. Each entry holds `sql`, `tested_type`, `cases` (SQL literals only; NULL in gives NULL out; at least two non-null cases), `tested_sha256`, and the digests of the drafts it came from. `validate` / `check` recompute `tested_sha256` and refuse a mismatch, so hand-edited SQL cannot govern until it is re-tested and re-adopted. A column whose type family is not listed gets the full version, as for a library treatment.
+- **`make adopt-custom-mask ENV=dev TREATMENT=custom_<name>`** refuses in CI, prod and promoted envs, then checks, in order:
+  - the name has the reserved `custom_` prefix, contains no `__`, and isn't a library name;
+  - a `test-custom-mask` pass record exists and its digests match the draft files;
+  - the offline rules pass again: one expression over `value`, no queries, no `current_user` or group checks, no randomness or time, NULL in gives NULL out, at least two non-null cases;
+  - no never-raw class maps to it, and an existing type family isn't replaced without `FORCE=1`.
+
+  It writes the file and prints the `tag_treatments` line to add. It never edits `env.auto.tfvars` and does not delete drafts.
+- **Governance treats it like a library treatment** through one shared lookup, the library plus the env's adopted masks, used by generate, validate, scaffold and verify-access.
+  - Versioned tag values and staged policy changes come for free, because the generation hash covers the partial SQL.
+  - Account tag-policy validation accepts `custom_*` values by name pattern (so the shared account union does not fail in envs that have not adopted the mask yet); new values still reach the account through `make apply-account` as today.
+  - Rehearse and release re-run each adopted mask's cases, read-only, on that env's warehouse (committed `custom_masks/`, never drafts).
+  - A partial→partial change whose **after** tag value is a different custom value (library→custom, or a custom SQL / generation change) counts as weakening under category `custom_mask_changed` and needs a normal §6 `weaken` ack (`<env>:weaken:<column>:<principal>`).
+  - `promote-to` copies `custom_masks/` byte for byte, as governance-owned.
+- **Residual risk:** a custom mask is only proven by its written cases. A numeric mask tested on one type is applied to the whole numeric family, where results that don't fit become NULL.
+
 ### 18.5 Docs, organised by persona
 
 ```
-README.md (root)                     start here; pick: govern tables, or govern and promote agents
-shared/examples/dev_to_prod/README   champion flow
-shared/docs/agents.md                data citizen playbook
-shared/docs/governance.md            governance engineer playbook
-shared/docs/operations.md            day-2 changes, including the one-team path (from #111)
-shared/docs/pipelines.md             DevOps setup for GitHub Actions and Azure DevOps (replaces cicd.md)
-shared/docs/deployment-machine.md    the v1 deployment machine
-shared/docs/legacy.md                legacy mode, as a migration source only
-REFERENCE.md                         every command and setting
+README.md (root)                      start here; pick: govern tables, or govern and promote agents
+shared/examples/dev_to_prod/README    champion flow
+shared/docs/playbooks/agents.md       data citizen playbook
+shared/docs/playbooks/governance.md   governance engineer playbook, including govern tables only
+shared/docs/playbooks/one-team.md     both kinds of change in one PR (the day-2 content of #111)
+shared/docs/pipelines.md              DevOps setup for GitHub Actions and Azure DevOps (replaces cicd.md)
+shared/docs/deployment-machine.md     the v1 deployment machine
+shared/docs/legacy-mode.md            legacy mode, as a migration source only
+REFERENCE.md                          every command and setting
 ```
 
-Each playbook follows the champion README's style: the flow in one code block, short numbered steps, a "pass looks like" line, and what to do when it stops. `playbook.md`, `version-control.md`, `from-ui-to-production.md` and `self-service-genie.md` are merged into these and retired.
+Each playbook follows the champion README's style: the flow in one code block, short numbered steps, a "pass looks like" line, and what to do when it stops. `playbook.md`, `version-control.md`, `from-ui-to-production.md`, `self-service-genie.md` and `cicd.md` are merged into these and retired, each leaving a redirect stub.
 
 ### 18.6 Proving it
 
@@ -446,9 +469,9 @@ Each playbook follows the champion README's style: the flow in one code block, s
 
 14. Persona file ownership (18.1): `tag_treatments` for customer mappings, `promote-to` output split, CODEOWNERS sample. Built: every reader (generate, the ACL sidecar, promote) merges `agents/` files, and generate never imports a captured agent's live config into `generated/`; `promote-to` carries agents before the split and prints the changed files by owner; `shared/examples/CODEOWNERS.example`; `tag_treatments` keys are `class.<name>` mapped to mask-library treatments (other tag keys are refused, since this version reads only `class.*` tags), written by `scaffold-treatments` to the env (a promote-to target's source); legacy envs keep their inline agents until the explicit `make split-agent-files`, which refuses any move that would change the plan.
 15. `make setup` `.gitignore` and the walkthrough commit step (18.3); scheduled job from the data_access root and the `shared/**` prod trigger (18.2). Built: an existing job moves from the workspace state to the data_access state before any command on either root (`move_scheduled_job.py`), and the workspace root's `removed` block forgets rather than destroys it.
-16. `make bootstrap-pipelines` (18.2). Built ([cicd.md](../cicd.md#setting-up-the-pipelines)).
-17. Optional AI helpers (18.4).
-18. Persona docs (18.5).
+16. `make bootstrap-pipelines` (18.2). Built ([pipelines.md](../pipelines.md#setting-up-the-pipelines)).
+17. Optional AI helpers (18.4). Built: `make suggest-treatment`, `draft-genie-content` and `draft-custom-mask` (`scripts/ai_helpers.py`) run only with `ENV=dev` at the checkout's real `envs/dev`, write only inside the real `envs/dev/drafts/` (no symlinks, staged writes), refuse in CI, send the model only schema (never data or an agent's existing text), and read the model endpoint from `ai_helper_endpoint` in `envs/dev/env.auto.tfvars`; `make test-custom-mask` runs the mask library's exact-output rules on a draft (offline, then each fixture case, whose inputs must be typed literals, on the dev SQL warehouse, read-only) and records the digests it passed. A pass does not adopt the mask. Nothing reads `drafts/` (the rehearse fingerprint and `make check`'s copy skip it), and a test walks every target and module `generate`, `rehearse`, `release`, `maintain` and `check` reach and runs them under a model tripwire. `tag_treatments` still names only mask-library treatments; applying a custom mask in governance is not built yet; that is `make adopt-custom-mask` (18.4.1).
+18. Persona docs (18.5). Built: the pages above.
 19. Live persona runs, real pipeline runs, and migration of the existing deployments (18.6).
 20. `generate_abac.py` split (18.7).
 

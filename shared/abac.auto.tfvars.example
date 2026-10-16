@@ -19,7 +19,7 @@
 #                                    Use with: make apply-genie ENV=<env>
 #
 # For the self-service Genie pattern (central ABAC team + BU teams self-serve Genie agents)
-# see docs/self-service-genie.md.
+# see docs/legacy-mode.md (legacy only; deterministic envs use docs/playbooks/).
 #
 # ============================================================================
 # `make generate` writes a full draft into `envs/<env>/generated/abac.auto.tfvars`.

@@ -125,7 +125,7 @@ any unfinished transition with its completed phases. Writes are atomic.
   state.
 
 In `rehearse`, `apply` and `maintain` these phases run inside the applying
-command. A prod release is two-phase (rollout step 9, [cicd.md](cicd.md#release-gating-deterministic-envs)):
+command. A prod release is two-phase (rollout step 9, [pipelines.md](pipelines.md#release-gating-deterministic-envs)):
 `make release-plan` runs the controller's `plan --out-dir`, which saves the
 plan of each remaining apply phase in order (a phase that changes nothing is
 recorded and planning goes on) and stops after the first phase that changes

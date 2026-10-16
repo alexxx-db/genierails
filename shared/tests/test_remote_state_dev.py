@@ -554,10 +554,11 @@ def _dev_samples(cloud):
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
-def test_dev_samples_rehearse_only_the_head_of_main_with_remote_state(cloud):
+def test_dev_samples_rehearse_only_the_newest_commit_in_their_paths_with_remote_state(cloud):
     for path in _dev_samples(cloud):
         text = path.read_text()
-        assert '"$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)"' in text, path
+        assert 'newest="$(git log -1 --format=%H FETCH_HEAD -- . ../shared)"' in text, path
+        assert '"$(git rev-parse HEAD)" != "$newest"' in text, path
         assert "envs/dev/remote_state.hcl" in text and "envs/account/remote_state.hcl" in text, path
         assert text.index("FETCH_HEAD") < text.rindex("make rehearse ENV=dev"), path
         header = text[:text.index("\non:" if ".github" in path.parts else "\ntrigger:")]
@@ -568,7 +569,7 @@ def test_dev_samples_rehearse_only_the_head_of_main_with_remote_state(cloud):
 def test_prod_scope_fails_loudly_when_it_cannot_diff(cloud):
     for path in (ROOT / cloud / ".github/workflows/prod-release.yml", ROOT / cloud / "azure-pipelines/prod-release.yml"):
         text = path.read_text()
-        assert 'changed="$(git diff --name-only HEAD^ HEAD -- envs/prod ../shared)" || exit $?' in text, path
+        assert 'changed="$(git diff --name-only "$base" HEAD -- envs/prod ../shared)" || exit $?' in text, path
         assert "grep -q ." not in text, path
 
 

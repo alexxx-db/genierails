@@ -23,7 +23,7 @@ The quickstart edits files in `envs/<env>/`, while Terraform itself runs from fi
 
 ### Self-service Genie operating mode
 
-The layers are designed so that different teams can own different layers independently. In self-service Genie deployments, a central Data Governance team owns the account + data_access layers while BU teams own only their workspace layers. See [self-service-genie.md](self-service-genie.md) for the full guide and CI/CD integration patterns.
+The layers are designed so that different teams can own different layers independently. In self-service Genie deployments, a central Data Governance team owns the account + data_access layers while BU teams own only their workspace layers. In deterministic envs the same split is done with per-agent files and CODEOWNERS: see [who owns which file](pipelines.md#who-owns-which-file).
 
 ## Directory Contract
 
@@ -47,7 +47,7 @@ The layers are designed so that different teams can own different layers indepen
 | `envs/<env>/data_access/masking_functions.sql` | Env-scoped masking SQL deployed by the governance layer | **Yes** |
 | `envs/<env>/abac.auto.tfvars` | Workspace-owned config: group lookups and Genie config only | **Yes** |
 
-> **See also:** [Version Control & Standalone Terraform](version-control.md) for detailed guidance on what to commit, how to set up git tracking, version pinning, and running Terraform independently.
+> **See also:** [What to commit](pipelines.md#what-to-commit) and how to set up git tracking, [upgrading GenieRails](playbooks/governance.md#upgrade-genierails), and [running Terraform directly](legacy-mode.md#standalone-terraform) (legacy envs only).
 
 ### Rules versus facts
 
