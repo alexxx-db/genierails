@@ -418,24 +418,24 @@ Output is written to files for review and committed like any change. A missing m
 
 #### 18.4.1 Adopting a custom mask
 
-An approved custom mask becomes governance config, reviewed like any other governance change. Nothing in governance reads `drafts/`, and adoption calls no model.
+An approved custom mask becomes governance config, reviewed like any other governance change. Nothing in governance reads `drafts/`, and adoption calls no model. `make adopt-custom-mask` is an **authoring** command (it writes committed files); `generate`, `rehearse`, `release` and `maintain` never call it.
 
-- **Where it lives:** one governance-owned file per mask, `envs/<env>/custom_masks/custom_<name>.json`. The class mapping stays in `tag_treatments`.
-  - `never_raw: false` is required. A never-raw class maps to the library's `secret`; there are no custom never-raw masks.
-  - `full` is fixed to the library's `redacted` (`[REDACTED]` or NULL), so tier 3 never meets custom SQL.
-  - `partial` is keyed by column type family. Each entry holds `sql`, `tested_type`, `cases` (literal values only, including NULL in gives NULL out), `tested_sha256`, and the digests of the drafts it came from.
+- **Where it lives:** one governance-owned file per mask, `envs/<env>/custom_masks/custom_<name>.json` (governance owns this path under CODEOWNERS with the rest of `envs/`; see 18.1). The class mapping stays in `tag_treatments`.
+  - `never_raw: false` is required. A never-raw class maps to the library's `secret`; there are no custom never-raw masks. Custom treatments use the ordinary EXCEPT lists, so tier 1, `raw_exempt_principals` and the deployer see raw — never map secret-like data to a custom mask.
+  - `full` is fixed to the library's `redacted` (`[REDACTED]` or NULL), so the full version (tier 3 and anyone outside the tiers) never meets custom SQL.
+  - `partial` is keyed by column type family. Each entry holds `sql`, `tested_type`, `cases` (SQL literals only; NULL in gives NULL out; at least two non-null cases), `tested_sha256`, and the digests of the drafts it came from. `validate` / `check` recompute `tested_sha256` and refuse a mismatch, so hand-edited SQL cannot govern until it is re-tested and re-adopted. A column whose type family is not listed gets the full version, as for a library treatment.
 - **`make adopt-custom-mask ENV=dev TREATMENT=custom_<name>`** refuses in CI, prod and promoted envs, then checks, in order:
   - the name has the reserved `custom_` prefix, contains no `__`, and isn't a library name;
   - a `test-custom-mask` pass record exists and its digests match the draft files;
-  - the offline rules pass again: one expression over `value`, no queries, no `current_user` or group checks, no randomness or time, NULL in gives NULL out;
+  - the offline rules pass again: one expression over `value`, no queries, no `current_user` or group checks, no randomness or time, NULL in gives NULL out, at least two non-null cases;
   - no never-raw class maps to it, and an existing type family isn't replaced without `FORCE=1`.
 
-  It writes the file and prints the `tag_treatments` line to add. It never edits `env.auto.tfvars`.
+  It writes the file and prints the `tag_treatments` line to add. It never edits `env.auto.tfvars` and does not delete drafts.
 - **Governance treats it like a library treatment** through one shared lookup, the library plus the env's adopted masks, used by generate, validate, scaffold and verify-access.
   - Versioned tag values and staged policy changes come for free, because the generation hash covers the partial SQL.
-  - `apply-account` accepts `custom_*` values by name pattern, since the account tag policy is shared across envs.
-  - Rehearse and release re-run each adopted mask's cases, read-only, on that env's warehouse.
-  - Changing an adopted mask's SQL counts as weakening and needs an ack (`custom_mask_changed`).
+  - Account tag-policy validation accepts `custom_*` values by name pattern (so the shared account union does not fail in envs that have not adopted the mask yet); new values still reach the account through `make apply-account` as today.
+  - Rehearse and release re-run each adopted mask's cases, read-only, on that env's warehouse (committed `custom_masks/`, never drafts).
+  - A partial→partial change whose **after** tag value is a different custom value (library→custom, or a custom SQL / generation change) counts as weakening under category `custom_mask_changed` and needs a normal §6 `weaken` ack (`<env>:weaken:<column>:<principal>`).
   - `promote-to` copies `custom_masks/` byte for byte, as governance-owned.
 - **Residual risk:** a custom mask is only proven by its written cases. A numeric mask tested on one type is applied to the whole numeric family, where results that don't fit become NULL.
 
