@@ -39,6 +39,8 @@ import hcl2
 
 layer, env_name, command, *args = sys.argv[1:]
 layer_dir = os.environ["LAYER_ENV_DIR"]
+# Like terraform_layer.sh: a staged phase's render stands in for the split config.
+config_dir = os.environ.get("GENIERAILS_LAYER_CONFIG_DIR") or layer_dir
 state_path = os.path.join(layer_dir, "terraform.tfstate")
 with open(os.path.join(layer_dir, "..", "runner.log"), "a") as log:
     log.write(" ".join([command] + args) + "\n")
@@ -60,7 +62,7 @@ def instances(state, kind):
 
 
 def desired():
-    cfg = hcl2.loads(open(os.path.join(layer_dir, "abac.auto.tfvars")).read())
+    cfg = hcl2.loads(open(os.path.join(config_dir, "abac.auto.tfvars")).read())
     masks = {}
     for p in cfg.get("fgac_policies") or []:
         if p.get("policy_type") == "POLICY_TYPE_COLUMN_MASK":
@@ -73,7 +75,7 @@ def desired():
     tags = {f"columns|{t['entity_name']}|gr_treatment": {"entity_name": t["entity_name"], "tag_value": t["tag_value"]}
             for t in cfg.get("tag_assignments") or []
             if t["entity_type"] == "columns" and t["tag_key"] == "gr_treatment"}
-    sql = open(os.path.join(layer_dir, "masking_functions.sql")).read()
+    sql = open(os.path.join(config_dir, "masking_functions.sql")).read()
     functions, catalog, schema = [], "", ""
     for line in sql.splitlines():
         if line.startswith("USE CATALOG "):

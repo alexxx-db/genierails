@@ -269,7 +269,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         ("Nothing to restore; migrate-plan is report-only.",)),
     _scenario("migration-cutover", "Legacy migration cutover", (
         "Reviewed pending legacy migration fixture exists in dev and prod.",
-        "Expected to fail on main until fix/migration-adopt-order lands (layout guard order and deterministic import).",
     ), (
         mk("Review dev migration mapping", "migrate-plan", "dev"),
         mk("Review prod migration mapping", "migrate-plan", "prod"),
@@ -277,8 +276,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan prod adopt-only release", "release-plan", "prod"),
         mk("Apply prod adopt-only release", "release", "prod", args=("MANIFEST={manifest}",)),
     ), ("Legacy values are adopted into deterministic values without weaker protection or raw exposure.",),
-       ("Forward-release the pinned baseline through the same bounded staged lifecycle.",),
-       known_failure="fix/migration-adopt-order"),
+       ("Forward-release the pinned baseline through the same bounded staged lifecycle.",)),
 )
 
 # Explicit top-level snapshot components each scenario is allowed to change.

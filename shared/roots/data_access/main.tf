@@ -189,6 +189,13 @@ variable "env_dir" {
   type = string
 }
 
+# Set only by scripts/terraform_layer.sh, to a staged policy phase's render
+# (generated/.runtime/data_access); empty means env_dir's masking_functions.sql.
+variable "masking_sql_file" {
+  type    = string
+  default = ""
+}
+
 # A snapshot of this layer's own state, which the locals above read. Empty (the
 # default) means the in-checkout state file in env_dir. With
 # GENIERAILS_STATE_DIR or remote state, terraform_layer.sh writes it through
@@ -593,7 +600,7 @@ module "data_access" {
   sql_warehouse_id                         = var.sql_warehouse_id
   warehouse_name                           = var.warehouse_name
   retain_auto_warehouse                    = local.retain_auto_warehouse
-  masking_sql_file                         = "${var.env_dir}/masking_functions.sql"
+  masking_sql_file                         = var.masking_sql_file != "" ? var.masking_sql_file : "${var.env_dir}/masking_functions.sql"
   deploy_masking_script                    = "${local.project_root}/deploy_masking_functions.py"
   auth_file                                = "${var.env_dir}/auth.auto.tfvars"
 }

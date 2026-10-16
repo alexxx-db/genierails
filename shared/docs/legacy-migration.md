@@ -95,7 +95,13 @@ adopts the legacy deployment as the live generation:
    legacy applies from then on, even if the adoption is interrupted.
 2. **create**: the new functions and policies are added under new names; every
    column keeps its legacy value and mask. Verified live and with the legacy
-   verify-access checks.
+   verify-access checks. The coverage check accepts the legacy values here
+   (the live refresh recorded the deterministic ones the switch applies) only
+   while the adopted migration record, the policy journal and the legacy
+   snapshot agree; the switch is checked against the refreshed values. Like
+   every staged phase, it renders into the ignored
+   `generated/.runtime/data_access/`, so the committed `data_access/` files
+   never change.
 3. **switch**: each column is retagged in place, from its legacy value to its
    deterministic one. One tag per column, so no column is ever unmasked or
    doubly masked. Verified against the tier rule.
