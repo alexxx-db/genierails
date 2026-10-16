@@ -103,7 +103,8 @@ def snapshot(masks=("mask_ssn",), tags=(("t", "ssn", "class.ssn"),), grants=(), 
     return {"uc": {"cat": {
         "governed_tags": [{"catalog_name": "cat", "schema_name": "s", "table_name": t, "column_name": c,
                            "tag_name": "pii", "tag_value": v} for t, c, v in tags],
-        "mask_functions": [{"routine_catalog": "cat", "routine_schema": "s", "routine_name": m} for m in masks],
+        "mask_functions": [{"routine_catalog": "cat", "routine_schema": "s", "routine_name": m,
+                            "definition_hash": f"hash:{m}"} for m in masks],
         "abac_policies": [{"table": "cat.s.t", "policies": [{"name": "mask_ssn_p", "to_principals": ["account users"],
                            "except_principals": list(policy_except), "column_mask": {"function_name": "cat.s.mask_ssn"}}]}],
         "table_grants": [{"grantee": g, "privilege_type": "SELECT", "table_catalog": "cat", "table_schema": "s",
@@ -545,6 +546,7 @@ def azure_legacy_mid_migration_snapshot(*, treatment="redact", policy_except=())
             "routine_catalog": catalog,
             "routine_schema": "dev_to_prod_demo",
             "routine_name": "mask_redact",
+            "definition_hash": "hash:mask_redact",
         }],
         "abac_policies": [{"table": table, "policies": [{
             "name": f"{catalog}_gr_mask_{catalog}_redact",
@@ -570,19 +572,38 @@ def test_unchanged_azure_legacy_never_raw_snapshot_is_not_weaker():
 def test_azure_legacy_never_raw_policy_gaining_exception_is_weaker():
     baseline = azure_legacy_mid_migration_snapshot()
     current = azure_legacy_mid_migration_snapshot(policy_except=("payments_ops",))
-    assert driver.protection_diff(baseline, current)["policies"] == [
+    assert driver.protection_diff(baseline, current) == {"policies": [
         "louis_serverless.dev_to_prod_demo.payments "
         "louis_serverless_gr_mask_louis_serverless_redact: newly exempts payments_ops"
-    ]
+    ]}
+
+
+def test_azure_legacy_policy_dropping_matched_value_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot(treatment="email_partial")
+    current["uc"]["louis_serverless"]["governed_tags"][0]["tag_value"] = "redact"
+    assert driver.protection_diff(baseline, current) == {"policies": [
+        "louis_serverless.dev_to_prod_demo.payments "
+        "louis_serverless_gr_mask_louis_serverless_redact: no longer matches redact"
+    ]}
+
+
+def test_live_policy_mask_function_definition_change_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    current["uc"]["louis_serverless"]["mask_functions"][0]["definition_hash"] = "changed"
+    assert driver.protection_diff(baseline, current) == {"masks": [
+        "louis_serverless.dev_to_prod_demo.mask_redact: definition changed"
+    ]}
 
 
 def test_azure_legacy_never_raw_replaced_by_raw_capable_treatment_is_weaker():
     baseline = azure_legacy_mid_migration_snapshot()
     current = azure_legacy_mid_migration_snapshot(treatment="email_partial")
-    assert driver.protection_diff(baseline, current)["columns"] == [
+    assert driver.protection_diff(baseline, current) == {"columns": [
         "louis_serverless.dev_to_prod_demo.payments.cvv "
         "gr_treatment never-raw redact -> email_partial"
-    ]
+    ]}
 
 
 def test_widened_grant_after_restore_fails(tmp_path, live):
@@ -978,7 +999,9 @@ def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
 def test_d4_snapshot_query_includes_deterministic_masks():
     class Statement:
         def execute_statement(self, *, statement, **_):
-            assert "startswith(routine_name, 'gr_mask_')" in statement if "routines" in statement else True
+            if "routines" in statement:
+                assert "startswith(routine_name, 'gr_mask_')" in statement
+                assert "routine_definition" in statement
             cols = [SimpleNamespace(name=n) for n in ("table_catalog", "table_schema", "table_name")]
             rows = [["cat", "s", "t"]] if "information_schema.tables" in statement else []
             return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
@@ -987,6 +1010,54 @@ def test_d4_snapshot_query_includes_deterministic_masks():
     client = SimpleNamespace(statement_execution=Statement(),
                              policies=SimpleNamespace(list_policies=lambda *_a, **_k: []))
     driver._sql_snapshots(client, "wh", "cat")
+
+
+@pytest.mark.parametrize("definition", [None, ""])
+def test_mask_snapshot_fails_closed_when_definition_is_unreadable(definition):
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type",
+                         "routine_definition")
+                rows = [["cat", "s", "mask_ssn", "FUNCTION", definition]]
+            elif "information_schema.tables" in statement:
+                names = ("table_catalog", "table_schema", "table_name")
+                rows = [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(
+                    columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: []))
+    with pytest.raises(RuntimeError, match=r"cat\.s\.mask_ssn: mask function definition is unreadable"):
+        driver._sql_snapshots(client, "wh", "cat")
+
+
+def test_mask_snapshot_hashes_definition_without_persisting_body():
+    body = "RETURN 'redacted'"
+
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type",
+                         "routine_definition")
+                rows = [["cat", "s", "mask_ssn", "FUNCTION", body]]
+            elif "information_schema.tables" in statement:
+                names = ("table_catalog", "table_schema", "table_name")
+                rows = [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(
+                    columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: []))
+    routine = driver._sql_snapshots(client, "wh", "cat")["mask_functions"][0]
+    assert routine["definition_hash"] == driver.hashlib.sha256(body.encode()).hexdigest()
+    assert "routine_definition" not in routine
 
 
 def _deterministic_snapshot(value, *, policy_value=None):

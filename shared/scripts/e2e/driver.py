@@ -492,7 +492,7 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
         "schema_grants": f"SELECT * FROM system.information_schema.schema_privileges WHERE catalog_name = '{_sql_lit(catalog)}'",
         "table_grants": f"SELECT * FROM system.information_schema.table_privileges WHERE table_catalog = '{_sql_lit(catalog)}'",
         "governed_tags": f"SELECT * FROM system.information_schema.column_tags WHERE catalog_name = '{_sql_lit(catalog)}'",
-        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND (startswith(routine_name, 'mask_') OR startswith(routine_name, 'gr_mask_'))",
+        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type,routine_definition FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND (startswith(routine_name, 'mask_') OR startswith(routine_name, 'gr_mask_'))",
         "tables": f"SELECT table_catalog,table_schema,table_name FROM system.information_schema.tables WHERE table_catalog = '{_sql_lit(catalog)}' AND table_schema <> 'information_schema'",
     }
     out: dict[str, Any] = {}
@@ -507,6 +507,13 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
             rows.extend(chunk.data_array or [])
             next_index = getattr(chunk, "next_chunk_index", None)
         out[name] = [dict(zip(columns, row)) for row in rows]
+    for routine in out["mask_functions"]:
+        definition = routine.pop("routine_definition", None)
+        qualified = ".".join(str(routine.get(k) or "")
+                             for k in ("routine_catalog", "routine_schema", "routine_name"))
+        if not isinstance(definition, str) or not definition.strip():
+            raise RuntimeError(f"{qualified}: mask function definition is unreadable")
+        routine["definition_hash"] = hashlib.sha256(definition.encode()).hexdigest()
     # information_schema shows only what the principal can see: a governed
     # catalog with no visible tables is an unreadable catalog, not "no data".
     if not out["tables"]:
@@ -906,7 +913,8 @@ def customer_checkout_problems(checkout_dir: Path, cloud: str, commit: str) -> l
 
 def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Per-column and per-principal protection facts, independent of IDs and timestamps."""
-    result: dict[str, Any] = {"columns": {}, "masks": set(), "mask_names": set(), "policies": {}, "grants": set()}
+    result: dict[str, Any] = {"columns": {}, "masks": set(), "mask_names": set(),
+                              "mask_definitions": {}, "policies": {}, "grants": set()}
     uc = snapshot.get("uc", {})
     for catalog, evidence in uc.items() if isinstance(uc, Mapping) else []:
         if not isinstance(evidence, Mapping): continue
@@ -920,7 +928,10 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             normalized = _normalized_mask(name)
             prefix = f"{row.get('routine_catalog')}.{row.get('routine_schema')}."
             result["masks"].add(prefix + ("__".join(normalized) if normalized else name))
-            result["mask_names"].add(prefix + name)
+            qualified = prefix + name
+            result["mask_names"].add(qualified)
+            if row.get("definition_hash"):
+                result["mask_definitions"][qualified] = str(row["definition_hash"])
         for entry in evidence.get("abac_policies") or []:
             for policy in entry.get("policies") or []:
                 mask = policy.get("column_mask") or policy.get("row_filter") or {}
@@ -1079,6 +1090,12 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
             lost_columns.append(f"{key[0]} {key[1]}={was}: changed to {now}")
     if lost_columns: weaker["columns"] = lost_columns
     lost_masks = sorted((before["masks"] - after["masks"]) - excused_masks)
+    live_before = {fn for fact in before["policies"].values() for fn in fact["raw_functions"]}
+    live_after = {fn for fact in after["policies"].values() for fn in fact["raw_functions"]}
+    changed_masks = sorted(fn for fn in live_before & live_after
+                           if fn in before["mask_definitions"] and fn in after["mask_definitions"]
+                           and before["mask_definitions"][fn] != after["mask_definitions"][fn])
+    lost_masks.extend(f"{fn}: definition changed" for fn in changed_masks)
     if lost_masks: weaker["masks"] = lost_masks
     policies = []
     for key, was in sorted(before["policies"].items()):
@@ -1089,6 +1106,11 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
         elif now is not None and now["function"] != was["function"]:
             policies.append(f"{label}: function {sorted(was['function'])} -> {sorted(now['function'])}")
         elif now is not None:
+            table_values = {value[2] if isinstance(value, tuple) else value
+                            for (location, tag), value in after["columns"].items()
+                            if tag == "gr_treatment" and location.rsplit(".", 1)[0] == key[0]}
+            policies += [f"{label}: no longer matches {value}" for value in
+                         sorted((was["values"] - now["values"]) & table_values)]
             policies += [f"{label}: no longer applies to {p}" for p in sorted(was["to"] - now["to"])]
             policies += [f"{label}: newly exempts {p}" for p in sorted(now["except"] - was["except"])]
     if policies: weaker["policies"] = policies
