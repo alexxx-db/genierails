@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.script_stubs import without_ci
+
 import agent_files
 from agent_files import AgentFileError
 from scripts import agent_ownership as ownership
@@ -658,7 +660,7 @@ def test_live_round_trip():  # pragma: no cover - live only
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
 @pytest.mark.parametrize("target", ["capture", "detach-agent"])
 def test_make_dry_run_for_agent_targets(cloud, target, tmp_path):
-    env = {k: v for k, v in os.environ.items() if k not in ("CI", "MAKEFLAGS", "MAKELEVEL")}
+    env = {k: v for k, v in without_ci(os.environ).items() if k not in ("MAKEFLAGS", "MAKELEVEL")}
     result = subprocess.run(["make", "-n", "-C", str(ROOT / cloud), target, "ENV=dev", "SPACE=Sales"],
                             text=True, capture_output=True, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
