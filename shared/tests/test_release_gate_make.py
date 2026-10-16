@@ -607,3 +607,63 @@ def test_migrate_plan_passes_when_the_inventory_and_the_report_pass(make, repo):
     result = make("migrate-plan", "prod", stubs={"migration.py report": "true"})
     assert result.returncode == 0, result.stdout + result.stderr
     assert "inventory failed" not in result.stderr and "block the cutover" not in result.stderr
+
+
+# -- adopted custom-mask cases (design 18.4.1): read-only, before the env lock ----------
+
+CASES_STUB = r'''#!{python}
+"""custom_masks.py live-check: records whether the env lock was held when the cases ran."""
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+env_dir = Path(args[args.index("--env-dir") + 1])
+held = "locked" if (env_dir / "generated" / ".governance.lock").exists() else "unlocked"
+with open({log!r}, "a") as log:
+    log.write(json.dumps(["cases", held, env_dir.name]) + "\n")
+sys.exit(int(Path({rc!r}).read_text()) if Path({rc!r}).exists() else 0)
+'''
+
+
+def _cases_stub(make: Make) -> dict[str, str]:
+    stub = make._write("cases-stub", CASES_STUB.format(python=sys.executable, log=str(make.log),
+                                                      rc=str(make.tmp / "cases.rc")))
+    return {"custom_masks.py live-check": str(stub)}
+
+
+def test_rehearse_runs_the_custom_mask_cases_before_the_lock_and_before_any_step(make, repo):
+    stubs = _cases_stub(make)
+    result = make("rehearse", "dev", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert make.calls()[0] == ["cases", "unlocked", "dev"]
+    assert make.names() == ["cases", "_derive-before-exposure", "validate-generated", "coverage-gate", "apply",
+                            "verify-access"]
+
+
+def test_a_failing_custom_mask_case_stops_rehearse_before_the_lock_and_the_receipt(make, repo):
+    stubs = _cases_stub(make)
+    make.exit_code("cases", 1)
+    result = make("rehearse", "dev", stubs=stubs)
+    assert result.returncode != 0
+    assert make.calls() == [["cases", "unlocked", "dev"]]
+    assert not rg.rehearse_receipts(repo.cloud, "dev") and _no_lock(repo, "dev")
+
+
+def test_release_plan_and_release_run_the_custom_mask_cases_before_the_lock(make, repo):
+    stubs = _cases_stub(make)
+    assert make("rehearse", "dev", stubs=stubs).returncode == 0
+    make.reset()
+    result = make("release-plan", "prod", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert make.calls()[:2] == [["inventory", "--env-dir", str(repo.prod)], ["cases", "unlocked", "prod"]]
+    manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ["cases", "unlocked", "prod"] in make.calls()
+    assert make.names().index("cases") < make.names().index("live")
+    # A failure stops release-plan before the lock: nothing under it ran and no manifest was written.
+    make.exit_code("cases", 1)
+    make.reset()
+    result = make("release-plan", "prod", stubs=stubs)
+    assert result.returncode != 0
+    assert make.names() == ["inventory", "cases"] and _no_lock(repo, "prod")

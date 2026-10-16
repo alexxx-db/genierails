@@ -698,14 +698,14 @@ def _recipe(target):
     return match.group(1)
 
 
-def test_rehearse_and_release_run_the_cases_before_anything_applies():
+def test_rehearse_and_release_run_the_cases_before_the_lock():
     makefile = (SHARED / "Makefile.shared").read_text()
     assert ('override _CUSTOM_MASK_CASES = python3 "$(SHARED_ROOT)/scripts/custom_masks.py" live-check '
             '--env-dir "$(ENV_DIR)" --env "$(ENV)"') in makefile
+    # Before the env lock (and so before every step under it) in rehearse, release-plan and release.
     steps = makefile.split("override _REHEARSE_STEPS = ", 1)[1].split("\n\n", 1)[0]
-    assert steps.index('validate-generated ENV="$(ENV)"') < steps.index("$(_CUSTOM_MASK_CASES) &&") \
-        < steps.index("$(MAKE) apply ")
-    for target in ("release-plan", "_release-manifest"):
+    assert "_CUSTOM_MASK_CASES" not in steps
+    for target in ("rehearse", "release-plan", "_release-manifest"):
         recipe = _recipe(target)
         assert "$(_CUSTOM_MASK_CASES) || exit 1" in recipe, target
         assert recipe.index("$(_CUSTOM_MASK_CASES)") < recipe.index("$(call _ENV_LOCK,"), target

@@ -764,7 +764,8 @@ override _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)
 # Live checks the release targets run (overridable so tests never reach Databricks).
 override _EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
 override _CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
-# Every adopted custom mask's cases, read-only on the env's SQL warehouse (no-op without custom_masks/).
+# Every adopted custom mask's cases, read-only on the env's SQL warehouse (no-op without
+# custom_masks/). rehearse, release-plan and release MANIFEST= run it before the env lock.
 override _CUSTOM_MASK_CASES = python3 "$(SHARED_ROOT)/scripts/custom_masks.py" live-check --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
@@ -811,7 +812,6 @@ _apply-account-locked:
 # without re-applying. release-plan releases only a commit with a passing one.
 override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 	$(MAKE) validate-generated ENV="$(ENV)" && \
-	$(_CUSTOM_MASK_CASES) && \
 	$(MAKE) coverage-gate ENV="$(ENV)" && \
 	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
 	$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
@@ -833,6 +833,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
+		$(_CUSTOM_MASK_CASES) || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
 		gate=0; $(_RELEASE_GATE) rehearse-start --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || gate=$$?; \
 		if [ $$gate -eq 10 ]; then exit 0; elif [ $$gate -ne 0 ]; then exit $$gate; fi; \
