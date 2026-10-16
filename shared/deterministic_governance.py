@@ -9,7 +9,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Collection, Literal, Mapping, Sequence
 
 
 ACCESS_LEVELS = {"raw", "partial", "full"}
@@ -61,6 +61,11 @@ def _known_treatments(registry_path: Path | None = None) -> set[str]:
     return {item["value"] for item in data.get("treatments", [])} | set(PARTIAL_VERSIONS)
 
 
+def custom_partial_versions(custom_treatments: Collection[str]) -> dict[str, frozenset[str]]:
+    """The partial versions of an env's adopted custom masks: its own, or stricter (redacted)."""
+    return {name: frozenset({name, "redacted"}) for name in custom_treatments}
+
+
 @dataclass(frozen=True)
 class AccessResolution:
     """One effective access decision; only partial access carries a version."""
@@ -83,6 +88,7 @@ def resolve_precedence(
     deployer_principal: str | None = None,
     raw_exempt_principals: list[str] | None = None,
     never_raw: bool = False,
+    custom_treatments: Collection[str] = (),
 ) -> AccessResolution:
     """Resolve access first, then resolve a version only for partial access.
 
@@ -90,6 +96,8 @@ def resolve_precedence(
     effective access. Principals outside every tier fail closed to full.
     ``never_raw`` is set when any class on the column is never raw, even if
     strictest-wins picked an ordinary treatment (see mask_library.resolve_class).
+    ``custom_treatments`` are the env's adopted custom masks (design 18.4.1),
+    known treatments like the library's.
     """
     memberships = [group] if isinstance(group, str) else list(group)
     configured = list(access_tier_groups)
@@ -98,7 +106,8 @@ def resolve_precedence(
 
     # Invalid or drifted names can never open access. validate_config reports
     # the schema error; direct resolver callers still fail closed.
-    if treatment not in PARTIAL_VERSIONS or effective_treatment not in PARTIAL_VERSIONS:
+    known = PARTIAL_VERSIONS.keys() | set(custom_treatments)
+    if treatment not in known or effective_treatment not in known:
         return AccessResolution("full")
 
     # Never-raw beats everything, including the deployer SP: nobody sees raw.
@@ -171,9 +180,13 @@ import deployer_identity  # noqa: E402
 
 def validate_config(
     cfg: Mapping[str, Any], *, ack_unclassified: str | None = None,
-    ack_weaken: str | None = None,
+    ack_weaken: str | None = None, library: Mapping | None = None,
 ) -> list[str]:
-    """Return all deterministic-governance schema errors in an env config."""
+    """Return all deterministic-governance schema errors in an env config.
+
+    ``library`` is the env's effective library (scripts/custom_masks.py): its
+    adopted custom masks are known treatments, like the mask library's.
+    """
     errors: list[str] = []
     governance_mode = cfg.get("governance_mode", "legacy")
     if not isinstance(governance_mode, str) or governance_mode not in {"legacy", "deterministic"}:
@@ -199,8 +212,18 @@ def validate_config(
         tiers = []
     elif len(tiers) != len(set(tiers)):
         errors.append("access_tier_groups must not contain duplicate groups")
+    elif any(group.startswith("<") and group.endswith(">") for group in tiers):
+        errors.append(
+            "replace the access_tier_groups placeholders with your IdP-synced group names, "
+            "most to least privileged"
+        )
 
-    known = _known_treatments()
+    from governance_policies import CUSTOM_TREATMENT
+
+    custom = custom_partial_versions(
+        name for name in (library or {}).get("treatments", {}) if CUSTOM_TREATMENT.fullmatch(name))
+    partial_versions = {**PARTIAL_VERSIONS, **custom}
+    known = _known_treatments() | set(custom)
     versions = cfg.get("treatment_versions", {})
     if not isinstance(versions, dict):
         errors.append("treatment_versions must be a map")
@@ -217,7 +240,7 @@ def validate_config(
             errors.append(f"{label}.partial may not be raw; use a column or tier access override")
         elif rule["partial"] == "hmac_sha256":
             errors.append(f"{label}.partial: {KEYED_HASH_UNAVAILABLE}")
-        elif rule["partial"] not in PARTIAL_VERSIONS.get(treatment, frozenset()):
+        elif rule["partial"] not in partial_versions.get(treatment, frozenset()):
             errors.append(f"{label}.partial names unknown version {rule['partial']!r}")
 
     tier_overrides = cfg.get("tier_access_overrides", {})
@@ -346,7 +369,7 @@ def validate_config(
             if "delete" in space and not isinstance(space["delete"], bool):
                 errors.append(f"agent {name} delete must be a boolean")
     from governance_policies import tag_treatment_errors
-    errors.extend(tag_treatment_errors(cfg.get("tag_treatments")))
+    errors.extend(tag_treatment_errors(cfg.get("tag_treatments"), library))
     from table_readers import validation_errors as table_readers_errors
     errors.extend(table_readers_errors(cfg))
     from group_map import validation_errors as group_map_errors

@@ -29,7 +29,8 @@ no agent's config, so it never waits for an agent that's mid-curation.
 ## Before you start
 
 - Run `make` from `aws/` (or `azure/`).
-- Each env sets `governance_mode = "deterministic"` and its own
+- The champion template and newly scaffolded workspace envs set
+  `governance_mode = "deterministic"`; each env also sets its own
   `deployer_principal_id` (the application ID of the SP that applies it) in its
   `env.auto.tfvars`. `promote-to` never sets either in prod. An env deployed
   before in legacy mode migrates first: [legacy mode](../legacy-mode.md).
@@ -238,8 +239,12 @@ rehearse and release. Read the [CHANGELOG](../../../aws/CHANGELOG.md) first.
 > for review, are never run by `generate`, `rehearse`, `release` or `maintain`,
 > and refuse in CI and in prod:
 > - `make suggest-treatment ENV=dev CLASS=<class>` proposes a library treatment for an unmapped class.
-> - `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` drafts
+> - `make draft-custom-mask ENV=dev TREATMENT=custom_<name> TYPE=<sql-type>` drafts
 >   a custom mask and its exact-output test fixture under `envs/dev/drafts/custom_masks/`.
-> - `make test-custom-mask ENV=dev TREATMENT=<name>` runs the mask library's
+> - `make test-custom-mask ENV=dev TREATMENT=custom_<name>` runs the mask library's
 >   exact-output tests on that draft. A pass does not adopt it: `tag_treatments`
->   can't use a custom mask until `make adopt-custom-mask` lands.
+>   can't use a custom mask until it is adopted.
+> - `make adopt-custom-mask ENV=dev TREATMENT=custom_<name>` (no model) copies a
+>   passed draft into `envs/dev/custom_masks/`, which you own and review like
+>   `env.auto.tfvars`, and prints the `tag_treatments` line to add
+>   ([reference](../../REFERENCE.md#adopted-custom-masks)).

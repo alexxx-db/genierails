@@ -118,6 +118,7 @@ def test_promote_never_cleans_redirected_source_or_dest_dirs(cloud, tmp_path):
     (source / "env.auto.tfvars").write_text(DEV_ENV)
     (source / "generated/abac.auto.tfvars").write_text(DEV_GENERATED)
     (source / "generated/masking_functions.sql").write_text("-- none\n")
+    (dest / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
 
     result = cloud("promote", "SOURCE_ENV=dev", f"SOURCE_ENV_DIR={source}", "DEST_ENV=prod",
                    f"DEST_ENV_DIR={dest}", "DEST_CATALOG_MAP=paycat=ppay")

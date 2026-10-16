@@ -330,7 +330,8 @@ def _load_tfvars(path: Path, label: str, *, strict: bool = False) -> dict:
 
 
 def load_auth_config(
-    auth_file: Path, env_file: Path | None = None, *, strict_env: bool = False
+    auth_file: Path, env_file: Path | None = None, *, strict_env: bool = False,
+    allow_access_tier_placeholders: bool = False,
 ) -> dict:
     """Load config from auth + env tfvars files. Merges both; env overrides auth.
 
@@ -339,7 +340,6 @@ def load_auth_config(
     is set, relative uc_tables entries are expanded into full 3-part refs before being
     returned so the rest of the script does not need to know about the split.
     """
-    cfg = _load_tfvars(auth_file, "credentials")
     if env_file is None:
         env_file = auth_file.parent / "env.auto.tfvars"
     env_cfg = _load_tfvars(env_file, "environment", strict=strict_env)
@@ -350,9 +350,15 @@ def load_auth_config(
         env_cfg = with_agents(env_file, env_cfg)
     except AgentFileError as exc:
         raise ValueError(str(exc)) from exc
-    placeholder = placeholder_error(env_cfg, env_file)
+    placeholder = placeholder_error(
+        env_cfg, env_file, allow_access_tier_placeholders=allow_access_tier_placeholders
+    )
     if placeholder:
         raise ValueError(placeholder)
+    # Only read credentials after the committed config has passed the
+    # placeholder preflight; no credential or account API should be touched
+    # for an unfilled template.
+    cfg = _load_tfvars(auth_file, "credentials")
     cfg.update(env_cfg)
 
     # Combine uc_catalog + relative uc_tables into full 3-part refs when the new
@@ -3419,11 +3425,16 @@ def write_deterministic_draft(
 
 def deterministic_model_for(
     env_cfg: dict, classification_source, ddl_text: str, *,
-    columns: list[str] | None = None,
+    columns: list[str] | None = None, env_dir: Path | None = None,
 ):
-    """The deterministic model for the classified columns of the governed set."""
+    """The deterministic model for the classified columns of the governed set.
+
+    ``env_dir`` adds the env's adopted custom masks (envs/<env>/custom_masks/)
+    to the mask library; an invalid one stops generation.
+    """
     from deployer_identity import SETTING, validation_errors
     from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
+    from scripts.custom_masks import effective_library
 
     # The committed deployer ID, never auth.auto.tfvars: the output is a
     # function of the commit (deployer_identity.py).
@@ -3435,6 +3446,7 @@ def deterministic_model_for(
         column_types_from_ddl(ddl_text),
         env_cfg,
         deployer_principal=str(env_cfg[SETTING]),
+        library=effective_library(env_dir),
     )
 
 
@@ -7877,7 +7889,8 @@ def main():
 
     try:
         auth_cfg = load_auth_config(
-            auth_file, strict_env=not args.tables and not args.dry_run
+            auth_file, strict_env=not args.tables and not args.dry_run,
+            allow_access_tier_placeholders=bool(args.groups or args.create_groups),
         )
     except ValueError as e:
         print(f"ERROR: {e}")
@@ -8432,7 +8445,7 @@ def main():
                   "were read; set enable_classification = true and wait for the tags")
             sys.exit(1)
         try:
-            deterministic_model = deterministic_model_for(auth_cfg, classification_source, ddl_text)
+            deterministic_model = deterministic_model_for(auth_cfg, classification_source, ddl_text, env_dir=WORK_DIR)
         except DeterministicGovernanceError as exc:
             print(f"ERROR: {exc}")
             sys.exit(1)

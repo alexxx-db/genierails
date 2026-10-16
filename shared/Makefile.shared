@@ -3,7 +3,7 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
-.PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask
+.PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask adopt-custom-mask
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -200,6 +200,9 @@ _prepare-env:
 		fi; \
 		if [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
 			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars"; \
+			if [ "$$env_name" = "$(ACCOUNT_ENV)" ] || [ "$${_SEED_PROMOTION_SETTINGS:-1}" = 0 ]; then \
+				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars"; \
+			fi; \
 			if [ "$${_SEED_PROMOTION_SETTINGS:-1}" != 0 ] && [ "$$env_name" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" != "$(DEFAULT_ENV)" ]; then \
 				printf '\n# Promotion source and catalog renames; replace both catalog placeholders.\npromote_from = "$(DEFAULT_ENV)"\ncatalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }\n' "$$env_name" >> "$$env_dir/env.auto.tfvars"; \
 			fi; \
@@ -247,8 +250,10 @@ _guard-data-access-config:
 # Fail fast while env.auto.tfvars still holds the template's <your-genie-space-id>.
 # Promote also checks its source env and, if it already exists, its destination.
 # Missing files pass, so ENV=account and not-yet-created envs are unaffected.
-override _GENIE_PLACEHOLDER_GUARD = python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
+override _GENIE_PLACEHOLDER_GUARD = GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$(if $(and $(filter generate,$(MAKECMDGOALS)),$(or $(findstring --groups,$(GENERATE_ARGS)),$(findstring --create-groups,$(GENERATE_ARGS)))),1,0) python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
 	"$(SOURCE_ENV_DIR)/env.auto.tfvars" $(if $(DEST_ENV),"$(DEST_ENV_DIR)/env.auto.tfvars",)
+override _PROMOTE_TO_PLACEHOLDER_GUARD = python3 "$(SHARED_ROOT)/genie_space_placeholder.py" \
+	$(if $(_PROMOTE_TO_FROM),"$(CLOUD_ROOT)/envs/$(_PROMOTE_TO_FROM)/env.auto.tfvars",) "$(ENV_DIR)/env.auto.tfvars"
 
 _guard-genie-placeholder:
 	@$(_GENIE_PLACEHOLDER_GUARD)
@@ -296,10 +301,12 @@ _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
 setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@echo "=== Setup ($(ENV)) ==="
+	@python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
 	@gov_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+	if python3 -c 'import sys,hcl2; c=hcl2.load(open(sys.argv[1])); raise SystemExit(0 if any(str(g).startswith("<") for g in c.get("access_tier_groups",[])) else 1)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then gov_only=0; fi; \
 	det="$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 	deployer_note=""; \
-	if [ "$$det" = 1 ] && ! python3 -c 'import sys,hcl2; sys.exit(0 if hcl2.load(open(sys.argv[1])).get("deployer_principal_id") else 1)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
+	if [ "$$det" = 1 ] && ! python3 -c 'import sys,hcl2; sys.path.insert(0, "$(SHARED_ROOT)"); from deployer_identity import validation_errors; sys.exit(1 if validation_errors(hcl2.load(open(sys.argv[1]))) else 0)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
 		deployer_note="     Then commit that SP's client_id as deployer_principal_id in $(_SETUP_ENV_REL)/env.auto.tfvars (required in deterministic mode; not secret)"; \
 	fi; \
 	access_note="     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)"; \
@@ -326,6 +333,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)"; \
 		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + prod workspace host & id"; \
 		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
+		if [ "$$det" = 1 ]; then echo "     Replace this env's access_tier_groups placeholders with prod IdP groups, most to least privileged."; fi; \
 		echo "  3. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
 		echo "  4. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
@@ -361,7 +369,12 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 			echo "     (who gets SELECT; without it GenieRails grants none and masks apply to existing readers)"; step=$$((step+1)); \
 		else \
 			echo "  $$step. Edit $(_SETUP_ENV_REL)/env.auto.tfvars — set genie_space_id to your Genie agent ID and"; \
-			echo "     access_tier_groups to your IdP groups, most to least privileged"; \
+			if [ "$$det" = 1 ]; then \
+				echo "     deployer_principal_id to the applying SP's client_id, and access_tier_groups to your IdP groups,"; \
+				echo "     most to least privileged (the template starts new champions in deterministic mode)"; \
+			else \
+				echo "     access_tier_groups to your IdP groups, most to least privileged"; \
+			fi; \
 			echo "     (No agent yet? See ../shared/examples/dev_to_prod/SAMPLE_ENV.md)"; step=$$((step+1)); \
 		fi; \
 		echo "  $$step. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
@@ -568,6 +581,15 @@ draft-custom-mask: _guard-workspace-target ## [AI helper] Draft a custom mask an
 test-custom-mask: _guard-workspace-target ## Run the mask library's exact-output checks on a drafted custom mask (dev SQL warehouse, read-only): TREATMENT=<name>
 	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) test-custom-mask $(_AI_HELPER_ARGS) --treatment "$(strip $(TREATMENT))"
 
+# Adopting a custom mask (scripts/custom_masks.py, design 18.4.1) calls no model:
+# it copies a draft test-custom-mask passed into envs/dev/custom_masks/ (governance
+# config, reviewed in a PR) and prints the tag_treatments line to add. Same
+# guards as the AI helpers: never in CI (no opt-out), only ENV=dev at this
+# checkout's real envs/dev. FORCE=1 replaces an adopted type family.
+override _CUSTOM_MASKS = python3 "$(SHARED_ROOT)/scripts/custom_masks.py"
+adopt-custom-mask: _guard-workspace-target ## Adopt a custom mask test-custom-mask passed into envs/dev/custom_masks/ (no model; prints the tag_treatments line): TREATMENT=custom_<name>
+	@$(_DRY_RUN_GUARD); $(_CUSTOM_MASKS) adopt-custom-mask $(_AI_HELPER_ARGS) --treatment "$(strip $(TREATMENT))"
+
 derive-assignments: _guarded-bootstrap _guard-workspace-target ## Re-derive only tag_assignments from live native class.* tags (requires prior promote; never calls an LLM)
 	@echo "=== Derive Assignments ($(ENV)) ==="
 	@$(_COVERAGE_GATE) invalidate --env-dir "$(ENV_DIR)"
@@ -755,6 +777,9 @@ override _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)
 # Live checks the release targets run (overridable so tests never reach Databricks).
 override _EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
 override _CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
+# Every adopted custom mask's cases, read-only on the env's SQL warehouse (no-op without
+# custom_masks/). rehearse, release-plan and release MANIFEST= run it before the env lock.
+override _CUSTOM_MASK_CASES = python3 "$(SHARED_ROOT)/scripts/custom_masks.py" live-check --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
@@ -821,6 +846,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
+		$(_CUSTOM_MASK_CASES) || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
 		gate=0; $(_RELEASE_GATE) rehearse-start --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || gate=$$?; \
 		if [ $$gate -eq 10 ]; then exit 0; elif [ $$gate -ne 0 ]; then exit $$gate; fi; \
@@ -998,10 +1024,12 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	prov="$$(mktemp)"; \
 	$(_RELEASE_GATE) provenance --env-dir "$(ENV_DIR)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
+	$(_CUSTOM_MASK_CASES) || exit 1; \
 	$(_CLASSIFICATION_CHECK) --mode deterministic --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
 	$(_AGENT_OWNERSHIP) check-deletes --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
+	$(_AGENT_OWNERSHIP) check-detach --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	$(call _ENV_LOCK,release-plan); \
 	$(_AGENT_OWNERSHIP) restore-ids --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	$(_AGENT_OWNERSHIP) guard-removals --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
@@ -1113,6 +1141,7 @@ _release-manifest: _guard-not-ci-apply
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
+	$(_CUSTOM_MASK_CASES) || exit 1; \
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
@@ -1349,6 +1378,7 @@ _PROMOTE_TO_MAP = $(if $(filter command line,$(origin CATALOG_MAP)),$(CATALOG_MA
 # CHECK=1 writes nothing: it reruns promote-to in a scratch copy of envs/ (no
 # credentials or state) and fails if the committed output differs.
 promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
+	@$(_PROMOTE_TO_PLACEHOLDER_GUARD)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	if [ "$(CHECK)" = 1 ]; then \
@@ -1360,6 +1390,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
 	$(call _PROMOTION_TXN_BEGIN,"$$dest_dir" "$(ACCOUNT_ENV_DIR)"); \
 	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
+	python3 "$(SHARED_ROOT)/scripts/custom_masks.py" promote --source-dir "$$src_dir" --dest-dir "$$dest_dir" || exit 1; \
 	$(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
 		DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" write --source "$$src_dir/generated/abac.auto.tfvars" \
@@ -1381,6 +1412,7 @@ override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter
 	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
+	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	$(_CHECK_ENV) check

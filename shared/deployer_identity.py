@@ -51,6 +51,9 @@ def validation_errors(cfg: Mapping) -> list[str]:
             return [f"{SETTING} is required in deterministic mode: set it to the application ID of the "
                     "service principal that applies this env (databricks_client_id in its auth.auto.tfvars)"]
         return []
+    if isinstance(value, str) and value.startswith("<") and value.endswith(">"):
+        return [f"replace the {SETTING} placeholder {value!r} with the application ID of the "
+                "service principal that applies this env"]
     if not isinstance(value, str) or not _APPLICATION_ID.fullmatch(value):
         # A group name (account users, users) or anything else here would be exempted from every mask.
         return [f"{SETTING} must be a service principal application ID "

@@ -340,7 +340,7 @@ def _offline_markers(tfvars_path: Path) -> list[tuple[str, str, str]]:
 def _live_deterministic_markers(auth_path: Path, env_path: Path, tag_treatments: dict) -> list[tuple[str, str, str]]:
     """class.* tags on the governed set that neither the mask library nor tag_treatments maps."""
     from governance_policies import with_tag_treatments
-    from mask_library import load_library
+    from scripts.custom_masks import effective_library
 
     runtime = load_auth_config(auth_path, env_path)
     declared = list(runtime.get("uc_tables") or [])
@@ -354,7 +354,7 @@ def _live_deterministic_markers(auth_path: Path, env_path: Path, tag_treatments:
     native = _fetch_live_classification_source(table_refs, runtime, require_native=True)
     if native is None or not native.has_native_data():
         return []
-    library = with_tag_treatments(load_library(), tag_treatments)
+    library = with_tag_treatments(effective_library(env_path.parent), tag_treatments)
     known = {name for item in library["treatments"].values() for name in item["classes"]}
     return sorted(
         (column, f"class.{semantic}", semantic)
@@ -406,11 +406,11 @@ def map_deterministic(
     tfvars_path: Path, env_dir: Path, treatment: str, *,
     auth_path: Path | None = None, env_path: Path | None = None,
 ) -> dict:
-    """Map every unmapped class.* to a mask-library treatment in the env's tag_treatments."""
+    """Map every unmapped class.* to a mask-library treatment (or an adopted custom mask) in tag_treatments."""
     from governance_policies import tag_treatment_errors
-    from mask_library import load_library
+    from scripts.custom_masks import effective_library
 
-    library = load_library()
+    library = effective_library(env_dir)
     if not treatment:
         raise ValueError(
             "deterministic envs map a new class to a mask-library treatment; nothing was changed. "
@@ -418,8 +418,10 @@ def map_deterministic(
             f"(full redaction for every masked tier). Treatments: {', '.join(sorted(library['treatments']))}")
     if treatment not in library["treatments"]:
         raise ValueError(
-            f"TREATMENT={treatment} is not a mask-library treatment; nothing was changed. "
-            f"Treatments: {', '.join(sorted(library['treatments']))}")
+            f"TREATMENT={treatment} is not a mask-library treatment or an adopted custom mask; nothing was "
+            f"changed. Treatments: {', '.join(sorted(library['treatments']))}"
+            + (f". Adopt it first: make adopt-custom-mask ENV=dev TREATMENT={treatment}"
+               if treatment.startswith("custom_") else ""))
     target_dir = mapping_env_dir(env_dir)
     target_file = target_dir / "env.auto.tfvars"
     existing = dict(hcl2.loads(target_file.read_text()).get("tag_treatments") or {})

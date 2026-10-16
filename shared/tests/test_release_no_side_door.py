@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.script_stubs import without_ci
+
 from tests import script_stubs
 
 from scripts import environment_lock
@@ -66,7 +68,7 @@ def run(tmp_path, envs, target, env, *extra, stub_make=True):
         "staged_policy_apply.py": str(stubs["staged"]), "coverage_gate.py": str(stubs["gate"]),
         "sticky_governance.py": str(stubs["sticky"]), "agent_coverage.py": str(stubs["agent"]),
         "table_readers.py check": "true", "group_map.py": "true", "deployer_identity.py": "true"})
-    environ = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "CI", "APPLY_FLAGS")}
+    environ = {k: v for k, v in without_ci(os.environ).items() if k not in ("MAKEFLAGS", "MAKELEVEL", "APPLY_FLAGS")}
     environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
     result = subprocess.run(args, cwd=ROOT / "aws", text=True, capture_output=True,
                             env=environ | {"SIDE_DOOR_LOG": str(log)})

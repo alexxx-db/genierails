@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -16,6 +17,8 @@ from ack_file import AckFileError, load_consequences, merge_consequences, parse_
 class Protection:
     level: str
     consequence: str
+    # The gr_treatment value whose policies give this level ("" when none or unknown).
+    value: str = ""
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,8 @@ class CheckResult:
 
 
 _STRONGEST = 2
+# An adopted custom mask (design 18.4.1); the same pattern as governance_policies.CUSTOM_TREATMENT.
+_CUSTOM_VALUE = re.compile(r"custom_[a-z0-9]+(?:_[a-z0-9]+)*__[a-z0-9_]+__[0-9a-f]{8}")
 
 
 def protection_rank(level: str) -> int:
@@ -151,6 +156,12 @@ def find_weakenings(before: GovernanceState, after: GovernanceState, env: str) -
                 add(_issue(env, "missing_after", column, principal, prior.consequence, "missing after state (protection unknown)"))
             elif protection_rank(current.level) < protection_rank(prior.level):
                 add(_issue(env, "protection", column, principal, prior.consequence, current.consequence))
+            elif (protection_rank(prior.level) == protection_rank(current.level) == 1
+                  and _CUSTOM_VALUE.fullmatch(current.value) and current.value != prior.value):
+                # partial -> partial keeps the rank, but custom SQL decides what is
+                # revealed: a library mask swapped for a custom one, one custom mask
+                # for another, or a custom mask's SQL edited (a new generation).
+                add(_issue(env, "custom_mask_changed", column, principal, prior.consequence, current.consequence))
 
     # An exemption applies to every mask the principal meets, and it can reach a
     # governed table through groups or grants GenieRails doesn't see here, so a
@@ -245,7 +256,7 @@ def check_weakenings(
 def _state(payload: Mapping[str, object]) -> GovernanceState:
     columns = {
         str(column): {
-            str(principal): Protection(str(value["level"]), str(value["consequence"]))
+            str(principal): Protection(str(value["level"]), str(value["consequence"]), str(value.get("value") or ""))
             for principal, value in dict(principals).items()
         }
         for column, principals in dict(payload.get("columns", {})).items()

@@ -22,6 +22,25 @@ import sys
 from pathlib import Path
 from typing import Mapping
 
+SHARED = Path(__file__).resolve().parents[1]
+if str(SHARED) not in sys.path:
+    sys.path.insert(0, str(SHARED))
+
+from scripts.custom_masks import CI_MARKERS as _MARKERS  # noqa: E402
+
+# Every CI marker a GenieRails guard reads: _guard-not-ci-apply and
+# _guard-account-plan-empty (CI, TF_BUILD, JENKINS_URL, GITLAB_CI, BUILDKITE,
+# CIRCLECI), and the AI helpers' and adopt-custom-mask's refuse_ci (those plus
+# GITHUB_ACTIONS, BUILD_BUILDID and the other runners). A test that expects an
+# applying target to run under stubs clears all of them, so it passes on any
+# CI runner (Azure DevOps sets TF_BUILD=True); CI-refusal tests set one back.
+CI_ENV_MARKERS = ("CI", *_MARKERS, "GENIERAILS_ALLOW_CI_APPLY")
+
+
+def without_ci(environ: Mapping[str, str]) -> dict[str, str]:
+    """environ minus every CI marker (and the CI apply opt-out)."""
+    return {key: value for key, value in environ.items() if key not in CI_ENV_MARKERS}
+
 
 def install(bin_dir: Path, stubs: Mapping[str, str]) -> Path:
     bin_dir = Path(bin_dir)

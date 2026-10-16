@@ -51,7 +51,8 @@ MASK_REPLY = {
         {"input": "CAST('x' AS STRING)", "expected": "[REDACTED]", "note": "malformed"},
     ],
 }
-CI_MARKERS = ["CI", "GITHUB_ACTIONS", "TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI"]
+# Every marker refuse_ci reads, so no test inherits one from the runner.
+CI_MARKERS = ["CI", *ai_helpers.CI_MARKERS]
 
 
 class FakeModel:
@@ -143,8 +144,8 @@ def test_suggest_treatment_can_point_at_a_custom_mask(envs):
     assert _run(envs, "suggest-treatment", model, class_name="class.postcode") == 0
     draft = json.loads((envs / "dev" / "drafts" / "treatments" / "postcode.json").read_text())
     assert draft["suggested_treatment"] is None
-    assert draft["custom_mask"] == {"name": "postcode_area", "type": "STRING", "description": "first two digits"}
-    assert "make draft-custom-mask ENV=dev TREATMENT=postcode_area TYPE=STRING" in draft["to_adopt"]
+    assert draft["custom_mask"] == {"name": "custom_postcode_area", "type": "STRING", "description": "first two digits"}
+    assert "make draft-custom-mask ENV=dev TREATMENT=custom_postcode_area TYPE=STRING" in draft["to_adopt"]
 
 
 @pytest.mark.parametrize("env_text, class_name, message", [
@@ -236,11 +237,11 @@ def test_draft_genie_content_refusals(envs):
 def test_draft_custom_mask_writes_the_sql_and_its_exact_output_fixture(envs):
     dev = envs / "dev"
     before = _snapshot(dev)
-    assert _run(envs, "draft-custom-mask", FakeModel(MASK_REPLY), treatment="postcode_area", type="string") == 0
-    sql_path, json_path, passed = ai_helpers.mask_paths(dev, "postcode_area")
+    assert _run(envs, "draft-custom-mask", FakeModel(MASK_REPLY), treatment="custom_postcode_area", type="string") == 0
+    sql_path, json_path, passed = ai_helpers.mask_paths(dev, "custom_postcode_area")
     assert ai_helpers.mask_expression(sql_path.read_text()) == MASK_REPLY["sql"]
     fixture = json.loads(json_path.read_text())
-    assert fixture["treatment"] == "postcode_area" and fixture["type"] == "STRING"
+    assert fixture["treatment"] == "custom_postcode_area" and fixture["type"] == "STRING"
     # The behaviour contract's NULL case is always in the fixture.
     assert fixture["cases"][0] == {"input": "CAST(NULL AS STRING)", "expected": None, "note": "NULL in gives NULL out"}
     assert fixture["cases"][1:] == MASK_REPLY["cases"]
@@ -262,15 +263,15 @@ def test_draft_custom_mask_writes_the_sql_and_its_exact_output_fixture(envs):
 ])
 def test_draft_custom_mask_refuses_sql_that_breaks_the_library_rules(envs, sql, message):
     with pytest.raises(ai_helpers.Refused, match=re.escape(message)):
-        _run(envs, "draft-custom-mask", FakeModel(dict(MASK_REPLY, sql=sql)), treatment="postcode_area", type="STRING")
+        _run(envs, "draft-custom-mask", FakeModel(dict(MASK_REPLY, sql=sql)), treatment="custom_postcode_area", type="STRING")
     assert not (envs / "dev" / "drafts").exists()
 
 
 @pytest.mark.parametrize("treatment, sql_type, message", [
     ("redact", "STRING", "is a mask-library treatment"),
     ("Bad-Name", "STRING", "is not a custom mask name"),
-    ("postcode_area", "BOOLEAN", "only ever gets the full"),
-    ("postcode_area", "ARRAY<STRING>", "only scalar types"),
+    ("custom_postcode_area", "BOOLEAN", "only ever gets the full"),
+    ("custom_postcode_area", "ARRAY<STRING>", "only scalar types"),
 ])
 def test_draft_custom_mask_refuses_bad_names_and_types_before_the_model(envs, treatment, sql_type, message):
     with pytest.raises(ai_helpers.Refused, match=re.escape(message)):
@@ -296,8 +297,8 @@ class FakeWarehouse:
 
 
 def _drafted_mask(envs, reply=MASK_REPLY, sql_type="STRING"):
-    _run(envs, "draft-custom-mask", FakeModel(reply), treatment="postcode_area", type=sql_type)
-    fixture = json.loads(ai_helpers.mask_paths(envs / "dev", "postcode_area")[1].read_text())
+    _run(envs, "draft-custom-mask", FakeModel(reply), treatment="custom_postcode_area", type=sql_type)
+    fixture = json.loads(ai_helpers.mask_paths(envs / "dev", "custom_postcode_area")[1].read_text())
     return {case["input"]: case["expected"] for case in fixture["cases"]}
 
 
@@ -305,42 +306,42 @@ def test_test_custom_mask_passes_exact_outputs_and_records_the_digests(envs):
     dev = envs / "dev"
     answers = _drafted_mask(envs)
     warehouse = FakeWarehouse(answers)
-    result = ai_helpers.check_custom_mask(dev, "postcode_area", (warehouse, "wh-dev"))
+    result = ai_helpers.check_custom_mask(dev, "custom_postcode_area", (warehouse, "wh-dev"))
     assert result == {"passed": True, "cases": 4, "problems": [], "mismatches": []}
     # Read-only and typed: one SELECT per case, the library's cast and non-UTC rendering.
     assert [w for w, _ in warehouse.statements] == ["wh-dev"] * 4
     for _wh, statement in warehouse.statements:
         assert statement.startswith(f"SELECT to_json(named_struct('v', CAST(({MASK_REPLY['sql']}) AS STRING)), {TO_JSON_OPTIONS}) FROM (SELECT ")
-    sql_path, json_path, passed = ai_helpers.mask_paths(dev, "postcode_area")
+    sql_path, json_path, passed = ai_helpers.mask_paths(dev, "custom_postcode_area")
     record = json.loads(passed.read_text())
     assert record["sql_sha256"] == hashlib.sha256(sql_path.read_bytes()).hexdigest()
     assert record["fixture_sha256"] == hashlib.sha256(json_path.read_bytes()).hexdigest()
-    assert ai_helpers.passed_record(dev, "postcode_area") == record
+    assert ai_helpers.passed_record(dev, "custom_postcode_area") == record
     # Editing the draft after it passed invalidates the record.
     sql_path.write_text(sql_path.read_text().replace("'**'", "'##'"))
-    assert ai_helpers.passed_record(dev, "postcode_area") is None
+    assert ai_helpers.passed_record(dev, "custom_postcode_area") is None
 
 
 def test_test_custom_mask_fails_on_any_mismatch_and_leaves_no_record(envs):
     dev = envs / "dev"
     answers = _drafted_mask(envs)
-    ai_helpers.check_custom_mask(dev, "postcode_area", (FakeWarehouse(answers), "wh"))
+    ai_helpers.check_custom_mask(dev, "custom_postcode_area", (FakeWarehouse(answers), "wh"))
     answers["CAST('2000' AS STRING)"] = "2000"  # the warehouse disagrees with the fixture
-    result = ai_helpers.check_custom_mask(dev, "postcode_area", (FakeWarehouse(answers), "wh"))
+    result = ai_helpers.check_custom_mask(dev, "custom_postcode_area", (FakeWarehouse(answers), "wh"))
     assert result["passed"] is False
     assert result["mismatches"] == [{"input": "CAST('2000' AS STRING)", "expected": "20**", "actual": "2000"}]
-    assert not ai_helpers.mask_paths(dev, "postcode_area")[2].exists()
+    assert not ai_helpers.mask_paths(dev, "custom_postcode_area")[2].exists()
 
 
 def test_test_custom_mask_runs_the_static_rules_before_the_warehouse(envs):
     dev = envs / "dev"
     _drafted_mask(envs)
-    sql_path, json_path, _passed = ai_helpers.mask_paths(dev, "postcode_area")
+    sql_path, json_path, _passed = ai_helpers.mask_paths(dev, "custom_postcode_area")
     sql_path.write_text(sql_path.read_text().replace("WHEN value IS NULL", "WHEN is_account_group_member('t1') THEN value WHEN value IS NULL"))
     fixture = json.loads(json_path.read_text())
     fixture["cases"] = [c for c in fixture["cases"] if c["expected"] is not None]
     json_path.write_text(json.dumps(fixture))
-    result = ai_helpers.check_custom_mask(dev, "postcode_area", (_no_model, "wh"))
+    result = ai_helpers.check_custom_mask(dev, "custom_postcode_area", (_no_model, "wh"))
     assert result["passed"] is False
     assert any("caller-independent" in p for p in result["problems"])
     assert any("NULL in gives NULL out" in p for p in result["problems"])
@@ -352,7 +353,7 @@ def test_test_custom_mask_numeric_uses_try_cast_and_exact_decimals(envs):
     dev = envs / "dev"
     answers = _drafted_mask(envs, reply, "INT")
     warehouse = FakeWarehouse({k: (Decimal(str(v)) if v is not None else None) for k, v in answers.items()})
-    assert ai_helpers.check_custom_mask(dev, "postcode_area", (warehouse, "wh"))["passed"] is True
+    assert ai_helpers.check_custom_mask(dev, "custom_postcode_area", (warehouse, "wh"))["passed"] is True
     assert all("TRY_CAST((round(" in s for _w, s in warehouse.statements)
 
 
@@ -361,39 +362,40 @@ def test_test_custom_mask_compares_decimal_fixture_values_exactly(envs):
              "cases": [{"input": "CAST(1.25 AS DOUBLE)", "expected": 1.3}, {"input": "CAST(-1.25 AS DOUBLE)", "expected": -1.3}]}
     answers = _drafted_mask(envs, reply, "DOUBLE")
     warehouse = FakeWarehouse({k: (Decimal(str(v)) if v is not None else None) for k, v in answers.items()})
-    assert ai_helpers.check_custom_mask(envs / "dev", "postcode_area", (warehouse, "wh"))["passed"] is True
+    assert ai_helpers.check_custom_mask(envs / "dev", "custom_postcode_area", (warehouse, "wh"))["passed"] is True
     answers["CAST(1.25 AS DOUBLE)"] = 1.2
     warehouse = FakeWarehouse({k: (Decimal(str(v)) if v is not None else None) for k, v in answers.items()})
-    result = ai_helpers.check_custom_mask(envs / "dev", "postcode_area", (warehouse, "wh"))
+    result = ai_helpers.check_custom_mask(envs / "dev", "custom_postcode_area", (warehouse, "wh"))
     assert result["passed"] is False and result["problems"] == []
     assert [m["input"] for m in result["mismatches"]] == ["CAST(1.25 AS DOUBLE)"]
 
 
 def test_test_custom_mask_needs_a_warehouse_and_a_draft(envs):
     with pytest.raises(ai_helpers.Refused, match="run make draft-custom-mask"):
-        ai_helpers.check_custom_mask(envs / "dev", "postcode_area")
+        ai_helpers.check_custom_mask(envs / "dev", "custom_postcode_area")
     _drafted_mask(envs)
     (envs / "dev" / "env.auto.tfvars").write_text(DEV_ENV.replace('sql_warehouse_id = "wh-dev"\n', ""))
     with pytest.raises(ai_helpers.Refused, match="set sql_warehouse_id"):
-        ai_helpers.check_custom_mask(envs / "dev", "postcode_area")
+        ai_helpers.check_custom_mask(envs / "dev", "custom_postcode_area")
 
 
 def test_tag_treatments_cant_name_a_drafted_custom_mask(envs):
     answers = _drafted_mask(envs)
-    assert ai_helpers.check_custom_mask(envs / "dev", "postcode_area", (FakeWarehouse(answers), "wh"))["passed"]
-    assert ai_helpers.passed_record(envs / "dev", "postcode_area")
-    # Even after the draft passes, tag_treatments names only mask-library treatments.
-    errors = validate_config({"access_tier_groups": ["t1"], "tag_treatments": {"class.postcode": "postcode_area"}})
+    assert ai_helpers.check_custom_mask(envs / "dev", "custom_postcode_area", (FakeWarehouse(answers), "wh"))["passed"]
+    assert ai_helpers.passed_record(envs / "dev", "custom_postcode_area")
+    # Even after the draft passes, tag_treatments can't name it until it is adopted.
+    errors = validate_config({"access_tier_groups": ["t1"], "tag_treatments": {"class.postcode": "custom_postcode_area"}})
     assert len(errors) == 1
-    assert "'postcode_area', which is not a mask-library treatment" in errors[0]
+    assert "'custom_postcode_area', which is not adopted in this env's custom_masks/" in errors[0]
+    assert "make adopt-custom-mask ENV=dev TREATMENT=custom_postcode_area" in errors[0]
     assert "governance never reads drafts/" in errors[0]
 
 
 # ── Guards ──────────────────────────────────────────────────────────────────
 
 COMMANDS = [("suggest-treatment", {"class_name": "loyalty_id"}), ("draft-genie-content", {"space": "Payments"}),
-            ("draft-custom-mask", {"treatment": "postcode_area", "type": "STRING"}),
-            ("test-custom-mask", {"treatment": "postcode_area"})]
+            ("draft-custom-mask", {"treatment": "custom_postcode_area", "type": "STRING"}),
+            ("test-custom-mask", {"treatment": "custom_postcode_area"})]
 
 
 @pytest.mark.parametrize("command, extra", COMMANDS)
@@ -496,23 +498,23 @@ NOT_LITERALS = [
 def test_fixture_inputs_must_be_typed_literals_and_never_run(envs, bad):
     dev = envs / "dev"
     answers = _drafted_mask(envs)
-    json_path = ai_helpers.mask_paths(dev, "postcode_area")[1]
+    json_path = ai_helpers.mask_paths(dev, "custom_postcode_area")[1]
     fixture = json.loads(json_path.read_text())
     fixture["cases"].append({"input": bad, "expected": "x"})
     json_path.write_text(json.dumps(fixture))
     warehouse = FakeWarehouse(answers)
-    result = ai_helpers.check_custom_mask(dev, "postcode_area", (warehouse, "wh"))
+    result = ai_helpers.check_custom_mask(dev, "custom_postcode_area", (warehouse, "wh"))
     assert result["passed"] is False
     assert any("must be one typed SQL literal" in problem for problem in result["problems"])
     assert warehouse.statements == []  # nothing ran, not even the valid cases
-    assert not ai_helpers.mask_paths(dev, "postcode_area")[2].exists()
+    assert not ai_helpers.mask_paths(dev, "custom_postcode_area")[2].exists()
 
 
 @pytest.mark.parametrize("bad", NOT_LITERALS[:6])
 def test_a_drafted_fixture_with_a_non_literal_input_is_never_written(envs, bad):
     reply = dict(MASK_REPLY, cases=MASK_REPLY["cases"] + [{"input": bad, "expected": "x"}])
     with pytest.raises(ai_helpers.Refused, match="must be one typed SQL literal"):
-        _run(envs, "draft-custom-mask", FakeModel(reply), treatment="postcode_area", type="STRING")
+        _run(envs, "draft-custom-mask", FakeModel(reply), treatment="custom_postcode_area", type="STRING")
     assert not (envs / "dev" / "drafts").exists()
 
 
@@ -565,7 +567,7 @@ def test_a_symlinked_draft_file_is_refused_even_with_force(envs, tmp_path):
     assert target.read_text() == "keep"
 
 
-@pytest.mark.parametrize("leaf", ["postcode_area.sql", "postcode_area.json", "postcode_area.passed.json"])
+@pytest.mark.parametrize("leaf", ["custom_postcode_area.sql", "custom_postcode_area.json", "custom_postcode_area.passed.json"])
 def test_test_custom_mask_never_reads_writes_or_removes_through_a_symlink(envs, tmp_path, leaf):
     dev, outside = envs / "dev", _outside(tmp_path)
     answers = _drafted_mask(envs)
@@ -576,7 +578,7 @@ def test_test_custom_mask_never_reads_writes_or_removes_through_a_symlink(envs, 
     path.symlink_to(target)
     before = target.read_text()
     with pytest.raises(ai_helpers.Refused, match=f"{leaf} is a symlink"):
-        ai_helpers.check_custom_mask(dev, "postcode_area", (FakeWarehouse(answers), "wh"))
+        ai_helpers.check_custom_mask(dev, "custom_postcode_area", (FakeWarehouse(answers), "wh"))
     assert target.read_text() == before
 
 
@@ -593,7 +595,7 @@ def test_draft_genie_content_refuses_a_symlinked_capture(envs, tmp_path):
 def test_drafts_are_staged_so_a_failed_write_changes_nothing(envs, monkeypatch):
     dev = envs / "dev"
     _drafted_mask(envs)
-    sql_path, json_path, _ = ai_helpers.mask_paths(dev, "postcode_area")
+    sql_path, json_path, _ = ai_helpers.mask_paths(dev, "custom_postcode_area")
     before = (sql_path.read_text(), json_path.read_text())
     real_fsync, calls = os.fsync, []
 
@@ -606,9 +608,9 @@ def test_drafts_are_staged_so_a_failed_write_changes_nothing(envs, monkeypatch):
     monkeypatch.setattr(ai_helpers.os, "fsync", failing_fsync)
     reply = dict(MASK_REPLY, sql=MASK_REPLY["sql"].replace("'**'", "'##'"))
     with pytest.raises(OSError, match="disk full"):
-        _run(envs, "draft-custom-mask", FakeModel(reply), treatment="postcode_area", type="STRING", force=True)
+        _run(envs, "draft-custom-mask", FakeModel(reply), treatment="custom_postcode_area", type="STRING", force=True)
     assert (sql_path.read_text(), json_path.read_text()) == before
-    assert sorted(p.name for p in sql_path.parent.iterdir()) == ["postcode_area.json", "postcode_area.sql"]
+    assert sorted(p.name for p in sql_path.parent.iterdir()) == ["custom_postcode_area.json", "custom_postcode_area.sql"]
 
 
 SENTINEL = "SENTINEL-SECRET-4242"
@@ -725,18 +727,18 @@ def test_make_suggest_treatment_calls_the_configured_endpoint_and_writes_a_draft
 def test_make_draft_genie_content_and_draft_custom_mask(repo):
     result = _make(repo, "draft-genie-content", "ENV=dev", "SPACE=Payments", reply=GENIE_REPLY)
     assert result.returncode == 0, result.stdout + result.stderr
-    result = _make(repo, "draft-custom-mask", "ENV=dev", "TREATMENT=postcode_area", "TYPE=STRING", reply=MASK_REPLY)
+    result = _make(repo, "draft-custom-mask", "ENV=dev", "TREATMENT=custom_postcode_area", "TYPE=STRING", reply=MASK_REPLY)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "make test-custom-mask ENV=dev TREATMENT=postcode_area" in result.stdout
+    assert "make test-custom-mask ENV=dev TREATMENT=custom_postcode_area" in result.stdout
     drafts = sorted(str(p.relative_to(repo / "aws" / "envs")) for p in (repo / "aws" / "envs").rglob("drafts/**/*") if p.is_file())
-    assert drafts == ["dev/drafts/custom_masks/postcode_area.json", "dev/drafts/custom_masks/postcode_area.sql",
+    assert drafts == ["dev/drafts/custom_masks/custom_postcode_area.json", "dev/drafts/custom_masks/custom_postcode_area.sql",
                       "dev/drafts/genie/Payments.json"]
     assert len(_model_calls(repo)) == 2
 
 
 @pytest.mark.parametrize("target, extra", [
     ("suggest-treatment", ["CLASS=loyalty_id"]), ("draft-genie-content", ["SPACE=Payments"]),
-    ("draft-custom-mask", ["TREATMENT=postcode_area", "TYPE=STRING"]), ("test-custom-mask", ["TREATMENT=postcode_area"]),
+    ("draft-custom-mask", ["TREATMENT=custom_postcode_area", "TYPE=STRING"]), ("test-custom-mask", ["TREATMENT=custom_postcode_area"]),
 ])
 @pytest.mark.parametrize("ci", [("CI", "true"), ("TF_BUILD", "True"), ("GITHUB_ACTIONS", "true")])
 def test_make_targets_refuse_in_ci(repo, target, extra, ci):

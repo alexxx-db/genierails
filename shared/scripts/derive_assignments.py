@@ -281,7 +281,7 @@ def _derive_deterministic(config_path: Path, env_path: Path, runtime: dict, nati
     fail-safe redaction, and the coverage check keeps blocking new access.
     """
     try:
-        model = deterministic_model_for(runtime, native, ddl_text)
+        model = deterministic_model_for(runtime, native, ddl_text, env_dir=env_path.parent)
     except DeterministicGovernanceError as exc:
         raise RuntimeError(str(exc)) from exc
     for column, semantic in model.unmapped:
