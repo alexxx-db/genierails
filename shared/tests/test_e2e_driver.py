@@ -865,6 +865,20 @@ def test_driver_remote_is_removed_after_a_failing_run(sim):
     assert driver.E2E_REMOTE not in _remotes(sim.checkout)
 
 
+def test_driver_remote_is_removed_when_final_protection_capture_is_interrupted(sim):
+    class InterruptFinalCapture(FakeSnapshots):
+        def capture(self, env):
+            # The scenario's report is written before the run's final-protection capture.
+            if (sim.reports / "s4.json").exists(): raise KeyboardInterrupt("final protection")
+            return super().capture(env)
+
+    with pytest.raises(KeyboardInterrupt, match="final protection"):
+        driver.main([*sim.args, "--scenarios", "s4"], snapshot_factory=InterruptFinalCapture)
+    assert json.loads((sim.reports / "s4.json").read_text())["status"] == "passed"
+    assert not (sim.reports / "final-protection.json").exists()
+    assert driver.E2E_REMOTE not in _remotes(sim.checkout)
+
+
 def test_foreign_driver_remote_is_refused_and_kept(sim, tmp_path):
     foreign = tmp_path / "someone-else.git"
     _git(sim.checkout, "remote", "add", driver.E2E_REMOTE, str(foreign))

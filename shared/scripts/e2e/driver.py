@@ -1568,23 +1568,27 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             if stop: break
     finally:
         try:
-            if run_baseline:
-                final = capture()
-                weak_final = protection_diff_envs(run_baseline, final, include_grants=True)
-                (reports / "final-protection.json").write_text(json.dumps(redact(
-                    {"status": "ERROR" if weak_final else "passed", "weaker_than_baseline": weak_final},
-                    runner.secrets), indent=2, sort_keys=True) + "\n")
-                failed |= bool(weak_final)
-        except Exception as exc:
-            (reports / "final-protection.json").write_text(json.dumps(
-                {"status": "ERROR", "error": redact_text(f"{type(exc).__name__}: {exc}", runner.secrets)}, indent=2) + "\n")
-            failed = True
-        try:
-            repo.remove_remote()
-        except Exception as exc:
-            print(f"warning: could not remove git remote {E2E_REMOTE}: {exc}; "
-                  f"run `git remote remove {E2E_REMOTE}` in {checkout_dir}", file=sys.stderr)
-        for sig, handler in old_handlers.items(): signal.signal(sig, handler)
+            try:
+                if run_baseline:
+                    final = capture()
+                    weak_final = protection_diff_envs(run_baseline, final, include_grants=True)
+                    (reports / "final-protection.json").write_text(json.dumps(redact(
+                        {"status": "ERROR" if weak_final else "passed", "weaker_than_baseline": weak_final},
+                        runner.secrets), indent=2, sort_keys=True) + "\n")
+                    failed |= bool(weak_final)
+            except Exception as exc:
+                (reports / "final-protection.json").write_text(json.dumps(
+                    {"status": "ERROR", "error": redact_text(f"{type(exc).__name__}: {exc}", runner.secrets)}, indent=2) + "\n")
+                failed = True
+        finally:
+            # Even an interrupt during the final capture must not leave the run's remote behind.
+            try:
+                repo.remove_remote()
+            except Exception as exc:
+                print(f"warning: could not remove git remote {E2E_REMOTE}: {exc}; "
+                      f"run `git remote remove {E2E_REMOTE}` in {checkout_dir}", file=sys.stderr)
+            finally:
+                for sig, handler in old_handlers.items(): signal.signal(sig, handler)
     return 1 if failed else 0
 
 
