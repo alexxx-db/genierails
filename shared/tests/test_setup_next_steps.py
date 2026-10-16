@@ -121,6 +121,18 @@ def test_setup_omits_completed_walkthrough_copy_and_renumbers(cloud, tmp_path):
     assert re.findall(r"^  (\d+)\. ", result.stdout, flags=re.MULTILINE) == ["1", "2", "3", "4", "5"]
 
 
+def test_setup_existing_legacy_env_does_not_request_a_deployer_principal(tmp_path):
+    cloud_root = tmp_path / "aws"
+    env_dir = cloud_root / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+
+    result = _make("aws", tmp_path, "setup", "ENV=dev")
+
+    assert result.returncode == 0, result.stderr
+    assert "deployer_principal_id" not in result.stdout
+
+
 @pytest.mark.parametrize("cloud", CLOUDS)
 def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
     result = _make(cloud, tmp_path, "setup", "ENV=prod")

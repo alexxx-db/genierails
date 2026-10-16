@@ -130,6 +130,17 @@ def test_persist_fills_the_template_line_in_place(tmp_path):
     )
 
 
+def test_persist_replaces_all_placeholder_groups_in_the_champion_template(tmp_path):
+    path = tmp_path / "env.auto.tfvars"
+    path.write_text(TEMPLATE.read_text())
+
+    persist_access_tier_groups(path, TIERS)
+
+    cfg = hcl2.loads(path.read_text())
+    assert cfg["access_tier_groups"] == TIERS
+    assert "<most-privileged-group>" not in path.read_text()
+
+
 def _persist(tmp_path, text, groups=TIERS):
     path = tmp_path / "env.auto.tfvars"
     path.write_text(text)
@@ -406,7 +417,7 @@ def test_placeholder_guard_runs_before_group_resolution(tmp_path, monkeypatch, c
     out = capsys.readouterr().out
 
     assert code == 1
-    assert f"replace {PLACEHOLDER} in envs/dev/env.auto.tfvars" in out
+    assert f"replace placeholder {PLACEHOLDER} in envs/dev/env.auto.tfvars" in out
     assert preflighted is None
     assert (env_dir / "env.auto.tfvars").read_text() == before
 

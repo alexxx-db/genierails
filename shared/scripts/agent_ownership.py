@@ -282,6 +282,7 @@ def receipt_agents(env_dir: Path, manifest: dict | None = None) -> dict[str, dic
     plan created or adopted is verified again before the receipt is written.
     """
     planned = ((manifest or {}).get("agents") or {}).get("agents") or {}
+    previous = (load_receipt(env_dir, env_dir.name).get("agents") or {})
     result = {}
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
@@ -308,6 +309,17 @@ def receipt_agents(env_dir: Path, manifest: dict | None = None) -> dict[str, dic
             "create_resource_id": (created or {}).get("id"),
             "created_space_id": ((record or {}).get("result") or {}).get("id"),
         }
+    current_keys = {entry["key"] for entry in result.values()}
+    # Detached agents remain tombstoned in every later receipt even after the
+    # removal PR drops their committed capture. This keeps recovery/audit state
+    # sticky; an explicit active config with the same identity supersedes it.
+    for previous_name, entry in previous.items():
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or agent_files.space_key(previous_name))
+        detached = entry.get("detached") is True or entry.get("lifecycle") == "detached"
+        if detached and key not in current_keys:
+            result[previous_name] = dict(entry, key=key, detached=True, lifecycle="detached")
     return result
 
 
@@ -914,7 +926,8 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
         _run(runner, env_dir, env, "state-rm", address)
         print(f"  forgot {address}")
     print(f"Detached {name}: {len(addresses)} state address(es) removed; the agent and its conversations stay.")
-    print(f"  Next: a PR that removes agents/{name}.* — its plan must show no destroy.")
+    print(f"  Next: a PR that removes only agents/{name}.space.json and keeps the detached "
+          f"agents/{name}.auto.tfvars tombstone — its plan must show no destroy.")
     return addresses
 
 

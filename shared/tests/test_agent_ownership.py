@@ -397,26 +397,42 @@ def test_promote_preserves_a_detached_target_agent(tmp_path):
     settings = prod / "agents" / "Sales.auto.tfvars"
     settings.write_text('genie_space_id = ""\nacl_groups = []\ndetached = true\n')
 
-    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+    with pytest.raises(AgentFileError, match="committed detached"):
+        agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
 
     assert agent_files.load(prod, "Sales")["detached"] is True
     assert agent_files.load(prod, "Sales")["acl_groups"] == []
 
 
-def test_promote_refuses_to_recreate_an_agent_removed_after_detach(tmp_path, monkeypatch):
+def test_promote_refuses_a_committed_detached_tombstone_without_receipts(tmp_path, monkeypatch):
     dev, prod = _promote_envs(tmp_path)
-    monkeypatch.setattr(
-        agent_promote,
-        "load_receipt",
-        lambda *_: {"agents": {"Sales": {"detached": True, "acl_groups": [], "lifecycle": "detached"}}},
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
     )
+    monkeypatch.setattr(ownership, "load_receipt", lambda *_: pytest.fail("promotion read a receipt"))
     before = {p.relative_to(prod): p.read_bytes() for p in prod.rglob("*") if p.is_file()}
 
-    with pytest.raises(agent_files.AgentFileError, match="removed after it was released detached"):
+    with pytest.raises(AgentFileError, match="committed detached"):
         agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
 
     assert {p.relative_to(prod): p.read_bytes() for p in prod.rglob("*") if p.is_file()} == before
-    assert not (prod / "agents").exists()
+
+
+@pytest.mark.parametrize("source_name", ["sales", "SALES", "Sales-"])
+def test_promote_matches_detached_tombstones_by_space_key(tmp_path, source_name):
+    dev, prod = _promote_envs(tmp_path)
+    source_settings = dev / "agents" / "Sales.auto.tfvars"
+    source_capture = dev / "agents" / "Sales.space.json"
+    source_settings.rename(dev / "agents" / f"{source_name}.auto.tfvars")
+    source_capture.rename(dev / "agents" / f"{source_name}.space.json")
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+
+    with pytest.raises(AgentFileError, match="committed detached"):
+        agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
 
 
 # ── Prod ownership ───────────────────────────────────────────────────────────
@@ -803,6 +819,25 @@ def test_the_release_receipt_records_each_agents_id_and_detach_state(tmp_path, m
                                           "config_sha256": None, "binding": "adopt",
                                           "create_resource_id": None, "created_space_id": None}
     assert "prod-9" not in repo.git("show", "HEAD:aws/envs/prod/agents/Sales.auto.tfvars")
+
+
+def test_detached_receipt_tombstone_survives_the_next_real_receipt(tmp_path, monkeypatch):
+    from scripts import release_gate as rg
+
+    prod = _deterministic_prod(
+        tmp_path, monkeypatch, 'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+    stamps = iter(["2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z",
+                   "2026-01-01T00:00:02Z", "2026-01-01T00:00:02Z"])
+    monkeypatch.setattr(rg, "_now", lambda: next(stamps))
+    first = ownership.receipt_agents(prod)
+    _step9_receipt(prod, "c1", first)
+    (prod / "agents" / "Sales.auto.tfvars").unlink()
+    (prod / "agents" / "Sales.space.json").unlink()
+    second = ownership.receipt_agents(prod)
+    _step9_receipt(prod, "c2", second)
+
+    assert ownership.load_receipt(prod, "prod")["agents"]["Sales"]["lifecycle"] == "detached"
 
 
 def test_release_plan_records_what_release_will_push_with_the_overwrite_report(tmp_path, monkeypatch, capsys):

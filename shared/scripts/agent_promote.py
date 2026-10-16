@@ -32,7 +32,7 @@ if str(SHARED) not in sys.path:
 
 import agent_files  # noqa: E402
 from agent_files import AgentFileError  # noqa: E402
-from scripts.agent_ownership import AgentError, load_receipt, render  # noqa: E402
+from scripts.agent_ownership import render  # noqa: E402
 from scripts.saved_settings import catalog_map_dict  # noqa: E402
 
 # A catalog is an identifier when it starts a dotted name: not preceded by an
@@ -102,30 +102,30 @@ def warehouse_map(source_dir: Path, dest_dir: Path) -> dict[str, str]:
 def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> None:
     """Refuse before writing when promotion would resurrect a detached target agent.
 
-    The release receipt is runtime state, but it is the durable record left by
-    the two-step detach flow after the committed agent file is removed.  An
-    absent target file is therefore not a first promotion when that record says
-    the target agent was detached.
+    A detached target settings file is the committed tombstone left by the
+    two-step detach flow. Identity is its normalized Terraform ``space_key``,
+    not its display name, so spelling/case variants cannot adopt it again.
     """
-    missing = {
-        agent["name"]
-        for agent in source_agents
-        if agent_files.capture_path(agent["_dir"], agent["name"]).is_file()
-        and not agent_files.settings_path(dest_dir, agent["name"]).is_file()
+    tombstones = {
+        agent_files.space_key(agent["name"]): agent["name"]
+        for agent in agent_files.load_all(dest_dir)
+        if agent["detached"]
     }
-    if not missing:
-        return
-    released = (load_receipt(dest_dir, dest_dir.name).get("agents") or {})
     blocked = sorted(
-        name for name in missing
-        if (released.get(name) or {}).get("detached") is True
-        or (released.get(name) or {}).get("lifecycle") == "detached"
+        (agent["name"], tombstones[agent_files.space_key(agent["name"])])
+        for agent in source_agents
+        if not agent["detached"] and not agent["delete"]
+        and agent_files.capture_path(agent["_dir"], agent["name"]).is_file()
+        and agent_files.space_key(agent["name"]) in tombstones
     )
     if blocked:
-        names = ", ".join(repr(name) for name in blocked)
+        names = ", ".join(
+            repr(source) if source == target else f"{source!r} (detached as {target!r})"
+            for source, target in blocked
+        )
         raise AgentFileError(
-            f"{names} was removed after it was released detached in {dest_dir.name}; refusing to recreate it "
-            f"from the active source. Keep it detached, or make a deliberate {dest_dir.name}-side lifecycle "
+            f"{names} is committed detached in {dest_dir.name}; refusing to promote the active source over its "
+            f"tombstone. Keep it detached, or make a deliberate {dest_dir.name}-side lifecycle "
             "change; nothing was written"
         )
 
@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         if agent_files.names(args.source_dir):
             print(f"=== Promote agents ({args.source_dir.name} -> {args.dest_dir.name}) ===")
         promote(args.source_dir, args.dest_dir, catalogs)
-    except (AgentError, AgentFileError, ValueError, OSError) as exc:
+    except (AgentFileError, ValueError, OSError) as exc:
         print(f"ERROR: promote-to agents: {exc}", file=sys.stderr)
         return 1
     return 0

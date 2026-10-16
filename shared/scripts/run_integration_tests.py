@@ -6587,11 +6587,15 @@ def scenario_champion(
         if (dev_dir / "data_access" / "discovered_uc_tables.auto.tfvars").exists():
             raise AssertionError("placeholder run wrote discovered_uc_tables.auto.tfvars")
 
-        # Only the edits the walkthrough's Dev section asks for: the agent ID and warehouse.
+        # Fill the deterministic champion template before any credentialed/API work.
         text = dev_env_file.read_text()
         if text.count('"<your-genie-space-id>"') != 1:
             raise AssertionError("walkthrough template no longer has exactly one genie_space_id placeholder")
         dev_env_file.write_text(text.replace('"<your-genie-space-id>"', f'"{dev_space_id}"'))
+        deployer = str(_load_tfvars(auth_file).get("databricks_client_id") or "")
+        if not deployer:
+            raise AssertionError(f"{auth_file} must set databricks_client_id for deterministic governance")
+        _set_tfvar(dev_env_file, "deployer_principal_id", json.dumps(deployer))
         _set_tfvar(dev_env_file, "sql_warehouse_id", f'"{resolved_wh}"')
         dev_cfg = _load_tfvars(dev_env_file)
         if dev_cfg.get("uc_tables") or any(s.get("uc_tables") for s in dev_cfg.get("genie_spaces", [])):

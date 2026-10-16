@@ -72,9 +72,10 @@ keeps its last captured version.
    and an empty `genie_space_id` (prod's ID lives in prod's state and release
    receipt). Later promotions keep prod's file and print how its `acl_groups`
    differ from dev's. A detached prod file stays detached. If that file was
-   removed after a detached release, promotion refuses instead of recreating
-   the still-active dev agent; reactivation requires a deliberate prod-side
-   lifecycle change.
+   kept as the committed tombstone while its `.space.json` capture is removed;
+   promotion refuses instead of recreating the still-active dev agent, including
+   case/punctuation variants with the same identity. Reactivation requires a
+   deliberate prod-side lifecycle change.
 2. **Check and open the promotion PR.** `make check ENV=prod`; commit
    `envs/prod/`. It can carry the dev change too, in one PR.
 3. **Merge.** After the dev rehearsal passes on the merge commit, the operator

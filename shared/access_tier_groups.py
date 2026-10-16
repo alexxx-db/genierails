@@ -25,6 +25,10 @@ _IDENT_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01
 _OPEN = {"[": "]", "{": "}", "(": ")"}
 
 
+def _all_placeholders(groups: list[str]) -> bool:
+    return bool(groups) and all(group.startswith("<") and group.endswith(">") for group in groups)
+
+
 def parse_groups_arg(value: str) -> list[str]:
     """Split a ``--groups 'a,b,c'`` value into ordered, non-empty names."""
     return [group.strip() for group in value.split(",") if group.strip()]
@@ -43,6 +47,8 @@ def persisted_access_tier_groups(config: dict, path: Path) -> list[str]:
             'most to least privileged (e.g. ["payments_ops", "viewers"])'
         )
     groups = [group.strip() for group in value]
+    if _all_placeholders(groups):
+        return []
     duplicates = sorted({group for group in groups if groups.count(group) > 1})
     if duplicates:
         raise ValueError(
@@ -176,6 +182,7 @@ def persist_access_tier_groups(path: Path, groups: list[str]) -> None:
     target = Path(path).resolve()
     text = target.read_text()
     before = hcl2.loads(text)
+    had_placeholders = isinstance(before.get(SETTING), list) and _all_placeholders(before[SETTING])
     saved = persisted_access_tier_groups(before, target)
     if saved == list(groups):
         return
@@ -192,7 +199,7 @@ def persist_access_tier_groups(path: Path, groups: list[str]) -> None:
         start, end = spans[0]
         current = text[start:end]
         inner = current[current.index("[") + 1 : -1] if current.endswith("]") else ""
-        if inner.strip():
+        if inner.strip() and not had_placeholders:
             # Keep comments written inside the empty list; append the items.
             items = ", ".join(_hcl_string(group) for group in groups)
             line = f"{current[:current.index('[') + 1]}{inner.rstrip()}\n  {items},\n]"

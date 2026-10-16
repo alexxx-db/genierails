@@ -27,14 +27,22 @@ VALIDATOR = SHARED / "scripts/validate_classification_config.py"
 GUARD = SHARED / "genie_space_placeholder.py"
 MAKEFILE = SHARED / "Makefile.shared"
 EXPECTED_ERROR = (
-    f"replace {PLACEHOLDER} in envs/dev/env.auto.tfvars with your Genie agent ID"
+    f"replace placeholder {PLACEHOLDER} in envs/dev/env.auto.tfvars with your Genie agent ID"
 )
+
+
+def _resolved_template(*, genie_space_id="01ef7b3c2a4d5e6f"):
+    return (TEMPLATE.read_text()
+            .replace(PLACEHOLDER, genie_space_id)
+            .replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
+            .replace("<most-privileged-group>", "payments_ops")
+            .replace("<least-privileged-group>", "viewers"))
 
 
 def _dev_env(tmp_path, genie_space_id=PLACEHOLDER, discovered=None):
     env_dir = tmp_path / "envs" / "dev"
     (env_dir / "data_access").mkdir(parents=True)
-    template = TEMPLATE.read_text().replace(PLACEHOLDER, genie_space_id)
+    template = _resolved_template(genie_space_id=genie_space_id)
     template = template.replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
     template = template.replace("<most-privileged-group>", "payments_ops")
     template = template.replace("<least-privileged-group>", "viewers")
@@ -84,7 +92,19 @@ def test_placeholder_error_names_the_file_and_the_fix(tmp_path):
 def test_generate_config_loading_fails_fast_on_placeholder(tmp_path):
     env_dir = _dev_env(tmp_path)
 
-    with pytest.raises(ValueError, match="replace <your-genie-space-id> in envs/dev/env.auto.tfvars"):
+    with pytest.raises(ValueError, match="replace placeholder <your-genie-space-id> in envs/dev/env.auto.tfvars"):
+        generate_abac.load_auth_config(env_dir / "auth.auto.tfvars", strict_env=True)
+
+
+def test_generate_checks_governance_placeholders_before_credentials(tmp_path):
+    env_dir = _dev_env(tmp_path, genie_space_id="01ef7b3c2a4d5e6f")
+    env_file = env_dir / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace(
+        "d0000000-0000-0000-0000-00000000d001", "<your-deployer-principal-id>"
+    ))
+    (env_dir / "auth.auto.tfvars").unlink()
+
+    with pytest.raises(ValueError, match="replace placeholder <your-deployer-principal-id>"):
         generate_abac.load_auth_config(env_dir / "auth.auto.tfvars", strict_env=True)
 
 
@@ -120,7 +140,7 @@ def test_plan_apply_guard_fails_fast_on_placeholder(tmp_path):
     assert EXPECTED_ERROR in result.stderr
 
     (env_dir / "env.auto.tfvars").write_text(
-        TEMPLATE.read_text().replace(PLACEHOLDER, "01ef7b3c2a4d5e6f")
+        _resolved_template()
     )
     result = subprocess.run(
         [sys.executable, GUARD, env_dir / "env.auto.tfvars"],
@@ -207,7 +227,7 @@ def _assert_fails_fast(result, env_name="dev"):
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert (
-        f"ERROR: replace {PLACEHOLDER} in envs/{env_name}/env.auto.tfvars "
+            f"ERROR: replace placeholder {PLACEHOLDER} in envs/{env_name}/env.auto.tfvars "
         "with your Genie agent ID"
     ) in result.stderr, output
     # Nothing ran past the guard: no target banner, Terraform, or Genie API call.
@@ -223,7 +243,7 @@ def test_champion_targets_fail_fast_on_placeholder(placeholder_cloud, target):
 
 def test_promote_fails_fast_on_placeholder_in_existing_dest(placeholder_cloud):
     (placeholder_cloud / "envs/dev/env.auto.tfvars").write_text(
-        TEMPLATE.read_text().replace(PLACEHOLDER, "01ef7b3c2a4d5e6f")
+        _resolved_template()
     )
     (placeholder_cloud / "envs/prod/env.auto.tfvars").write_text(TEMPLATE.read_text())
 
@@ -286,7 +306,7 @@ def test_setup_is_not_blocked_by_the_placeholder(placeholder_cloud):
 
 def test_placeholder_guard_passes_once_agent_id_is_set(placeholder_cloud):
     (placeholder_cloud / "envs/dev/env.auto.tfvars").write_text(
-        TEMPLATE.read_text().replace(PLACEHOLDER, "01ef7b3c2a4d5e6f")
+        _resolved_template()
     )
 
     result = _run_make(placeholder_cloud, "_guard-genie-placeholder", "ENV=dev")
@@ -375,6 +395,9 @@ def test_sample_env_snippet_replaces_template_lines_without_duplicates():
     warehouse_line = '\nsql_warehouse_id = ""\n'
     assert genie_block in template and warehouse_line in template
     merged = template.replace(genie_block, "\n" + snippet + "\n").replace(warehouse_line, "\n")
+    merged = (merged.replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
+              .replace("<most-privileged-group>", "payments_ops")
+              .replace("<least-privileged-group>", "viewers"))
 
     cfg = hcl2.loads(merged)
     assert cfg["uc_tables"] == ["dev_finance.genierails_e2e.customers"]

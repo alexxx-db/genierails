@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail fast when env.auto.tfvars still holds a template genie_space_id placeholder.
+"""Fail fast when env.auto.tfvars still holds an active ``<...>`` placeholder.
 
 The dev-to-prod template ships ``genie_space_id = "<your-genie-space-id>"``.
 Real Genie agent IDs never contain angle brackets, so any ``<...>`` value is an
@@ -9,6 +9,7 @@ Usage:
     python genie_space_placeholder.py <path/to/env.auto.tfvars> [<more env files>...]
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -34,31 +35,49 @@ def placeholder_genie_space_ids(config: dict) -> list[str]:
     return found
 
 
-def placeholder_error(config: dict, path: Path) -> str | None:
-    """Return a user-facing error when a placeholder ID is present, else None."""
+def placeholder_error(config: dict, path: Path, *, allow_access_tier_placeholders: bool = False) -> str | None:
+    """Return the first actionable placeholder error, else None."""
     found = placeholder_genie_space_ids(config)
-    if not found:
-        return None
-    return (
-        f"replace {found[0]} in {_display_path(path)} with your Genie agent ID "
-        "(Genie UI > your agent > Configure > About this agent > Agent ID, "
-        "or the <id> in its /genie/rooms/<id> URL)"
-    )
+    if found:
+        return (
+            f"replace placeholder {found[0]} in {_display_path(path)} with your Genie agent ID "
+            "(Genie UI > your agent > Configure > About this agent > Agent ID, "
+            "or the <id> in its /genie/rooms/<id> URL)"
+        )
+    deployer = config.get("deployer_principal_id")
+    if isinstance(deployer, str) and deployer.startswith("<") and deployer.endswith(">"):
+        return (f"replace placeholder {deployer} in {_display_path(path)} with the application ID of the "
+                "service principal that applies this env")
+    groups = config.get("access_tier_groups")
+    if isinstance(groups, list) and not allow_access_tier_placeholders:
+        placeholder = next((group for group in groups if isinstance(group, str)
+                            and group.startswith("<") and group.endswith(">")), None)
+        if placeholder:
+            return (f"replace placeholder {placeholder} in {_display_path(path)} with an IdP-synced group "
+                    "name; replace every access_tier_groups placeholder, most to least privileged")
+    return None
 
 
 def main() -> int:
     import hcl2
 
-    for arg in sys.argv[1:]:
+    advice = "--advice" in sys.argv[1:]
+    for arg in (arg for arg in sys.argv[1:] if arg != "--advice"):
         path = Path(arg)
         if not path.exists():
             continue
         with path.open() as handle:
             config = hcl2.load(handle)
-        error = placeholder_error(config, path)
+        error = placeholder_error(
+            config, path,
+            allow_access_tier_placeholders=os.environ.get("GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS") == "1",
+        )
         if error:
-            print(f"ERROR: {error}", file=sys.stderr)
-            return 1
+            if advice:
+                print(f"  Setup required: {error}")
+            else:
+                print(f"ERROR: {error}", file=sys.stderr)
+                return 1
     return 0
 
 
