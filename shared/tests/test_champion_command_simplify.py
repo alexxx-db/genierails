@@ -545,6 +545,24 @@ def test_promote_to_check_accepts_documented_detach_removal(promote_cloud, ci):
     assert not (prod / "agents" / "Detached.space.json").exists()
 
 
+@pytest.mark.parametrize("ci", [None, "true"], ids=["ci-unset", "ci-true"])
+def test_promote_to_check_refuses_tombstone_violation_with_no_source_agents(promote_cloud, ci):
+    prod = promote_cloud.envs / "prod"
+    prod.mkdir(exist_ok=True)
+    (prod / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Retired.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = ["anyone"]\n'
+    )
+    (prod / "ack.txt").write_text("prod:detached-agent:retired\n")
+
+    result = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay", "CHECK=1",
+                           **({} if ci is None else {"CI": ci}))
+
+    assert result.returncode != 0
+    assert "governance-reviewed PR" in result.stdout + result.stderr
+
+
 def test_promote_to_explicit_map_overrides_and_updates_the_saved_one(promote_cloud):
     assert promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay").returncode == 0
 

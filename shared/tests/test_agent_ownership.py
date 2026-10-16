@@ -476,6 +476,23 @@ def test_removing_governance_tombstone_allows_revival(tmp_path):
     assert agent_files.load(prod, "Sales")["acl_groups"] == ["sales_analysts"]
 
 
+def test_gap3_promote_checks_tombstone_when_source_has_no_agents(tmp_path):
+    dev = _env(tmp_path)
+    prod = _env(tmp_path, name="prod", Sales='genie_space_id = ""\nacl_groups = ["anyone"]\n')
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+
+    with pytest.raises(AgentFileError, match="governance-reviewed PR"):
+        agent_promote.promote(dev, prod, {})
+
+
+def test_gap2_release_plan_enforces_tombstone_without_capture(tmp_path):
+    prod = _env(tmp_path, name="prod", Sales='genie_space_id = ""\nacl_groups = ["anyone"]\n')
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+
+    with pytest.raises(ownership.AgentError, match="still retired"):
+        ownership.check_detach_acks(prod, "prod")
+
+
 # ── Prod ownership ───────────────────────────────────────────────────────────
 
 def _prod(tmp_path, settings='genie_space_id = ""\nacl_groups = ["a"]\n', payload=None) -> Path:
@@ -887,6 +904,15 @@ def test_release_plan_refuses_old_receipt_reactivation_without_governance_ack(tm
 
     with pytest.raises(ownership.AgentError, match="revive-agent:sales"):
         ownership.plan(prod, "prod", tmp_path / "plan")
+
+
+def test_gap1_old_receipt_requires_ack_for_uncaptured_agent(tmp_path, monkeypatch):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    (prod / "agents" / "Sales.space.json").unlink()
+    _step9_receipt(prod, "c1", {"Sales": _released(detached=True, lifecycle="detached")})
+
+    with pytest.raises(ownership.AgentError, match="revive-agent:sales"):
+        ownership.check_detach_acks(prod, "prod")
 
 
 def test_release_plan_records_what_release_will_push_with_the_overwrite_report(tmp_path, monkeypatch, capsys):

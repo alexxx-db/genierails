@@ -156,6 +156,10 @@ def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> set
 
 def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[str]:
     """Write the target's agent files; returns the agents carried."""
+    # Validate governance-owned tombstones even when the source no longer has
+    # any agent files. Otherwise the early return would let an agent-only prod
+    # edit revive a retired identity without governance review.
+    detached_keys = detached_dest_keys(dest_dir)
     source_agents = agent_files.load_all(source_dir)
     if not source_agents:
         return []

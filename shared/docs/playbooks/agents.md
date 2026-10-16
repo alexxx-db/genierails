@@ -112,7 +112,8 @@ make detach-agent ENV=prod SPACE="<agent>"   # forgets it from Terraform state; 
   until governance runs `make ungovern`.
 - **Removal PR:** add `prod:detached-agent:<key>` to governance-owned `ack.txt`,
   keep the detached `.auto.tfvars`, and remove only `.space.json`. Later
-  promotions keep that removal stable. To revive, remove the ack line in a
+  run `make promote-to ENV=prod` and commit the changed
+  `generated/governed_tables.json`; promotions then keep that removal stable. To revive, remove the ack line in a
   governance-reviewed PR; an edit or deletion only under `agents/` is refused.
 - `make detach-agent` needs a release receipt, so it runs in prod, not dev.
 - **To delete the agent instead** (and its conversations): set `delete = true`

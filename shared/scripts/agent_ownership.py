@@ -606,17 +606,26 @@ def reactivation_consequences(env_dir: Path, env: str) -> dict[str, str]:
                 and (entry.get("detached") is True or entry.get("lifecycle") == "detached")}
     active = {agent_files.space_key(agent["name"]): agent["name"]
               for agent in agent_files.load_all(env_dir)
-              if not agent["detached"] and not agent["delete"]
-              and agent_files.capture_path(env_dir, agent["name"]).is_file()}
+              if not agent["detached"] and not agent["delete"]}
     return {f"{env}:revive-agent:{key}": f"reactivates detached Genie agent {active[key]}"
             for key in sorted(detached & set(active))}
 
 
 def check_detach_acks(env_dir: Path, env: str) -> list[str]:
+    keys = _ack_keys(env_dir, env)
+    configured = {agent_files.space_key(agent["name"]): agent
+                  for agent in agent_files.load_all(env_dir)}
+    invalid = sorted(key for key in keys if key.startswith(f"{env}:detached-agent:")
+                     and (key.rsplit(":", 1)[-1] not in configured
+                          or not configured[key.rsplit(":", 1)[-1]]["detached"]
+                          or configured[key.rsplit(":", 1)[-1]]["acl_groups"]))
+    if invalid:
+        raise AgentError(f"the agent is still retired by {', '.join(invalid)}; its settings must remain "
+                         "detached with acl_groups = [], or remove the ack.txt line in a "
+                         "governance-reviewed PR to revive it")
     needed = reactivation_consequences(env_dir, env)
     if not needed:
         return []
-    keys = _ack_keys(env_dir, env)
     needed_keys = {key.rsplit(":", 1)[-1] for key in needed}
     persistent = sorted(key for key in keys if key.startswith(f"{env}:detached-agent:")
                         and key.rsplit(":", 1)[-1] in needed_keys)
@@ -961,7 +970,8 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
     key = agent_files.space_key(name)
     print(f"  Next: a governance-reviewed PR that adds {env}:detached-agent:{key} to ack.txt, "
           f"removes only agents/{name}.space.json, and keeps detached agents/{name}.auto.tfvars — "
-          "its plan must show no destroy. To revive later, remove that ack.txt line in a governance PR.")
+          f"then runs make promote-to ENV={env} and commits governed_tables.json; its plan must show no "
+          "destroy. To revive later, remove that ack.txt line in a governance PR.")
     return addresses
 
 
