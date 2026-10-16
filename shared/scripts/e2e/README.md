@@ -77,7 +77,12 @@ may change `envs/`, and the scenario's next step commits that on a
 driver's own main. That main lives in a bare repo under `<reports>/e2e-remote.git`
 (git remote `genierails-e2e`), and every `make` runs with
 `RELEASE_REMOTE=genierails-e2e`, so release-plan's "merged on main" rule holds
-without pushing to `origin`.
+without pushing to `origin`. The driver removes that remote when the run ends,
+whether it passed, failed or was interrupted (the bare repo stays with the
+reports). It refuses to reuse a `genierails-e2e` remote that points anywhere
+else. If an earlier run was killed before its cleanup, check that the remote's
+URL (`git remote get-url genierails-e2e`) is an old `<reports>/e2e-remote.git`,
+then clear it with `git remote remove genierails-e2e`.
 
 Everything a scenario needs is checked before it touches anything. A missing
 public target or a human gate without a TTY makes the whole scenario `NOT RUN`. An

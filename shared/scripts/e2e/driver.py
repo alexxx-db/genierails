@@ -806,6 +806,7 @@ class Checkout:
 
     def __init__(self, runner: CommandRunner, baseline: str, remote_dir: Path):
         self.runner, self.baseline, self.remote_dir = runner, baseline, remote_dir
+        self.owns_remote = False
         self.head = baseline
         self.main_tip = baseline
 
@@ -835,12 +836,28 @@ class Checkout:
         """Create (or reuse) the driver-owned bare remote and point its main at the baseline."""
         if not (self.remote_dir / "HEAD").is_file():
             self.git("init", "--bare", "--quiet", str(self.remote_dir), label="e2e-remote-init")
-        url = self.runner.run(("git", "remote", "get-url", E2E_REMOTE), "e2e-remote-url")
-        if url.returncode:
+        url = self.remote_url("e2e-remote-url")
+        if url is None:
             self.git("remote", "add", E2E_REMOTE, str(self.remote_dir), label="e2e-remote-add")
-        elif Path(url.stdout.strip()).resolve() != self.remote_dir.resolve():
-            raise RuntimeError(f"git remote {E2E_REMOTE} exists and points elsewhere; refusing to reuse it")
+        elif Path(url).resolve() != self.remote_dir.resolve():
+            raise RuntimeError(
+                f"git remote {E2E_REMOTE} exists and points elsewhere ({url}); refusing to reuse it. If that URL "
+                f"is an old e2e reports dir (<reports>/e2e-remote.git) left by an earlier run, clear it with "
+                f"`git remote remove {E2E_REMOTE}` and re-run")
+        self.owns_remote = True
         self.publish(self.baseline)
+
+    def remote_url(self, label: str) -> str | None:
+        url = self.runner.run(("git", "remote", "get-url", E2E_REMOTE), label)
+        return None if url.returncode else url.stdout.strip()
+
+    def remove_remote(self) -> None:
+        """Drop the driver's remote at the end of the run, only if it still points at this run's bare repo."""
+        if not self.owns_remote: return
+        url = self.remote_url("e2e-remote-cleanup-url")
+        if url is not None and Path(url).resolve() == self.remote_dir.resolve():
+            self.git("remote", "remove", E2E_REMOTE, label="e2e-remote-remove")
+        self.owns_remote = False
 
     def publish(self, commit: str) -> None:
         self.git("branch", "--force", f"{E2E_BRANCH_PREFIX}main", commit, label="e2e-main-branch")
@@ -1562,6 +1579,11 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             (reports / "final-protection.json").write_text(json.dumps(
                 {"status": "ERROR", "error": redact_text(f"{type(exc).__name__}: {exc}", runner.secrets)}, indent=2) + "\n")
             failed = True
+        try:
+            repo.remove_remote()
+        except Exception as exc:
+            print(f"warning: could not remove git remote {E2E_REMOTE}: {exc}; "
+                  f"run `git remote remove {E2E_REMOTE}` in {checkout_dir}", file=sys.stderr)
         for sig, handler in old_handlers.items(): signal.signal(sig, handler)
     return 1 if failed else 0
 
