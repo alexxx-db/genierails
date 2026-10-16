@@ -269,6 +269,7 @@ variable "genie_space_id_to_name" {
 
 variable "genie_spaces" {
   type = list(object({
+    key              = optional(string, "")
     name             = optional(string, "")
     genie_space_id   = optional(string, "")
     sql_warehouse_id = optional(string, "")

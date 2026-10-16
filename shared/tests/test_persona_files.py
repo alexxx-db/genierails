@@ -580,11 +580,8 @@ def test_split_agent_files_moves_every_inline_agent_with_the_same_terraform_inpu
 
 
 @pytest.mark.parametrize("entry, message", [
-    ('{ genie_space_id = "01ef0c" }', "has no name"),
     ('{ name = "Payments", genie_space_id = "1", declared_footprint = ["c.s.t"] }', "sets declared_footprint"),
     ('{ name = "Payments", genie_space_id = "1", delete = true }', "has delete = true"),
-    ('{ name = "../x", genie_space_id = "1" }', "is not allowed"),
-    ('{ name = "A b", genie_space_id = "1" }, { name = "a-b", genie_space_id = "2" }', "share the Terraform key"),
 ])
 def test_split_agent_files_refuses_any_entry_that_would_change_the_plan(tmp_path, entry, message):
     env = _legacy_env(tmp_path, f"genie_spaces = [{entry}]\n")
@@ -593,6 +590,89 @@ def test_split_agent_files_refuses_any_entry_that_would_change_the_plan(tmp_path
         agent_files.split(env)
     assert {p: p.read_bytes() for p in env.rglob("*") if p.is_file()} == before
     assert not (env / "agents").exists()
+
+
+@pytest.mark.parametrize("entry, expected_file, expected_key, display_name", [
+    ('{ genie_space_id = "01ef0c" }', "01ef0c", "01ef0c", ""),
+    ('{ name = "GenieRails Dev-to-Prod Walkthrough (louis_genierails_prod.dev_to_prod_demo)", '
+     'genie_space_id = "01ef0d" }',
+     "genierails_dev_to_prod_walkthrough_louis_genierails_prod_dev_to_prod_demo",
+     "genierails_dev_to_prod_walkthrough_louis_genierails_prod_dev_to_prod_demo",
+     "GenieRails Dev-to-Prod Walkthrough (louis_genierails_prod.dev_to_prod_demo)"),
+])
+def test_split_agent_files_preserves_address_and_display_for_legacy_names(
+        tmp_path, entry, expected_file, expected_key, display_name):
+    env = _legacy_env(tmp_path, f"genie_spaces = [{entry}]\n")
+    assert agent_files.split(env) == [expected_file]
+    agent = agent_files.load(env, expected_file)
+    assert agent["key"] == expected_key
+    assert agent["display_name"] == display_name
+    assert agent_files.merged_config(env)["genie_spaces"][0]["name"] == display_name
+
+
+def test_split_agent_files_accepts_explicit_key_to_filename_mapping(tmp_path):
+    env = _legacy_env(tmp_path, 'genie_spaces = [{ genie_space_id = "01ef0c" }]\n')
+    assert agent_files.split(env, "01ef0c=walkthrough") == ["walkthrough"]
+    agent = agent_files.load(env, "walkthrough")
+    assert agent["key"] == "01ef0c"
+    assert agent["display_name"] == ""
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+@pytest.mark.parametrize("entry", [
+    '{ genie_space_id = "01ef0c" }',
+    '{ name = "GenieRails Dev-to-Prod Walkthrough (louis_genierails_prod.dev_to_prod_demo)", '
+    'genie_space_id = "01ef0d" }',
+])
+def test_terraform_apply_inline_split_then_plan_has_no_genie_replacement(tmp_path, entry):
+    """The preserved key keeps representative space, config and ACL addresses."""
+    env = _legacy_env(tmp_path, f"genie_spaces = [{entry}]\n")
+    root = tmp_path / "tf"
+    root.mkdir()
+    (root / "main.tf").write_text('''
+terraform { required_version = ">= 1.5" }
+variable "genie_spaces" { type = list(object({
+  key = optional(string, "")
+  name = optional(string, "")
+  genie_space_id = optional(string, "")
+  sql_warehouse_id = optional(string, "")
+  uc_tables = optional(list(string), [])
+  acl_groups = optional(list(string), null)
+  delete = optional(bool, false)
+})) }
+locals {
+  spaces = { for s in var.genie_spaces :
+    (s.key != "" ? s.key : (s.name != "" ? trim(replace(lower(s.name), "/[^a-z0-9]+/", "_"), "_") : s.genie_space_id)) => s
+  }
+}
+resource "terraform_data" "genie_space" {
+  for_each = local.spaces
+  input = each.value.genie_space_id
+}
+resource "terraform_data" "genie_space_config" {
+  for_each = local.spaces
+  input = each.value.name
+}
+resource "terraform_data" "genie_space_acl" {
+  for_each = local.spaces
+  input = each.value.acl_groups
+}
+''')
+    shutil.copy2(env / "env.auto.tfvars", root / "env.auto.tfvars")
+    subprocess.run(["terraform", "init", "-input=false"], cwd=root, check=True,
+                   text=True, capture_output=True, timeout=TIMEOUT)
+    subprocess.run(["terraform", "apply", "-auto-approve", "-input=false"], cwd=root, check=True,
+                   text=True, capture_output=True, timeout=TIMEOUT)
+
+    agent_files.split(env)
+    merged = agent_files.merged_config(env)
+    (root / "env.auto.tfvars").write_text("genie_spaces = []\n")
+    (root / "split.auto.tfvars.json").write_text(json.dumps({"genie_spaces": merged["genie_spaces"]}))
+    plan = subprocess.run(["terraform", "plan", "-detailed-exitcode", "-input=false"], cwd=root,
+                          text=True, capture_output=True, timeout=TIMEOUT)
+    assert plan.returncode == 0, plan.stdout + plan.stderr
+    assert "No changes." in plan.stdout
+    assert "must be replaced" not in plan.stdout
 
 
 def test_split_agent_files_keeps_a_promoted_envs_agent_ids_out_of_git(tmp_path):
@@ -610,13 +690,31 @@ def test_make_split_agent_files_is_explicit_and_reports_the_move(tmp_path):
     shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
     (tmp_path / "shared").symlink_to(SHARED)
 
+    environ = base._env(tmp_path)
+    environ["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
     result = subprocess.run(["make", "--no-print-directory", "-C", str(cloud), "split-agent-files", "ENV=dev"],
-                            text=True, capture_output=True, env=base._env(tmp_path), timeout=120)
+                            text=True, capture_output=True, env=environ, timeout=120)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "moved 'Payments' -> envs/dev/agents/Payments.auto.tfvars" in result.stdout
     assert "make plan ENV=dev shows no change" in result.stdout
     assert agent_files.names(env) == ["Card Ops", "Payments"]
+
+
+def test_make_split_agent_files_refuses_ci_without_writing(tmp_path):
+    cloud = tmp_path / "aws"
+    env = cloud / "envs" / "dev"
+    env.mkdir(parents=True)
+    (env / "env.auto.tfvars").write_text(LEGACY_DEV)
+    shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
+    (tmp_path / "shared").symlink_to(SHARED)
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    environ = base._env(tmp_path, CI="true")
+    result = subprocess.run(["make", "--no-print-directory", "-C", str(cloud), "split-agent-files", "ENV=dev"],
+                            text=True, capture_output=True, env=environ, timeout=120)
+    assert result.returncode != 0
+    assert "cannot run in CI" in result.stderr
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
 
 
 # Terraform's view: the roots' own locals, evaluated by terraform console

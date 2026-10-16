@@ -132,10 +132,16 @@ make plan ENV=dev                # no change: Terraform gets the same agents
 
 It moves each entry's `genie_space_id`, `acl_groups`, `uc_tables` and
 `sql_warehouse_id` into `agents/<name>.auto.tfvars` and sets
-`genie_spaces = []`. It refuses, writing nothing, when the move would change
-the plan: an entry with no `name`, a setting agent files don't hold (such as
-`declared_footprint`), a pending `delete = true`, two names with the same
-Terraform key, or an agent ID in a promoted env (move it to
+`genie_spaces = []`. Every file records the existing Terraform `key`
+separately from its display `name`, so an unnamed agent (keyed by ID) or a
+title containing filename-unsafe characters keeps the same resource address
+and display title. No state move or `moved` block is needed. The derived
+filename is the existing key; override only the filename with
+`KEY='existing-key=my-file-name'` (comma-separate multiple mappings).
+
+The command holds the env lock and refuses in CI. It refuses, writing nothing,
+for a setting agent files don't hold (such as `declared_footprint`), a pending
+`delete = true`, or an agent ID in a promoted env (move it to
 `.genie_space_id_<key>` first). Migrate an env and its promote-to targets
 together: `make promote-to ENV=prod` refuses while prod still has an agent
 inline that dev keeps in a file.

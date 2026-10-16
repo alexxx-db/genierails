@@ -104,9 +104,10 @@ locals {
   }
 
   # ── Merged space map passed to the workspace module ───────────────────────
-  # The internal Terraform for_each key is derived by sanitizing the human-
-  # readable name: lowercase, collapse any run of non-alphanumeric characters
-  # into a single underscore, strip leading/trailing underscores.
+  # Agent files can carry an explicit immutable key (used by the inline-to-file
+  # migration to preserve resource addresses). Otherwise the internal Terraform
+  # for_each key is derived by sanitizing the human-readable name: lowercase,
+  # collapse non-alphanumeric runs into underscores, strip edge underscores.
   # e.g. "Finance & HR Analytics" -> "finance_hr_analytics"
   #
   # When name is omitted (empty string), genie_space_id is used as the key
@@ -122,7 +123,7 @@ locals {
   # does not set an explicit title.
   merged_spaces = {
     for idx, s in local.effective_spaces :
-    (length([
+    (s.key != "" ? s.key : (length([
       for prior_idx, prior in local.effective_spaces : prior
       if prior_idx < idx && (
         prior.name != ""
@@ -138,7 +139,7 @@ locals {
         ? trim(replace(lower(s.name), "/[^a-z0-9]+/", "_"), "_")
       : s.genie_space_id)
       : "${s.name != "" ? trim(replace(lower(s.name), "/[^a-z0-9]+/", "_"), "_") : s.genie_space_id}--${s.genie_space_id != "" ? s.genie_space_id : idx}"
-      ) => {
+      )) => {
       name                        = local.canonical_space_names[idx]
       genie_space_id              = s.genie_space_id
       sql_warehouse_id            = s.sql_warehouse_id != "" ? s.sql_warehouse_id : var.sql_warehouse_id
@@ -411,6 +412,7 @@ variable "databricks_workspace_host" {
 
 variable "genie_spaces" {
   type = list(object({
+    key              = optional(string, "")
     name             = optional(string, "")
     genie_space_id   = optional(string, "")
     sql_warehouse_id = optional(string, "")

@@ -40,6 +40,9 @@
   writing nothing, any move that would change what Terraform plans. Envs that
   don't run it keep working unchanged; `make promote-to` refuses while the
   target still keeps inline an agent the source has in a file.
+  Unnamed and filename-unsafe display names now split safely: the agent file
+  records the old Terraform key independently, preserving every resource
+  address and the UI title. `KEY='old-key=file-name'` overrides the filename.
 - **`tag_treatments`** (deterministic envs): `"class.<name>" = "<treatment>"`
   maps a customer class to a mask-library treatment in the env's own
   `env.auto.tfvars`; promotion carries it. `make scaffold-treatments

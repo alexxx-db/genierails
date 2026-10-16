@@ -510,10 +510,11 @@ rebuild-governed-tables: ## Rebuild envs/<env>/generated/governed_tables.json af
 # the governance-owned env.auto.tfvars. Authoring: writes only those committed
 # files, refuses (writing nothing) unless Terraform gets exactly the same agents,
 # and is never run implicitly; an env that never runs it keeps working as is.
-split-agent-files: _guard-workspace-target ## Move ENV's inline genie_spaces into agents/<agent>.auto.tfvars (explicit migration; the plan is unchanged)
+split-agent-files: _guard-not-ci-apply _guard-workspace-target ## Move inline agents (optional KEY=old-key=file-name; addresses stay unchanged)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
-	python3 "$(SHARED_ROOT)/agent_files.py" split --env-dir "$(ENV_DIR)"
+	$(call _ENV_LOCK,split-agent-files); \
+	python3 "$(SHARED_ROOT)/agent_files.py" split --env-dir "$(ENV_DIR)" $(if $(strip $(KEY)),--key-map "$(strip $(KEY))",)
 
 scaffold-treatments: _guarded-bootstrap _guard-workspace-target ## Map unmapped native class.* tags: TREATMENT=<existing> reuses that mask (deterministic envs: a mask-library treatment, written to the env's tag_treatments); without it, adds fail-safe REVIEW stubs (legacy only)
 	@python3 "$(SHARED_ROOT)/scripts/scaffold_treatments.py" \
