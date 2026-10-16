@@ -427,6 +427,9 @@ def test_check_copy_gets_no_auth_file(tmp_path):
         (cloud / "envs" / env / "auth.auto.tfvars").write_text(_auth(DEPLOYER).replace(
             'databricks_client_secret = ""', 'databricks_client_secret = "do-not-copy"'))
     shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
+    # Even an auth file git tracks by mistake stays out of the copy.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
     scratch = Scratch(cloud, cloud / "Makefile", "make")
     try:
         assert not [p for p in scratch.root.rglob("auth.auto.tfvars") if p.exists() and not p.is_symlink()]
