@@ -142,7 +142,13 @@ REFUSAL_SOURCE_ANCHORS: Mapping[str, tuple[str, str]] = {
     REFUSALS["tamper"]: ("shared/scripts/release_gate.py", "no longer matches:"),
     REFUSALS["stale"]: ("shared/scripts/check_env.py", "committed files differ from what the commit regenerates"),
 }
+CI_MARKERS = (
+    "CI", "TF_BUILD", "GITHUB_ACTIONS", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI",
+    "BUILD_BUILDID", "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI", "TEAMCITY_VERSION", "TRAVIS",
+    "BITBUCKET_BUILD_NUMBER", "CODEBUILD_BUILD_ID", "DRONE", "SEMAPHORE", "APPVEYOR",
+)
 CI_ENV = {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": None}
+NON_CI_ENV = {key: None for key in (*CI_MARKERS, "GENIERAILS_ALLOW_CI_APPLY")}
 
 
 AUTHOR_MERGE = action("Commit and merge authored changes on the driver's local main", "local_merge")
@@ -765,6 +771,10 @@ def write_report(out: Path, scenario: Scenario, payload: Mapping[str, Any], secr
     lines += ["", "## Snapshot comparison", "", f"Changed top-level components: {', '.join(diff) if diff else 'none'}", ""]
     if diff:
         lines += ["```json", json.dumps(diff, indent=2, sort_keys=True, default=str), "```", ""]
+    post_reset_diff = clean.get("post_reset_snapshot_diff", {})
+    if post_reset_diff:
+        lines += ["## Post-reset snapshot comparison", "", "```json",
+                  json.dumps(post_reset_diff, indent=2, sort_keys=True, default=str), "```", ""]
     (out / f"{scenario.key}.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1308,6 +1318,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             mutated = False
             restored_lifecycle = False
             manual_restore_commands: list[str] = []
+            post_reset_diff: dict[str, Any] = {}
             stop = False
             confirmations: list[dict[str, str]] = []
             allowed_adoptions: dict[str, dict[str, Adoption]] = {}
@@ -1340,6 +1351,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     step_env = dict(step.extra_env)
                     if step.expect_failure and step.refusal and step.refusal_in_ci:
                         step_env = {**CI_ENV, **step_env}
+                    elif step.expect_failure and step.refusal:
+                        step_env = {**step_env, **NON_CI_ENV}
                     result = runner.run(argv2, f"{label}-{step.name}", step_env)
                     item["exit_code"] = result.returncode
                     if step.target == "migrate-plan" and not step.expect_failure:
@@ -1449,6 +1462,15 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         repo.reset()
                         repo.switch(repo.baseline, f"{scenario.key}-restored")
                         restored = capture()
+                        post_reset_diff = snapshot_diff(before, restored) if scenario.read_only else {}
+                        if scenario.read_only and post_reset_diff:
+                            scenario_status = "RESTORE NEEDED"
+                            failed = True
+                            stop = True
+                            manual_restore_commands = list(MANUAL_RESTORE_COMMANDS)
+                            notice = "read-only/refusal-only post-reset snapshot differs; no automatic apply was attempted"
+                            if notice not in (error_message or ""):
+                                error_message = "; ".join(filter(None, (error_message, notice)))
                         weak_restore = protection_diff_envs(before, restored, include_grants=True,
                                                             allowed_adoptions=allowed_adoptions)
                         if weak_restore and not scenario.read_only:
@@ -1472,6 +1494,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                            "restored_lifecycle": restored_lifecycle,
                            "manual_restore_commands": manual_restore_commands,
                            "snapshot_diff": snapshot_diff(before, after) if before and after else {},
+                           "post_reset_snapshot_diff": post_reset_diff,
                            "refusal_snapshot_diffs": refusal_diffs,
                            "successful_step_snapshot_diffs": successful_step_diffs}
                 write_report(reports, scenario, payload, runner.secrets)

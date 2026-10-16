@@ -293,11 +293,56 @@ def test_s13_sets_ci_unsets_override_and_passes_on_exact_refusals(tmp_path, live
     assert report["status"] == "passed" and report["restored_lifecycle"] is False
 
 
-def test_missed_read_only_refusal_never_runs_applying_restore(tmp_path, live):
-    calls = live()  # The first s13 refusal unexpectedly exits zero.
-    assert driver.main(live_args(tmp_path, "s13"), snapshot_factory=FakeSnapshots) == 1
-    assert [argv[1] for argv in makes(calls)] == ["release-plan"]
-    assert json.loads((tmp_path / "reports/s13.json").read_text())["restored_lifecycle"] is False
+def test_s10_refusals_get_default_ci_environment(tmp_path, live):
+    calls = live(refuse=(lambda argv: True, "committed files differ from what the commit regenerates\n"))
+    assert driver.main(live_args(tmp_path, "s10"), snapshot_factory=FakeSnapshots) == 0
+    envs = [env for argv, env in calls if argv and argv[0] == "make"]
+    assert len(envs) == 2 and all(env.get("CI") == "true" for env in envs)
+    assert all("GENIERAILS_ALLOW_CI_APPLY" not in env for env in envs)
+
+
+@pytest.mark.parametrize(("scenario", "values", "message", "call_count"), [
+    ("s11", ("u=" + "b" * 40, "o=" + "c" * 40, "manifest=/tmp/foreign.json"),
+     "release-plan refused: make release refused\n", 2),
+    ("manifest", ("tampered_manifest=/tmp/tampered.json",), "make release refused: x no longer matches\n", 1),
+])
+def test_non_ci_refusals_clear_every_ci_marker(tmp_path, live, monkeypatch,
+                                               scenario, values, message, call_count):
+    markers = (*driver.CI_MARKERS, "GENIERAILS_ALLOW_CI_APPLY")
+    for marker in markers:
+        monkeypatch.setenv(marker, "inherited")
+    calls = live(refuse=(lambda argv: True, message))
+    value_args = tuple(part for value in values for part in ("--value", value))
+    args = live_args(tmp_path, scenario, *value_args)
+    assert driver.main(args, snapshot_factory=FakeSnapshots) == 0
+    envs = [env for argv, env in calls if argv and argv[0] == "make"]
+    assert len(envs) == call_count
+    assert all(all(marker not in env for marker in markers) for env in envs)
+
+
+def test_read_only_scenarios_match_structure():
+    actual = {scenario.key for scenario in driver.SCENARIOS if scenario.read_only}
+    assert actual == {"s10", "s11", "s13", "manifest", "migration"}
+    for scenario in driver.SCENARIOS:
+        applying_is_refusal_only = all(
+            step.expect_failure for step in scenario.steps if step.target in driver.APPLYING)
+        has_successful_authoring_or_merge = any(
+            (step.target in driver.AUTHORING and not step.expect_failure) or step.action == "local_merge"
+            for step in scenario.steps)
+        assert scenario.read_only == (applying_is_refusal_only and not has_successful_authoring_or_merge), scenario.key
+
+
+@pytest.mark.parametrize(("scenario", "values", "first_target"), [
+    ("s13", (), "release-plan"),
+    ("s11", ("u=" + "b" * 40, "o=" + "c" * 40, "manifest=/tmp/foreign.json"), "release-plan"),
+    ("manifest", ("tampered_manifest=/tmp/tampered.json",), "release"),
+])
+def test_missed_read_only_refusal_never_runs_applying_restore(tmp_path, live, scenario, values, first_target):
+    calls = live()  # The first refusal unexpectedly exits zero.
+    value_args = tuple(part for value in values for part in ("--value", value))
+    assert driver.main(live_args(tmp_path, scenario, *value_args), snapshot_factory=FakeSnapshots) == 1
+    assert [argv[1] for argv in makes(calls)] == [first_target]
+    assert json.loads((tmp_path / f"reports/{scenario}.json").read_text())["restored_lifecycle"] is False
 
 
 def test_read_only_drift_reports_manual_restore_and_stops(tmp_path, live):
@@ -320,6 +365,19 @@ def test_read_only_drift_reports_manual_restore_and_stops(tmp_path, live):
     assert "Manual restore required" in markdown and '"unexpected"' in markdown
     assert [argv[1] for argv in makes(calls)] == ["release-plan"]
     assert not (tmp_path / "reports/migration.json").exists()
+
+
+def test_read_only_post_reset_drift_reports_restore_needed(tmp_path, live):
+    class DriftAfterReset(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            return snapshot(grants=("post-reset",) if self.n > 4 else ())
+    live()
+    assert driver.main(live_args(tmp_path, "migration"), snapshot_factory=DriftAfterReset) == 1
+    report = json.loads((tmp_path / "reports/migration.json").read_text())
+    assert report["status"] == "RESTORE NEEDED"
+    assert report["manual_restore_commands"]
+    assert report["snapshot_diff"] == {} and report["post_reset_snapshot_diff"]
 
 
 def test_missing_release_plan_manifest_errors_before_release(tmp_path, live, monkeypatch):
