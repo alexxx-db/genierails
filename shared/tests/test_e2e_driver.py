@@ -528,6 +528,63 @@ def test_protection_diff_is_per_column_and_principal():
         "eve SELECT cat.s.t"]
 
 
+def azure_legacy_mid_migration_snapshot(*, treatment="redact", policy_except=()):
+    """Relevant shape captured from the legacy Azure environment in migration."""
+    catalog = "louis_serverless"
+    table = f"{catalog}.dev_to_prod_demo.payments"
+    return {"uc": {catalog: {
+        "governed_tags": [{
+            "catalog_name": catalog,
+            "schema_name": "dev_to_prod_demo",
+            "table_name": "payments",
+            "column_name": "cvv",
+            "tag_name": "gr_treatment",
+            "tag_value": treatment,
+        }],
+        "mask_functions": [{
+            "routine_catalog": catalog,
+            "routine_schema": "dev_to_prod_demo",
+            "routine_name": "mask_redact",
+        }],
+        "abac_policies": [{"table": table, "policies": [{
+            "name": f"{catalog}_gr_mask_{catalog}_redact",
+            "to_principals": ["account users"],
+            "except_principals": list(policy_except),
+            "match_columns": [{
+                "alias": "gr_treatment_redact",
+                "condition": f"hasTagValue('gr_treatment', '{treatment}')",
+            }],
+            "column_mask": {"function_name": f"{catalog}.dev_to_prod_demo.mask_redact"},
+        }]}],
+    }}, "agents": []}
+
+
+def test_unchanged_azure_legacy_never_raw_snapshot_is_not_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    # Regression: main reported "never-raw redact -> redact" even though the
+    # driver's before/after snapshots and the live state hashes were identical.
+    assert driver.snapshot_diff(baseline, baseline) == {}
+    assert driver.protection_diff(baseline, baseline) == {}
+
+
+def test_azure_legacy_never_raw_policy_gaining_exception_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot(policy_except=("payments_ops",))
+    assert driver.protection_diff(baseline, current)["policies"] == [
+        "louis_serverless.dev_to_prod_demo.payments "
+        "louis_serverless_gr_mask_louis_serverless_redact: newly exempts payments_ops"
+    ]
+
+
+def test_azure_legacy_never_raw_replaced_by_raw_capable_treatment_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot(treatment="email_partial")
+    assert driver.protection_diff(baseline, current)["columns"] == [
+        "louis_serverless.dev_to_prod_demo.payments.cvv "
+        "gr_treatment never-raw redact -> email_partial"
+    ]
+
+
 def test_widened_grant_after_restore_fails(tmp_path, live):
     class Widen(FakeSnapshots): mode = "widen_after"
     live()
