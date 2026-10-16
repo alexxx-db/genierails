@@ -391,6 +391,34 @@ def test_promote_keeps_agents_only_in_the_target(tmp_path, capsys):
     assert "Legacy: only in prod; kept" in capsys.readouterr().out
 
 
+def test_promote_preserves_a_detached_target_agent(tmp_path):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "agents").mkdir()
+    settings = prod / "agents" / "Sales.auto.tfvars"
+    settings.write_text('genie_space_id = ""\nacl_groups = []\ndetached = true\n')
+
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert agent_files.load(prod, "Sales")["detached"] is True
+    assert agent_files.load(prod, "Sales")["acl_groups"] == []
+
+
+def test_promote_refuses_to_recreate_an_agent_removed_after_detach(tmp_path, monkeypatch):
+    dev, prod = _promote_envs(tmp_path)
+    monkeypatch.setattr(
+        agent_promote,
+        "load_receipt",
+        lambda *_: {"agents": {"Sales": {"detached": True, "acl_groups": [], "lifecycle": "detached"}}},
+    )
+    before = {p.relative_to(prod): p.read_bytes() for p in prod.rglob("*") if p.is_file()}
+
+    with pytest.raises(agent_files.AgentFileError, match="removed after it was released detached"):
+        agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert {p.relative_to(prod): p.read_bytes() for p in prod.rglob("*") if p.is_file()} == before
+    assert not (prod / "agents").exists()
+
+
 # ── Prod ownership ───────────────────────────────────────────────────────────
 
 def _prod(tmp_path, settings='genie_space_id = ""\nacl_groups = ["a"]\n', payload=None) -> Path:

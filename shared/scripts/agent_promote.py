@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """promote-to's agent step: carry captured agents from the source env to the target.
 
-A pure function of the commit: it reads only committed files (the source
-env's agents/ and env.auto.tfvars, the target's env.auto.tfvars and agents/
-settings) and never live Databricks or Terraform state.
+It reads committed source and target files and never live Databricks. Before
+seeding a missing target agent file it also reads the target's last release
+receipt, so a removed detached agent cannot be silently recreated.
 
 - agents/<agent>.space.json is promote-to output: rewritten every time from
   the source capture through remap_payload (JSON-aware: catalog names and the
@@ -32,7 +32,7 @@ if str(SHARED) not in sys.path:
 
 import agent_files  # noqa: E402
 from agent_files import AgentFileError  # noqa: E402
-from scripts.agent_ownership import render  # noqa: E402
+from scripts.agent_ownership import AgentError, load_receipt, render  # noqa: E402
 from scripts.saved_settings import catalog_map_dict  # noqa: E402
 
 # A catalog is an identifier when it starts a dotted name: not preceded by an
@@ -99,11 +99,44 @@ def warehouse_map(source_dir: Path, dest_dir: Path) -> dict[str, str]:
     return {source: dest} if source and dest and source != dest else {}
 
 
+def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> None:
+    """Refuse before writing when promotion would resurrect a detached target agent.
+
+    The release receipt is runtime state, but it is the durable record left by
+    the two-step detach flow after the committed agent file is removed.  An
+    absent target file is therefore not a first promotion when that record says
+    the target agent was detached.
+    """
+    missing = {
+        agent["name"]
+        for agent in source_agents
+        if agent_files.capture_path(agent["_dir"], agent["name"]).is_file()
+        and not agent_files.settings_path(dest_dir, agent["name"]).is_file()
+    }
+    if not missing:
+        return
+    released = (load_receipt(dest_dir, dest_dir.name).get("agents") or {})
+    blocked = sorted(
+        name for name in missing
+        if (released.get(name) or {}).get("detached") is True
+        or (released.get(name) or {}).get("lifecycle") == "detached"
+    )
+    if blocked:
+        names = ", ".join(repr(name) for name in blocked)
+        raise AgentFileError(
+            f"{names} was removed after it was released detached in {dest_dir.name}; refusing to recreate it "
+            f"from the active source. Keep it detached, or make a deliberate {dest_dir.name}-side lifecycle "
+            "change; nothing was written"
+        )
+
+
 def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[str]:
     """Write the target's agent files; returns the agents carried."""
     source_agents = agent_files.load_all(source_dir)
     if not source_agents:
         return []
+    source_agents = [agent | {"_dir": source_dir} for agent in source_agents]
+    refuse_detached_recreation(source_agents, dest_dir)
     # A target still in the legacy layout keeps these agents inline, with its
     # own (env-owned) acl_groups; carrying them as files would replace those
     # silently. Moving them is the explicit, reviewed make split-agent-files.
@@ -131,7 +164,7 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
         (folder / capture.name).write_text(render(remap_payload(payload, catalogs, warehouses)))
         settings = agent_files.settings_path(dest_dir, name)
         if not settings.is_file():
-            settings.write_text(seed_settings(agent | {"_dir": source_dir}, catalogs))
+            settings.write_text(seed_settings(agent, catalogs))
             print(f"  {name}: promoted; seeded agents/{settings.name} (acl_groups from {source_dir.name})")
         else:
             kept = agent_files.load(dest_dir, name)["acl_groups"]
@@ -156,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         if agent_files.names(args.source_dir):
             print(f"=== Promote agents ({args.source_dir.name} -> {args.dest_dir.name}) ===")
         promote(args.source_dir, args.dest_dir, catalogs)
-    except (AgentFileError, ValueError, OSError) as exc:
+    except (AgentError, AgentFileError, ValueError, OSError) as exc:
         print(f"ERROR: promote-to agents: {exc}", file=sys.stderr)
         return 1
     return 0

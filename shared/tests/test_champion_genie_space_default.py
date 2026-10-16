@@ -34,9 +34,11 @@ EXPECTED_ERROR = (
 def _dev_env(tmp_path, genie_space_id=PLACEHOLDER, discovered=None):
     env_dir = tmp_path / "envs" / "dev"
     (env_dir / "data_access").mkdir(parents=True)
-    (env_dir / "env.auto.tfvars").write_text(
-        TEMPLATE.read_text().replace(PLACEHOLDER, genie_space_id)
-    )
+    template = TEMPLATE.read_text().replace(PLACEHOLDER, genie_space_id)
+    template = template.replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
+    template = template.replace("<most-privileged-group>", "payments_ops")
+    template = template.replace("<least-privileged-group>", "viewers")
+    (env_dir / "env.auto.tfvars").write_text(template)
     (env_dir / "auth.auto.tfvars").write_text(
         'databricks_workspace_host = "https://example.invalid"\n'
         'databricks_client_id = "client"\ndatabricks_client_secret = "secret"\n'
@@ -59,6 +61,14 @@ def test_template_genie_space_placeholder_is_the_only_active_footprint():
     assert "enable_auto_tagging" not in cfg
     # The retired exposure flag is no longer needed (or set) in the template.
     assert "business_access_enabled" not in cfg
+
+
+def test_champion_template_starts_deterministic_with_required_placeholders():
+    cfg = hcl2.loads(TEMPLATE.read_text())
+
+    assert cfg["governance_mode"] == "deterministic"
+    assert cfg["deployer_principal_id"] == "<your-deployer-principal-id>"
+    assert cfg["access_tier_groups"] == ["<most-privileged-group>", "<least-privileged-group>"]
 
 
 def test_placeholder_error_names_the_file_and_the_fix(tmp_path):
@@ -396,6 +406,11 @@ def test_generate_discovers_tables_from_agent_id_only_template(
         "fetch_tables_from_genie_space",
         lambda *a, **k: (api_tables, {}, "Finance Agent", True),
     )
+    monkeypatch.setattr(
+        generate_abac,
+        "list_account_group_names",
+        lambda *a, **k: ["payments_ops", "viewers"],
+    )
     captured = {}
 
     def stop_after_footprint(table_refs, auth_cfg):
@@ -407,8 +422,7 @@ def test_generate_discovers_tables_from_agent_id_only_template(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["generate_abac.py", "--auth-file", str(env_dir / "auth.auto.tfvars"),
-         "--create-groups", *mode_args],
+        ["generate_abac.py", "--auth-file", str(env_dir / "auth.auto.tfvars"), *mode_args],
     )
     with pytest.raises(RuntimeError, match="stop after footprint"):
         generate_abac.main()

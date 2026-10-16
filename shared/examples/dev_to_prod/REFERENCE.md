@@ -75,7 +75,7 @@ unused until the rollout step shown, so adding them cannot change current behavi
 
 | Setting | Shape and meaning | Used from step |
 |---|---|---|
-| `governance_mode` | `"legacy"` (default) or `"deterministic"`; gates rollout behavior so existing deployments remain unchanged. | 2 |
+| `governance_mode` | `"deterministic"` in the champion template and newly scaffolded workspace envs. Omitted still means `"legacy"`, so existing deployments remain unchanged. | 2 |
 | `access_tier_groups` | Ordered group names: first sees raw, last sees full masking, and groups between see partial masking. One group is raw-only; two are raw/full. Empty remains the legacy unset value. | 5 |
 | `raw_exempt_principals` | Environment-owned principals that see raw, except for never-raw treatments; the deployer SP also sees raw, except for never-raw treatments. | 5 |
 | `deployer_principal_id` | Deterministic envs (required): the application ID of the service principal that applies this env, committed (not secret). Generation, validation, `make check` and `promote-to` read it instead of `auth.auto.tfvars`; env-owned (`promote-to` swaps dev's for prod's in the promoted EXCEPT lists and never copies it); rehearse, release-plan, release and maintain refuse before the lock unless `databricks_client_id` matches it. See [access.md](../../docs/access.md). | 8 |

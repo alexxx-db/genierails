@@ -42,6 +42,14 @@ def _dev_env(tmp_path, groups=None, genie_space_id=AGENT_ID):
     env_dir = tmp_path / "envs" / "dev"
     (env_dir / "data_access").mkdir(parents=True)
     text = TEMPLATE.read_text().replace(PLACEHOLDER, genie_space_id)
+    # Most tests in this module exercise the legacy group-resolution contract;
+    # the template's deterministic defaults have their own contract tests.
+    text = text.replace('governance_mode = "deterministic"\n', "")
+    text = text.replace('deployer_principal_id = "<your-deployer-principal-id>"\n', "")
+    text = text.replace(
+        'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]',
+        "access_tier_groups = []",
+    )
     if groups is not None:
         text = text.replace("access_tier_groups = []", groups)
     (env_dir / "env.auto.tfvars").write_text(text)
@@ -499,12 +507,12 @@ def test_roots_loading_the_workspace_env_file_declare_the_setting(root):
     assert "default     = []" in body
 
 
-def test_template_ships_an_empty_access_tier_groups_line_next_to_the_agent():
+def test_template_ships_access_tier_group_placeholders_next_to_the_agent():
     text = TEMPLATE.read_text()
     cfg = hcl2.loads(text)
 
-    assert cfg["access_tier_groups"] == []
-    assert text.index("genie_spaces = [") < text.index("access_tier_groups = []") < text.index(
+    assert cfg["access_tier_groups"] == ["<most-privileged-group>", "<least-privileged-group>"]
+    assert text.index("genie_spaces = [") < text.index("access_tier_groups = [") < text.index(
         "sql_warehouse_id ="
     )
     assert "MOST to LEAST" in text

@@ -29,7 +29,8 @@ no agent's config, so it never waits for an agent that's mid-curation.
 ## Before you start
 
 - Run `make` from `aws/` (or `azure/`).
-- Each env sets `governance_mode = "deterministic"` and its own
+- The champion template and newly scaffolded workspace envs set
+  `governance_mode = "deterministic"`; each env also sets its own
   `deployer_principal_id` (the application ID of the SP that applies it) in its
   `env.auto.tfvars`. `promote-to` never sets either in prod. An env deployed
   before in legacy mode migrates first: [legacy mode](../legacy-mode.md).

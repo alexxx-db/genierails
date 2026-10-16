@@ -66,7 +66,8 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
     assert "Edit envs/account/env.auto.tfvars" not in out
     assert (
         "  3. Edit envs/dev/env.auto.tfvars — set genie_space_id to your Genie agent ID and\n"
-        "     access_tier_groups to your IdP groups, most to least privileged\n"
+        "     deployer_principal_id to the applying SP's client_id, and access_tier_groups to your IdP groups,\n"
+        "     most to least privileged (the template starts new champions in deterministic mode)\n"
     ) in out
     # One plain generate imports the agent; no separate MODE=genie step.
     assert "MODE=genie" not in out
@@ -88,7 +89,7 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
     assert "  5. Run: make generate ENV=dev   (one run: imports the agent, finds its tables, drafts rules)\n" in out
     assert "  6. Run: make rehearse ENV=dev\n" in out
     assert "business_access_enabled" not in out
-    assert "     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)\n" in out
+    assert "     (grants SELECT only from table_readers after its coverage check passes, and Genie CAN_RUN only from acl_groups after the live agent coverage check)\n" in out
     assert re.findall(r"^  (\d+)\. ", out, flags=re.MULTILINE) == ["1", "2", "3", "4", "5", "6"]
     assert "shared/examples/dev_to_prod/README.md" in out
     # The champion flow relies on native Data Classification, not the country overlay.
@@ -134,26 +135,32 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "envs/prod/auth.auto.tfvars",
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
-        "  5. Run: make release ENV=prod\n",
+        "  5. Run: make release-plan ENV=prod",
+        "make release ENV=prod MANIFEST=<the manifest it printed>",
         "make maintain ENV=prod",
     ]
     positions = [out.index(step) for step in order]
     assert positions == sorted(positions)
     assert "make rehearse" not in out
     assert "make generate" not in out
+    assert "deployer_principal_id" in out
     assert "VERIFY_KEY_COLUMN" not in out
     assert "DEST_CATALOG_MAP" not in out
     assert "     It proves a row-pairing key for every masked table before applying (no key to set).\n" in out
     assert "VERIFY_KEY_COLUMN" not in out and "verify_key_column" not in out
     assert "Set business_access_enabled" not in out
     assert "business_access_enabled" not in out
-    assert "     (grants business SELECT + Genie CAN_RUN once its coverage check passes; no access flag to set)\n" in out
+    assert "     (grants SELECT only from table_readers after its coverage check passes, and Genie CAN_RUN only from acl_groups after the live agent coverage check)\n" in out
     assert "make apply ENV=prod" not in out
     assert "make verify-access ENV=prod" not in out
     assert "make certify" not in out
     assert re.findall(r"^  (\d+)\. ", out, flags=re.MULTILINE) == ["1", "2", "3", "4", "5", "6"]
     assert "shared/examples/dev_to_prod/README.md" in out
     env_text = (tmp_path / cloud / "envs/prod/env.auto.tfvars").read_text()
+    env_cfg = hcl2.loads(env_text)
+    assert env_cfg["governance_mode"] == "deterministic"
+    assert env_cfg["deployer_principal_id"] == "<your-deployer-principal-id>"
+    assert env_cfg["access_tier_groups"] == ["<most-privileged-group>", "<least-privileged-group>"]
     assert "enable_auto_tagging" not in hcl2.loads(env_text)
     assert 'promote_from = "dev"' in env_text
     assert 'catalog_map  = { "<dev_catalog>" = "<prod_catalog>" }' in env_text

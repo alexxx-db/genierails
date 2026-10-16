@@ -23,7 +23,8 @@ git add envs/prod/ && git commit       # the promotion PR; after merge and rehea
 
 - Run `make` from `aws/` (or `azure/`).
 - The envs are deterministic: `governance_mode = "deterministic"` in
-  `envs/dev/env.auto.tfvars`. No such line means legacy: see
+  `envs/dev/env.auto.tfvars` (the champion template and new workspace setup use
+  this default). Existing envs with no such line remain legacy: see
   [legacy mode](../legacy-mode.md) to migrate first.
 - Your agents are in `agents/` files. Still inline in `genie_spaces`? Ask
   governance to run [`make split-agent-files`](../pipelines.md#who-owns-which-file).
@@ -70,7 +71,10 @@ keeps its last captured version.
    it also seeds `envs/prod/agents/<agent>.auto.tfvars` with dev's `acl_groups`
    and an empty `genie_space_id` (prod's ID lives in prod's state and release
    receipt). Later promotions keep prod's file and print how its `acl_groups`
-   differ from dev's.
+   differ from dev's. A detached prod file stays detached. If that file was
+   removed after a detached release, promotion refuses instead of recreating
+   the still-active dev agent; reactivation requires a deliberate prod-side
+   lifecycle change.
 2. **Check and open the promotion PR.** `make check ENV=prod`; commit
    `envs/prod/`. It can carry the dev change too, in one PR.
 3. **Merge.** After the dev rehearsal passes on the merge commit, the operator
