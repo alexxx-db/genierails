@@ -6,7 +6,8 @@ Take a Genie agent you've curated in **dev** and ship it to **prod** with its se
 
 ```bash
 # dev
-make setup ENV=dev          # then copy the template; set genie_space_id and access_tier_groups
+make setup ENV=dev          # then copy the template; set governance_mode = "deterministic",
+                            #   deployer_principal_id, genie_space_id and access_tier_groups
 #   Catalog Explorer: turn on Data classification, review detections, enable auto-tagging
 make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
 make rehearse ENV=dev       # applies in dev and proves the masks work
@@ -14,7 +15,8 @@ make rehearse ENV=dev       # applies in dev and proves the masks work
 # prod (same for stg or any env)
 make promote-to ENV=prod    # copies the reviewed rules (set catalog_map first)
 #   Catalog Explorer: same classification review on the prod catalog
-make release ENV=prod       # applies in prod and proves the masks work
+make release-plan ENV=prod  # plans prod and writes the manifest to approve
+make release ENV=prod MANIFEST=<manifest>   # applies exactly the approved plan, proves the masks
 make maintain ENV=prod      # run on a schedule
 
 # commit
@@ -86,15 +88,16 @@ Using the sample environment? Load its tables into prod first (`--skip-agent`, s
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 
-**3. Release.**
+**3. Release.** Plan, review the manifest, then apply exactly what was approved:
 ```bash
-make release ENV=prod
+make release-plan ENV=prod
+make release ENV=prod MANIFEST=<manifest printed by release-plan>
 ```
 **Pass looks like:** `ALL EFFECTIVE` and "Release complete". Business users can now open the agent and get masked answers.
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
-- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>`, commit `../shared/treatment_config.json`, then `make release ENV=prod`.
-- **A new kind of mask**: `make scaffold-treatments ENV=prod` and review the stub it adds, then `make materialize-treatment ENV=dev TREATMENT=<new>`, `make rehearse ENV=dev`, `make promote-to ENV=prod` and `make release ENV=prod`. Commit the changed `../shared/` files and `envs/dev/generated/`.
+- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make release-plan ENV=prod` and `make release ENV=prod MANIFEST=<manifest>`.
+- **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Applying a custom mask in governance (`make adopt-custom-mask`) is not on `main` yet. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
 
 Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-gap-found-in-prod).
 
