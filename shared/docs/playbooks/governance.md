@@ -238,7 +238,11 @@ rehearse and release. Read the [CHANGELOG](../../../aws/CHANGELOG.md) first.
 > write files for review, are never run by `generate`, `rehearse`, `release` or
 > `maintain`, and never run in CI:
 > - `make suggest-treatment CLASS=<class>` will propose a treatment for an unmapped class.
-> - `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` will draft
+> - `make draft-custom-mask ENV=dev TREATMENT=custom_<name> TYPE=<sql-type>` will draft
 >   a custom mask and its exact-output test fixture under `envs/dev/drafts/custom_masks/`.
-> - `make test-custom-mask ENV=dev TREATMENT=<name>` will run the mask library's
+> - `make test-custom-mask ENV=dev TREATMENT=custom_<name>` will run the mask library's
 >   exact-output tests on that draft; `tag_treatments` can't use it until they pass.
+> - `make adopt-custom-mask ENV=dev TREATMENT=custom_<name>` (no model) copies a
+>   passed draft into `envs/dev/custom_masks/`, which you own and review like
+>   `env.auto.tfvars`, and prints the `tag_treatments` line to add
+>   ([reference](../../REFERENCE.md#adopted-custom-masks)).

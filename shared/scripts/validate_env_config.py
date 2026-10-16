@@ -9,6 +9,7 @@ import hcl2
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent_files import AgentFileError, merged_config  # noqa: E402
 from deterministic_governance import validate_config  # noqa: E402
+from scripts.custom_masks import env_errors  # noqa: E402
 
 
 def main() -> int:
@@ -23,11 +24,16 @@ def main() -> int:
     except Exception as exc:
         print(f"env config validation: {path}: {exc}", file=sys.stderr)
         return 1
-    errors = validate_config(
+    # The env's adopted custom masks (custom_masks/, tested_sha256 recomputed).
+    library, errors, warnings = env_errors(path.parent, cfg)
+    errors += validate_config(
         cfg,
         ack_unclassified=os.environ.get("ACK_UNCLASSIFIED"),
         ack_weaken=os.environ.get("ACK_WEAKEN"),
-    )
+        library=library,
+    ) if library is not None else []
+    for warning in warnings:
+        print(f"env config validation: WARNING: {warning}", file=sys.stderr)
     if errors:
         for error in errors:
             print(f"env config validation: {error}", file=sys.stderr)

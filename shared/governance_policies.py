@@ -33,7 +33,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from deterministic_governance import NEVER_RAW_TREATMENTS
-from mask_library import load_library, resolve_class, sql_body, type_family
+from mask_library import load_library, resolve_class, sql_body, type_family, typed_body
 
 TAG_KEY = "gr_treatment"
 FAILSAFE_TREATMENT = "unmapped_redact"
@@ -64,6 +64,9 @@ class DeterministicGovernanceError(ValueError):
 # A customer class (Data Classification's custom classes) as class.* tags carry
 # it: lowercase, words joined by "_" (sensitivity_source._normalize_semantic).
 _CLASS_KEY = re.compile(r"class\.([a-z0-9][a-z0-9_]*)")
+# An adopted custom mask (design 18.4.1, envs/<env>/custom_masks/): the
+# reserved prefix, and no "__", which separates the parts of a treatment value.
+CUSTOM_TREATMENT = re.compile(r"custom_[a-z0-9]+(?:_[a-z0-9]+)*")
 
 
 def tag_treatment_errors(tag_treatments, library: dict | None = None) -> list[str]:
@@ -75,6 +78,8 @@ def tag_treatment_errors(tag_treatments, library: dict | None = None) -> list[st
     library already maps can't be remapped here (one column changes through
     column_overrides). Tags other than class.* are not read in this version,
     so a mapping for one would mask nothing; it is refused rather than ignored.
+    A custom_<name> value names a mask adopted into the env's custom_masks/,
+    which ``library`` then holds (scripts/custom_masks.effective_library).
     """
     if tag_treatments is None:
         return []
@@ -95,12 +100,18 @@ def tag_treatment_errors(tag_treatments, library: dict | None = None) -> list[st
             errors.append(
                 f"{label}: the mask library already maps {key} (to {mapped[match.group(1)]}); "
                 "change one column with column_overrides instead")
-        if not isinstance(treatment, str) or treatment not in data["treatments"]:
+        if isinstance(treatment, str) and CUSTOM_TREATMENT.fullmatch(treatment) \
+                and treatment not in data["treatments"]:
+            errors.append(
+                f"{label} names {treatment!r}, which is not adopted in this env's custom_masks/. "
+                "A drafted custom mask can't be named here until it is adopted: make test-custom-mask, "
+                f"then make adopt-custom-mask ENV=dev TREATMENT={treatment} (governance never reads drafts/)")
+        elif not isinstance(treatment, str) or treatment not in data["treatments"]:
             errors.append(
                 f"{label} names {treatment!r}, which is not a mask-library treatment "
-                f"(one of: {', '.join(sorted(data['treatments']))}). A custom mask from make "
-                "draft-custom-mask can't be named here: it stays a draft for review, and governance "
-                "never reads drafts/")
+                f"(one of: {', '.join(sorted(data['treatments']))}) or an adopted custom_<name> mask. "
+                "A custom mask from make draft-custom-mask can't be named here: it stays a draft for "
+                "review until make adopt-custom-mask, and governance never reads drafts/")
     return errors
 
 
@@ -127,6 +138,9 @@ class ColumnTreatment:
     partial: str
     full: str
     never_raw: bool
+    # The adopted custom mask's partial expression for this type family
+    # (envs/<env>/custom_masks/); None for every library version.
+    custom_partial_sql: str | None = None
 
     @property
     def type_token(self) -> str:
@@ -134,6 +148,8 @@ class ColumnTreatment:
 
     @property
     def partial_sql(self) -> str:
+        if self.custom_partial_sql and not self.never_raw:
+            return typed_body(self.custom_partial_sql, self.sql_type)
         return sql_body(self.full if self.never_raw else self.partial, self.sql_type)
 
     @property
@@ -164,9 +180,13 @@ def is_library_treatment_value(tag_key: str, value: str) -> bool:
 
     Mode-blind: the account tag policy is shared, so it can hold deterministic
     values next to legacy ones. Callers that know the env's mode also check it.
+    A custom_<name> value is accepted by its shape: the account policy is one
+    union across envs, and an env that hasn't adopted the mask must still
+    re-split it (each env's generate requires its own definition).
     """
     parsed = parse_treatment_value(value)
-    return bool(tag_key == TAG_KEY and parsed and parsed[0] in _library_treatments())
+    return bool(tag_key == TAG_KEY and parsed and (
+        parsed[0] in _library_treatments() or CUSTOM_TREATMENT.fullmatch(parsed[0])))
 
 
 @functools.cache
@@ -249,7 +269,9 @@ def resolve_column(
     if not never_raw:
         version = (treatment_versions or {}).get(treatment, {}).get("partial")
         partial = override.get("partial", version or partial)
-    return ColumnTreatment(treatment, exact_type, partial or full, full, never_raw)
+    # An adopted custom mask's partial version is named after it.
+    custom = None if never_raw else (data.get("custom_bodies") or {}).get(partial, {}).get(family)
+    return ColumnTreatment(treatment, exact_type, partial or full, full, never_raw, custom)
 
 
 def build_policies(
@@ -431,20 +453,21 @@ def build_model(
     classes_by_column: Mapping[str, Sequence[str]],
     types_by_column: Mapping[str, str],
     settings: Mapping,
-    *, deployer_principal: str = "",
+    *, deployer_principal: str = "", library: dict | None = None,
 ) -> DeterministicModel:
     """The whole governance model for the classified columns of the governed set.
 
     ``settings`` is the env config (``access_tier_groups``,
     ``raw_exempt_principals``, ``treatment_versions``, ``column_overrides``,
-    ``tag_treatments``).
+    ``tag_treatments``). ``library`` is the env's effective library (the mask
+    library plus its adopted custom masks); the mask library by default.
     """
     if settings.get("tier_access_overrides"):
         raise DeterministicGovernanceError(
             "tier_access_overrides are deferred (group-level overrides of the tier rule); "
             "remove them for deterministic governance"
         )
-    library = with_tag_treatments(load_library(), settings.get("tag_treatments"))
+    library = with_tag_treatments(library or load_library(), settings.get("tag_treatments"))
     overrides = normalize_column_overrides(settings.get("column_overrides"))
     ddl_columns = {column.lower() for column in types_by_column}
     unknown_overrides = sorted(

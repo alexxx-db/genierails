@@ -2,9 +2,10 @@
 
 Two independent proofs:
 
-* Static: every make target those commands reach (prerequisites and nested
-  $(MAKE) calls, with every variable expanded) and every GenieRails Python
-  module their recipes run (with its local imports) are walked. None of them
+* Static: every make target those commands (and make adopt-custom-mask)
+  reach (prerequisites and nested $(MAKE) calls, with every variable
+  expanded) and every GenieRails Python module their recipes run (with its
+  local imports) are walked. None of them
   is an AI-helper target, names scripts/ai_helpers.py, or imports it.
 * Runtime: a tripwire (a sitecustomize on PYTHONPATH) records, in every Python
   process make starts, any import of the model client (scripts.ai_helpers),
@@ -38,6 +39,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SHARED = ROOT / "shared"
 MAKEFILE = SHARED / "Makefile.shared"
 GOVERNANCE_TARGETS = ("generate", "rehearse", "release-plan", "release", "maintain", "check")
+# Authoring commands that write governance config and must never call a model either.
+NO_MODEL_TARGETS = GOVERNANCE_TARGETS + ("adopt-custom-mask",)
 AI_TARGETS = ("suggest-treatment", "draft-genie-content", "draft-custom-mask", "test-custom-mask")
 MODEL_MODULES = ("ai_helpers", "anthropic", "openai")
 
@@ -149,7 +152,7 @@ def test_the_parser_finds_the_ai_helpers_from_their_own_targets():
     assert {"validate", "promote", "coverage-gate", "plan", "promote-to"} <= _closure("check")[0]
 
 
-@pytest.mark.parametrize("target", GOVERNANCE_TARGETS)
+@pytest.mark.parametrize("target", NO_MODEL_TARGETS)
 def test_governance_targets_never_reach_an_ai_helper_target_or_the_model_client(target):
     reached, text = _closure(target)
     assert len(reached) > 1, f"{target}: the Makefile parser found nothing to walk"

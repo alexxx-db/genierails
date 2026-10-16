@@ -80,8 +80,9 @@ commands that call a model. `generate`, `rehearse`, `release`, `maintain` and
 |---|---|
 | `make suggest-treatment ENV=dev CLASS=<class>` | `envs/dev/drafts/treatments/<class>.json`: a mask-library treatment for a class nothing maps yet, with the library's partial and full versions, or a pointer to `draft-custom-mask` when none fits |
 | `make draft-genie-content ENV=dev SPACE="<agent>"` | `envs/dev/drafts/genie/<agent>.json`: instructions, sample questions and benchmarks the captured agent doesn't have yet. The model sees only table names, column types and which parts already exist; never data, the agent's name or its existing text |
-| `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` | `envs/dev/drafts/custom_masks/<name>.sql` (one expression over `value`) and `<name>.json` (exact-output fixture, always with a NULL case) |
-| `make test-custom-mask ENV=dev TREATMENT=<name>` | `envs/dev/drafts/custom_masks/<name>.passed.json`, only on a pass. Calls no model |
+| `make draft-custom-mask ENV=dev TREATMENT=custom_<name> TYPE=<sql-type>` | `envs/dev/drafts/custom_masks/custom_<name>.sql` (one expression over `value`) and `custom_<name>.json` (exact-output fixture, always with a NULL case). The name must carry the reserved `custom_` prefix |
+| `make test-custom-mask ENV=dev TREATMENT=custom_<name>` | `envs/dev/drafts/custom_masks/custom_<name>.passed.json`, only on a pass. Calls no model |
+| `make adopt-custom-mask ENV=dev TREATMENT=custom_<name>` | `envs/dev/custom_masks/custom_<name>.json`: governance config (see [Adopted custom masks](#adopted-custom-masks)). Calls no model |
 
 - **Model endpoint:** `ai_helper_endpoint` in the env's `env.auto.tfvars` (a
   Databricks model serving endpoint, called with the env's workspace
@@ -119,6 +120,50 @@ commands that call a model. `generate`, `rehearse`, `release`, `maintain` and
   rendered in `America/Los_Angeles` like `scripts/live_mask_library.py`. A
   pass records the SHA-256 of the `.sql` and `.json` it tested, so a reviewer
   can see the committed draft is the one that passed; a failing run deletes
-  the record. `tag_treatments` names only mask-library treatments, so it
-  can't reference a draft; this version has no setting that applies a custom
-  mask.
+  the record. `tag_treatments` can't reference a draft: only a mask adopted
+  with `make adopt-custom-mask` (below).
+
+### Adopted custom masks
+
+`make adopt-custom-mask ENV=dev TREATMENT=custom_<name>` (design 18.4.1)
+turns a draft that passed `test-custom-mask` into governance config. It runs
+under the same guards as the AI helpers (never in CI, with no opt-out; only
+`ENV=dev` at this checkout's real `envs/dev`; no symlinks) and calls no
+model. It refuses unless:
+
+- the name has the reserved `custom_` prefix, no `__`, and isn't a mask-library name;
+- the `test-custom-mask` pass record matches the draft's `.sql` and `.json` bytes;
+- the offline rules pass again (one expression over `value`, no query,
+  `current_user`, group check, randomness or time; NULL in gives NULL out; at
+  least two non-null cases, all typed literals);
+- no never-raw class (`secret`, `card_pin`, ...) maps to it in `tag_treatments`;
+- an adopted type family is replaced only with `FORCE=1`.
+
+It writes `envs/dev/custom_masks/custom_<name>.json` and only prints the
+`tag_treatments` line to add; it never edits `env.auto.tfvars` or deletes
+drafts. The file holds, per type family, the partial `sql`, its
+`tested_type`, the literal-only `cases` and `tested_sha256` (the SHA-256 of
+`[treatment, tested_type, sql, cases]`). `full` is always the library's
+`redacted` (`[REDACTED]`, or NULL for other types), so tier 3 and anyone
+outside the tiers never meet custom SQL. `never_raw` must be `false`:
+tier 1, `raw_exempt_principals` and the deployer see a custom-masked column
+raw, so map a class that must never be raw to `secret` instead.
+
+- **One lookup:** `generate`, `validate`, `scaffold-treatments` and
+  `verify-access` all read the mask library plus the env's `custom_masks/`.
+  The partial SQL is part of the generation hash, so an edit gives new tag
+  values, functions and policies through the usual staged change.
+  `treatment_versions` can only make a custom mask stricter (`redacted`).
+- **validate and check** recompute `tested_sha256` and refuse a mismatch, so
+  hand-edited SQL can't govern until it is re-tested and re-adopted.
+- **rehearse and release** (`release-plan` and `release MANIFEST=`) re-run
+  every adopted case, read-only, on that env's `sql_warehouse_id`, before
+  anything is applied.
+- **Weakening:** a partial tier moving to a different custom value (a library
+  mask swapped for a custom one, one custom mask for another, or an edit to a
+  custom mask's SQL) is reported as `custom_mask_changed` and needs a
+  `<env>:weaken:<column>:<principal>` acknowledgement.
+- **Promotion:** `make promote-to` copies `custom_masks/` byte for byte
+  (removing files the source no longer has) and reports it as governance
+  files. The account tag policy accepts any `custom_*` value, so
+  `make apply-account` adds new values as usual.

@@ -3419,11 +3419,16 @@ def write_deterministic_draft(
 
 def deterministic_model_for(
     env_cfg: dict, classification_source, ddl_text: str, *,
-    columns: list[str] | None = None,
+    columns: list[str] | None = None, env_dir: Path | None = None,
 ):
-    """The deterministic model for the classified columns of the governed set."""
+    """The deterministic model for the classified columns of the governed set.
+
+    ``env_dir`` adds the env's adopted custom masks (envs/<env>/custom_masks/)
+    to the mask library; an invalid one stops generation.
+    """
     from deployer_identity import SETTING, validation_errors
     from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
+    from scripts.custom_masks import effective_library
 
     # The committed deployer ID, never auth.auto.tfvars: the output is a
     # function of the commit (deployer_identity.py).
@@ -3435,6 +3440,7 @@ def deterministic_model_for(
         column_types_from_ddl(ddl_text),
         env_cfg,
         deployer_principal=str(env_cfg[SETTING]),
+        library=effective_library(env_dir),
     )
 
 
@@ -8432,7 +8438,7 @@ def main():
                   "were read; set enable_classification = true and wait for the tags")
             sys.exit(1)
         try:
-            deterministic_model = deterministic_model_for(auth_cfg, classification_source, ddl_text)
+            deterministic_model = deterministic_model_for(auth_cfg, classification_source, ddl_text, env_dir=WORK_DIR)
         except DeterministicGovernanceError as exc:
             print(f"ERROR: {exc}")
             sys.exit(1)

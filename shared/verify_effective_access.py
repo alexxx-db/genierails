@@ -2794,7 +2794,10 @@ def load_spec_from_tfvars(
     if _as_str(governance.get("governance_mode")) == "deterministic":
         from deterministic_governance import resolve_precedence
         from governance_policies import base_treatment, normalize_column_overrides
+        from scripts.custom_masks import custom_treatments, effective_library
 
+        # The env's adopted custom masks resolve by tier like library treatments.
+        custom = custom_treatments(effective_library(Path(env_file).parent)) if env_file else frozenset()
         tiers = _as_list(governance.get("access_tier_groups"))
         raw_exempt = _as_list(governance.get("raw_exempt_principals"))
         invalid_names = [principal for principal in (*tiers, *raw_exempt)
@@ -2842,7 +2845,7 @@ def load_spec_from_tfvars(
                 treatment_versions=governance.get("treatment_versions") or {},
                 tier_access_overrides=governance.get("tier_access_overrides") or {},
                 principal=principal, deployer_principal=principal if deployer else None,
-                raw_exempt_principals=raw_exempt)
+                raw_exempt_principals=raw_exempt, custom_treatments=custom)
             return str(getattr(resolved, "access", resolved))
 
         for check in spec.column_masks:
