@@ -1047,6 +1047,14 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
         elif key[1] == "gr_treatment":
             was_raw = was[2] if isinstance(was, tuple) else was
             now_raw = now[2] if isinstance(now, tuple) else now
+            # The same observed treatment cannot be a transition.  In
+            # particular, a legacy ``redact`` value is inferred as never-raw
+            # below while the deterministic parser deliberately does not
+            # infer that property from the bare legacy label.  Comparing those
+            # two interpretations made an unchanged mid-migration environment
+            # look like ``never-raw redact -> redact``.
+            if was_raw == now_raw:
+                continue
             requested = allowed_adoptions.get(key[0])
             adoption = (key[0] in verified_adoptions and requested is not None
                         and (requested.old, requested.new) == (was_raw, now_raw))
