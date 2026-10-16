@@ -199,6 +199,11 @@ def validate_config(
         tiers = []
     elif len(tiers) != len(set(tiers)):
         errors.append("access_tier_groups must not contain duplicate groups")
+    elif any(group.startswith("<") and group.endswith(">") for group in tiers):
+        errors.append(
+            "replace the access_tier_groups placeholders with your IdP-synced group names, "
+            "most to least privileged"
+        )
 
     known = _known_treatments()
     versions = cfg.get("treatment_versions", {})

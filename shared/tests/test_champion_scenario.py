@@ -61,15 +61,20 @@ class FakeMake:
     def _setup(self, args, env_dir):
         for sub in ("generated", "data_access", "ddl"):
             (env_dir / sub).mkdir(parents=True, exist_ok=True)
-        (env_dir / "auth.auto.tfvars").write_text('databricks_workspace_host = ""\n')
+        (env_dir / "auth.auto.tfvars").write_text(
+            'databricks_workspace_host = ""\n'
+            'databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n'
+        )
         (self.envs / "account").mkdir(exist_ok=True)
         return self._done(args)
 
     def _guard(self, args, env_dir):
+        allow_groups = "1" if "--groups" in str(_var(args, "GENERATE_ARGS") or "") else "0"
         guard = subprocess.run(
             [sys.executable, str(SHARED / "genie_space_placeholder.py"),
              str(env_dir / "env.auto.tfvars")],
             capture_output=True, text=True,
+            env=dict(os.environ, GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=allow_groups),
         )
         return self._done(args, guard.returncode, guard.stdout + guard.stderr)
 

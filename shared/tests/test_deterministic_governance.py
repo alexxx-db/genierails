@@ -81,6 +81,17 @@ def test_governance_mode_and_raw_exempt_principals():
         assert errors(raw_exempt_principals=[principal])
 
 
+def test_deterministic_template_placeholders_are_actionable_errors():
+    found = errors(
+        governance_mode="deterministic",
+        deployer_principal_id="<your-deployer-principal-id>",
+        access_tier_groups=["<most-privileged-group>", "<least-privileged-group>"],
+    )
+
+    assert any("replace the deployer_principal_id placeholder" in error for error in found)
+    assert any("replace the access_tier_groups placeholders" in error for error in found)
+
+
 def test_one_two_and_three_plus_tiers_are_valid():
     for tiers in (["a"], ["a", "b"], ["a", "b", "c"], ["a", "b", "c", "d"]):
         assert errors(access_tier_groups=tiers) == []

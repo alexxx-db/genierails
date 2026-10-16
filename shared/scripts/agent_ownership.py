@@ -282,6 +282,7 @@ def receipt_agents(env_dir: Path, manifest: dict | None = None) -> dict[str, dic
     plan created or adopted is verified again before the receipt is written.
     """
     planned = ((manifest or {}).get("agents") or {}).get("agents") or {}
+    previous = (load_receipt(env_dir, env_dir.name).get("agents") or {})
     result = {}
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
@@ -308,6 +309,17 @@ def receipt_agents(env_dir: Path, manifest: dict | None = None) -> dict[str, dic
             "create_resource_id": (created or {}).get("id"),
             "created_space_id": ((record or {}).get("result") or {}).get("id"),
         }
+    current_keys = {entry["key"] for entry in result.values()}
+    # Detached agents remain tombstoned in every later receipt even after the
+    # removal PR drops their committed capture. This keeps recovery/audit state
+    # sticky; an explicit active config with the same identity supersedes it.
+    for previous_name, entry in previous.items():
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or agent_files.space_key(previous_name))
+        detached = entry.get("detached") is True or entry.get("lifecycle") == "detached"
+        if detached and key not in current_keys:
+            result[previous_name] = dict(entry, key=key, detached=True, lifecycle="detached")
     return result
 
 
@@ -587,6 +599,46 @@ def check_delete_acks(env_dir: Path, env: str) -> list[str]:
     return sorted(needed)
 
 
+def reactivation_consequences(env_dir: Path, env: str) -> dict[str, str]:
+    previous = (load_receipt(env_dir, env).get("agents") or {})
+    detached = {str(entry.get("key") or agent_files.space_key(name))
+                for name, entry in previous.items() if isinstance(entry, dict)
+                and (entry.get("detached") is True or entry.get("lifecycle") == "detached")}
+    active = {agent_files.space_key(agent["name"]): agent["name"]
+              for agent in agent_files.load_all(env_dir)
+              if not agent["detached"] and not agent["delete"]}
+    return {f"{env}:revive-agent:{key}": f"reactivates detached Genie agent {active[key]}"
+            for key in sorted(detached & set(active))}
+
+
+def check_detach_acks(env_dir: Path, env: str) -> list[str]:
+    keys = _ack_keys(env_dir, env)
+    configured = {agent_files.space_key(agent["name"]): agent
+                  for agent in agent_files.load_all(env_dir)}
+    invalid = sorted(key for key in keys if key.startswith(f"{env}:detached-agent:")
+                     and (key.rsplit(":", 1)[-1] not in configured
+                          or not configured[key.rsplit(":", 1)[-1]]["detached"]
+                          or configured[key.rsplit(":", 1)[-1]]["acl_groups"]))
+    if invalid:
+        raise AgentError(f"the agent is still retired by {', '.join(invalid)}; its settings must remain "
+                         "detached with acl_groups = [], or remove the ack.txt line in a "
+                         "governance-reviewed PR to revive it")
+    needed = reactivation_consequences(env_dir, env)
+    if not needed:
+        return []
+    needed_keys = {key.rsplit(":", 1)[-1] for key in needed}
+    persistent = sorted(key for key in keys if key.startswith(f"{env}:detached-agent:")
+                        and key.rsplit(":", 1)[-1] in needed_keys)
+    if persistent:
+        raise AgentError(f"the agent is still retired by {', '.join(persistent)}; remove that line from "
+                         f"envs/{env}/ack.txt in a governance-reviewed PR to revive it")
+    missing = sorted(set(needed) - keys)
+    if missing:
+        raise AgentError("the last release receipt records this agent as detached; reactivation needs a "
+                         f"governance acknowledgement: add {', '.join(missing)} to envs/{env}/ack.txt")
+    return sorted(needed)
+
+
 def sync(env_dir: Path, env: str, api=None) -> dict[str, list[str]]:
     """Legacy envs: push every captured config to its agent (full replacement, one PATCH each)."""
     if env == DEV_ENV:
@@ -634,6 +686,7 @@ def _planned(agent: dict, env_dir: Path, env: str) -> dict:
 def plan(env_dir: Path, env: str, plan_dir: Path, api=None) -> dict:
     """release-plan: what release will do to each agent, with the overwrite report; writes agents.json."""
     check_delete_acks(env_dir, env)
+    check_detach_acks(env_dir, env)
     entries: dict[str, dict] = {}
     for agent in ([] if env == DEV_ENV else agent_files.load_all(env_dir)):
         entry = _planned(agent, env_dir, env)
@@ -723,6 +776,7 @@ def _manifest_entries(env_dir: Path, env: str, manifest_path: Path, *, applied: 
                                  f"{entry.get(field)!r} -> {now.get(field)!r}); run make release-plan ENV={env} again")
     if set(check_delete_acks(env_dir, env)) != {e["ack"] for e in entries.values() if e["action"] == "delete"}:
         raise AgentError(f"the agent deletions changed since release-plan; run make release-plan ENV={env} again")
+    check_detach_acks(env_dir, env)
     return entries
 
 
@@ -914,7 +968,11 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
         _run(runner, env_dir, env, "state-rm", address)
         print(f"  forgot {address}")
     print(f"Detached {name}: {len(addresses)} state address(es) removed; the agent and its conversations stay.")
-    print(f"  Next: a PR that removes agents/{name}.* — its plan must show no destroy.")
+    key = agent_files.space_key(name)
+    print(f"  Next: a governance-reviewed PR that adds {env}:detached-agent:{key} to ack.txt, "
+          f"removes only agents/{name}.space.json, and keeps detached agents/{name}.auto.tfvars — "
+          f"then runs make promote-to ENV={env} and commits governed_tables.json; its plan must show no "
+          "destroy. To revive later, remove that ack.txt line in a governance PR.")
     return addresses
 
 
@@ -956,7 +1014,7 @@ def guard_removals(env_dir: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("capture", "import-new", "restore-ids", "check-deletes", "plan",
+    parser.add_argument("command", choices=("capture", "import-new", "restore-ids", "check-deletes", "check-detach", "plan",
                                             "preflight", "sync", "receipt", "detach", "guard-removals"))
     parser.add_argument("--env-dir", type=Path, required=True)
     parser.add_argument("--env", required=True)
@@ -978,6 +1036,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "check-deletes":
             for key in check_delete_acks(env_dir, args.env):
                 print(f"Acknowledged agent deletion: {key}")
+        elif args.command == "check-detach":
+            for key in check_detach_acks(env_dir, args.env):
+                print(f"Acknowledged agent reactivation: {key}")
         elif args.command == "preflight":
             if not args.manifest:
                 raise AgentError("preflight needs --manifest")

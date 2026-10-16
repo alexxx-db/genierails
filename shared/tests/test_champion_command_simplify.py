@@ -86,7 +86,13 @@ def classification_cloud(tmp_path):
                            cwd=REPO / "aws", text=True, capture_output=True, env=_clean_env())
     assert setup.returncode == 0, setup.stdout + setup.stderr
     env_file = cloud_root / "envs/dev/env.auto.tfvars"
-    env_file.write_text(TEMPLATE.read_text().replace("<your-genie-space-id>", SPACE_ID))
+    env_file.write_text(
+        TEMPLATE.read_text()
+        .replace("<your-genie-space-id>", SPACE_ID)
+        .replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
+        .replace("<most-privileged-group>", "payments_ops")
+        .replace("<least-privileged-group>", "viewers")
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "terraform").write_text(FAKE_TERRAFORM)
@@ -383,6 +389,17 @@ def promote_cloud(tmp_path):
     cloud = _promote_cloud(tmp_path)
 
     def run(*args, **env):
+        values = {arg.split("=", 1)[0]: arg.split("=", 1)[1] for arg in args if "=" in arg}
+        source = values.get("FROM") or values.get("SOURCE_ENV")
+        mapping = values.get("CATALOG_MAP") or values.get("DEST_CATALOG_MAP")
+        target = values.get("ENV") or values.get("DEST_ENV")
+        if ("ENV_DIR" not in values and source in {"dev", "stg"} and mapping and "=" in mapping
+                and target in {"prod", "stg"}):
+            target_dir = cloud / "envs" / target
+            target_dir.mkdir(exist_ok=True)
+            target_file = target_dir / "env.auto.tfvars"
+            if not target_file.exists():
+                target_file.write_text('governance_mode = "legacy"\n')
         return subprocess.run(
             ["make", "--no-print-directory", *args], cwd=tmp_path, text=True, capture_output=True,
             env=_clean_env(PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}", **env), timeout=120)
@@ -502,6 +519,48 @@ def test_promote_to_reuses_saved_values(promote_cloud):
     assert "Using saved FROM and CATALOG_MAP from envs/prod/env.auto.tfvars: FROM=dev CATALOG_MAP=paycat=ppay" in out
     assert "=== Cross-env promote: dev -> prod ===" in out
     assert (promote_cloud.envs / "prod/env.auto.tfvars").read_text() == before
+
+
+@pytest.mark.parametrize("ci", [None, "true"], ids=["ci-unset", "ci-true"])
+def test_promote_to_check_accepts_documented_detach_removal(promote_cloud, ci):
+    dev = promote_cloud.envs / "dev"
+    prod = promote_cloud.envs / "prod"
+    prod.mkdir(exist_ok=True)
+    (prod / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    for env_dir in (dev, prod):
+        (env_dir / "agents").mkdir(exist_ok=True)
+        (env_dir / "agents" / "Detached.auto.tfvars").write_text(
+            'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+        )
+        (env_dir / "agents" / "Detached.space.json").write_text("{}\n")
+    first = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay")
+    assert first.returncode == 0, first.stdout + first.stderr
+    (prod / "agents" / "Detached.space.json").unlink()
+    (prod / "ack.txt").write_text("prod:detached-agent:detached\n")
+
+    result = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay", "CHECK=1",
+                           **({} if ci is None else {"CI": ci}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (prod / "agents" / "Detached.space.json").exists()
+
+
+@pytest.mark.parametrize("ci", [None, "true"], ids=["ci-unset", "ci-true"])
+def test_promote_to_check_refuses_tombstone_violation_with_no_source_agents(promote_cloud, ci):
+    prod = promote_cloud.envs / "prod"
+    prod.mkdir(exist_ok=True)
+    (prod / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Retired.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = ["anyone"]\n'
+    )
+    (prod / "ack.txt").write_text("prod:detached-agent:retired\n")
+
+    result = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay", "CHECK=1",
+                           **({} if ci is None else {"CI": ci}))
+
+    assert result.returncode != 0
+    assert "governance-reviewed PR" in result.stdout + result.stderr
 
 
 def test_promote_to_explicit_map_overrides_and_updates_the_saved_one(promote_cloud):
@@ -678,6 +737,10 @@ def test_promote_to_is_exactly_the_legacy_cross_env_promote(tmp_path):
         root = tmp_path / name
         root.mkdir()
         cloud = _promote_cloud(root)
+        (cloud / "envs" / "prod").mkdir(parents=True)
+        (cloud / "envs" / "prod" / "env.auto.tfvars").write_text(
+            'governance_mode = "legacy"\n'
+        )
         result = subprocess.run(
             ["make", "--no-print-directory", *args], cwd=root, text=True, capture_output=True,
             env=_clean_env(PATH=f"{root / 'bin'}:{os.environ['PATH']}"), timeout=120)
