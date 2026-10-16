@@ -994,6 +994,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
 	$(_AGENT_OWNERSHIP) check-deletes --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
+	$(_AGENT_OWNERSHIP) check-detach --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	$(call _ENV_LOCK,release-plan); \
 	$(_AGENT_OWNERSHIP) restore-ids --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	$(_AGENT_OWNERSHIP) guard-removals --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \

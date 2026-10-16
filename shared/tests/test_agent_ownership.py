@@ -1028,7 +1028,8 @@ def test_a_manifest_without_an_agent_plan_is_refused_when_agents_are_captured(tm
 def test_the_release_targets_carry_agents_through_the_manifest():
     makefile = (SHARED / "Makefile.shared").read_text()
     plan = makefile[makefile.index("\nrelease-plan:"):makefile.index("\n_release-plan-roots:")]
-    order = [plan.index(s) for s in ("$(_AGENT_OWNERSHIP) check-deletes", "_ENV_LOCK,release-plan",
+    order = [plan.index(s) for s in ("$(_AGENT_OWNERSHIP) check-deletes", "$(_AGENT_OWNERSHIP) check-detach",
+                                     "_ENV_LOCK,release-plan",
                                      "$(_AGENT_OWNERSHIP) restore-ids",
                                      "$(_AGENT_OWNERSHIP) guard-removals", "_release-plan-roots",
                                      "$(_AGENT_OWNERSHIP) plan", "manifest-write")]
@@ -1057,7 +1058,7 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     calls = make.calls()
     agent_calls = [c[1] for c in calls if c[0] == "agents"]
-    assert agent_calls == ["check-deletes", "restore-ids", "guard-removals", "plan"]
+    assert agent_calls == ["check-deletes", "check-detach", "restore-ids", "guard-removals", "plan"]
     manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
     assert json.loads(manifest.read_text())["agents"] == {"agents": {}}
     make.reset()
@@ -1072,6 +1073,37 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     first = flat.index("agents")
     assert first < flat.index("sync-tags") and first < flat.index("staged") and first < flat.index("runner")
     assert flat.index("runner") < len(flat) - flat[::-1].index("agents") - 1 < flat.index("verify-access")
+
+
+def test_make_release_plan_refuses_revived_tombstone_before_lock_or_plan(tmp_path, monkeypatch):
+    from scripts import release_gate as rg
+    from tests.test_release_gate import Repo
+    from tests.test_release_gate_make import Make, _no_lock
+
+    repo = Repo(tmp_path, monkeypatch)
+    repo.commit({
+        "aws/envs/prod/agents/Retired.auto.tfvars":
+            'genie_space_id = ""\nacl_groups = ["anyone"]\n',
+        "aws/envs/prod/ack.txt": "prod:detached-agent:retired\n",
+    })
+    make = Make(tmp_path, repo)
+    calls = make._recorder("agents")
+    real = SHARED / "scripts" / "agent_ownership.py"
+    wrapper = make._write(
+        "agents-wrapper",
+        f'#!/bin/sh\nif [ "$1" = check-detach ]; then exec {sys.executable} {real} "$@"; fi\n'
+        f'exec {calls} "$@"\n',
+    )
+    assert make("rehearse", "dev").returncode == 0
+    make.reset()
+
+    result = make("release-plan", "prod", stubs={"agent_ownership.py": str(wrapper)})
+
+    assert result.returncode != 0 and "still retired" in result.stderr, result.stdout + result.stderr
+    assert _no_lock(repo, "prod")
+    assert not rg.manifests_dir(repo.cloud, "prod").exists()
+    assert "_release-plan-roots" not in make.names()
+    assert not any(call[0] == "runner" and "plan" in call for call in make.calls())
 
 
 def test_make_release_fails_without_a_receipt_when_the_agent_push_fails(tmp_path, monkeypatch):

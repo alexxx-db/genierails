@@ -776,6 +776,7 @@ def _manifest_entries(env_dir: Path, env: str, manifest_path: Path, *, applied: 
                                  f"{entry.get(field)!r} -> {now.get(field)!r}); run make release-plan ENV={env} again")
     if set(check_delete_acks(env_dir, env)) != {e["ack"] for e in entries.values() if e["action"] == "delete"}:
         raise AgentError(f"the agent deletions changed since release-plan; run make release-plan ENV={env} again")
+    check_detach_acks(env_dir, env)
     return entries
 
 
@@ -1013,7 +1014,7 @@ def guard_removals(env_dir: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("capture", "import-new", "restore-ids", "check-deletes", "plan",
+    parser.add_argument("command", choices=("capture", "import-new", "restore-ids", "check-deletes", "check-detach", "plan",
                                             "preflight", "sync", "receipt", "detach", "guard-removals"))
     parser.add_argument("--env-dir", type=Path, required=True)
     parser.add_argument("--env", required=True)
@@ -1035,6 +1036,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "check-deletes":
             for key in check_delete_acks(env_dir, args.env):
                 print(f"Acknowledged agent deletion: {key}")
+        elif args.command == "check-detach":
+            for key in check_detach_acks(env_dir, args.env):
+                print(f"Acknowledged agent reactivation: {key}")
         elif args.command == "preflight":
             if not args.manifest:
                 raise AgentError("preflight needs --manifest")
