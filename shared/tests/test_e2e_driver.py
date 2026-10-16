@@ -1067,6 +1067,35 @@ def test_mask_snapshot_fails_closed_when_definition_is_unreadable(definition):
         driver._sql_snapshots(client, "wh", "cat")
 
 
+@pytest.mark.parametrize("routine_rows", [
+    pytest.param([], id="no-visible-routines"),
+    pytest.param([["cat", "s", "mask_other", "FUNCTION", "RETURN 'masked'"]],
+                 id="partial-routine-inventory"),
+])
+def test_policy_function_missing_from_routines_fails_closed(routine_rows):
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type",
+                         "routine_definition")
+                rows = routine_rows
+            elif "information_schema.tables" in statement:
+                names = ("table_catalog", "table_schema", "table_name")
+                rows = [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(
+                    columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    policy = SimpleNamespace(as_dict=lambda: {
+        "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
+    client = SimpleNamespace(statement_execution=Statement(),
+                             policies=SimpleNamespace(list_policies=lambda *_a, **_k: [policy]))
+    with pytest.raises(RuntimeError, match=r"cat\.s\.secure_rows: policy function definition is unreadable"):
+        driver._sql_snapshots(client, "wh", "cat")
+
+
 def test_mask_snapshot_hashes_definition_without_persisting_body():
     body = "RETURN 'redacted'"
 
