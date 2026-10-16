@@ -111,7 +111,7 @@ together: while prod still has an agent inline that dev keeps in a file,
 |------|-----|
 | `auth.auto.tfvars` | Contains service principal credentials |
 | Runtime records | `.*.apply.sha`, `.coverage_gate.json`, `.can_run_check.json`, `generated/.*` |
-| `*.tfstate`, `*.tfstate.backup` | Terraform state may contain secrets |
+| `*.tfstate`, `*.tfstate.backup`, `*.tfstate.*.backup` | Terraform state may contain secrets (`terraform state mv`/`rm` backups are written next to the env's state, never in `shared/roots`) |
 | `.terraform/` | Provider binaries and cache |
 | `.genie_space_id` | Auto-managed by Terraform lifecycle |
 | `.genierails-state/` | Rehearse and release receipts and release manifests (when `GENIERAILS_STATE_DIR` isn't set) |

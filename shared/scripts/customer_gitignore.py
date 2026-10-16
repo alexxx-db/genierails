@@ -43,6 +43,7 @@ COMMON = """\
 auth.auto.tfvars
 *.tfstate
 *.tfstate.backup
+*.tfstate.*.backup
 *.tfplan
 .terraform/
 __pycache__/

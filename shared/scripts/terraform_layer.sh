@@ -72,6 +72,22 @@ fi
 
 mkdir -p "$ENV_DIR"
 
+# A staged policy phase (scripts/policy_generations.py) renders the data_access
+# config into the env's ignored generated/.runtime/data_access and points
+# GENIERAILS_LAYER_CONFIG_DIR at it: its abac.auto.tfvars and
+# masking_functions.sql stand in for the split ones, which stay untouched.
+LAYER_CONFIG_DIR="$ENV_DIR"
+if [ "$LAYER" = "data_access" ] && [ -n "${GENIERAILS_LAYER_CONFIG_DIR:-}" ]; then
+  if [ ! -f "$GENIERAILS_LAYER_CONFIG_DIR/abac.auto.tfvars" ]; then
+    echo "ERROR: GENIERAILS_LAYER_CONFIG_DIR=$GENIERAILS_LAYER_CONFIG_DIR has no abac.auto.tfvars" >&2
+    exit 2
+  fi
+  LAYER_CONFIG_DIR="$GENIERAILS_LAYER_CONFIG_DIR"
+fi
+_layer_tfvars() {
+  if [ "$1" = abac.auto.tfvars ]; then printf '%s/%s' "$LAYER_CONFIG_DIR" "$1"; else printf '%s/%s' "$ENV_DIR" "$1"; fi
+}
+
 # Use TF_DATA_DIR for per-env .terraform/ isolation. The .terraform.lock.hcl
 # file is always in the working directory — use -lockfile=readonly during init
 # to prevent concurrent writes from corrupting it. On first run (no lock file),
@@ -98,7 +114,8 @@ case "$COMMAND" in
   plan|apply|destroy|import|console|print-cmd)
     RUNNER_VAR_FILES=()
     for tfvars in auth.auto.tfvars env.auto.tfvars abac.auto.tfvars classification.auto.tfvars discovered_uc_tables.auto.tfvars; do
-      if [ -f "$ENV_DIR/$tfvars" ]; then RUNNER_VAR_FILES+=(--var-file "$ENV_DIR/$tfvars"); fi
+      tfvars_path="$(_layer_tfvars "$tfvars")"
+      if [ -f "$tfvars_path" ]; then RUNNER_VAR_FILES+=(--var-file "$tfvars_path"); fi
     done
     if ! python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@"; then
       echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state)." >&2
@@ -265,8 +282,9 @@ fi
 
 VAR_ARGS=()
 for tfvars in auth.auto.tfvars env.auto.tfvars abac.auto.tfvars classification.auto.tfvars discovered_uc_tables.auto.tfvars; do
-  if [ -f "$ENV_DIR/$tfvars" ]; then
-    VAR_ARGS+=(-var-file="$ENV_DIR/$tfvars")
+  tfvars_path="$(_layer_tfvars "$tfvars")"
+  if [ -f "$tfvars_path" ]; then
+    VAR_ARGS+=(-var-file="$tfvars_path")
   fi
 done
 
@@ -296,6 +314,9 @@ esac
 RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
   RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
+fi
+if [ "$LAYER_CONFIG_DIR" != "$ENV_DIR" ]; then
+  RUNNER_VARS+=(-var="masking_sql_file=$LAYER_CONFIG_DIR/masking_functions.sql")
 fi
 
 # The roots read state with file(): the workspace root its own and the
@@ -350,11 +371,13 @@ case "$COMMAND" in
     terraform state pull >&3
     exit $?
     ;;
-  state-rm)
-    CMD=(terraform state rm "$@")
-    ;;
-  state-mv)
-    CMD=(terraform state mv "$@")
+  state-rm|state-mv)
+    # Terraform backs up a local state before changing it, by default as
+    # <state file>.<time>.backup in its working directory, shared/roots,
+    # where a broad add stages it. Keep it next to the state instead
+    # (STATE_BASE: the env's state dir, under GENIERAILS_STATE_DIR when set).
+    # A remote backend writes no backup.
+    CMD=(terraform state "${COMMAND#state-}" "-backup=$STATE_BASE/terraform.tfstate.$(date -u +%Y%m%dT%H%M%SZ).$$.backup" "$@")
     ;;
   output)
     CMD=(terraform output "$@")
