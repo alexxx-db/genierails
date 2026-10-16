@@ -2786,6 +2786,15 @@ def load_spec_from_tfvars(
     # a group) from every mask. The admin baseline authenticates as that
     # deployer, so check it as DEFAULT_ADMIN_TIER rather than as a tier group.
     deployer = _as_str(governance.get("deployer_principal_id")) if deterministic else ""
+    # Fail closed rather than alias a real group (or a policy target) away.
+    configured_groups = {*groups, *_as_list(governance.get("access_tier_groups")),
+                         *_as_list(governance.get("raw_exempt_principals"))}
+    configured_groups.update(p for pol in fgac_policies for p in _as_list(pol.get("to_principals")))
+    if deployer and deployer in configured_groups:
+        raise ValueError(
+            f"ERROR: deployer_principal_id {deployer!r} is also a configured group name "
+            "(access_tier_groups, raw_exempt_principals, groups or a policy's "
+            "to_principals); verify-access cannot tell the deployer from that group")
     derive_policies = [
         {**pol, **{key: [DEFAULT_ADMIN_TIER if p == deployer else p
                          for p in _as_list(pol.get(key))]

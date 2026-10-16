@@ -385,6 +385,15 @@ def test_deterministic_spec_checks_deployer_as_admin_baseline_not_tier_group(tmp
     assert sum(DEPLOYER_APP_ID in e for e in excepts) == 2
 
 
+def test_deterministic_spec_refuses_deployer_principal_id_equal_to_a_tier_group(tmp_path):
+    tfvars, env = _deployer_excepted_tfvars(tmp_path, 'governance_mode = "deterministic"\n')
+    tfvars.write_text(tfvars.read_text().replace('to_principals = ["analyst"]',
+                                                 f'to_principals = ["{DEPLOYER_APP_ID}"]'))
+    env.write_text(env.read_text().replace('"analyst"', f'"{DEPLOYER_APP_ID}"'))
+    with pytest.raises(ValueError, match="deployer_principal_id .* is also a configured group"):
+        load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
+
+
 def test_legacy_spec_keeps_deployer_principal_id_unaliased(tmp_path):
     tfvars, env = _deployer_excepted_tfvars(tmp_path, "")
     spec = load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
