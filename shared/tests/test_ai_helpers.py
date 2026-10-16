@@ -51,7 +51,8 @@ MASK_REPLY = {
         {"input": "CAST('x' AS STRING)", "expected": "[REDACTED]", "note": "malformed"},
     ],
 }
-CI_MARKERS = ["CI", "GITHUB_ACTIONS", "TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI"]
+# Every marker refuse_ci reads, so no test inherits one from the runner.
+CI_MARKERS = ["CI", *ai_helpers.CI_MARKERS]
 
 
 class FakeModel:

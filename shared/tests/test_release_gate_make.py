@@ -117,8 +117,8 @@ class Make:
         if stub_make:
             args.append(f"MAKE={self.make}")
         bin_dir = script_stubs.install(self.tmp / "stub-bin", self.script_stubs(stubs))
-        environ = {k: v for k, v in os.environ.items()
-                   if k not in ("MAKEFLAGS", "MAKELEVEL", "CI", "VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MANIFEST")}
+        environ = {k: v for k, v in script_stubs.without_ci(os.environ).items()
+                   if k not in ("MAKEFLAGS", "MAKELEVEL", "VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MANIFEST")}
         environ |= self.repo.env | ({"CI": "true"} if ci else {}) | (environ_extra or {})
         environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
         return subprocess.run(args, cwd=ROOT / self.cloud, text=True, capture_output=True, env=environ)

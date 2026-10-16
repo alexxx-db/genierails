@@ -310,9 +310,26 @@ def _stub_make(tmp_path):
 
 
 def _clean_env(**extra):
-    env = {k: v for k, v in os.environ.items() if k not in ("VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MAKEFLAGS", "MAKELEVEL", "CI")}
+    """The caller's env minus make state and every CI marker: release, maintain and
+    rehearse run as on the deployment machine (tests/script_stubs.without_ci)."""
+    from tests.script_stubs import without_ci
+
+    env = {k: v for k, v in without_ci(os.environ).items()
+           if k not in ("VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MAKEFLAGS", "MAKELEVEL")}
     env.update(extra)
     return env
+
+
+def test_the_stub_env_clears_every_ci_marker_a_guard_reads():
+    from tests.script_stubs import CI_ENV_MARKERS, without_ci
+
+    makefile = MAKEFILE.read_text()
+    read = set(re.findall(r"\$\$([A-Z][A-Z0-9_]*)", "".join(
+        line for line in makefile.splitlines() if "ci_value" in line or "$$TF_BUILD" in line)))
+    assert {"CI", "TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI"} <= read
+    assert read - {"ci_value", "is_ci"} <= set(CI_ENV_MARKERS), read - set(CI_ENV_MARKERS)
+    assert set(ai_helpers.CI_MARKERS) <= set(CI_ENV_MARKERS)
+    assert without_ci({"TF_BUILD": "True", "BUILD_BUILDID": "1", "CI": "true", "PATH": "/bin"}) == {"PATH": "/bin"}
 
 
 @pytest.mark.parametrize("target", ["release", "maintain"])
