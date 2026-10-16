@@ -492,7 +492,7 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
         "schema_grants": f"SELECT * FROM system.information_schema.schema_privileges WHERE catalog_name = '{_sql_lit(catalog)}'",
         "table_grants": f"SELECT * FROM system.information_schema.table_privileges WHERE table_catalog = '{_sql_lit(catalog)}'",
         "governed_tags": f"SELECT * FROM system.information_schema.column_tags WHERE catalog_name = '{_sql_lit(catalog)}'",
-        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type,routine_definition FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}' AND (startswith(routine_name, 'mask_') OR startswith(routine_name, 'gr_mask_'))",
+        "mask_functions": f"SELECT routine_catalog,routine_schema,routine_name,routine_type,routine_definition FROM system.information_schema.routines WHERE routine_catalog = '{_sql_lit(catalog)}'",
         "tables": f"SELECT table_catalog,table_schema,table_name FROM system.information_schema.tables WHERE table_catalog = '{_sql_lit(catalog)}' AND table_schema <> 'information_schema'",
     }
     out: dict[str, Any] = {}
@@ -507,13 +507,6 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
             rows.extend(chunk.data_array or [])
             next_index = getattr(chunk, "next_chunk_index", None)
         out[name] = [dict(zip(columns, row)) for row in rows]
-    for routine in out["mask_functions"]:
-        definition = routine.pop("routine_definition", None)
-        qualified = ".".join(str(routine.get(k) or "")
-                             for k in ("routine_catalog", "routine_schema", "routine_name"))
-        if not isinstance(definition, str) or not definition.strip():
-            raise RuntimeError(f"{qualified}: mask function definition is unreadable")
-        routine["definition_hash"] = hashlib.sha256(definition.encode()).hexdigest()
     # information_schema shows only what the principal can see: a governed
     # catalog with no visible tables is an unreadable catalog, not "no data".
     if not out["tables"]:
@@ -521,14 +514,37 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
     # Effective-policy evidence is per table. Inability to read it is a failed
     # snapshot, never evidence that no policy exists.
     policies: list[Mapping[str, Any]] = []
+    policy_functions: set[str] = set()
     for table in out.pop("tables"):
         qualified = ".".join(str(table[k]) for k in ("table_catalog", "table_schema", "table_name"))
         try:
             listed = client.policies.list_policies("TABLE", qualified, include_inherited=True)
-            policies.append({"table": qualified, "policies": [p.as_dict() for p in listed]})
+            captured = [p.as_dict() for p in listed]
+            policies.append({"table": qualified, "policies": captured})
+            policy_functions.update(str(mask.get("function_name")) for policy in captured
+                                    if (mask := policy.get("column_mask") or policy.get("row_filter"))
+                                    and mask.get("function_name"))
         except Exception as exc:
             raise RuntimeError(f"policy inventory failed for {qualified}: {type(exc).__name__}") from exc
     out["abac_policies"] = policies
+    routines: list[Mapping[str, Any]] = []
+    captured_functions: set[str] = set()
+    for routine in out["mask_functions"]:
+        qualified = ".".join(str(routine.get(k) or "")
+                             for k in ("routine_catalog", "routine_schema", "routine_name"))
+        name = str(routine.get("routine_name") or "")
+        if qualified not in policy_functions and not name.startswith(("mask_", "gr_mask_", "filter_", "gr_filter_")):
+            continue
+        definition = routine.pop("routine_definition", None)
+        if not isinstance(definition, str) or not definition.strip():
+            raise RuntimeError(f"{qualified}: policy function definition is unreadable")
+        routine["definition_hash"] = hashlib.sha256(definition.encode()).hexdigest()
+        routines.append(routine)
+        captured_functions.add(qualified)
+    missing_functions = sorted(policy_functions - captured_functions)
+    if missing_functions:
+        raise RuntimeError(f"{missing_functions[0]}: policy function definition is unreadable")
+    out["mask_functions"] = routines
     return out
 
 
@@ -1096,6 +1112,10 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
                            if fn in before["mask_definitions"] and fn in after["mask_definitions"]
                            and before["mask_definitions"][fn] != after["mask_definitions"][fn])
     lost_masks.extend(f"{fn}: definition changed" for fn in changed_masks)
+    unreadable_masks = sorted(fn for fn in live_before & live_after
+                              if ((before["mask_definitions"] and fn not in before["mask_definitions"])
+                                  or (after["mask_definitions"] and fn not in after["mask_definitions"])))
+    lost_masks.extend(f"{fn}: definition unreadable" for fn in unreadable_masks)
     if lost_masks: weaker["masks"] = lost_masks
     policies = []
     for key, was in sorted(before["policies"].items()):
