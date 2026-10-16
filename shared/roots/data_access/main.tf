@@ -415,6 +415,12 @@ variable "promote_from" {
   description = "make promote-to input only (saved in the destination env): the env rules are promoted from. Declared so env.auto.tfvars loads cleanly; no resource reads it."
 }
 
+variable "ai_helper_endpoint" {
+  type        = string
+  default     = ""
+  description = "AI helpers only (make suggest-treatment, draft-genie-content, draft-custom-mask): the model serving endpoint they call. Declared so env.auto.tfvars loads cleanly; no resource reads it, and governance never calls a model."
+}
+
 variable "catalog_map" {
   type        = any
   default     = {}

@@ -98,7 +98,9 @@ def tag_treatment_errors(tag_treatments, library: dict | None = None) -> list[st
         if not isinstance(treatment, str) or treatment not in data["treatments"]:
             errors.append(
                 f"{label} names {treatment!r}, which is not a mask-library treatment "
-                f"(one of: {', '.join(sorted(data['treatments']))})")
+                f"(one of: {', '.join(sorted(data['treatments']))}). A custom mask from make "
+                "draft-custom-mask can't be named here: it stays a draft for review, and governance "
+                "never reads drafts/")
     return errors
 
 
