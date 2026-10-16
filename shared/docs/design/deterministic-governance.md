@@ -386,7 +386,7 @@ Agreed in design discussion after the rollout above was set. It starts once roll
 |---|---|---|
 | **Champion** (first deployment) | one agent, end to end | everything, once |
 | **Data citizen** | curates an agent in the dev UI (including which tables it reads), captures it, promotes it | `envs/<env>/agents/<agent>.*` |
-| **Governance engineer** | treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, top-level `uc_tables`, `ungovern`; approves every change to the governed-table set | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/` (including `governed_tables.json`), `ack.txt` |
+| **Governance engineer** | treatments, `tag_treatments`, tiers, `group_map`, `table_readers`, row filters, top-level `uc_tables`, `ungovern`; approves every change to the governed-table set | `envs/<env>/env.auto.tfvars`, `envs/<env>/generated/` (including `governed_tables.json`), `ack.txt`, `envs/<env>/custom_masks/` |
 | **One team doing both** (small or medium company) | both kinds of change, often in one PR | both sets |
 
 - `env.auto.tfvars` holds only governance and env-owned settings. Agent settings live only in `agents/` files (section 5), so an agent-only PR never touches `env.auto.tfvars`.
