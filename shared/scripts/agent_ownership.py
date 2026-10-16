@@ -599,6 +599,37 @@ def check_delete_acks(env_dir: Path, env: str) -> list[str]:
     return sorted(needed)
 
 
+def reactivation_consequences(env_dir: Path, env: str) -> dict[str, str]:
+    previous = (load_receipt(env_dir, env).get("agents") or {})
+    detached = {str(entry.get("key") or agent_files.space_key(name))
+                for name, entry in previous.items() if isinstance(entry, dict)
+                and (entry.get("detached") is True or entry.get("lifecycle") == "detached")}
+    active = {agent_files.space_key(agent["name"]): agent["name"]
+              for agent in agent_files.load_all(env_dir)
+              if not agent["detached"] and not agent["delete"]
+              and agent_files.capture_path(env_dir, agent["name"]).is_file()}
+    return {f"{env}:revive-agent:{key}": f"reactivates detached Genie agent {active[key]}"
+            for key in sorted(detached & set(active))}
+
+
+def check_detach_acks(env_dir: Path, env: str) -> list[str]:
+    needed = reactivation_consequences(env_dir, env)
+    if not needed:
+        return []
+    keys = _ack_keys(env_dir, env)
+    needed_keys = {key.rsplit(":", 1)[-1] for key in needed}
+    persistent = sorted(key for key in keys if key.startswith(f"{env}:detached-agent:")
+                        and key.rsplit(":", 1)[-1] in needed_keys)
+    if persistent:
+        raise AgentError(f"the agent is still retired by {', '.join(persistent)}; remove that line from "
+                         f"envs/{env}/ack.txt in a governance-reviewed PR to revive it")
+    missing = sorted(set(needed) - keys)
+    if missing:
+        raise AgentError("the last release receipt records this agent as detached; reactivation needs a "
+                         f"governance acknowledgement: add {', '.join(missing)} to envs/{env}/ack.txt")
+    return sorted(needed)
+
+
 def sync(env_dir: Path, env: str, api=None) -> dict[str, list[str]]:
     """Legacy envs: push every captured config to its agent (full replacement, one PATCH each)."""
     if env == DEV_ENV:
@@ -646,6 +677,7 @@ def _planned(agent: dict, env_dir: Path, env: str) -> dict:
 def plan(env_dir: Path, env: str, plan_dir: Path, api=None) -> dict:
     """release-plan: what release will do to each agent, with the overwrite report; writes agents.json."""
     check_delete_acks(env_dir, env)
+    check_detach_acks(env_dir, env)
     entries: dict[str, dict] = {}
     for agent in ([] if env == DEV_ENV else agent_files.load_all(env_dir)):
         entry = _planned(agent, env_dir, env)
@@ -926,8 +958,10 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
         _run(runner, env_dir, env, "state-rm", address)
         print(f"  forgot {address}")
     print(f"Detached {name}: {len(addresses)} state address(es) removed; the agent and its conversations stay.")
-    print(f"  Next: a PR that removes only agents/{name}.space.json and keeps the detached "
-          f"agents/{name}.auto.tfvars tombstone — its plan must show no destroy.")
+    key = agent_files.space_key(name)
+    print(f"  Next: a governance-reviewed PR that adds {env}:detached-agent:{key} to ack.txt, "
+          f"removes only agents/{name}.space.json, and keeps detached agents/{name}.auto.tfvars — "
+          "its plan must show no destroy. To revive later, remove that ack.txt line in a governance PR.")
     return addresses
 
 

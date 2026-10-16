@@ -811,13 +811,14 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     rollbacks = rollback_consequences(env_dir, env, entries)
     if rollback:
         rollbacks[rollback["key"]] = rollback["consequence"]
-    from scripts.agent_ownership import delete_consequences
+    from scripts.agent_ownership import delete_consequences, reactivation_consequences
 
     deletes = delete_consequences(env_dir, env)
+    reactivations = reactivation_consequences(env_dir, env)
     consequences = merge_consequences(weak.consequences, reader_consequences, group_consequences, rollbacks,
-                                      migrated, deletes)
+                                      migrated, deletes, reactivations)
     # Unclassified acks belong to the classification check (ACK_UNCLASSIFIED today).
-    reconciled = [e for e in entries if e.kind != "unclassified"]
+    reconciled = [e for e in entries if e.kind not in ("unclassified", "detached-agent")]
     _, unmatched = reconcile(reconciled, consequences)
     unacked_readers = [f for c in reader_checks for f in c["unacknowledged"]]
     return {

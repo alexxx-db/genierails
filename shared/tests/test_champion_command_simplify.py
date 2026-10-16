@@ -521,6 +521,30 @@ def test_promote_to_reuses_saved_values(promote_cloud):
     assert (promote_cloud.envs / "prod/env.auto.tfvars").read_text() == before
 
 
+@pytest.mark.parametrize("ci", [None, "true"], ids=["ci-unset", "ci-true"])
+def test_promote_to_check_accepts_documented_detach_removal(promote_cloud, ci):
+    dev = promote_cloud.envs / "dev"
+    prod = promote_cloud.envs / "prod"
+    prod.mkdir(exist_ok=True)
+    (prod / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    for env_dir in (dev, prod):
+        (env_dir / "agents").mkdir(exist_ok=True)
+        (env_dir / "agents" / "Detached.auto.tfvars").write_text(
+            'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+        )
+        (env_dir / "agents" / "Detached.space.json").write_text("{}\n")
+    first = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay")
+    assert first.returncode == 0, first.stdout + first.stderr
+    (prod / "agents" / "Detached.space.json").unlink()
+    (prod / "ack.txt").write_text("prod:detached-agent:detached\n")
+
+    result = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay", "CHECK=1",
+                           **({} if ci is None else {"CI": ci}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (prod / "agents" / "Detached.space.json").exists()
+
+
 def test_promote_to_explicit_map_overrides_and_updates_the_saved_one(promote_cloud):
     assert promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay").returncode == 0
 

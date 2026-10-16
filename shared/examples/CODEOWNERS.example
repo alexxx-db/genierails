@@ -35,8 +35,10 @@
 /azure/envs/                    @your-org/governance-engineers
 /aws/envs/*/ack.txt             @your-org/governance-engineers
 /azure/envs/*/ack.txt           @your-org/governance-engineers
+# Detached-agent tombstones live in ack.txt; agents/ edits alone cannot revive one.
 
 # Agents: one settings file and one captured config per agent, in every env.
+# Lifecycle revival additionally requires a governance-owned ack.txt change.
 /aws/envs/*/agents/             @your-org/data-citizens
 /azure/envs/*/agents/           @your-org/data-citizens
 # Per-agent owners (optional): name each agent's team, e.g.

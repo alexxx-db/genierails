@@ -435,6 +435,47 @@ def test_promote_matches_detached_tombstones_by_space_key(tmp_path, source_name)
         agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
 
 
+def test_promote_keeps_removed_capture_for_detached_source(tmp_path):
+    dev, prod = _promote_envs(tmp_path)
+    (dev / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = "dev-id"\nacl_groups = []\ndetached = true\n'
+    )
+    (prod / "agents").mkdir()
+    (prod / "agents" / "Sales.auto.tfvars").write_text(
+        'genie_space_id = ""\nacl_groups = []\ndetached = true\n'
+    )
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert not (prod / "agents" / "Sales.space.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ["active", "deleted"])
+def test_governance_tombstone_refuses_agent_only_revival(tmp_path, mutation):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "agents").mkdir()
+    settings = prod / "agents" / "Sales.auto.tfvars"
+    settings.write_text('genie_space_id = ""\nacl_groups = []\ndetached = true\n')
+    (prod / "ack.txt").write_text("prod:detached-agent:sales\n")
+    if mutation == "active":
+        settings.write_text('genie_space_id = ""\nacl_groups = ["anyone"]\n')
+    else:
+        settings.unlink()
+
+    with pytest.raises(AgentFileError, match="governance-reviewed PR"):
+        agent_promote.promote(dev, prod, {})
+
+
+def test_removing_governance_tombstone_allows_revival(tmp_path):
+    dev, prod = _promote_envs(tmp_path)
+    (prod / "ack.txt").write_text("")
+
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+
+    assert agent_files.load(prod, "Sales")["acl_groups"] == ["sales_analysts"]
+
+
 # ── Prod ownership ───────────────────────────────────────────────────────────
 
 def _prod(tmp_path, settings='genie_space_id = ""\nacl_groups = ["a"]\n', payload=None) -> Path:
@@ -838,6 +879,14 @@ def test_detached_receipt_tombstone_survives_the_next_real_receipt(tmp_path, mon
     _step9_receipt(prod, "c2", second)
 
     assert ownership.load_receipt(prod, "prod")["agents"]["Sales"]["lifecycle"] == "detached"
+
+
+def test_release_plan_refuses_old_receipt_reactivation_without_governance_ack(tmp_path, monkeypatch):
+    prod = _deterministic_prod(tmp_path, monkeypatch)
+    _step9_receipt(prod, "c1", {"Sales": _released(detached=True, lifecycle="detached")})
+
+    with pytest.raises(ownership.AgentError, match="revive-agent:sales"):
+        ownership.plan(prod, "prod", tmp_path / "plan")
 
 
 def test_release_plan_records_what_release_will_push_with_the_overwrite_report(tmp_path, monkeypatch, capsys):

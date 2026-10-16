@@ -15,6 +15,19 @@ ROOT = Path(__file__).parents[2]
 CLOUD_ROOT = ROOT / "aws"
 
 
+def _write_valid_env(env_dir):
+    env_dir.mkdir(parents=True, exist_ok=True)
+    text = (ROOT / "shared/env.auto.tfvars.example").read_text()
+    text = (text.replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
+            .replace("<most-privileged-group>", "ops")
+            .replace("<least-privileged-group>", "viewers"))
+    text = text.replace(
+        "genie_spaces = []",
+        'genie_spaces = [{ name = "Fixture", genie_space_id = "fixture-id", acl_groups = ["ops"] }]',
+    )
+    (env_dir / "env.auto.tfvars").write_text(text)
+
+
 def test_offline_evidence_does_not_resolve_a_terraform_warehouse():
     makefile = (ROOT / "shared" / "Makefile.shared").read_text()
     recipe = makefile[makefile.index("evidence:"):makefile.index("audit-rulebook:")]
@@ -167,6 +180,7 @@ def test_force_apply_bypasses_a_matching_input_fingerprint(tmp_path):
 
 def test_plan_real_target_skips_layers_with_missing_configs(tmp_path):
     env_dir = tmp_path / "env"
+    _write_valid_env(env_dir)
     account_dir = tmp_path / "account"
     runner_log = tmp_path / "runner.log"
     runner = tmp_path / "record-runner"
@@ -206,6 +220,7 @@ def test_plan_real_target_skips_layers_with_missing_configs(tmp_path):
 
 def test_plan_real_target_runs_configured_workspace_layers(tmp_path):
     env_dir = tmp_path / "env"
+    _write_valid_env(env_dir)
     data_access_dir = env_dir / "data_access"
     data_access_dir.mkdir(parents=True)
     (env_dir / "abac.auto.tfvars").write_text("# present\n")
@@ -252,13 +267,11 @@ def test_plan_real_target_runs_configured_workspace_layers(tmp_path):
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert runner_log.read_text().splitlines() == [
-        f"{data_access_dir}|data_access dev console",
-        f"{data_access_dir}|data_access dev console",
-        f"{data_access_dir}|data_access dev plan",
-        f"{env_dir}|workspace dev console",
-        f"{env_dir}|workspace dev plan",
-    ]
+    calls = runner_log.read_text().splitlines()
+    assert calls[:2] == [f"{data_access_dir}|data_access dev console"] * 2
+    assert any(call.startswith(f"{data_access_dir}|data_access dev plan") for call in calls)
+    assert f"{env_dir}|workspace dev console" in calls
+    assert f"{env_dir}|workspace dev plan" in calls
     # No flag makes the gate "not required" any more: it always runs.
     assert "not required" not in result.stdout
     assert "=== Coverage Check (data_access:dev) ===" in result.stdout

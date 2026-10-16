@@ -31,6 +31,7 @@ if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
 
 import agent_files  # noqa: E402
+from scripts.ack_file import AckFileError, parse_file  # noqa: E402
 from agent_files import AgentFileError  # noqa: E402
 from scripts.agent_ownership import render  # noqa: E402
 from scripts.saved_settings import catalog_map_dict  # noqa: E402
@@ -99,7 +100,27 @@ def warehouse_map(source_dir: Path, dest_dir: Path) -> dict[str, str]:
     return {source: dest} if source and dest and source != dest else {}
 
 
-def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> None:
+def detached_dest_keys(dest_dir: Path) -> set[str]:
+    agents = agent_files.load_all(dest_dir)
+    configured = {agent_files.space_key(agent["name"]): agent for agent in agents}
+    path = dest_dir / "ack.txt"
+    acked: set[str] = set()
+    if path.is_file():
+        try:
+            acked = {entry.object_name for entry in parse_file(path, dest_dir.name)
+                     if entry.kind == "detached-agent"}
+        except AckFileError as exc:
+            raise AgentFileError(f"{path}: {exc}") from exc
+    invalid = sorted(key for key in acked if key not in configured or not configured[key]["detached"])
+    if invalid:
+        raise AgentFileError(
+            f"{', '.join(invalid)} is retired in {dest_dir.name}; remove its detached-agent line from "
+            f"envs/{dest_dir.name}/ack.txt in a governance-reviewed PR to revive it; nothing was written"
+        )
+    return acked | {key for key, agent in configured.items() if agent["detached"]}
+
+
+def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> set[str]:
     """Refuse before writing when promotion would resurrect a detached target agent.
 
     A detached target settings file is the committed tombstone left by the
@@ -111,23 +132,26 @@ def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> Non
         for agent in agent_files.load_all(dest_dir)
         if agent["detached"]
     }
+    keys = detached_dest_keys(dest_dir)
     blocked = sorted(
         (agent["name"], tombstones[agent_files.space_key(agent["name"])])
         for agent in source_agents
         if not agent["detached"] and not agent["delete"]
         and agent_files.capture_path(agent["_dir"], agent["name"]).is_file()
-        and agent_files.space_key(agent["name"]) in tombstones
+        and agent_files.space_key(agent["name"]) in keys
     )
     if blocked:
+        source_env = source_agents[0]["_dir"].name
         names = ", ".join(
             repr(source) if source == target else f"{source!r} (detached as {target!r})"
             for source, target in blocked
         )
         raise AgentFileError(
             f"{names} is committed detached in {dest_dir.name}; refusing to promote the active source over its "
-            f"tombstone. Keep it detached, or make a deliberate {dest_dir.name}-side lifecycle "
-            "change; nothing was written"
+            f"tombstone. Detach it in {source_env} too, or remove the detached-agent line from "
+            f"envs/{dest_dir.name}/ack.txt in a governance-reviewed PR to revive it; nothing was written"
         )
+    return keys
 
 
 def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[str]:
@@ -136,7 +160,7 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
     if not source_agents:
         return []
     source_agents = [agent | {"_dir": source_dir} for agent in source_agents]
-    refuse_detached_recreation(source_agents, dest_dir)
+    detached_keys = refuse_detached_recreation(source_agents, dest_dir)
     # A target still in the legacy layout keeps these agents inline, with its
     # own (env-owned) acl_groups; carrying them as files would replace those
     # silently. Moving them is the explicit, reviewed make split-agent-files.
@@ -159,6 +183,12 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
         if not capture.is_file():
             print(f"  {name}: not captured in {source_dir.name} yet (make capture ENV={source_dir.name} "
                   f'SPACE="{name}"); not promoted')
+            continue
+        key = agent_files.space_key(name)
+        dest_captures = {agent_files.space_key(path.name.removesuffix(".space.json"))
+                         for path in agent_files.agents_dir(dest_dir).glob("*.space.json")}
+        if key in detached_keys and key not in dest_captures:
+            print(f"  {name}: detached in {dest_dir.name}; not promoted (its tombstone is kept)")
             continue
         payload = json.loads(capture.read_text())
         (folder / capture.name).write_text(render(remap_payload(payload, catalogs, warehouses)))

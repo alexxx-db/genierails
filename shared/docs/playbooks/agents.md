@@ -72,10 +72,9 @@ keeps its last captured version.
    and an empty `genie_space_id` (prod's ID lives in prod's state and release
    receipt). Later promotions keep prod's file and print how its `acl_groups`
    differ from dev's. A detached prod file stays detached. If that file was
-   kept as the committed tombstone while its `.space.json` capture is removed;
-   promotion refuses instead of recreating the still-active dev agent, including
-   case/punctuation variants with the same identity. Reactivation requires a
-   deliberate prod-side lifecycle change.
+   paired with the governance-owned `prod:detached-agent:<key>` tombstone in
+   `ack.txt` while its capture is removed. Reactivation requires removing that
+   ack line in a governance-reviewed PR.
 2. **Check and open the promotion PR.** `make check ENV=prod`; commit
    `envs/prod/`. It can carry the dev change too, in one PR.
 3. **Merge.** After the dev rehearsal passes on the merge commit, the operator
@@ -111,9 +110,10 @@ make detach-agent ENV=prod SPACE="<agent>"   # forgets it from Terraform state; 
   agent and its conversations stay.`
 - Table access is unchanged, because it belongs to `table_readers`. Masks stay
   until governance runs `make ungovern`.
-- **Keep both agent files**, detached. While dev still has the agent, the next
-  `promote-to` would seed a fresh, active prod file if prod's were gone.
-  Removing an agent that is still in state from config is refused.
+- **Removal PR:** add `prod:detached-agent:<key>` to governance-owned `ack.txt`,
+  keep the detached `.auto.tfvars`, and remove only `.space.json`. Later
+  promotions keep that removal stable. To revive, remove the ack line in a
+  governance-reviewed PR; an edit or deletion only under `agents/` is refused.
 - `make detach-agent` needs a release receipt, so it runs in prod, not dev.
 - **To delete the agent instead** (and its conversations): set `delete = true`
   and add the committed line `prod:delete-agent:<key>` to `envs/prod/ack.txt`

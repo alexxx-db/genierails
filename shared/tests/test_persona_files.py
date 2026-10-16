@@ -118,6 +118,8 @@ def _agent_repo(tmp_path: Path, monkeypatch) -> Path:
     (repo / ".gitignore").write_text(GITIGNORE)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    (bin_dir / "python3").write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+    (bin_dir / "python3").chmod(0o755)
     (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
     (bin_dir / "terraform").chmod(0o755)
     result = base._make(repo, tmp_path, "promote", "ENV=dev")
@@ -609,6 +611,10 @@ def test_make_split_agent_files_is_explicit_and_reports_the_move(tmp_path):
     (env / "env.auto.tfvars").write_text(LEGACY_DEV)
     shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
     (tmp_path / "shared").symlink_to(SHARED)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+    (bin_dir / "python3").chmod(0o755)
 
     result = subprocess.run(["make", "--no-print-directory", "-C", str(cloud), "split-agent-files", "ENV=dev"],
                             text=True, capture_output=True, env=base._env(tmp_path), timeout=120)
@@ -730,6 +736,8 @@ def _legacy_promotion(tmp_path: Path, shared: Path, makefile: Path) -> dict[str,
     (repo / ".gitignore").write_text(GITIGNORE)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "python3").write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+    (bin_dir / "python3").chmod(0o755)
     (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
     (bin_dir / "terraform").chmod(0o755)
     result = base._make(repo, tmp_path, "promote", "ENV=dev")

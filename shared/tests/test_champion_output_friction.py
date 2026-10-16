@@ -737,6 +737,9 @@ def real_cloud(tmp_path):
     assert setup.returncode == 0, setup.stdout + setup.stderr
     (cloud_root / "envs/dev/env.auto.tfvars").write_text(
         TEMPLATE.read_text().replace("<your-genie-space-id>", SPACE_ID)
+        .replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
+        .replace("<most-privileged-group>", "ops")
+        .replace("<least-privileged-group>", "viewers")
         + '\nuc_tables = ["dev_finance.genierails_e2e.customers"]\n'
     )
     fake_bin = tmp_path / "bin"

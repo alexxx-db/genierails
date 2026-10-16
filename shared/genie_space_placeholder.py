@@ -59,11 +59,15 @@ def placeholder_error(config: dict, path: Path, *, allow_access_tier_placeholder
 
 
 def main() -> int:
+    advice = "--advice" in sys.argv[1:]
+    paths = [Path(arg) for arg in sys.argv[1:] if arg != "--advice"]
+    # Legacy configs have no placeholders. Avoid importing the HCL parser in
+    # bootstrap-only environments unless a placeholder can actually exist.
+    if not any(path.exists() and ("<" in path.read_text() or ">" in path.read_text()) for path in paths):
+        return 0
     import hcl2
 
-    advice = "--advice" in sys.argv[1:]
-    for arg in (arg for arg in sys.argv[1:] if arg != "--advice"):
-        path = Path(arg)
+    for path in paths:
         if not path.exists():
             continue
         with path.open() as handle:

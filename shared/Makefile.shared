@@ -200,8 +200,8 @@ _prepare-env:
 		fi; \
 		if [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
 			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars"; \
-			if [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); lines=("governance_mode       = \"deterministic\"\n", "deployer_principal_id = \"<your-deployer-principal-id>\"\n", "access_tier_groups    = [\"<most-privileged-group>\", \"<least-privileged-group>\"]\n"); p.write_text("".join(line for line in s.splitlines(keepends=True) if line not in lines))' "$$env_dir/env.auto.tfvars"; \
+			if [ "$$env_name" = "$(ACCOUNT_ENV)" ] || [ "$${_SEED_PROMOTION_SETTINGS:-1}" = 0 ]; then \
+				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars"; \
 			fi; \
 			if [ "$${_SEED_PROMOTION_SETTINGS:-1}" != 0 ] && [ "$$env_name" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" != "$(DEFAULT_ENV)" ]; then \
 				printf '\n# Promotion source and catalog renames; replace both catalog placeholders.\npromote_from = "$(DEFAULT_ENV)"\ncatalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }\n' "$$env_name" >> "$$env_dir/env.auto.tfvars"; \
