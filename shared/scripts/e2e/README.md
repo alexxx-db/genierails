@@ -4,10 +4,13 @@ The driver encodes the champion flow from
 `shared/docs/design/deterministic-governance.md` sections 9, 12, 13 and 17,
 plan scenarios S1–S16, cross-cutting
 manifest/concurrency checks, the report-only migration operation, and the
-migration cutover. The cutover is intentionally expected to fail on main until
-`fix/migration-adopt-order` lands; if it passes, its status is
-`UNEXPECTED PASS — remove known_failure ...` and the run fails, so the marker
-gets removed. The cutover's protection check accepts only the column retags
+migration cutover. A scenario that is expected to fail until a fix lands
+carries `known_failure="<branch>"`: it reports `ERROR (expected until ...)`, and
+if it passes its status is `UNEXPECTED PASS — remove known_failure ...` and the
+run fails, so the marker gets removed. No scenario carries one now: the
+cutover's marker (fix/migration-adopt-order, merged as #146) was removed with
+the staged coverage-check fix (fix/staged-migration-coverage-loop), so a
+cutover pass is a PASS. The cutover's protection check accepts only the column retags
 migrate-plan printed, and only once the replacement is live: for each adopted
 column, the `gr_mask_<value>_full` (and `_partial`, unless never-raw) policy and
 function exist on that table, and every principal the legacy policy masked is

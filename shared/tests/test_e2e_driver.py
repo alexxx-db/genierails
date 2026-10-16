@@ -293,6 +293,93 @@ def test_s13_sets_ci_unsets_override_and_passes_on_exact_refusals(tmp_path, live
     assert report["status"] == "passed" and report["restored_lifecycle"] is False
 
 
+def test_s10_refusals_get_default_ci_environment(tmp_path, live):
+    calls = live(refuse=(lambda argv: True, "committed files differ from what the commit regenerates\n"))
+    assert driver.main(live_args(tmp_path, "s10"), snapshot_factory=FakeSnapshots) == 0
+    envs = [env for argv, env in calls if argv and argv[0] == "make"]
+    assert len(envs) == 2 and all(env.get("CI") == "true" for env in envs)
+    assert all("GENIERAILS_ALLOW_CI_APPLY" not in env for env in envs)
+
+
+@pytest.mark.parametrize(("scenario", "values", "message", "call_count"), [
+    ("s11", ("u=" + "b" * 40, "o=" + "c" * 40, "manifest=/tmp/foreign.json"),
+     "release-plan refused: make release refused\n", 2),
+    ("manifest", ("tampered_manifest=/tmp/tampered.json",), "make release refused: x no longer matches\n", 1),
+])
+def test_non_ci_refusals_clear_every_ci_marker(tmp_path, live, monkeypatch,
+                                               scenario, values, message, call_count):
+    markers = (*driver.CI_MARKERS, "GENIERAILS_ALLOW_CI_APPLY")
+    for marker in markers:
+        monkeypatch.setenv(marker, "inherited")
+    calls = live(refuse=(lambda argv: True, message))
+    value_args = tuple(part for value in values for part in ("--value", value))
+    args = live_args(tmp_path, scenario, *value_args)
+    assert driver.main(args, snapshot_factory=FakeSnapshots) == 0
+    envs = [env for argv, env in calls if argv and argv[0] == "make"]
+    assert len(envs) == call_count
+    assert all(all(marker not in env for marker in markers) for env in envs)
+
+
+def test_read_only_scenarios_match_structure():
+    actual = {scenario.key for scenario in driver.SCENARIOS if scenario.read_only}
+    assert actual == {"s10", "s11", "s13", "manifest", "migration"}
+    for scenario in driver.SCENARIOS:
+        applying_is_refusal_only = all(
+            step.expect_failure for step in scenario.steps if step.target in driver.APPLYING)
+        has_successful_authoring_or_merge = any(
+            (step.target in driver.AUTHORING and not step.expect_failure) or step.action == "local_merge"
+            for step in scenario.steps)
+        assert scenario.read_only == (applying_is_refusal_only and not has_successful_authoring_or_merge), scenario.key
+
+
+@pytest.mark.parametrize(("scenario", "values", "first_target"), [
+    ("s13", (), "release-plan"),
+    ("s11", ("u=" + "b" * 40, "o=" + "c" * 40, "manifest=/tmp/foreign.json"), "release-plan"),
+    ("manifest", ("tampered_manifest=/tmp/tampered.json",), "release"),
+])
+def test_missed_read_only_refusal_never_runs_applying_restore(tmp_path, live, scenario, values, first_target):
+    calls = live()  # The first refusal unexpectedly exits zero.
+    value_args = tuple(part for value in values for part in ("--value", value))
+    assert driver.main(live_args(tmp_path, scenario, *value_args), snapshot_factory=FakeSnapshots) == 1
+    assert [argv[1] for argv in makes(calls)] == [first_target]
+    assert json.loads((tmp_path / f"reports/{scenario}.json").read_text())["restored_lifecycle"] is False
+
+
+def test_read_only_drift_reports_manual_restore_and_stops(tmp_path, live):
+    class Drift(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            return snapshot(grants=("unexpected",) if self.n > 4 else ())
+    calls = live()
+    assert driver.main(live_args(tmp_path, "s13,migration"), snapshot_factory=Drift) == 1
+    report = json.loads((tmp_path / "reports/s13.json").read_text())
+    assert report["status"] == "RESTORE NEEDED"
+    assert report["manual_restore_commands"] == [
+        "make rehearse ENV=dev",
+        "make release-plan ENV=prod",
+        "make release ENV=prod MANIFEST=<path-from-release-plan>",
+        "make maintain ENV=prod",
+    ]
+    assert report["snapshot_diff"]
+    markdown = (tmp_path / "reports/s13.md").read_text()
+    assert "Manual restore required" in markdown and '"unexpected"' in markdown
+    assert [argv[1] for argv in makes(calls)] == ["release-plan"]
+    assert not (tmp_path / "reports/migration.json").exists()
+
+
+def test_read_only_post_reset_drift_reports_restore_needed(tmp_path, live):
+    class DriftAfterReset(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            return snapshot(grants=("post-reset",) if self.n > 4 else ())
+    live()
+    assert driver.main(live_args(tmp_path, "migration"), snapshot_factory=DriftAfterReset) == 1
+    report = json.loads((tmp_path / "reports/migration.json").read_text())
+    assert report["status"] == "RESTORE NEEDED"
+    assert report["manual_restore_commands"]
+    assert report["snapshot_diff"] == {} and report["post_reset_snapshot_diff"]
+
+
 def test_missing_release_plan_manifest_errors_before_release(tmp_path, live, monkeypatch):
     calls = live(no_manifest=True)
     monkeypatch.setattr(driver, "governance_only_env", lambda *_: True)
@@ -306,6 +393,7 @@ def test_missing_release_plan_manifest_errors_before_release(tmp_path, live, mon
 def _fake_sdk(monkeypatch, seen, *, resolved_host=None, tables=(("prodcat", "s", "t"),)):
     class Statement:
         def execute_statement(self, *, statement, **kwargs):
+            seen.setdefault("statements", []).append(statement)
             rows = [list(t) for t in tables] if "information_schema.tables" in statement else []
             cols = ["table_catalog", "table_schema", "table_name"]
             return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="s",
@@ -361,11 +449,25 @@ def test_live_snapshot_read_failures_are_errors_not_data(tmp_path, monkeypatch):
     response = SimpleNamespace(status=SimpleNamespace(state="FAILED"), result=None, manifest=None)
     with pytest.raises(RuntimeError, match="did not succeed"):
         driver._require_succeeded(response, "tags")
+    response.status.error = SimpleNamespace(error_code="BAD_REQUEST", message="bad SQL containing actual-secret")
+    with pytest.raises(RuntimeError, match=r"code=BAD_REQUEST.*bad SQL containing <redacted>"):
+        driver._require_succeeded(response, "tags", secrets={"actual-secret"})
     state = tmp_path / "state"; state.mkdir(); (state / "x.tfstate").write_text("{not json")
     with pytest.raises(RuntimeError, match="Terraform serial"):
         driver._state_serials(state)
     with pytest.raises(RuntimeError, match="missing authentication file"):
         driver.LiveSnapshotProvider(cloud, state).client("dev")
+
+
+def test_mask_snapshot_query_uses_portable_prefix_predicates(monkeypatch, tmp_path):
+    pytest.importorskip("hcl2")
+    cloud = _env_files(tmp_path); seen = {}
+    _fake_sdk(monkeypatch, seen)
+    driver.LiveSnapshotProvider(cloud, tmp_path / "state").capture("prod")
+    mask_sql = next(sql for sql in seen["statements"] if "information_schema.routines" in sql)
+    assert "startswith(routine_name, 'mask_')" in mask_sql
+    assert "startswith(routine_name, 'gr_mask_')" in mask_sql
+    assert " ESCAPE " not in mask_sql
 
 
 def test_agent_ids_include_hcl_state_and_id_file(tmp_path):
@@ -805,20 +907,21 @@ def test_d2_ci_scenario_needs_no_value_and_omits_allowed_dev_rehearse():
 
 def test_d3_staged_release_replans_with_fresh_manifest(tmp_path, live):
     calls = live(staged_release=True)
-    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 0
     commands = makes(calls)
     assert [argv[1] for argv in commands[:7]] == [
         "migrate-plan", "migrate-plan", "rehearse", "release-plan", "release", "release-plan", "release"]
     manifests = [next(a for a in argv if a.startswith("MANIFEST=")) for argv in commands if argv[1] == "release"]
     assert manifests[:2] == ["MANIFEST=/tmp/approved-1.json", "MANIFEST=/tmp/approved-2.json"]
     report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
-    assert report["status"] == "UNEXPECTED PASS — remove known_failure fix/migration-adopt-order"
+    # No known_failure marker: a pass is a plain pass.
+    assert report["status"] == "passed" and report["known_failure"] is None
 
 
 def test_d4_snapshot_query_includes_deterministic_masks():
     class Statement:
         def execute_statement(self, *, statement, **_):
-            assert "gr\\_mask\\_%" in statement if "routines" in statement else True
+            assert "startswith(routine_name, 'gr_mask_')" in statement if "routines" in statement else True
             cols = [SimpleNamespace(name=n) for n in ("table_catalog", "table_schema", "table_name")]
             rows = [["cat", "s", "t"]] if "information_schema.tables" in statement else []
             return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
@@ -1034,30 +1137,64 @@ def test_d9_migration_is_read_only_and_cutover_is_explicit():
     assert "migration" not in driver.WEAKENING_EXPECTED
     cutover = next(s for s in driver.SCENARIOS if s.key == "migration-cutover")
     assert [s.target for s in cutover.steps] == ["migrate-plan", "migrate-plan", "rehearse", "release-plan", "release"]
-    assert "fix/migration-adopt-order" in " ".join(cutover.preconditions)
-    assert cutover.known_failure == "fix/migration-adopt-order"
+    # Its marker named fix/migration-adopt-order (#146); with the staged coverage-check fix a pass is a PASS.
+    assert "fix/migration-adopt-order" not in " ".join(cutover.preconditions)
+    assert cutover.known_failure is None
+    assert not [s.key for s in driver.SCENARIOS if s.known_failure]
 
 
-def test_migration_cutover_known_failure_is_visible_and_still_fails(tmp_path, live):
+def _first_rehearse_refused():
     refused = {"done": False}
     def first_rehearse(argv):
         match = argv[1:2] == ["rehearse"] and not refused["done"]
         refused["done"] |= match
         return match
-    calls = live(refuse=(first_rehearse, "engine migration order failure\n"))
+    return first_rehearse
+
+
+def test_a_failing_migration_cutover_is_a_plain_error(tmp_path, live):
+    calls = live(refuse=(_first_rehearse_refused(), "engine migration order failure\n"))
     assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
     report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
-    assert report["known_failure"] == "fix/migration-adopt-order"
-    assert report["status"] == "ERROR (expected until fix/migration-adopt-order)"
+    assert report["known_failure"] is None and report["status"] == "ERROR"
+    assert "expected until" not in report["error"]
     assert any(argv[1] == "rehearse" for argv in makes(calls))
 
 
-def test_migration_cutover_known_failure_is_in_dry_run_json_and_stdout(tmp_path, capsys):
+def test_migration_cutover_dry_run_carries_no_known_failure(tmp_path, capsys):
     assert driver.main(["--cloud", "aws", "--repo", str(ROOT), "--dry-run",
         "--scenarios", "migration-cutover", "--reports", str(tmp_path)]) == 0
     report = json.loads((tmp_path / "migration-cutover.json").read_text())
-    assert report["known_failure"] == "fix/migration-adopt-order"
-    assert "KNOWN FAILURE until fix/migration-adopt-order" in capsys.readouterr().out
+    assert report["known_failure"] is None
+    assert "KNOWN FAILURE" not in capsys.readouterr().out
+
+
+def _with_known_failure(monkeypatch, marker="fix/some-branch"):
+    """The marker mechanism, on the cutover scenario (no real scenario carries one now)."""
+    scenarios = tuple(dataclasses.replace(s, known_failure=marker) if s.key == "migration-cutover" else s
+                      for s in driver.SCENARIOS)
+    monkeypatch.setattr(driver, "SCENARIOS", scenarios)
+    return marker
+
+
+def test_a_known_failure_marker_is_visible_and_still_fails(tmp_path, live, monkeypatch, capsys):
+    marker = _with_known_failure(monkeypatch)
+    live(refuse=(_first_rehearse_refused(), "engine migration order failure\n"))
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
+    assert report["known_failure"] == marker and report["status"] == f"ERROR (expected until {marker})"
+    assert driver.main(["--cloud", "aws", "--repo", str(ROOT), "--dry-run",
+        "--scenarios", "migration-cutover", "--reports", str(tmp_path / "dry")]) == 0
+    assert json.loads((tmp_path / "dry/migration-cutover.json").read_text())["known_failure"] == marker
+    assert f"KNOWN FAILURE until {marker}" in capsys.readouterr().out
+
+
+def test_a_known_failure_that_passes_fails_the_run(tmp_path, live, monkeypatch):
+    marker = _with_known_failure(monkeypatch)
+    live(staged_release=True)
+    assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
+    assert report["status"] == f"UNEXPECTED PASS — remove known_failure {marker}"
 
 
 def test_d10_s14_is_blocked_unless_dev_is_governance_only(tmp_path):
@@ -1083,7 +1220,7 @@ def test_phase_bound_is_an_error_after_eight_releases(tmp_path, live):
     live(staged_releases=8)
     assert driver.main(live_args(tmp_path, "migration-cutover"), snapshot_factory=FakeSnapshots) == 1
     report = json.loads((tmp_path / "reports/migration-cutover.json").read_text())
-    assert report["status"] == "ERROR (expected until fix/migration-adopt-order)"
+    assert report["status"] == "ERROR"
     assert "release exceeded 8 phases" in report["error"]
 
 

@@ -4,8 +4,8 @@ You own how tables are protected and who can read them: treatments, tiers,
 `table_readers`, row filters, `tag_treatments`, `group_map`, the governed set
 and the acknowledgements. You own `envs/<env>/env.auto.tfvars`,
 `envs/<env>/generated/`, `envs/<env>/ack.txt` and `shared/`
-([who owns which file](../pipelines.md#who-owns-which-file)). No command here
-calls a model.
+([who owns which file](../pipelines.md#who-owns-which-file)). Nothing in the flow
+below calls a model; only the optional dev-only helpers at the end do.
 
 ## The whole flow
 
@@ -235,11 +235,12 @@ rehearse and release. Read the [CHANGELOG](../../../aws/CHANGELOG.md) first.
 | a group in `acl_groups` can't read an agent's table | add it to `table_readers`, or the agent's owner drops it |
 | `make check` says generated files differ | run `make generate ENV=dev` (or `make promote-to ENV=prod`) on the latest `main` and commit; never hand-merge generated files |
 
-> **Optional AI helpers (coming in #150).** These aren't on `main` yet. They
-> write files for review, are never run by `generate`, `rehearse`, `release` or
-> `maintain`, and never run in CI:
-> - `make suggest-treatment CLASS=<class>` will propose a treatment for an unmapped class.
-> - `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` will draft
+> **Optional AI helpers (dev only).** They write files under `envs/dev/drafts/`
+> for review, are never run by `generate`, `rehearse`, `release` or `maintain`,
+> and refuse in CI and in prod:
+> - `make suggest-treatment ENV=dev CLASS=<class>` proposes a library treatment for an unmapped class.
+> - `make draft-custom-mask ENV=dev TREATMENT=<name> TYPE=<sql-type>` drafts
 >   a custom mask and its exact-output test fixture under `envs/dev/drafts/custom_masks/`.
-> - `make test-custom-mask ENV=dev TREATMENT=<name>` will run the mask library's
->   exact-output tests on that draft; `tag_treatments` can't use it until they pass.
+> - `make test-custom-mask ENV=dev TREATMENT=<name>` runs the mask library's
+>   exact-output tests on that draft. A pass does not adopt it: `tag_treatments`
+>   can't use a custom mask until `make adopt-custom-mask` lands.

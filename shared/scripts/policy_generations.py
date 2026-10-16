@@ -9,10 +9,14 @@ Function, policy and treatment value names are content-versioned (see
 governance_policies.py), so two generations never fight over one name.
 
 Hooks are argv executables in ``scripts/policy_hooks/``, one per stage. Each
-renders its stage into the data_access layer, checks the render (no tagged
-column without a mask, no principal with two outside a tier move), plans it,
-refuses any destroy the stage doesn't allow, and applies exactly that plan.
-They read:
+renders its stage, checks the render (no tagged column without a mask, no
+principal with two outside a tier move), plans it, refuses any destroy the
+stage doesn't allow, and applies exactly that plan. A render never rewrites
+the layer's split config (``data_access/abac.auto.tfvars`` and
+``masking_functions.sql``, committed in a legacy or migrating env): it goes to
+the ignored ``envs/<env>/generated/.runtime/data_access/``, and every
+Terraform run of the stage reads it from there (``GENIERAILS_LAYER_CONFIG_DIR``,
+scripts/terraform_layer.sh). They read:
 
 * ``GENIERAILS_ENV_DIR``: the env (``envs/<env>``); required.
 * ``GENIERAILS_ENV_NAME``: defaults to the env dir's name.
@@ -25,7 +29,10 @@ They read:
 * ``GENIERAILS_POLICY_KEEP_NEW_TAGS=1``: a switch was attempted, so newly
   governed columns may already carry their new value; keep it.
 * ``GENIERAILS_COVERAGE_GATE_RUNNER``: when set, the coverage check re-runs on
-  each render, so its result matches what the stage applies.
+  each render, so its result matches what the stage applies. It is told the
+  stage and the active generation, so the stages that keep a recorded legacy
+  migration's tag values (create, tighten, restore, abandon) aren't judged against the
+  versioned values the live refresh derived (scripts/coverage_gate.py).
 * ``GENIERAILS_POLICY_PLAN_OUT=<file>`` (make release-plan): render, check and
   plan the stage into ``<file>``, record the render and whether the plan
   changes anything in ``<file>.json``, and apply nothing.
@@ -98,6 +105,12 @@ COVERAGE_GATE = SHARED / "scripts" / "coverage_gate.py"
 DEPLOY_FUNCTIONS = SHARED / "deploy_masking_functions.py"
 LEDGER = Path(".policy_generations")
 STAGE_RECORD = "stage.json"
+# Where a stage's render goes (ignored, like every generated/.*), and the
+# variable that points terraform_layer.sh at it.
+STAGE_CONFIG = Path("generated") / ".runtime" / "data_access"
+STAGE_CONFIG_ENV = "GENIERAILS_LAYER_CONFIG_DIR"
+# The stages whose render keeps the active generation's tag values.
+KEEP_TAG_STAGES = ("create", "tighten", "restore", "abandon")
 ALL_USERS = "account users"
 OUTSIDER = "<anyone outside the tiers>"
 # Resources a staged apply may never destroy: a live policy, a treatment tag
@@ -379,13 +392,29 @@ def stage_problems(stage: str, rendered: dict, desired: dict, old: dict | None) 
     return problems
 
 
-def write_stage(layer_dir: Path, rendered: dict) -> None:
-    """Write a rendered stage over the data_access layer's split config."""
+def stage_config_dir(env_dir: Path) -> Path:
+    return Path(env_dir) / STAGE_CONFIG
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def write_stage(layer_dir: Path, rendered: dict, out_dir: Path | None = None) -> Path:
+    """Write a rendered stage, from the layer's split config, into ``out_dir``.
+
+    ``out_dir`` defaults to the env's ignored stage dir (``stage_config_dir``);
+    the split config in ``layer_dir`` is only read. Returns ``out_dir``.
+    """
     from generate_abac import (
         _find_bracket_section, _render_fgac_policy_block, _render_tag_assignment_block,
         _replace_bracket_section,
     )
 
+    out_dir = Path(out_dir) if out_dir else stage_config_dir(Path(layer_dir).parent)
     path = layer_dir / "abac.auto.tfvars"
     text = path.read_text()
     cfg = _load(path)
@@ -406,10 +435,11 @@ def write_stage(layer_dir: Path, rendered: dict) -> None:
         if _find_bracket_section(text, section) is None:
             text = text.rstrip() + f"\n\n{section} = [\n]\n"
         text = _replace_bracket_section(text, section, [render(item) for item in items])
-    path.write_text(text)
     sql_path = layer_dir / "masking_functions.sql"
     sql = sql_path.read_text() if sql_path.is_file() else ""
-    sql_path.write_text(replace_sql_library(sql, rendered["functions_sql"]))
+    _write_text(out_dir / "abac.auto.tfvars", text)
+    _write_text(out_dir / "masking_functions.sql", replace_sql_library(sql, rendered["functions_sql"]))
+    return out_dir
 
 
 def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
@@ -449,9 +479,10 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
 
 
 def _runner(env_name: str, layer_dir: Path, *args: str, capture: bool = False) -> str:
+    """terraform_layer.sh on the layer, reading the stage's render (never the split config)."""
     result = subprocess.run(
         [str(RUNNER), "data_access", env_name, *args],
-        env=os.environ | {"LAYER_ENV_DIR": str(layer_dir)},
+        env=os.environ | {"LAYER_ENV_DIR": str(layer_dir), STAGE_CONFIG_ENV: str(stage_config_dir(layer_dir.parent))},
         text=True, stdout=subprocess.PIPE if capture else None, check=False,
     )
     if result.returncode:
@@ -459,12 +490,14 @@ def _runner(env_name: str, layer_dir: Path, *args: str, capture: bool = False) -
     return result.stdout or ""
 
 
-def _rerun_coverage_gate(env_dir: Path, env_name: str, runner: str) -> None:
+def _rerun_coverage_gate(env_dir: Path, env_name: str, runner: str, stage: str = "",
+                         old_fp: str = "", keep_new_tags: bool = False) -> None:
     """Re-judge the coverage check on the render, so its result matches what is applied."""
-    result = subprocess.run(
-        [sys.executable, str(COVERAGE_GATE), "run", "--env-dir", str(env_dir),
-         "--env-name", env_name, "--runner", runner], check=False,
-    )
+    command = [sys.executable, str(COVERAGE_GATE), "run", "--env-dir", str(env_dir),
+               "--env-name", env_name, "--runner", runner, "--layer-config-dir", str(stage_config_dir(env_dir))]
+    if stage:
+        command += ["--stage", stage, "--old-fingerprint", old_fp] + (["--keep-new-tags"] if keep_new_tags else [])
+    result = subprocess.run(command, check=False)
     if result.returncode:
         raise StageError(f"the coverage check stopped the stage (exit {result.returncode})")
 
@@ -578,7 +611,8 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
         return 0
     write_stage(layer_dir, staged["rendered"])
     if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
-        _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"])
+        _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"], stage, old_fp,
+                             keep_new_tags)
     plan_out = environ.get(PLAN_OUT_ENV)
     with tempfile.TemporaryDirectory() as tmp:
         plan_file = Path(plan_out) if plan_out else Path(tmp) / f"{stage}.tfplan"
@@ -622,7 +656,10 @@ def grant(env_dir: Path, environ: dict) -> int:
         return 0
     write_stage(layer_dir, record["rendered"])
     if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
-        _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"])
+        # The render is the last stage's, so it is judged as that stage.
+        _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"],
+                             str(record.get("stage") or ""), str(record.get("old") or ""),
+                             bool(record.get("keep_new_tags")))
     with tempfile.TemporaryDirectory() as tmp:
         plan_file = Path(plan_out) if plan_out else Path(tmp) / "grant.tfplan"
         plan = _plan_json(env_name, layer_dir, "grant", plan_file)

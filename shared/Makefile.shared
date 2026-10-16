@@ -3,7 +3,7 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
-.PHONY: capture detach-agent split-agent-files
+.PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -559,6 +559,27 @@ materialize-treatment: _guard-workspace-target ## Add TREATMENT=<t>'s mask polic
 	@$(_MATERIALIZE) --check-env
 	@$(MAKE) --no-print-directory _guarded-bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)"
 	@$(_MATERIALIZE)
+
+# Optional AI helpers (scripts/ai_helpers.py, design 18.4 and decision 5): the
+# only commands that call a model. Each writes a draft under envs/<env>/drafts/
+# for review and commit; nothing else reads drafts/. They refuse in CI and run
+# only with ENV=dev at this checkout's real envs/dev (GENIERAILS_CLOUD_DIR), and
+# the drafting ones need ai_helper_endpoint in envs/dev/env.auto.tfvars. test-custom-mask calls no model: it runs the mask
+# library's exact-output checks on a draft against the dev SQL warehouse.
+# FORCE=1 replaces an existing, different draft.
+override _AI_HELPERS = python3 "$(SHARED_ROOT)/scripts/ai_helpers.py"
+override _AI_HELPER_ARGS = --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" --cloud-dir "$(GENIERAILS_CLOUD_DIR)" $(if $(filter 1,$(FORCE)),--force,)
+suggest-treatment: _guard-workspace-target ## [AI helper] Draft a treatment suggestion for an unmapped class into envs/<env>/drafts/: CLASS=<class>
+	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) suggest-treatment $(_AI_HELPER_ARGS) --class "$(CLASS)"
+
+draft-genie-content: _guard-workspace-target ## [AI helper] Draft instructions, sample questions and benchmarks for a captured agent into envs/<env>/drafts/: SPACE="<agent>"
+	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) draft-genie-content $(_AI_HELPER_ARGS) --space "$(SPACE)"
+
+draft-custom-mask: _guard-workspace-target ## [AI helper] Draft a custom mask and its exact-output fixture into envs/<env>/drafts/custom_masks/: TREATMENT=<name> TYPE=<sql-type>
+	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) draft-custom-mask $(_AI_HELPER_ARGS) --treatment "$(strip $(TREATMENT))" --type "$(strip $(TYPE))"
+
+test-custom-mask: _guard-workspace-target ## Run the mask library's exact-output checks on a drafted custom mask (dev SQL warehouse, read-only): TREATMENT=<name>
+	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) test-custom-mask $(_AI_HELPER_ARGS) --treatment "$(strip $(TREATMENT))"
 
 derive-assignments: _guarded-bootstrap _guard-workspace-target ## Re-derive only tag_assignments from live native class.* tags (requires prior promote; never calls an LLM)
 	@echo "=== Derive Assignments ($(ENV)) ==="

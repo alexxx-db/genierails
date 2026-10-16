@@ -15,7 +15,14 @@
   4. Check the live-refresh record derive-assignments writes after it re-read
      Unity Catalog (generated/.live_refresh.json): it must match the DDL and
      the tags being gated, else the gate fails. Its time becomes the result's
-     refreshed_at.
+     refreshed_at. One exception, for a staged phase only (``--stage``): the
+     phases before the switch of a recorded legacy migration keep the legacy
+     tag values live, while the refresh recorded the versioned values the
+     switch applies. There the tags must be exactly the desired config the
+     refresh recorded, with each treatment tag at the value the adopted legacy
+     generation recorded (staged_migration_assignments). Without an adopted
+     migration record, a policy journal moving from it and a snapshot that
+     matches its fingerprint, the mismatch fails as before.
   5. Ask Terraform for the fingerprint again and write the result to
      envs/<env>/data_access/.coverage_gate.json.
 
@@ -69,6 +76,9 @@ GATE_VERSION = 1
 # contention reports the lock-specific timeout rather than a console timeout.
 SUBPROCESS_TIMEOUT = os.environ.get("COVERAGE_GATE_TIMEOUT_SECONDS", "660")
 TABLE_GRANT = ("module.data_access", "databricks_grant", "table_access")
+# Set by scripts/policy_generations.py: a staged phase's render, which
+# terraform_layer.sh reads instead of the split data_access config.
+LAYER_CONFIG_ENV = "GENIERAILS_LAYER_CONFIG_DIR"
 INPUTS_EXPRESSION = "base64encode(jsonencode(module.data_access.coverage_gate_inputs))"
 
 
@@ -245,8 +255,74 @@ def write_refresh_record(path: Path, *, mode: str, ddl_path: Path, config_path: 
     write_result(path, record)
 
 
-def live_refresh(env_dir: Path, tfvars: Path) -> tuple[str | None, str]:
-    """The refreshed_at of a live refresh that matches the gated inputs, or why not."""
+def staged_migration_assignments(env_dir: Path, stage: str, old_fingerprint: str,
+                                 keep_new_tags: bool = False) -> tuple[list, list]:
+    """(desired, staged) tag assignments of a phase that keeps a legacy migration's values.
+
+    ``desired`` is the effective generated config's; ``staged`` is what the
+    ``stage`` render holds: the same, with every treatment tag at the value
+    the adopted legacy generation recorded (and, after an attempted switch,
+    newly governed columns at their desired value), as
+    policy_generations.plan_stage renders it. Raises GateError, failing
+    closed, unless the stage keeps the old values and the migration is on
+    record: an adopted migration.json naming ``old_fingerprint``, a policy
+    journal whose active generation and transition are that generation, and
+    a snapshot whose content still hashes to it.
+    """
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from governance_policies import TAG_KEY
+    from scripts import migration, policy_generations as pg
+    from scripts import staged_policy_apply as spa
+    from scripts.runtime_overlay import effective
+
+    if stage not in pg.KEEP_TAG_STAGES:
+        raise GateError(f"the {stage} phase applies the desired values")
+    if not old_fingerprint.startswith(migration.LEGACY_PREFIX):
+        raise GateError(f"the active generation {old_fingerprint or '<none>'} is not a legacy migration's")
+    try:
+        record = migration.load_record(env_dir)
+        journal = spa.load_journal(env_dir)
+        snapshot = pg.load_snapshot(env_dir, old_fingerprint)
+        target = pg.desired_generation(env_dir)["fingerprint"]
+    except (migration.Refused, spa.Refused, pg.StageError, OSError, ValueError) as exc:
+        raise GateError(str(exc)) from exc
+    if not migration.adopted(record) or record.get("legacy") != old_fingerprint:
+        raise GateError(f"no adopted migration of legacy generation {old_fingerprint} is recorded "
+                        f"({migration.record_path(env_dir)})")
+    transition = (journal or {}).get("transition") or {}
+    # abandon drops a transition the generated config may have moved on from.
+    if (journal or {}).get("active") != old_fingerprint or transition.get("from") != old_fingerprint \
+            or (stage != "abandon" and transition.get("to") != target):
+        raise GateError(f"the policy journal records no transition from {old_fingerprint} to {target}")
+    try:
+        policies, old_tags = snapshot["fgac_policies"], dict(snapshot["tags"])
+        intact = migration.legacy_fingerprint(policies, old_tags) == old_fingerprint
+    except (KeyError, TypeError, ValueError):
+        intact = False
+    if not intact:
+        raise GateError(f"the snapshot of {old_fingerprint} doesn't match its fingerprint (edited since adoption)")
+
+    def treatment(item: dict) -> bool:
+        return item.get("entity_type") == "columns" and item.get("tag_key") == TAG_KEY
+
+    desired = list(_load_tfvars(effective(env_dir, "abac.auto.tfvars")).get("tag_assignments") or [])
+    tags = dict(old_tags)
+    if keep_new_tags:
+        tags.update({i.get("entity_name"): i.get("tag_value") for i in desired
+                     if treatment(i) and i.get("entity_name") not in old_tags})
+    staged = [i for i in desired if not treatment(i)] + [
+        {"entity_type": "columns", "entity_name": column, "tag_key": TAG_KEY, "tag_value": value}
+        for column, value in sorted(tags.items())]
+    return desired, staged
+
+
+def live_refresh(env_dir: Path, tfvars: Path, staged: dict | None = None) -> tuple[str | None, str]:
+    """The refreshed_at of a live refresh that matches the gated inputs, or why not.
+
+    ``staged`` (stage, old_fingerprint, keep_new_tags) names the staged phase
+    that rendered ``tfvars``; see staged_migration_assignments.
+    """
     path = env_dir / REFRESH_RELPATH
     hint = "make runs derive-assignments first; re-run the same make command"
     if not path.is_file():
@@ -262,21 +338,37 @@ def live_refresh(env_dir: Path, tfvars: Path) -> tuple[str | None, str]:
         return None, f"unknown live-refresh mode {mode!r} in {path}"
     if record.get("ddl_sha256") != file_sha256(env_dir / "ddl" / "_fetched.sql"):
         return None, f"ddl/_fetched.sql changed since the last live refresh; {hint}"
-    if mode == "full" and record.get("tag_assignments_sha256") != tag_assignments_digest(
-        _load_tfvars(tfvars).get("tag_assignments") or []
-    ):
-        return None, ("the data_access tag_assignments don't match the last live refresh "
-                      f"(promote hasn't re-split it, or it was edited); {hint}")
+    gated = tag_assignments_digest(_load_tfvars(tfvars).get("tag_assignments") or [])
+    if mode == "full" and record.get("tag_assignments_sha256") != gated:
+        if not staged:
+            return None, ("the data_access tag_assignments don't match the last live refresh "
+                          f"(promote hasn't re-split it, or it was edited); {hint}")
+        stage = staged["stage"]
+        try:
+            desired, kept = staged_migration_assignments(env_dir, **staged)
+        except GateError as exc:
+            return None, (f"the {stage} render's tag_assignments don't match the last live refresh, and it "
+                          f"isn't a phase that keeps a recorded legacy migration's values: {exc}")
+        if record.get("tag_assignments_sha256") != tag_assignments_digest(desired):
+            return None, f"the generated config's tag_assignments don't match the last live refresh; {hint}"
+        if gated != tag_assignments_digest(kept):
+            return None, (f"the {stage} render's tag_assignments are neither the live refresh's nor the "
+                          f"legacy values generation {staged['old_fingerprint']} keeps until the switch")
+        return refreshed_at, f"{mode}; {stage} keeps legacy generation {staged['old_fingerprint']}'s values"
     return refreshed_at, mode
 
 
-def query_inputs(runner: Path, env_name: str, layer_dir: Path, flags: list[str]) -> dict:
+def query_inputs(runner: Path, env_name: str, layer_dir: Path, flags: list[str],
+                 config_dir: Path | None = None) -> dict:
     """Evaluate output.coverage_gate_inputs with the apply's var files and flags."""
+    environ = {**os.environ, "LAYER_ENV_DIR": str(layer_dir)}
+    if config_dir:
+        environ[LAYER_CONFIG_ENV] = str(config_dir)
     try:
         result = _run_bounded(
             [str(runner), "data_access", env_name, "console", *flags],
             label="terraform console (data_access)", input=INPUTS_EXPRESSION + "\n",
-            env={**os.environ, "LAYER_ENV_DIR": str(layer_dir)},
+            env=environ,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except CommandTimeout:
@@ -499,15 +591,19 @@ def can_run_check(env_dir: Path, env_name: str, runner: Path, apply_flags: str) 
     return 0
 
 
-def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbose: bool) -> int:
+def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbose: bool,
+             config_dir: Path | None = None, staged: dict | None = None) -> int:
+    """Gate the data_access config: the split one, or a staged phase's render in ``config_dir``."""
     layer_dir = env_dir / DATA_ACCESS_SUBDIR
-    tfvars = layer_dir / "abac.auto.tfvars"
+    tfvars = (config_dir or layer_dir) / "abac.auto.tfvars"
     gate_path = layer_dir / GATE_FILENAME
     if not tfvars.is_file():
+        if config_dir:
+            raise GateError(f"the staged render {tfvars} is missing")
         print(f"=== Skipping coverage check (data_access:{env_name}): no {tfvars} ===")
         return 0
     flags = console_flags(apply_flags)
-    inputs = query_inputs(runner, env_name, layer_dir, flags)
+    inputs = query_inputs(runner, env_name, layer_dir, flags, config_dir)
 
     print(f"=== Coverage Check (data_access:{env_name}) ===")
     granted = granted_tables(layer_dir)
@@ -539,7 +635,7 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
     try:
         command = [
             sys.executable, str(VALIDATOR), "--coverage-gate", str(tfvars),
-            str(layer_dir / "masking_functions.sql"),
+            str((config_dir or layer_dir) / "masking_functions.sql"),
             "--ddl", str(env_dir / "ddl" / "_fetched.sql"),
             "--exposure-context", str(context),
             "--summary-label", f"coverage check (data_access:{env_name})",
@@ -554,7 +650,7 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
     finally:
         context.unlink(missing_ok=True)
 
-    after = query_inputs(runner, env_name, layer_dir, flags)
+    after = query_inputs(runner, env_name, layer_dir, flags, config_dir)
     if after["fingerprint"] != inputs["fingerprint"]:
         record.update(status="fail", reason="inputs changed while the coverage check ran")
         write_result(gate_path, record)
@@ -564,7 +660,7 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
     if validation.returncode != 0:
         return _failed(gate_path, record, inputs, env_name,
                        "coverage check failed (validate_abac.py --coverage-gate; see the report above)")
-    refreshed_at, detail = live_refresh(env_dir, tfvars)
+    refreshed_at, detail = live_refresh(env_dir, tfvars, staged)
     if refreshed_at is None:
         return _failed(gate_path, record, inputs, env_name, detail)
     print(f"  Live refresh ({detail}) at {refreshed_at}")
@@ -693,6 +789,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--runner", type=Path, default=RUNNER)
     run.add_argument("--apply-flags", default="")
     run.add_argument("--verbose", action="store_true")
+    # Set by scripts/policy_generations.py for a staged phase's re-check.
+    run.add_argument("--layer-config-dir", type=Path, help="gate a staged phase's render instead of the split config")
+    run.add_argument("--stage", default="", help="the staged phase that rendered --layer-config-dir")
+    run.add_argument("--old-fingerprint", default="", help="the active generation the phase keeps live")
+    run.add_argument("--keep-new-tags", action="store_true", help="a switch was attempted (the phase's KEEP_NEW_TAGS)")
     derive = sub.add_parser("needs-derive", help="print the live refresh make must run first: full, ddl or none")
     derive.add_argument("--env-dir", required=True, type=Path)
     derive.add_argument("--apply-flags", default="")
@@ -750,8 +851,10 @@ def main(argv: list[str] | None = None) -> int:
             if reason:
                 print(f"live refresh before exposure ({mode}): {reason}", file=sys.stderr)
             return 0
-        return run_gate(args.env_dir.resolve(), args.env_name, args.runner,
-                        args.apply_flags, args.verbose)
+        staged = ({"stage": args.stage, "old_fingerprint": args.old_fingerprint,
+                   "keep_new_tags": args.keep_new_tags} if args.stage else None)
+        return run_gate(args.env_dir.resolve(), args.env_name, args.runner, args.apply_flags, args.verbose,
+                        args.layer_config_dir.resolve() if args.layer_config_dir else None, staged)
     except GateError as exc:
         print(f"coverage check: ERROR: {exc}", file=sys.stderr)
         return 2

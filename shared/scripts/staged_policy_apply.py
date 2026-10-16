@@ -357,7 +357,10 @@ class Controller:
             return None
         verify_dir = pg.ledger_dir(self.env_dir) / "verify"
         verify_dir.mkdir(parents=True, exist_ok=True)
-        layer_tfvars = self.env_dir / "data_access" / "abac.auto.tfvars"
+        # The applied stage's render (policy_generations.write_stage), else the split config.
+        layer_tfvars = pg.stage_config_dir(self.env_dir) / "abac.auto.tfvars"
+        if not layer_tfvars.is_file():
+            layer_tfvars = self.env_dir / "data_access" / "abac.auto.tfvars"
         tfvars = verify_dir / f"{record['stage']}.abac.auto.tfvars"
         tfvars.write_text(layer_tfvars.read_text())
         _write_subset(tfvars, tags)

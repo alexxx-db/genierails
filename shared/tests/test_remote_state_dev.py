@@ -362,7 +362,9 @@ ALLOWED_STATE_MENTIONS = {
         r'\[ -f "\$\(ENV_DIR\)/\$\(DATA_ACCESS_SUBDIR\)/terraform\.tfstate" \]',
         r'\[ -f "\$\(ENV_DIR\)/terraform\.tfstate" \]',
     ),
-    "shared/scripts/terraform_layer.sh": (r'-backend-config="path=\$STATE_BASE/terraform\.tfstate"',),
+    "shared/scripts/terraform_layer.sh": (r'-backend-config="path=\$STATE_BASE/terraform\.tfstate"',
+                                          # where state mv/rm write Terraform's backup (never read)
+                                          r'"-backup=\$STATE_BASE/terraform\.tfstate\.'),
     "shared/scripts/sticky_governance.py": (r'^STATE = Path\("data_access/terraform\.tfstate"\)$',),  # messages
     "shared/scripts/remap_generated_config.py": (r'help="Destination data_access terraform\.tfstate\."',),
     # The roots read state with file() only from the snapshot terraform_layer.sh

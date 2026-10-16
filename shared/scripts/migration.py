@@ -187,6 +187,12 @@ def deployment(env_dir: Path) -> dict:
             "legacy": bool(masks or tags)}
 
 
+def legacy_fingerprint(policies: list, tags: Mapping) -> str:
+    """The fingerprint of a legacy generation: its masks (sorted by name) and treatment tags."""
+    body = json.dumps({"policies": list(policies), "tags": dict(tags)}, sort_keys=True)
+    return LEGACY_PREFIX + hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
 def legacy_generation(dep: Mapping) -> dict:
     """The legacy deployment as the staged controller's live ("old") generation.
 
@@ -195,9 +201,8 @@ def legacy_generation(dep: Mapping) -> dict:
     of a column still on a legacy value uses the legacy checks.
     """
     policies = [dep["masks"][name] for name in sorted(dep["masks"])]
-    body = json.dumps({"policies": policies, "tags": dep["tags"]}, sort_keys=True)
     return {
-        "fingerprint": LEGACY_PREFIX + hashlib.sha256(body.encode()).hexdigest()[:16],
+        "fingerprint": legacy_fingerprint(policies, dep["tags"]),
         "fgac_policies": policies, "tags": dict(dep["tags"]), "functions_sql": "",
         "settings": {"governance_mode": "legacy"},
         "legacy": {"grants": list(dep["grants"]), "can_run": dict(dep["can_run"]),

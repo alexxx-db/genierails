@@ -83,12 +83,25 @@ def test_switch_retags_and_keeps_retained_generations_until_retire(tmp_path):
 
 def test_write_stage_keeps_row_filters_and_other_tags(tmp_path):
     old = _generation(tmp_path)
-    pg.write_stage(tmp_path / "data_access", pg.render_stage("create", old, None, None))
-    cfg = hcl2.loads((tmp_path / "data_access" / "abac.auto.tfvars").read_text())
+    out = pg.write_stage(tmp_path / "data_access", pg.render_stage("create", old, None, None))
+    assert out == tmp_path / "generated" / ".runtime" / "data_access" == pg.stage_config_dir(tmp_path)
+    cfg = hcl2.loads((out / "abac.auto.tfvars").read_text())
     assert [p["name"] for p in cfg["fgac_policies"]][0] == "rf"
     assert {a["tag_key"] for a in cfg["tag_assignments"]} == {"row_scope"}
-    sql = (tmp_path / "data_access" / "masking_functions.sql").read_text()
+    sql = (out / "masking_functions.sql").read_text()
     assert "USE CATALOG cat;\nUSE SCHEMA sch;" in sql
+
+
+def test_write_stage_never_rewrites_the_split_config(tmp_path):
+    """The split layer files are committed in a legacy or migrating env; a render only reads them."""
+    old = _generation(tmp_path)
+    layer = tmp_path / "data_access"
+    (layer / "masking_functions.sql").write_text("-- committed\n")
+    before = {name: (layer / name).read_bytes() for name in ("abac.auto.tfvars", "masking_functions.sql")}
+    for stage in ("create", "switch"):
+        pg.write_stage(layer, pg.render_stage(stage, old, None, None))
+        assert {name: (layer / name).read_bytes() for name in before} == before
+    assert sorted(p.name for p in layer.iterdir()) == sorted(before)
 
 
 def _change(rtype, index, *actions, address=None):
