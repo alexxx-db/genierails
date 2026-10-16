@@ -2780,18 +2780,29 @@ def load_spec_from_tfvars(
             groups.extend(g.keys())
     groups.extend(_as_list(env_data.get("access_tier_groups")))
     groups.extend(_as_list(env_data.get("raw_exempt_principals")))
+    governance = {**data, **env_data}
+    deterministic = _as_str(governance.get("governance_mode")) == "deterministic"
+    # Deterministic generation exempts the deployer SP (an application ID, not
+    # a group) from every mask. The admin baseline authenticates as that
+    # deployer, so check it as DEFAULT_ADMIN_TIER rather than as a tier group.
+    deployer = _as_str(governance.get("deployer_principal_id")) if deterministic else ""
+    derive_policies = [
+        {**pol, **{key: [DEFAULT_ADMIN_TIER if p == deployer else p
+                         for p in _as_list(pol.get(key))]
+                   for key in ("to_principals", "except_principals")}}
+        for pol in fgac_policies
+    ] if deployer else fgac_policies
     # Also treat any principal referenced by a policy as a known group.
     for pol in fgac_policies:
-        groups.extend(_as_list(pol.get("to_principals")))
-        groups.extend(_as_list(pol.get("except_principals")))
+        for key in ("to_principals", "except_principals"):
+            groups.extend(p for p in _as_list(pol.get(key)) if not deployer or p != deployer)
 
     spec = derive_spec_from_config(
-        fgac_policies, tag_assignments, groups,
+        derive_policies, tag_assignments, groups,
         key_column=key_column, key_column_by_table=key_column_by_table,
     )
     spec.mask_config = {"fgac_policies": fgac_policies, "tag_assignments": tag_assignments}
-    governance = {**data, **env_data}
-    if _as_str(governance.get("governance_mode")) == "deterministic":
+    if deterministic:
         from deterministic_governance import resolve_precedence
         from governance_policies import base_treatment, normalize_column_overrides
         from scripts.custom_masks import custom_treatments, effective_library
