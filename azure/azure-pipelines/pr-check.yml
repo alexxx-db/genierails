@@ -1,14 +1,15 @@
 # GenieRails PR check (azure), Azure DevOps.
 #
-# Stage 2, "PR check", of shared/docs/cicd.md: read-only, on every pull
+# Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull
 # request. Create a pipeline from this file. For Azure Repos, add it to the
 # main branch policy as a required build validation (the pr: block below only
 # applies to GitHub and Bitbucket repos), and set the policy to re-run when
 # main changes, so every open PR re-checks against the latest main.
 #
 #   make check ENV=dev                 always
-#   make check ENV=prod                also, when the PR touches envs/prod/**
-#                                      (it includes make promote-to ENV=prod CHECK=1)
+#   make check ENV=prod                also, when the PR touches envs/prod/** or
+#                                      shared/** (the prod release counts both; it
+#                                      includes make promote-to ENV=prod CHECK=1)
 #
 # make check never writes envs/ and runs no applying target, so it is safe
 # under TF_BUILD and never trips the CI apply guard. Until an env has remote
@@ -49,16 +50,16 @@ steps:
       versionSpec: '3.11'
 
   - script: |
-      pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
+      pip install 'python-hcl2>=7.3.1,<8' 'databricks-sdk==0.150.0' pytest
       curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
       sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
     displayName: Install dependencies and Terraform
 
   - script: |
-      if git diff --name-only "origin/${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}...HEAD" -- envs/prod | grep -q .; then
+      if git diff --name-only "origin/${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}...HEAD" -- envs/prod ../shared | grep -q .; then
         echo "##vso[task.setvariable variable=CHECK_PROD]true"
       fi
-    displayName: Does this PR touch envs/prod?
+    displayName: Does this PR touch envs/prod or shared?
     workingDirectory: azure
 
   # Runtime files only (gitignored). make check copies them into its scratch

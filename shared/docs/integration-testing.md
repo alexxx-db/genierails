@@ -1,7 +1,7 @@
 # Integration Testing
 
 This guide covers the automated integration test scenarios that validate the
-playbooks documented in `docs/playbook.md`, the `setup_test_data.py` helper, and the
+legacy-mode flows (the retired legacy playbook; see [legacy-mode.md](legacy-mode.md)), the `setup_test_data.py` helper, and the
 `run_integration_tests.py` test runner.
 
 ---
@@ -318,7 +318,7 @@ This deletes cloud-specific resources, the workspace, metastore (and all catalog
 
 `scripts/run_integration_tests.py` runs 19 live scenarios end-to-end (data setup, generation/apply, assertions, teardown), each isolated. These exercise **topology, import, and promotion** mechanics; most predate the dev-to-prod invariants and do not by themselves prove native classification / coverage check / coverage-checked exposure / derive-assignments — the dev-to-prod **regression suite** above covers those deterministically, and **champion** exercises them live. (In the dev-to-prod walkthrough, prod enforcement is `derive-assignments` with no LLM, not re-generation.)
 
-| Scenario | playbook.md section | What it validates |
+| Scenario | Legacy playbook section | What it validates |
 |---|---|---|
 | **quickstart** | § 1 | Single Genie agent backed by a single UC catalog (`dev_fin`) |
 | **multi-catalog** | § 1 (multi-catalog) | One Genie agent drawing tables from two catalogs (`dev_fin` + `dev_clinical`) |
@@ -441,7 +441,7 @@ python scripts/run_integration_tests.py --auth-file envs/dev/auth.auto.tfvars
 
 ### 1. quickstart — Single space, single catalog
 
-Validates the core quickstart from docs/playbook.md § 1 with a single Genie
+Validates the core quickstart from the legacy playbook § 1 with a single Genie
 Space backed by `dev_fin`.
 
 **Steps:**
@@ -468,7 +468,7 @@ Space backed by `dev_fin`.
 
 ### 2. multi-catalog — One space spanning two catalogs
 
-Validates the "single space spanning multiple catalogs" pattern from playbook.md § 1.
+Validates the "single space spanning multiple catalogs" pattern from the legacy playbook § 1.
 One space ("Combined Analytics") draws tables from both `dev_fin` and `dev_clinical`.
 
 **Key assertions:**
@@ -480,7 +480,7 @@ One space ("Combined Analytics") draws tables from both `dev_fin` and `dev_clini
 
 ### 3. multi-space — Two spaces, separate catalogs
 
-Validates the two-space multi-catalog flow from playbook.md § 1. Finance Analytics
+Validates the two-space multi-catalog flow from the legacy playbook § 1. Finance Analytics
 uses `dev_fin`; Clinical Analytics uses `dev_clinical`. This is the core of the
 original `make integration-test` flow.
 
@@ -494,7 +494,7 @@ original `make integration-test` flow.
 
 ### 4. per-space — Incremental space addition (isolation test)
 
-Validates the per-space generation isolation guarantee from playbook.md § 4.
+Validates the per-space generation isolation guarantee from the legacy playbook § 4.
 
 **Phase 1:** Deploy Finance Analytics only.
 
@@ -513,7 +513,7 @@ without triggering a full LLM re-run over Finance Analytics.
 
 ### 5. promote — dev → prod cross-env promotion
 
-Validates the full dev → prod promotion from playbook.md § 5.
+Validates the full dev → prod promotion from the legacy playbook § 5.
 
 **Catalog mapping:** `dev_fin → prod_fin`, `dev_clinical → prod_clinical`
 
@@ -539,7 +539,7 @@ Validates the full dev → prod promotion from playbook.md § 5.
 
 ### 6. multi-env — Two independent envs (BU scenario)
 
-Validates the independent second environment from playbook.md § 6.
+Validates the independent second environment from the legacy playbook § 6.
 
 - `dev` env: Finance Analytics backed by `dev_fin`
 - `bu2` env: Clinical Analytics backed by `dev_clinical`
@@ -557,7 +557,7 @@ Validates the independent second environment from playbook.md § 6.
 
 ### 7. attach-promote — Attach to UI-created space and promote to prod
 
-Validates the "Import an existing Genie agent" flow from playbook.md § 3, combined
+Validates the "Import an existing Genie agent" flow from the legacy playbook § 3, combined
 with a dev → prod promotion. This is the adoption story: a data team already built a
 Genie agent in the Databricks UI and now wants to bring it under ABAC governance.
 
@@ -572,7 +572,7 @@ data team built in the UI before this tool was adopted.
 `env.auto.tfvars` is configured with `genie_space_id` **and** explicit `uc_tables`. The
 Genie API's `serialized_space` field is not immediately available for newly-created spaces
 (async processing, can take several minutes), so the test provides the table list directly
-rather than relying on auto-discovery. This simulates the playbook.md manual step: the user
+rather than relying on auto-discovery. This simulates the legacy playbook's manual step: the user
 runs `make generate` (which logs discovered tables), then copies them into
 `data_access/env.auto.tfvars`.
 
@@ -600,7 +600,7 @@ by `make apply ENV=prod` applies the same governance to prod.
 | 3 | Configure `dev` env: `genie_space_id = "<id>"`, no `uc_tables` |
 | 4 | `make generate ENV=dev` — discovers tables from Genie API, generates ABAC |
 | 5 | Assert generated config references `dev_fin` catalog and `Finance Analytics` |
-| 6 | Update `env.auto.tfvars` with discovered `uc_tables` (simulating playbook.md manual step) |
+| 6 | Update `env.auto.tfvars` with discovered `uc_tables` (simulating the legacy playbook's manual step) |
 | 7 | `make apply ENV=dev` — applies ABAC; no new space created |
 | 8 | Assert **no** `.genie_space_id_*` file was created (space not created by Terraform) |
 | 9 | `setup_test_data.py --verify` — row counts, column tags, masks |
@@ -620,7 +620,7 @@ by `make apply ENV=prod` applies the same governance to prod.
 
 ### 8. self-service-genie — Central governance + BU teams self-serve Genie
 
-Validates the self-service Genie pattern from playbook.md § 7 and [self-service-genie.md](self-service-genie.md).
+Validates the self-service Genie pattern from the legacy playbook § 7 ([legacy mode](legacy-mode.md#legacy-commands)).
 
 **Phase 1 — Governance team:**
 
@@ -675,7 +675,7 @@ A `bu_clin` env is set up with a Clinical Analytics space. `make generate MODE=g
 
 ### 9. abac-only — ABAC governance only (no Genie agent) + upgrade path
 
-Validates the "ABAC governance only" flow from playbook.md § 2 and the § 2 → § 4 upgrade path.
+Validates the "ABAC governance only" flow from the legacy playbook § 2 and the § 2 → § 4 upgrade path.
 
 **Phase 1 — ABAC-only deploy:**
 
@@ -699,7 +699,7 @@ A `genie_spaces` block is added to `env.auto.tfvars` and `make generate SPACE="F
 
 ### 10. multi-space-import — Import two UI-created Genie agents at once
 
-Validates the multi-space import pattern from playbook.md § 3.
+Validates the multi-space import pattern from the legacy playbook § 3.
 
 Two Genie agents are created directly via the Genie REST API (simulating spaces built in the Databricks UI). The `env.auto.tfvars` is configured with two `genie_space_id` entries. `make generate` imports both spaces' configs (a supported subset) from the API and generates shared ABAC governance. `make apply` attaches to both spaces (applies governance and ACLs) without creating any new spaces.
 
@@ -847,7 +847,7 @@ python scripts/setup_test_data.py --auth-file envs/dev/auth.auto.tfvars \
 ## Legacy: `make integration-test`
 
 The original monolithic integration test is still available. It combines the
-multi-space and promote scenarios (playbook.md § 1 + § 5) into a single pipeline without isolation:
+multi-space and promote scenarios (legacy playbook § 1 + § 5) into a single pipeline without isolation:
 
 ```bash
 # Full run — destroys everything at the end

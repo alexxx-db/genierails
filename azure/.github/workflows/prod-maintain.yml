@@ -1,6 +1,6 @@
 name: GenieRails prod maintain (azure)
 
-# Stage 5, "Keep protected", of shared/docs/cicd.md: on a schedule. Copy to
+# Stage 5, "Keep protected", of shared/docs/pipelines.md: on a schedule. Copy to
 # .github/workflows/ at the repository root.
 #
 #   make maintain ENV=prod     at the last released commit
@@ -17,10 +17,12 @@ name: GenieRails prod maintain (azure)
 # tag assignments are stale; GitHub's failed-run notification alerts the
 # owning team.
 #
-# Auth: OIDC workload identity federation, no PATs or secrets. The
-# "production-maintain" environment (deploys only from main, no reviewer, so
-# the schedule isn't held for approval) holds the prod read-only service
-# principal's IDs as variables; that SP also needs CAN_USE on a SQL warehouse:
+# Auth: OIDC workload identity federation, no PATs or secrets. The job runs
+# in the "production-maintain" environment (deploys only from main, no
+# reviewer, so the schedule isn't held for approval): the prod read-only
+# service principal trusts its OIDC subject. The environment holds no
+# variables. That SP also needs CAN_USE on a SQL warehouse.
+# Repository variables (IDs, not credentials):
 #   DATABRICKS_ACCOUNT_ID  PROD_READONLY_CLIENT_ID
 #   PROD_DATABRICKS_WORKSPACE_ID  PROD_DATABRICKS_WORKSPACE_HOST
 
@@ -65,7 +67,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk
+        run: pip install 'python-hcl2>=7.3.1,<8' 'databricks-sdk==0.150.0'
 
       - name: Write OIDC auth file (IDs only, no secrets)
         env:

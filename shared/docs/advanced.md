@@ -64,7 +64,7 @@ make generate GENERATE_ARGS='--create-groups'
 
 ## ABAC-Only Mode (No Genie agent)
 
-See [playbook.md — ABAC governance only](playbook.md#abac-governance-only-no-genie-agent) for the full step-by-step.
+See [govern tables only](playbooks/governance.md#govern-tables-only) for the full step-by-step.
 
 ## Existing Masking Functions
 
@@ -77,7 +77,7 @@ If you have pre-existing masking SQL UDFs, the tool can incorporate them:
 
 ## Multi-Environment File Layout
 
-For day-to-day workflows (promote, independent BU, self-service Genie) see [playbook.md](playbook.md). This section documents the directory structure those workflows produce.
+For day-to-day workflows see the [agents](playbooks/agents.md), [governance](playbooks/governance.md) and [one team](playbooks/one-team.md) playbooks. This section documents the directory structure those workflows produce.
 
 Workspace environment names can be anything: `dev`, `staging`, `prod`, `bu2`, or something business-unit-specific. `account` and `data_access` are reserved names.
 
@@ -128,7 +128,7 @@ make generate ENV=bu2
 
 Review and commit the result. CI runs `make check ENV=bu2`; after approval the
 deployment machine runs `make rehearse ENV=bu2`, which applies and verifies it.
-`make release` is only for envs filled by `make promote-to`. See [CI/CD](cicd.md).
+`make release` is only for envs filled by `make promote-to`. See [Pipelines](pipelines.md).
 
 ## Migrating an Existing Root-Based Workspace
 

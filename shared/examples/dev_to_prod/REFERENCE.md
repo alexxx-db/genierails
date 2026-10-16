@@ -118,7 +118,7 @@ validation, unit tests, coverage checks, and audits. The
 GenieRails' own throwaway integration-test jobs; never set it on a deployment
 job. Run `make release ENV=prod` from the persistent deployment workspace.
 `make check` and `make promote-to CHECK=1` are read-only and run in CI; see
-[CI/CD](../../docs/cicd.md#pipeline-samples-where-each-command-runs) for the
+[Pipelines](../../docs/pipelines.md#pipeline-samples-where-each-command-runs) for the
 pipeline samples.
 
 ---

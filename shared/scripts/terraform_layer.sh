@@ -92,7 +92,7 @@ cd "$ROOT_DIR"
 
 # env_dir and the state snapshots (workspace_state_file, data_access_state_file)
 # say where the roots read Terraform state; only this runner sets them, after
-# every caller argument. A caller assignment to one (-var in either form, a
+# every caller option. A caller assignment to one (-var in either form, a
 # -var-file, the env's tfvars, TF_CLI_ARGS*) refuses here, before Terraform.
 case "$COMMAND" in
   plan|apply|destroy|import|console|print-cmd)
@@ -327,10 +327,29 @@ if [ "$LAYER" != "account" ] && [ "$USE_STATE_LAYOUT" = 1 ]; then
   esac
 fi
 
+# Terraform reads options only before a command's positional arguments
+# (import: ADDR ID), so the runner's variables go after the caller's options
+# and before those, with a "--" ending the options.
+_split_caller_args() {
+  local positionals=0
+  case "$1" in import) positionals=2 ;; esac
+  shift
+  CALLER_OPTIONS=("$@")
+  CALLER_POSITIONALS=()
+  if [ "$positionals" -gt 0 ] && [ "$#" -ge "$positionals" ]; then
+    local split=$(($# - positionals))
+    if [ "$split" -gt 0 ] && [ "${CALLER_OPTIONS[$((split - 1))]}" = "--" ]; then split=$((split - 1)); fi
+    CALLER_POSITIONALS=("${CALLER_OPTIONS[@]:$split}")
+    CALLER_OPTIONS=("${CALLER_OPTIONS[@]:0:$split}")
+  fi
+}
+
 case "$COMMAND" in
   plan|apply|destroy|import|console)
-    # The runner's own variables last, so no earlier value can win.
-    CMD=(terraform "$COMMAND" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} "$@" ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"})
+    _split_caller_args "$COMMAND" "$@"
+    # The runner's own variables last among the options, so no earlier value can win.
+    CMD=(terraform "$COMMAND" ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} ${CALLER_OPTIONS[@]+"${CALLER_OPTIONS[@]}"}
+      ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"} ${CALLER_POSITIONALS[@]+"${CALLER_POSITIONALS[@]}"})
     ;;
   show)
     CMD=(terraform show "$@")
@@ -361,8 +380,11 @@ case "$COMMAND" in
     ;;
   print-cmd)
     printf 'terraform %s (in %s, TF_DATA_DIR=%s)' "$1" "$ROOT_DIR" "$TF_DATA_DIR"
+    print_command="${1:-}"
     shift || true
-    for arg in ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} "$@" ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"}; do
+    _split_caller_args "$print_command" "$@"
+    for arg in ${VAR_ARGS[@]+"${VAR_ARGS[@]}"} ${CALLER_OPTIONS[@]+"${CALLER_OPTIONS[@]}"} \
+      ${RUNNER_VARS[@]+"${RUNNER_VARS[@]}"} ${CALLER_POSITIONALS[@]+"${CALLER_POSITIONALS[@]}"}; do
       printf ' %q' "$arg"
     done
     printf '\n'

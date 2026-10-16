@@ -244,6 +244,28 @@ def test_record_mode_changes_nothing_live_or_in_state(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("mode", ["record", "import"])
+def test_an_import_already_in_state_is_skipped(tmp_path, mode):
+    # The runner's alias is state-list; "state list" is refused (and the
+    # refusal, behind 2>/dev/null, read as "not in state").
+    data_access = _layer(tmp_path, DETERMINISTIC)
+    fake = fake_uc.install(tmp_path, LIVE)
+    (data_access / "terraform.tfstate").write_text(json.dumps({"version": 4, "resources": [
+        {"module": "module.data_access", "mode": "managed", "type": "databricks_entity_tag_assignment",
+         "name": "assignments", "instances": [{"index_key": "tables|cat.sch.tbl|owner|fin",
+                                               "attributes": {"id": "tables,cat.sch.tbl,owner"}}]}]}))
+    record = tmp_path / "imports.jsonl"
+    args = [f"--record={record}"] if mode == "record" else []
+    result = _run(data_access, fake | {"LAYER_ENV_DIR": str(data_access)}, "--skip-treatment-tags", *args)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert TAG_IMPORT not in [argv[3] for argv in fake_uc.runner_imports(fake)]
+    assert {e["argv"][2] for e in fake_uc.events(fake) if e["src"] == "runner"} <= {"state-list", "import"}
+    if mode == "record":
+        assert [json.loads(line)["kind"] for line in record.read_text().splitlines()] == ["cleanup"]
+    else:
+        assert f"Already in state: {TAG_IMPORT}" in result.stdout
+
+
 def test_record_mode_refuses_what_it_cannot_verify(tmp_path):
     abac = ('fgac_policies = [{ name = "mask", catalog = "cat", policy_type = "POLICY_TYPE_COLUMN_MASK" }]\n')
     data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n', abac)

@@ -1,13 +1,14 @@
 name: GenieRails PR check (azure)
 
-# Stage 2, "PR check", of shared/docs/cicd.md: read-only, on every pull request.
+# Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull request.
 # Copy this file to .github/workflows/ at the repository root. On main, make
 # this job a required status check and require branches to be up to date
 # before merging, so every open PR re-runs against the latest main.
 #
 #   make check ENV=dev                 always
-#   make check ENV=prod                also, when the PR touches envs/prod/**
-#                                      (it includes make promote-to ENV=prod CHECK=1)
+#   make check ENV=prod                also, when the PR touches envs/prod/** or
+#                                      shared/** (the prod release counts both; it
+#                                      includes make promote-to ENV=prod CHECK=1)
 #
 # make check never writes envs/ and runs no applying target, so it is safe
 # under CI=true and never trips the CI apply guard. Until an env has remote
@@ -55,16 +56,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install 'python-hcl2>=7.3.1,<8' databricks-sdk pytest
+        run: pip install 'python-hcl2>=7.3.1,<8' 'databricks-sdk==0.150.0' pytest
 
-      - uses: hashicorp/setup-terraform@v3
+      # Pinned by commit (v3.1.2), with the Terraform the repository's CI tests.
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
+          terraform_version: "1.11.4"
           terraform_wrapper: false
 
-      - name: Does this PR touch envs/prod?
+      - name: Does this PR touch envs/prod or shared?
         id: scope
         run: |
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- envs/prod | grep -q .; then
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- envs/prod ../shared | grep -q .; then
             echo "prod=true" >> "$GITHUB_OUTPUT"
           fi
 

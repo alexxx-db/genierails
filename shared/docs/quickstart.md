@@ -132,8 +132,8 @@ Each entry in `genie_spaces` operates in one of two modes based on whether `geni
 
 ## What's next?
 
-- [Promote dev → prod](playbook.md#promote-dev--prod) — replicate governance to production with catalog remapping
-- [Add another Genie agent](playbook.md#add-another-genie-agent) — incremental generation without touching existing agents
-- [Country & industry overlays](playbook.md#country-and-industry-overlays) — region-specific or industry-specific governance
-- [Advanced scenarios](playbook.md#advanced-scenarios) — ABAC-only, self-service Genie, independent BU environments
-- [Version control your configs](version-control.md) — what to commit, version pinning, running Terraform directly
+- [Agents playbook](playbooks/agents.md) — add, update, promote and remove agents
+- [Governance playbook](playbooks/governance.md) — masks, classes, tiers, who can read each table; governing tables with no agents
+- [One team doing both](playbooks/one-team.md) — agent and governance changes in one PR
+- [Pipelines](pipelines.md) — what to commit, CODEOWNERS, CI
+- [Advanced](advanced.md#independent-environments) — independent BU environments
