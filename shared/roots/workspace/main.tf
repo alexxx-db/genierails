@@ -69,6 +69,7 @@ locals {
   # policy generation must NOT cause a Genie agent to be created.
   effective_spaces = length(var.genie_spaces) > 0 ? var.genie_spaces : (
     var.genie_space_title != "" || var.genie_space_id != "" ? [{
+      key              = ""
       name             = local.legacy_space_name
       genie_space_id   = var.genie_space_id
       sql_warehouse_id = var.sql_warehouse_id
@@ -104,8 +105,10 @@ locals {
   }
 
   # ── Merged space map passed to the workspace module ───────────────────────
-  # Agent files can carry an explicit immutable key (used by the inline-to-file
-  # migration to preserve resource addresses). Otherwise the internal Terraform
+  # An agent file's entry always carries its key, resolved by agent_files.py
+  # (explicit, else the file name; see agent_files._resolve_keys), so this map
+  # and every script (ID files, receipts, acks) use the same key. Otherwise
+  # (inline entries) the internal Terraform
   # for_each key is derived by sanitizing the human-readable name: lowercase,
   # collapse non-alphanumeric runs into underscores, strip edge underscores.
   # e.g. "Finance & HR Analytics" -> "finance_hr_analytics"
