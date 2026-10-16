@@ -211,5 +211,10 @@ def sql_body(version: str, sql_type: str) -> str:
     if not body_name or body_name not in SQL_BODIES:
         return ("CASE WHEN value IS NULL THEN CAST(NULL AS STRING) ELSE '[REDACTED]' END"
                 if family == "STRING" else f"CAST(NULL AS {sql_type})")
-    cast = "TRY_CAST" if family == "NUMERIC" else "CAST"
-    return f"{cast}(({SQL_BODIES[body_name]}) AS {sql_type})"
+    return typed_body(SQL_BODIES[body_name], sql_type)
+
+
+def typed_body(expression: str, sql_type: str) -> str:
+    """A mask expression with the library's outer cast to exactly ``sql_type``."""
+    cast = "TRY_CAST" if type_family(sql_type) == "NUMERIC" else "CAST"
+    return f"{cast}(({expression}) AS {sql_type})"

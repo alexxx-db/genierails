@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.script_stubs import without_ci
+
 ROOT = Path(__file__).resolve().parents[2]
 SHARED = ROOT / "shared"
 SCRIPT = SHARED / "scripts" / "sync_tag_policies.py"
@@ -95,7 +97,7 @@ class Repo:
         self.writes = tmp_path / "writes.log"
         self.writes.write_text("")
         self.env = {
-            **{k: v for k, v in os.environ.items() if k not in {"CI", "MAKEFLAGS", "MAKELEVEL", "TAG_SYNC_MODE"}},
+            **{k: v for k, v in without_ci(os.environ).items() if k not in {"MAKEFLAGS", "MAKELEVEL", "TAG_SYNC_MODE"}},
             "PYTHONPATH": str(sdk), "PIP_NO_INDEX": "1",
             "FAKE_TAGS_STATE": str(self.state), "FAKE_TAGS_WRITES": str(self.writes),
             "FAKE_LOCK_PATH": str(self.lock), "FAKE_RUNNER_LOG": str(tmp_path / "runner.log"),

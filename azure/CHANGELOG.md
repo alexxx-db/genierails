@@ -16,6 +16,21 @@
   and need `ai_helper_endpoint` in `envs/dev/env.auto.tfvars`. Fixture inputs
   must be typed literals. Nothing reads `drafts/`: committing a draft changes no
   rehearse fingerprint and no `make check` result.
+- **Adopting a custom mask** (design 18.4.1): `make adopt-custom-mask ENV=dev
+  TREATMENT=custom_<name>` copies a draft that `make test-custom-mask` passed
+  into the governance-owned `envs/dev/custom_masks/custom_<name>.json` and
+  prints the `tag_treatments` line to add; it calls no model and refuses in
+  CI (no opt-out), outside the real `envs/dev`, without the `custom_` prefix,
+  without a pass record matching the draft, when the offline rules fail, or
+  when a never-raw class maps to it. `generate`, `validate`,
+  `scaffold-treatments` and `verify-access` treat an adopted mask like a
+  library treatment (its full version is always the library's redaction);
+  `validate` and `make check` refuse a file whose `tested_sha256` no longer
+  matches; rehearse and release re-run its cases on the env's warehouse;
+  changing which custom SQL a partial tier sees needs a `weaken`
+  acknowledgement (`custom_mask_changed`); `make promote-to` copies
+  `custom_masks/` as governance files. Draft names now need the `custom_`
+  prefix. Envs without `custom_masks/` are unchanged.
 - **Persona file ownership** (design 18.1): agent settings live only in
   `envs/<env>/agents/` files and every reader merges them (`generate`, the
   Genie ACL sidecar, `promote`), so an env with its agents in files promotes;

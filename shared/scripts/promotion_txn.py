@@ -131,7 +131,7 @@ def owner(env_relative: str) -> str | None:
         return AGENT
     if env_relative in _LAYER_FILES:
         return LAYER
-    if env_relative in ("env.auto.tfvars", "ack.txt") or parts[0] == "generated":
+    if env_relative in ("env.auto.tfvars", "ack.txt") or parts[0] in ("generated", "custom_masks"):
         return GOVERNANCE
     return LAYER
 

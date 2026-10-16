@@ -217,7 +217,9 @@ def _layer(tmp_path, target, env_text):
     runner = tmp_path / "runner.sh"
     runner.write_text("#!/bin/sh\necho RUNNER-CALLED; exit 7\n")
     runner.chmod(0o755)
-    environ = {k: v for k, v in os.environ.items() if k not in {"CI", "MAKEFLAGS", "MAKELEVEL"}}
+    from tests.script_stubs import without_ci
+
+    environ = {k: v for k, v in without_ci(os.environ).items() if k not in {"MAKEFLAGS", "MAKELEVEL"}}
     return subprocess.run(
         ["make", "-f", str(ROOT / "aws" / "Makefile"), target, "LAYER=workspace", "TARGET_ENV=dev",
          f"LAYER_ENV_DIR={env_dir}", f"ROOT_RUNNER={runner}", f"SHARED_ROOT={ROOT / 'shared'}"],

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.script_stubs import without_ci
+
 from tests import script_stubs
 
 SHARED = Path(__file__).resolve().parents[1]
@@ -152,7 +154,7 @@ def test_a_relative_spec_resolves_from_shared_like_verify_access(tmp_path, monke
 # ── make release: refuse before the lock; re-check before apply ─────────────
 
 def _clean_env():
-    return {k: v for k, v in os.environ.items()
+    return {k: v for k, v in without_ci(os.environ).items()
             if k not in ("GNUMAKEFLAGS", "MAKEFLAGS", "MAKELEVEL", "VERIFY_KEY_COLUMN", "VERIFY_SPEC")}
 
 

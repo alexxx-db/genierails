@@ -3,7 +3,7 @@
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
 
-.PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask
+.PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask adopt-custom-mask
 
 # ── Variables expected from the including Makefile ──────────────
 # SHARED_ROOT  — absolute path to shared/
@@ -581,6 +581,15 @@ draft-custom-mask: _guard-workspace-target ## [AI helper] Draft a custom mask an
 test-custom-mask: _guard-workspace-target ## Run the mask library's exact-output checks on a drafted custom mask (dev SQL warehouse, read-only): TREATMENT=<name>
 	@$(_DRY_RUN_GUARD); $(_AI_HELPERS) test-custom-mask $(_AI_HELPER_ARGS) --treatment "$(strip $(TREATMENT))"
 
+# Adopting a custom mask (scripts/custom_masks.py, design 18.4.1) calls no model:
+# it copies a draft test-custom-mask passed into envs/dev/custom_masks/ (governance
+# config, reviewed in a PR) and prints the tag_treatments line to add. Same
+# guards as the AI helpers: never in CI (no opt-out), only ENV=dev at this
+# checkout's real envs/dev. FORCE=1 replaces an adopted type family.
+override _CUSTOM_MASKS = python3 "$(SHARED_ROOT)/scripts/custom_masks.py"
+adopt-custom-mask: _guard-workspace-target ## Adopt a custom mask test-custom-mask passed into envs/dev/custom_masks/ (no model; prints the tag_treatments line): TREATMENT=custom_<name>
+	@$(_DRY_RUN_GUARD); $(_CUSTOM_MASKS) adopt-custom-mask $(_AI_HELPER_ARGS) --treatment "$(strip $(TREATMENT))"
+
 derive-assignments: _guarded-bootstrap _guard-workspace-target ## Re-derive only tag_assignments from live native class.* tags (requires prior promote; never calls an LLM)
 	@echo "=== Derive Assignments ($(ENV)) ==="
 	@$(_COVERAGE_GATE) invalidate --env-dir "$(ENV_DIR)"
@@ -768,6 +777,9 @@ override _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)
 # Live checks the release targets run (overridable so tests never reach Databricks).
 override _EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
 override _CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
+# Every adopted custom mask's cases, read-only on the env's SQL warehouse (no-op without
+# custom_masks/). rehearse, release-plan and release MANIFEST= run it before the env lock.
+override _CUSTOM_MASK_CASES = python3 "$(SHARED_ROOT)/scripts/custom_masks.py" live-check --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
@@ -834,6 +846,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
+		$(_CUSTOM_MASK_CASES) || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
 		gate=0; $(_RELEASE_GATE) rehearse-start --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || gate=$$?; \
 		if [ $$gate -eq 10 ]; then exit 0; elif [ $$gate -ne 0 ]; then exit $$gate; fi; \
@@ -1011,6 +1024,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	prov="$$(mktemp)"; \
 	$(_RELEASE_GATE) provenance --env-dir "$(ENV_DIR)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
+	$(_CUSTOM_MASK_CASES) || exit 1; \
 	$(_CLASSIFICATION_CHECK) --mode deterministic --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
@@ -1127,6 +1141,7 @@ _release-manifest: _guard-not-ci-apply
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
+	$(_CUSTOM_MASK_CASES) || exit 1; \
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
@@ -1375,6 +1390,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
 	$(call _PROMOTION_TXN_BEGIN,"$$dest_dir" "$(ACCOUNT_ENV_DIR)"); \
 	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
+	python3 "$(SHARED_ROOT)/scripts/custom_masks.py" promote --source-dir "$$src_dir" --dest-dir "$$dest_dir" || exit 1; \
 	$(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
 		DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" write --source "$$src_dir/generated/abac.auto.tfvars" \
