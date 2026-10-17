@@ -1161,6 +1161,64 @@ class TestLiveGuard:
             )
         assert exc.value is original
 
+    def test_real_preflight_method_reraises_nontransient_query_error(self, monkeypatch):
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        verifier = EffectiveAccessVerifier(
+            {"host": "h", "client_id": "c", "client_secret": "s"},
+            warehouse_id="warehouse-123",
+        )
+        principal = VerificationPrincipal("viewer", "test", "app", "secret")
+        monkeypatch.setattr(verifier, "_ws_for", lambda _principal: object())
+        monkeypatch.setattr(
+            verifier, "run_query",
+            lambda _ws, _sql: (_ for _ in ()).throw(RuntimeError("invalid credentials")),
+        )
+        with pytest.raises(
+            RuntimeError, match="^test principal not query-capable: invalid credentials$",
+        ):
+            verifier.assert_query_capable(principal)
+
+    def test_real_preflight_retries_transient_entitlement_propagation(self, monkeypatch):
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        verifier = EffectiveAccessVerifier(
+            {"host": "h", "client_id": "c", "client_secret": "s"},
+            warehouse_id="warehouse-123",
+        )
+        attempts = []
+        monkeypatch.setattr(verifier, "_ws_for", lambda _principal: object())
+
+        def query(_ws, sql):
+            attempts.append(sql)
+            if len(attempts) < 3:
+                raise RuntimeError(
+                    "This API is disabled for users without the databricks-sql-access "
+                    "or workspace-consume entitlements")
+            return [[1]]
+
+        monkeypatch.setattr(verifier, "run_query", query)
+        monkeypatch.setattr("verify_effective_access.time.sleep", lambda _seconds: None)
+        verifier.assert_query_capable(
+            VerificationPrincipal("viewer", "test", "app", "secret"))
+        assert attempts == ["SELECT 1", "SELECT 1", "SELECT 1"]
+
+    def test_real_preflight_fails_when_transient_retry_cap_is_exhausted(self, monkeypatch):
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        verifier = EffectiveAccessVerifier(
+            {"host": "h", "client_id": "c", "client_secret": "s"},
+            warehouse_id="warehouse-123",
+        )
+        clock = iter((0.0, 121.0))
+        monkeypatch.setattr(verifier, "_ws_for", lambda _principal: object())
+        monkeypatch.setattr("verify_effective_access.time.monotonic", lambda: next(clock))
+        monkeypatch.setattr(
+            verifier, "run_query",
+            lambda _ws, _sql: (_ for _ in ()).throw(
+                RuntimeError("user does not have permission to use warehouse")),
+        )
+        with pytest.raises(RuntimeError, match="^test principal not query-capable:"):
+            verifier.assert_query_capable(
+                VerificationPrincipal("viewer", "test", "app", "secret"))
+
     def test_verifier_does_not_pick_an_arbitrary_workspace_warehouse(self, monkeypatch):
         monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
         verifier = EffectiveAccessVerifier(
@@ -1213,12 +1271,13 @@ class TestTemporaryWarehouseAccess:
         verifier = self._verifier(monkeypatch, object())
         verifier._admin_ws.service_principals = service_principals
         principal = VerificationPrincipal(
-            tier, f"test-{tier}", f"app-{tier}", "secret", f"id-{tier}")
+            tier, f"test-{tier}", f"app-{tier}", "secret",
+            f"account-id-{tier}", f"workspace-id-{tier}")
 
         verifier.grant_query_entitlement(principal)
 
         call = service_principals.patch.call_args
-        assert call.args[0] == f"id-{tier}"
+        assert call.args[0] == f"workspace-id-{tier}"
         operation = call.kwargs["operations"][0]
         assert operation.path == "entitlements"
         assert operation.value == [{"value": "workspace-consume"}]
@@ -1312,8 +1371,9 @@ class TestTemporaryWarehouseAccess:
             ),
             workspace_assignment=SimpleNamespace(update=Mock()),
         )
+        workspace_sp = SimpleNamespace(id="workspace-456", application_id="app-123")
         workspace = SimpleNamespace(
-            service_principals=SimpleNamespace(list=lambda **_: [sp]),
+            service_principals=SimpleNamespace(list=lambda **_: [workspace_sp]),
         )
         verifier._account = account
         verifier._admin_ws = workspace
@@ -1326,6 +1386,7 @@ class TestTemporaryWarehouseAccess:
         assert call["principal_id"] == 456
         assert call["permissions"][0].value == "USER"
         assert principal.application_id == "app-123"
+        assert principal.workspace_sp_id == "workspace-456"
         create_sp.assert_not_called()
         assert group_filters == [
             f"displayName eq {__import__('json').dumps(membership, ensure_ascii=False)}"]
@@ -1518,6 +1579,10 @@ class TestTieredLiveGrantLifecycle:
 
         monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
         monkeypatch.setenv("GENIERAILS_VERIFY_PROPAGATION_SLEEP", "0")
+        monkeypatch.setattr(
+            "verify_effective_access.time.sleep",
+            lambda seconds: log.append(("propagation-wait", seconds)),
+        )
         monkeypatch.setattr("verify_effective_access.load_auth", lambda path: {
             "client_id": "admin", "client_secret": "secret"})
         monkeypatch.setattr("verify_effective_access.EffectiveAccessVerifier", FakeVerifier)
@@ -1554,6 +1619,7 @@ class TestTieredLiveGrantLifecycle:
         for tier in ("raw_group", "analyst", "viewer", OUT_OF_TIER_PRINCIPAL):
             assert ("entitlement", tier) in log
             assert ("preflight", tier) in log
+            assert log.index(("propagation-wait", 0)) < log.index(("preflight", tier))
 
     def test_preflight_query_failure_is_clear_and_cleans_up(self, monkeypatch, tmp_path):
         deleted = []

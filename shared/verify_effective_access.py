@@ -66,6 +66,12 @@ LIVE_ENV_FLAG = "GENIERAILS_LIVE_VERIFY"
 SAMPLE_ROWS = 25
 SAMPLE_SALT_ENV = "GENIERAILS_VERIFY_SAMPLE_SALT"
 
+# Workspace assignment, entitlements and warehouse ACLs are eventually
+# consistent. The pre-flight retries only errors known to represent those
+# grants not being visible yet, and remains bounded/fail-closed.
+QUERY_PREFLIGHT_TIMEOUT_SECONDS = 120.0
+QUERY_PREFLIGHT_BACKOFF_SECONDS = 2.0
+
 # A per-mask "unmasked" comparison principal that is a workspace/metastore
 # admin sees raw values for everything; use it as the ground-truth tier when a
 # policy masks a column for a *specific* business group (the admin is not a
@@ -1876,10 +1882,25 @@ class EffectiveAccessVerifier:
     def assert_query_capable(self, principal: TestPrincipal) -> None:
         """Fail setup clearly unless a provisioned principal can execute SQL."""
         self._guard()
-        try:
-            self.run_query(self._ws_for(principal), "SELECT 1")
-        except Exception as exc:
-            raise RuntimeError(f"test principal not query-capable: {exc}") from exc
+        deadline = time.monotonic() + QUERY_PREFLIGHT_TIMEOUT_SECONDS
+        while True:
+            try:
+                self.run_query(self._ws_for(principal), "SELECT 1")
+                return
+            except Exception as exc:
+                reason = str(exc)
+                normalized = reason.lower()
+                transient = any(marker in normalized for marker in (
+                    "this api is disabled for users without the databricks-sql-access "
+                    "or workspace-consume entitlements",
+                    "does not have permission to use warehouse",
+                    "does not have can use permission",
+                ))
+                if not transient or time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"test principal not query-capable: {reason}") from exc
+                time.sleep(min(QUERY_PREFLIGHT_BACKOFF_SECONDS,
+                               max(0.0, deadline - time.monotonic())))
 
     def grant_outsider_table_access(
         self, principal: TestPrincipal, tables: Sequence[str], *, revoke: bool = False,
