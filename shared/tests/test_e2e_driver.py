@@ -596,6 +596,144 @@ def test_live_policy_mask_function_definition_change_is_weaker():
     ]}
 
 
+@pytest.mark.parametrize("field", ["when_condition", "match_columns"])
+def test_live_policy_condition_rewrite_is_weaker_unless_exactly_reviewed(field):
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    policy_before = baseline["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    policy_after = current["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    policy_before[f"{field}_hash"] = "a" * 64
+    policy_after[f"{field}_hash"] = "b" * 64
+    weak = driver.protection_diff(baseline, current)
+    assert weak == {"policies": [
+        "louis_serverless.dev_to_prod_demo.payments "
+        "louis_serverless_gr_mask_louis_serverless_redact: "
+        f"louis_serverless_gr_mask_louis_serverless_redact {field} changed or became unreadable"
+    ]}
+    adoption = driver.Adoption("redact", "redact", "mask_redact", policy_conditions=((
+        "louis_serverless_gr_mask_louis_serverless_redact", field, "b" * 64),))
+    assert driver.protection_diff(
+        baseline, current, allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": adoption}) == {}
+
+
+def test_reviewed_mask_body_change_requires_function_and_new_hash():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    function = "louis_serverless.dev_to_prod_demo.mask_redact"
+    current["uc"]["louis_serverless"]["mask_functions"][0]["definition_hash"] = "b" * 64
+    assert driver.protection_diff(baseline, current)["masks"] == [f"{function}: definition changed"]
+    adoption = driver.Adoption("redact", "redact", "mask_redact",
+                               mask_definitions=((function, "b" * 64),))
+    assert driver.protection_diff(
+        baseline, current, allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": adoption}) == {}
+    for declared_name, declared_hash in ((function, "c" * 64), ("mask_redact", "b" * 64),
+                                          ("x.y.mask_redact", "b" * 64)):
+        wrong = driver.Adoption("redact", "redact", "mask_redact",
+                                mask_definitions=((declared_name, declared_hash),))
+        assert driver.protection_diff(
+            baseline, current,
+            allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": wrong})["masks"] == [
+                f"{function}: definition changed"]
+
+
+def test_policy_condition_declaration_requires_exact_name_field_and_hash():
+    name = "louis_serverless_gr_mask_louis_serverless_redact"
+    location = "louis_serverless.dev_to_prod_demo.payments.cvv"
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    before = baseline["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    after = current["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    before["when_condition_hash"], after["when_condition_hash"] = "a" * 64, "b" * 64
+    for declared_name, field, digest in ((name, "when_condition", "c" * 64),
+                                          ("other", "when_condition", "b" * 64),
+                                          (name, "match_columns", "b" * 64)):
+        adoption = driver.Adoption("redact", "redact", "mask_redact",
+                                   policy_conditions=((declared_name, field, digest),))
+        assert driver.protection_diff(baseline, current, allowed_adoptions={location: adoption})["policies"]
+
+
+def test_saved_prod_policy_gaining_false_when_condition_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    for snapshot_value in (baseline, current):
+        entry = snapshot_value["uc"]["louis_serverless"]["abac_policies"][0]
+        raw = dict(entry["policies"][0])
+        raw.setdefault("when_condition", None)
+        raw.setdefault("match_columns", None)
+        entry["policies"] = [driver._snapshot_policy(raw, entry["table"])]
+    entry = current["uc"]["louis_serverless"]["abac_policies"][0]
+    raw = azure_legacy_mid_migration_snapshot()["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    raw.update({"when_condition": "false", "match_columns": raw.get("match_columns")})
+    entry["policies"] = [driver._snapshot_policy(raw, entry["table"])]
+    assert "when_condition changed" in driver.protection_diff(baseline, current)["policies"][0]
+
+
+def test_migration_report_parses_exact_reviewed_live_changes():
+    digest = "b" * 64
+    mapping = driver.parse_migration_mappings(
+        "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+        "    mask today: mask_ssn: legacy sql\n"
+        f"    reviewed policy condition: policy_name when_condition {digest}\n"
+        f"    reviewed mask definition: cat.s.mask_ssn {digest}\n")
+    adoption = mapping["cat.s.t.ssn"]
+    assert adoption.policy_conditions == (("policy_name", "when_condition", digest),)
+    assert adoption.mask_definitions == (("cat.s.mask_ssn", digest),)
+
+
+def test_reviewed_lines_only_bind_to_their_contiguous_mapping_block():
+    digest = "b" * 64
+    mapping = driver.parse_migration_mappings(
+        "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+        "    mask today: mask_ssn: legacy sql\n"
+        "    account users: redacted -> redacted\n"
+        f"    reviewed mask definition: cat.s.mask_ssn {digest}\n")
+    assert mapping["cat.s.t.ssn"].mask_definitions == ()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("when_condition", ""), ("match_columns", [{"alias": "x"}]),
+])
+def test_policy_snapshot_fails_closed_when_condition_is_unreadable(field, value):
+    policy = {"name": "governed", "column_mask": {"function_name": "cat.s.mask_ssn"}, field: value}
+    with pytest.raises(RuntimeError, match="policy condition is unreadable"):
+        driver._snapshot_policy(policy, "cat.s.t")
+
+
+def test_policy_snapshot_hashes_conditions_without_persisting_sql():
+    policy = driver._snapshot_policy({
+        "name": "governed", "when_condition": "true",
+        "match_columns": [{"alias": "sensitive", "condition": "hasTagValue('pii', 'ssn')"}],
+        "column_mask": {"function_name": "cat.s.mask_ssn"},
+    }, "cat.s.t")
+    assert all(policy[f"{field}_hash"] for field in driver.CONDITION_FIELDS)
+    assert policy["match_values"] == []
+    assert "hasTagValue" not in json.dumps(policy)
+
+
+def test_policy_snapshot_records_absent_conditions_explicitly():
+    policy = driver._snapshot_policy({"name": "governed"}, "cat.s.t")
+    assert {policy[f"{field}_hash"] for field in driver.CONDITION_FIELDS} == {driver.ABSENT_CONDITION}
+
+
+def test_generated_policy_condition_declaration_uses_real_policy_name():
+    def snap(condition):
+        policy = driver._snapshot_policy({
+            "name": "gr_mask_real_policy", "when_condition": condition, "match_columns": None,
+            "to_principals": ["account users"],
+            "column_mask": {"function_name": "cat.s.gr_mask_email_partial__string__11111111_partial"},
+        }, "cat.s.t")
+        return {"uc": {"cat": {"governed_tags": [], "mask_functions": [],
+            "abac_policies": [{"table": "cat.s.t", "policies": [policy]}]}}}
+    baseline, current = snap("x"), snap("y")
+    digest = driver.hashlib.sha256(b"y").hexdigest()
+    exact = driver.Adoption("old", "new", "legacy",
+        policy_conditions=(("gr_mask_real_policy", "when_condition", digest),))
+    treatment = driver.Adoption("old", "new", "legacy",
+        policy_conditions=(("email_partial", "when_condition", digest),))
+    assert driver.protection_diff(baseline, current, allowed_adoptions={"cat.s.t.c": exact}) == {}
+    assert driver.protection_diff(baseline, current, allowed_adoptions={"cat.s.t.c": treatment})["policies"]
+
+
 def test_live_policy_missing_definition_hash_is_weaker_when_snapshot_has_hashes():
     baseline = snapshot(masks=("mask_ssn", "mask_other"))
     current = snapshot(masks=("mask_ssn", "mask_other"))
@@ -1142,7 +1280,7 @@ def test_policy_function_missing_from_routines_fails_closed(routine_rows):
                 manifest=SimpleNamespace(schema=SimpleNamespace(
                     columns=[SimpleNamespace(name=n) for n in names])),
                 result=SimpleNamespace(data_array=rows, next_chunk_index=None))
-    policy = SimpleNamespace(as_dict=lambda: {
+    policy = SimpleNamespace(when_condition=None, match_columns=None, as_dict=lambda: {
         "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
     client = SimpleNamespace(statement_execution=Statement(),
                              policies=SimpleNamespace(list_policies=lambda *_a, **_k: [policy]))
@@ -1168,7 +1306,7 @@ def test_mask_snapshot_hashes_definition_without_persisting_body():
                 manifest=SimpleNamespace(schema=SimpleNamespace(
                     columns=[SimpleNamespace(name=n) for n in names])),
                 result=SimpleNamespace(data_array=rows, next_chunk_index=None))
-    row_policy = SimpleNamespace(as_dict=lambda: {
+    row_policy = SimpleNamespace(when_condition="false", match_columns=None, as_dict=lambda: {
         "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
     client = SimpleNamespace(statement_execution=Statement(),
                              policies=SimpleNamespace(list_policies=lambda *_a, **_k: [row_policy]))
@@ -1176,6 +1314,35 @@ def test_mask_snapshot_hashes_definition_without_persisting_body():
     assert routine["routine_name"] == "secure_rows"
     assert routine["definition_hash"] == driver.hashlib.sha256(body.encode()).hexdigest()
     assert "routine_definition" not in routine
+
+
+def test_live_snapshot_hashes_sdk_condition_fields_omitted_by_as_dict():
+    body = "RETURN 'redacted'"
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type", "routine_definition")
+                rows = [["cat", "s", "mask_ssn", "FUNCTION", body]]
+            elif "information_schema.tables" in statement:
+                names, rows = ("table_catalog", "table_schema", "table_name"), [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    from databricks.sdk.service.catalog import PolicyInfo
+    raw = dict(azure_legacy_mid_migration_snapshot()["uc"]["louis_serverless"]
+               ["abac_policies"][0]["policies"][0])
+    raw.update({"name": "mask_ssn_p", "when_condition": "false",
+                "column_mask": {"function_name": "cat.s.mask_ssn"}})
+    policy = PolicyInfo.from_dict(raw)
+    client = SimpleNamespace(statement_execution=Statement(),
+        policies=SimpleNamespace(list_policies=lambda *_a, **_k: [policy]))
+    captured = driver._sql_snapshots(client, "wh", "cat")["abac_policies"][0]["policies"][0]
+    assert captured["when_condition_hash"] == driver.hashlib.sha256(b"false").hexdigest()
+    assert len(captured["match_columns_hash"]) == 64
+    assert captured["match_values"] == ["redact"]
+    assert "when_condition" not in captured
 
 
 def _deterministic_snapshot(value, *, policy_value=None):

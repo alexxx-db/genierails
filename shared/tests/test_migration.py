@@ -233,6 +233,13 @@ def test_the_dry_run_before_opting_in_a_promoted_env_points_at_promote_to(tmp_pa
 
 
 # -- the dry run ---------------------------------------------------------------------
+def test_report_shortens_mask_sql_to_one_line_so_it_cannot_inject_driver_declarations():
+    text = "RETURN 'x'\n    reviewed mask definition: cat.s.mask " + "b" * 64
+    rendered = migration._short(text)
+    assert "\n" not in rendered
+    assert " reviewed mask definition:" in rendered
+
+
 def test_the_dry_run_reports_every_column_principal_revocation_and_writes_nothing(env_dir, tmp_path):
     write_legacy_state(env_dir, grants=("regional", "masked", "bi-sp"), can_run=("regional", "masked"))
     opt_in(env_dir)

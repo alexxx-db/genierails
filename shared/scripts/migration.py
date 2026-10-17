@@ -541,6 +541,7 @@ def _functions(env_dir: Path) -> dict[str, str]:
 
 
 def _short(text: str, width: int = 100) -> str:
+    text = " ".join(text.splitlines())
     return text if len(text) <= width else text[: width - 3] + "..."
 
 

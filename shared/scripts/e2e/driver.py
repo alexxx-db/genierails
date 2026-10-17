@@ -48,6 +48,10 @@ IMPORT_UNSET_LOG = re.compile(
 )
 IMPORT_UNSET_SOURCE_ANCHORS = ("Cleared tag {tkey} on", "; clearing tag")
 TAG_VALUE_MATCH = re.compile(r"hasTagValue\(\s*'gr_treatment'\s*,\s*'([^']*)'\s*\)", re.I)
+# PolicyInfo fields in the pinned databricks-sdk. The condition inside each
+# MatchColumn is covered by match_columns; PolicyInfo has no top-level condition.
+CONDITION_FIELDS = ("when_condition", "match_columns")
+ABSENT_CONDITION = "absent"
 LEGACY_REDACTED_TREATMENTS = frozenset({"redact", "compensation_redacted"})
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genierails-e2e@localhost",
                 "GIT_COMMITTER_NAME": "genierails-e2e", "GIT_COMMITTER_EMAIL": "genierails-e2e@localhost"}
@@ -102,6 +106,11 @@ class Adoption:
     old: str
     new: str
     legacy_function: str
+    # Exact live changes printed by the reviewed migrate-plan.  The table is
+    # implied by the adopted column; no blanket policy/function exception is
+    # possible.
+    policy_conditions: tuple[tuple[str, str, str], ...] = ()
+    mask_definitions: tuple[tuple[str, str], ...] = ()
 
 
 def mk(name: str, target: str, env: str | None = None, *,
@@ -519,7 +528,7 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
         qualified = ".".join(str(table[k]) for k in ("table_catalog", "table_schema", "table_name"))
         try:
             listed = client.policies.list_policies("TABLE", qualified, include_inherited=True)
-            captured = [p.as_dict() for p in listed]
+            captured = [_snapshot_live_policy(p, qualified) for p in listed]
             policies.append({"table": qualified, "policies": captured})
             policy_functions.update(str(mask.get("function_name")) for policy in captured
                                     if (mask := policy.get("column_mask") or policy.get("row_filter"))
@@ -546,6 +555,55 @@ def _sql_snapshots(client: Any, warehouse: str, catalog: str,
         raise RuntimeError(f"{missing_functions[0]}: policy function definition is unreadable")
     out["mask_functions"] = routines
     return out
+
+
+def _condition_hash(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{label}: policy condition is unreadable")
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _snapshot_live_policy(policy: Any, table: str) -> dict[str, Any]:
+    """Capture SDK fields explicitly: ``as_dict`` deliberately drops None."""
+    raw = policy.as_dict()
+    for field in CONDITION_FIELDS:
+        if not hasattr(policy, field):
+            raise RuntimeError(f"{table} {raw.get('name') or '<unnamed>'} {field}: policy condition is unreadable")
+        raw[field] = getattr(policy, field)
+    return _snapshot_policy(raw, table)
+
+
+def _snapshot_policy(policy: Mapping[str, Any], table: str) -> dict[str, Any]:
+    """Keep condition integrity evidence without persisting live SQL text."""
+    result = dict(policy)
+    name = str(result.get("name") or "<unnamed>")
+    for field in ("when_condition",):
+        value = result.pop(field, None)
+        result[f"{field}_hash"] = (ABSENT_CONDITION if value is None else
+                                    _condition_hash(value, f"{table} {name} {field}"))
+    columns = result.pop("match_columns", None)
+    if columns is not None:
+        if not isinstance(columns, list):
+            raise RuntimeError(f"{table} {name} match_columns: policy condition is unreadable")
+        hashed = []
+        match_values: set[str] = set()
+        for index, column in enumerate(columns):
+            if hasattr(column, "as_dict"):
+                column = column.as_dict()
+            if not isinstance(column, Mapping):
+                raise RuntimeError(f"{table} {name} match_columns[{index}]: policy condition is unreadable")
+            item = {k: v for k, v in column.items() if k != "condition"}
+            match_values.update(TAG_VALUE_MATCH.findall(str(column.get("condition") or "")))
+            item["condition_hash"] = _condition_hash(
+                column.get("condition"), f"{table} {name} match_columns[{index}]")
+            hashed.append(item)
+        result["match_columns_hash"] = hashlib.sha256(
+            json.dumps(sorted(hashed, key=lambda item: json.dumps(item, sort_keys=True)),
+                       sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        result["match_values"] = sorted(match_values)
+    else:
+        result["match_columns_hash"] = ABSENT_CONDITION
+    return result
 
 
 def _sql_lit(value: str) -> str:
@@ -745,17 +803,35 @@ def refusal_found_in_source(repo_root: Path, pattern: str) -> bool:
 def parse_migration_mappings(output: str) -> dict[str, Adoption]:
     mappings: dict[str, Adoption] = {}
     current: tuple[str, str, str] | None = None
+    declaration_location: str | None = None
     for line in output.splitlines():
         match = re.fullmatch(r"\s+(\S+\.\S+\.\S+\.\S+):\s+(\S+)\s+->\s+(\S+)\s*", line)
         if match:
             location, old, new = match.groups()
             current = (location, old, new) if old != "untagged" and parse_treatment_value(new) else None
+            declaration_location = None
             continue
         mask = re.match(r"\s+mask today:\s+([^:]+):", line)
         if current and mask:
             location, old, new = current
             mappings[location] = Adoption(old, new, mask.group(1).strip())
+            declaration_location = location
             current = None
+            continue
+        policy_change = re.fullmatch(
+            r"\s+reviewed policy condition:\s+(\S+)\s+(when_condition|match_columns)\s+(absent|[0-9a-f]{64})\s*", line)
+        if declaration_location and policy_change:
+            adoption = mappings[declaration_location]
+            mappings[declaration_location] = dataclasses.replace(
+                adoption, policy_conditions=(*adoption.policy_conditions, policy_change.groups()))
+            continue
+        mask_change = re.fullmatch(r"\s+reviewed mask definition:\s+(\S+)\s+([0-9a-f]{64})\s*", line)
+        if declaration_location and mask_change:
+            adoption = mappings[declaration_location]
+            mappings[declaration_location] = dataclasses.replace(
+                adoption, mask_definitions=(*adoption.mask_definitions, mask_change.groups()))
+            continue
+        declaration_location = None
     if not mappings:
         raise RuntimeError("migrate-plan printed no reviewed mapping with its exact legacy mask function")
     return mappings
@@ -977,10 +1053,13 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 fact = {"function": {normalized or (function,)},
                         "masks": {normalized_function},
                         "raw_functions": {function},
-                        "values": {value for column in policy.get("match_columns") or []
+                        "values": set(policy.get("match_values") or []) or
+                                  {value for column in policy.get("match_columns") or []
                                    for value in TAG_VALUE_MATCH.findall(str(column.get("condition") or ""))},
                         "to": set(policy.get("to_principals") or []),
-                        "except": set(policy.get("except_principals") or [])}
+                        "except": set(policy.get("except_principals") or []),
+                        "conditions": {(str(policy.get("name")), field): {str(policy[f"{field}_hash"])}
+                                       for field in CONDITION_FIELDS if f"{field}_hash" in policy}}
                 prior = result["policies"].get(key)
                 if prior:
                     prior["function"].update(fact["function"])
@@ -989,6 +1068,8 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                     prior["values"].update(fact["values"])
                     prior["to"].intersection_update(fact["to"])
                     prior["except"].update(fact["except"])
+                    for field, hashes in fact["conditions"].items():
+                        prior["conditions"].setdefault(field, set()).update(hashes)
                 else:
                     result["policies"][key] = fact
         for kind in ("catalog_grants", "schema_grants", "table_grants"):
@@ -999,6 +1080,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     for fact in result["policies"].values():
         fact["function"] = tuple(sorted(fact["function"]))
         fact["masks"] = tuple(sorted(fact["masks"]))
+        fact["conditions"] = {field: tuple(sorted(hashes)) for field, hashes in fact["conditions"].items()}
     return result
 
 
@@ -1081,6 +1163,11 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
     allowed_adoptions = allowed_adoptions or {}
     verified_adoptions = _verified_adoptions(before, after, allowed_adoptions)
     excused_policy_keys, excused_masks = _excused_legacy(before, after, allowed_adoptions)
+    allowed_conditions = {(location.rsplit(".", 1)[0], name, field): digest
+                          for location, adoption in allowed_adoptions.items()
+                          for name, field, digest in adoption.policy_conditions}
+    allowed_definitions = {name: digest for adoption in allowed_adoptions.values()
+                           for name, digest in adoption.mask_definitions}
     weaker: dict[str, list[str]] = {}
     lost_columns = []
     for key, was in sorted(before["columns"].items()):
@@ -1127,7 +1214,8 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
     live_after = {fn for fact in after["policies"].values() for fn in fact["raw_functions"]}
     changed_masks = sorted(fn for fn in live_before & live_after
                            if fn in before["mask_definitions"] and fn in after["mask_definitions"]
-                           and before["mask_definitions"][fn] != after["mask_definitions"][fn])
+                           and before["mask_definitions"][fn] != after["mask_definitions"][fn]
+                           and allowed_definitions.get(fn) != after["mask_definitions"][fn])
     lost_masks.extend(f"{fn}: definition changed" for fn in changed_masks)
     unreadable_masks = sorted(fn for fn in live_before & live_after
                               if ((before["mask_definitions"] and fn not in before["mask_definitions"])
@@ -1143,6 +1231,14 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
         elif now is not None and now["function"] != was["function"]:
             policies.append(f"{label}: function {sorted(was['function'])} -> {sorted(now['function'])}")
         elif now is not None:
+            condition_keys = set(was["conditions"]) | set(now["conditions"])
+            for (policy_name, field) in sorted(condition_keys):
+                digest = was["conditions"].get((policy_name, field))
+                current_digest = now["conditions"].get((policy_name, field))
+                allowed = allowed_conditions.get((key[0], policy_name, field))
+                declared = allowed is not None and current_digest == (allowed,)
+                if current_digest != digest and not declared:
+                    policies.append(f"{label}: {policy_name} {field} changed or became unreadable")
             table_values = {value[2] if isinstance(value, tuple) else value
                             for (location, tag), value in after["columns"].items()
                             if tag == "gr_treatment" and location.rsplit(".", 1)[0] == key[0]}
