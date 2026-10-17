@@ -596,6 +596,69 @@ def test_live_policy_mask_function_definition_change_is_weaker():
     ]}
 
 
+@pytest.mark.parametrize("field", ["condition", "when_condition", "match_columns"])
+def test_live_policy_condition_rewrite_is_weaker_unless_exactly_reviewed(field):
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    policy_before = baseline["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    policy_after = current["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    policy_before[f"{field}_hash"] = "a" * 64
+    policy_after[f"{field}_hash"] = "b" * 64
+    weak = driver.protection_diff(baseline, current)
+    assert weak == {"policies": [
+        "louis_serverless.dev_to_prod_demo.payments "
+        f"louis_serverless_gr_mask_louis_serverless_redact: {field} changed or became unreadable"
+    ]}
+    adoption = driver.Adoption("redact", "redact", "mask_redact", policy_conditions=((
+        "louis_serverless_gr_mask_louis_serverless_redact", field, "b" * 64),))
+    assert driver.protection_diff(
+        baseline, current, allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": adoption}) == {}
+
+
+def test_reviewed_mask_body_change_requires_function_and_new_hash():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    function = "louis_serverless.dev_to_prod_demo.mask_redact"
+    current["uc"]["louis_serverless"]["mask_functions"][0]["definition_hash"] = "b" * 64
+    assert driver.protection_diff(baseline, current)["masks"] == [f"{function}: definition changed"]
+    adoption = driver.Adoption("redact", "redact", "mask_redact",
+                               mask_definitions=((function, "b" * 64),))
+    assert driver.protection_diff(
+        baseline, current, allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": adoption}) == {}
+
+
+def test_migration_report_parses_exact_reviewed_live_changes():
+    digest = "b" * 64
+    mapping = driver.parse_migration_mappings(
+        "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+        "    mask today: mask_ssn: legacy sql\n"
+        f"    reviewed policy condition: policy_name when_condition {digest}\n"
+        f"    reviewed mask definition: cat.s.mask_ssn {digest}\n")
+    adoption = mapping["cat.s.t.ssn"]
+    assert adoption.policy_conditions == (("policy_name", "when_condition", digest),)
+    assert adoption.mask_definitions == (("cat.s.mask_ssn", digest),)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("condition", None), ("when_condition", ""), ("match_columns", [{"alias": "x"}]),
+])
+def test_policy_snapshot_fails_closed_when_condition_is_unreadable(field, value):
+    policy = {"name": "governed", "column_mask": {"function_name": "cat.s.mask_ssn"}, field: value}
+    with pytest.raises(RuntimeError, match="policy condition is unreadable"):
+        driver._snapshot_policy(policy, "cat.s.t")
+
+
+def test_policy_snapshot_hashes_conditions_without_persisting_sql():
+    policy = driver._snapshot_policy({
+        "name": "governed", "condition": "x = 1", "when_condition": "true",
+        "match_columns": [{"alias": "sensitive", "condition": "hasTagValue('pii', 'ssn')"}],
+        "column_mask": {"function_name": "cat.s.mask_ssn"},
+    }, "cat.s.t")
+    assert all(policy[f"{field}_hash"] for field in ("condition", "when_condition", "match_columns"))
+    assert policy["match_values"] == []
+    assert "x = 1" not in json.dumps(policy) and "hasTagValue" not in json.dumps(policy)
+
+
 def test_live_policy_missing_definition_hash_is_weaker_when_snapshot_has_hashes():
     baseline = snapshot(masks=("mask_ssn", "mask_other"))
     current = snapshot(masks=("mask_ssn", "mask_other"))
