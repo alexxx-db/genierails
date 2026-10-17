@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "treatment": "custom_e2e_suffix",
+  "description": "Deterministic live-e2e suffix mask fixture, version 1.",
+  "never_raw": false,
+  "full": "redacted",
+  "partial": {
+    "STRING": {
+      "sql": "CASE WHEN value IS NULL THEN NULL ELSE concat('***', right(value, 2)) END",
+      "tested_type": "STRING",
+      "cases": [
+        {"input": "CAST(NULL AS STRING)", "expected": null},
+        {"input": "'ABCD'", "expected": "***CD"},
+        {"input": "'12345'", "expected": "***45"}
+      ],
+      "tested_sha256": "aa0ee84ccf2bc5ddd2218d4ae96d3992ff2f24c2f0bb52514696a990ab3a127d"
+    }
+  }
+}

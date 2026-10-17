@@ -24,6 +24,8 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequenc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from governance_policies import FAILSAFE_TREATMENT, is_never_raw, parse_treatment_value
+from access_tier_groups import _assignment_spans
+from scripts.scaffold_treatments import write_tag_treatments
 
 
 DESIGN_SOURCE = "shared/docs/design/deterministic-governance.md"
@@ -125,6 +127,10 @@ def mk(name: str, target: str, env: str | None = None, *,
 
 def action(name: str, kind: str, value: str | None = None) -> Step:
     return Step(name=name, action=kind, value=value)
+
+
+def fixture_action(name: str, kind: str, *values: str) -> Step:
+    return Step(name=name, action=kind, assertions=tuple(values))
 
 
 # Each refusal pattern is the diagnostic the implementing target prints, so an
@@ -305,6 +311,73 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Apply prod adopt-only release", "release", "prod", args=("MANIFEST={manifest}",)),
     ), ("Legacy values are adopted into deterministic values without weaker protection or raw exposure.",),
        ("Forward-release the pinned baseline through the same bounded staged lifecycle.",)),
+    _scenario("tier-groupmap", "Tier, group-map and prod-only ACL changes", (
+        "Disposable dev/prod groups named by tier_group and mapped_group exist; prod_agent names a committed agent fixture.",
+        "The fixture has three ordered tiers, one governed table, and effective-access verification rows for every tier.",
+    ), (
+        fixture_action("Add a new tier group", "tier_add", "tier_group"),
+        mk("Regenerate for the added tier", "generate", "dev"), AUTHOR_MERGE,
+    ) + DAY2 + (
+        fixture_action("Remove the tier group", "tier_remove", "tier_group"),
+        mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
+    ) + DAY2 + (
+        fixture_action("Map the tier to a different real group", "group_map_change",
+                       "group_map_source", "mapped_group"), AUTHOR_MERGE,
+        mk("Refuse unacknowledged group-map weakening", "release-plan", "prod", fail=True,
+           refusal=REFUSALS["weakening"], refusal_in_ci=False),
+        fixture_action("Write exact env-scoped group-map acknowledgement", "add_group_map_ack",
+                       "group_map_source", "mapped_group"),
+        action("Commit and merge the exact acknowledgement", "local_merge"),
+        mk("Plan only the acknowledged group-map effect", "release-plan", "prod"),
+        mk("Apply acknowledged group-map manifest", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Maintain mapped access", "maintain", "prod"),
+        fixture_action("Prepare isolated prod-only acl_groups PR", "prod_acl_change", "prod_agent", "acl_group"),
+        action("Commit and merge prod-only ACL change", "local_merge"),
+        mk("Check isolated prod ACL PR", "check", "prod"),
+        mk("Plan isolated prod ACL release", "release-plan", "prod"),
+        mk("Apply isolated prod ACL release", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Maintain prod ACL", "maintain", "prod"),
+    ), (
+        "The added tier has its configured partial/full/raw effective access; removal revokes its SELECT/CAN_RUN and widens nothing else.",
+        "The unacknowledged group_map plan mutates nothing; the exact prod ack permits only its named effect.",
+        "The final PR changes only the named prod agent acl_groups and prod effective access matches it.",
+    ), ("Forward-release the pinned baseline, then remove disposable groups and access fixtures.",)),
+    _scenario("custom-mask", "Prepared adopted custom mask lifecycle", (
+        "custom_mask_class is a non-secret class on one STRING fixture column with raw, partial and full tier verification rows.",
+        "custom_mask_ack is the exact prod:weaken:<column>:<principal> entry for the one prepared SQL change.",
+    ), (
+        fixture_action("Install prepared adopted custom mask and class mapping", "custom_mask_install",
+                       "custom_mask_class"),
+        mk("Generate policy for prepared custom mask", "generate", "dev"), AUTHOR_MERGE,
+        mk("Validate prepared custom mask", "check", "dev"),
+        mk("Run committed cases read-only before the dev lock", "rehearse", "dev",
+           assertions=("custom mask cases precede environment lock",)),
+        mk("Promote adopted mask byte-for-byte", "promote-to", "prod"), AUTHOR_MERGE,
+        mk("Check promoted custom mask", "check", "prod"),
+        mk("Run committed cases read-only before the prod plan lock", "release-plan", "prod",
+           assertions=("custom mask cases precede environment lock",)),
+        mk("Release prepared custom mask", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Verify partial/full behavior and idempotence", "maintain", "prod"),
+        fixture_action("Replace with separately tested custom SQL fixture", "custom_mask_change"),
+        mk("Generate changed custom-mask policy", "generate", "dev"),
+        action("Commit and merge tested SQL change", "local_merge"),
+        mk("Check changed custom mask", "check", "dev"),
+        mk("Rehearse changed committed cases", "rehearse", "dev",
+           assertions=("custom mask cases precede environment lock",)),
+        mk("Promote changed mask", "promote-to", "prod"), AUTHOR_MERGE,
+        mk("Refuse unacknowledged custom-mask weakening", "release-plan", "prod", fail=True,
+           refusal=REFUSALS["weakening"], refusal_in_ci=False),
+        action("Write exact env-scoped custom-mask acknowledgement", "add_ack", "custom_mask_ack"),
+        action("Commit and merge custom-mask acknowledgement", "local_merge"),
+        mk("Plan acknowledged custom-mask change", "release-plan", "prod",
+           assertions=("custom mask cases precede environment lock",)),
+        mk("Release acknowledged custom-mask change", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Verify changed partial/full behavior", "maintain", "prod"),
+    ), (
+        "Every committed case runs read-only before rehearsal/release locks on both clouds.",
+        "Prod raw/partial/full rows show raw, the fixture's exact partial output, and library redacted respectively.",
+        "Changing tested SQL is refused without mutation until the exact prod weakening acknowledgement is committed.",
+    ), ("Forward-release the pinned baseline and remove the disposable classified column/table.",)),
 )
 
 # Explicit top-level snapshot components each scenario is allowed to change.
@@ -319,6 +392,7 @@ ALLOWED_CHANGES: Mapping[str, frozenset[str]] = {
     "s13": frozenset(), "s14": frozenset({"uc", "state_serials", "receipts"}), "s15": _ALL_COMPONENTS,
     "s16": _ALL_COMPONENTS, "manifest": frozenset(),
     "migration": frozenset(), "migration-cutover": frozenset({"uc", "state_serials", "receipts"}),
+    "tier-groupmap": _ALL_COMPONENTS, "custom-mask": frozenset({"uc", "state_serials", "receipts"}),
 }
 
 
@@ -736,6 +810,28 @@ def check_argument(arg: str) -> None:
         raise ValueError(f"unresolved placeholder in argument {arg!r}")
 
 
+def _replace_hcl_setting(path: Path, name: str, value: Any) -> None:
+    """Replace one top-level fixture setting, proving no other parsed value moved."""
+    text_value = path.read_text(encoding="utf-8")
+    before = _load_hcl(path)
+    spans = _assignment_spans(text_value, name)
+    if len(spans) != 1:
+        raise RuntimeError(f"{path}: expected exactly one top-level {name} assignment")
+    start, end = spans[0]
+    rendered = json.dumps(value, sort_keys=True)
+    updated = text_value[:start] + f"{name} = {rendered}" + text_value[end:]
+    try:
+        import hcl2
+        after = hcl2.loads(updated)
+    except Exception as exc:
+        raise RuntimeError(f"{path}: fixture edit made invalid HCL: {exc}") from exc
+    expected = dict(before)
+    expected[name] = value
+    if after != expected:
+        raise RuntimeError(f"{path}: fixture edit would change settings other than {name}")
+    path.write_text(updated, encoding="utf-8")
+
+
 def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str]:
     """Every value a scenario needs that is neither supplied nor produced by an earlier step."""
     produced: set[str] = set()
@@ -743,6 +839,9 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
     for step in scenario.steps:
         if step.action in ("checkout_value", "add_ack") and not values.get(step.value or ""):
             missing.append(step.value or "")
+        if step.action in {"tier_add", "tier_remove", "group_map_change", "prod_acl_change",
+                           "custom_mask_install"}:
+            missing.extend(name for name in step.assertions if not values.get(name))
         for name in (n for part in step.command for n in PLACEHOLDER.findall(part)):
             if not values.get(name) and name not in produced: missing.append(name)
         if step.target == "release-plan" and not step.expect_failure: produced.add("manifest")
@@ -1278,6 +1377,15 @@ def release_plan_workspace_diff(before: Mapping[str, Any], after: Mapping[str, A
             if any(key != "receipts" for key in snapshot_diff(before.get(env, {}), after.get(env, {})))}
 
 
+def _write_ack(cloud_root: Path, entry: str) -> None:
+    if not re.fullmatch(r"prod:(?:weaken|reader|unclassified|revoke|rollback):[^\s:#][^\n#]*", entry):
+        raise RuntimeError("acknowledgement is not an exact typed prod acknowledgement")
+    path = cloud_root / "envs" / "prod" / "ack.txt"
+    prior = path.read_text(encoding="utf-8") if path.exists() else ""
+    if entry not in prior.splitlines():
+        path.write_text(prior.rstrip("\n") + ("\n" if prior.strip() else "") + entry + "\n", encoding="utf-8")
+
+
 def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[str, str]) -> None:
     if step.action == "checkout_value":
         repo.require_clean(f"{scenario.key}-before-checkout")
@@ -1285,14 +1393,74 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
         return
     if step.action == "add_ack":
         entry = values[step.value or ""]
-        if not re.fullmatch(r"prod:(?:weaken|reader|unclassified|revoke|rollback):[^\s:#][^\n#]*", entry):
-            raise RuntimeError("ack_entry is not an exact typed prod acknowledgement")
-        path = repo.runner.cwd / "envs" / "prod" / "ack.txt"
-        prior = path.read_text(encoding="utf-8") if path.exists() else ""
-        if entry not in prior.splitlines(): path.write_text(prior.rstrip("\n") + ("\n" if prior.strip() else "") + entry + "\n", encoding="utf-8")
+        _write_ack(repo.runner.cwd, entry)
         return
     if step.action == "local_merge":
         repo.local_merge(scenario.key)
+        return
+    if step.action in {"tier_add", "tier_remove"}:
+        group = values[step.assertions[0]]
+        for env in ("dev", "prod"):
+            path = repo.runner.cwd / "envs" / env / "env.auto.tfvars"
+            cfg = _load_hcl(path)
+            tiers = cfg.get("access_tier_groups")
+            if not isinstance(tiers, list) or len(tiers) < 2 or not all(isinstance(x, str) for x in tiers):
+                raise RuntimeError(f"{path}: tier fixture needs at least two access_tier_groups")
+            updated = list(tiers)
+            if step.action == "tier_add":
+                if group in updated: raise RuntimeError(f"tier_group {group!r} already exists in {env}")
+                updated.insert(-1, group)
+            else:
+                if group not in updated: raise RuntimeError(f"tier_group {group!r} is absent in {env}")
+                updated.remove(group)
+            _replace_hcl_setting(path, "access_tier_groups", updated)
+        return
+    if step.action == "group_map_change":
+        path = repo.runner.cwd / "envs" / "prod" / "env.auto.tfvars"
+        cfg = _load_hcl(path)
+        mapping = cfg.get("group_map") or {}
+        if not isinstance(mapping, dict): raise RuntimeError(f"{path}: group_map must be an object")
+        mapping = dict(mapping)
+        source, target = (values[name] for name in step.assertions)
+        if source not in mapping: raise RuntimeError(f"{path}: group_map_source {source!r} is not mapped")
+        if mapping[source] == target: raise RuntimeError(f"{path}: group_map already maps {source!r} to {target!r}")
+        mapping[source] = target
+        _replace_hcl_setting(path, "group_map", mapping)
+        return
+    if step.action == "add_group_map_ack":
+        source, target = (values[name] for name in step.assertions)
+        _write_ack(repo.runner.cwd, f"prod:weaken:group_map:{source}={target}")
+        return
+    if step.action == "prod_acl_change":
+        agent, group = (values[name] for name in step.assertions)
+        path = repo.runner.cwd / "envs" / "prod" / "agents" / f"{agent}.auto.tfvars"
+        if not path.is_file() or path.is_symlink(): raise RuntimeError(f"prod agent fixture is missing or unsafe: {path}")
+        cfg = _load_hcl(path)
+        groups = cfg.get("acl_groups")
+        if not isinstance(groups, list) or not all(isinstance(x, str) for x in groups):
+            raise RuntimeError(f"{path}: acl_groups must be an explicit list")
+        if group in groups: raise RuntimeError(f"acl_group {group!r} is already present")
+        _replace_hcl_setting(path, "acl_groups", [*groups, group])
+        return
+    if step.action in {"custom_mask_install", "custom_mask_change"}:
+        version = "v1" if step.action == "custom_mask_install" else "v2"
+        fixture = Path(__file__).with_name("fixtures") / f"custom_mask_{version}.json"
+        data = json.loads(fixture.read_text(encoding="utf-8"))
+        from scripts.custom_masks import mask_file_problems
+        problems = mask_file_problems(data, data["treatment"])
+        if problems: raise RuntimeError(f"prepared custom mask is invalid: {'; '.join(problems)}")
+        target = repo.runner.cwd / "envs" / "dev" / "custom_masks" / f"{data['treatment']}.json"
+        target.parent.mkdir(exist_ok=True)
+        target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        if step.action == "custom_mask_install":
+            env_file = repo.runner.cwd / "envs" / "dev" / "env.auto.tfvars"
+            mapping = _load_hcl(env_file).get("tag_treatments") or {}
+            if not isinstance(mapping, dict): raise RuntimeError(f"{env_file}: tag_treatments must be an object")
+            mapping = dict(mapping)
+            class_name = values[step.assertions[0]]
+            if class_name in mapping: raise RuntimeError(f"custom_mask_class {class_name!r} is already mapped")
+            mapping[class_name] = data["treatment"]
+            write_tag_treatments(env_file, mapping)
         return
     raise RuntimeError(f"unknown scenario action: {step.action}")
 

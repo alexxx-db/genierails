@@ -14,6 +14,7 @@ import types
 import pytest
 
 from scripts.e2e import driver
+from scripts import custom_masks
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -84,6 +85,63 @@ def test_scenario_catalog_contains_plan_matrix_and_governance_only():
     assert {f"s{i}" for i in range(1, 17)} <= keys
     assert {"champion", "manifest", "migration", "migration-cutover"} <= keys
     assert next(s for s in driver.SCENARIOS if s.key == "s14").title == "Governance-only environment"
+    assert {"tier-groupmap", "custom-mask"} <= keys
+
+
+@pytest.mark.parametrize("cloud", ["aws", "azure"])
+@pytest.mark.parametrize("scenario", ["tier-groupmap", "custom-mask"])
+def test_new_day2_scenarios_dry_run_offline_with_every_step(tmp_path, monkeypatch, cloud, scenario):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dry-run must stay offline")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    out = tmp_path / cloud / scenario
+    assert driver.main(["--cloud", cloud, "--repo", str(ROOT), "--dry-run",
+                        "--scenarios", scenario, "--reports", str(out)]) == 0
+    report = json.loads((out / f"{scenario}.json").read_text())
+    expected = next(item for item in driver.SCENARIOS if item.key == scenario)
+    assert len(report["steps"]) == len(expected.steps)
+    assert all(item["status"] == "planned" for item in report["steps"])
+    assert not report["known_failure"]
+
+
+def test_tier_groupmap_keeps_all_four_day2_changes_and_guards():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "tier-groupmap")
+    signatures = [(step.action or step.target, step.expect_failure) for step in scenario.steps]
+    required = [
+        ("tier_add", False), ("rehearse", False), ("release-plan", False), ("release", False),
+        ("tier_remove", False), ("rehearse", False), ("release", False),
+        ("group_map_change", False), ("release-plan", True), ("add_group_map_ack", False),
+        ("release-plan", False), ("release", False), ("prod_acl_change", False),
+        ("check", False), ("release-plan", False), ("release", False),
+    ]
+    cursor = 0
+    for signature in required:
+        cursor = signatures.index(signature, cursor) + 1
+    assert len(scenario.steps) == 40  # deleting any declared acceptance step is a regression
+    assert all(step.refusal == driver.REFUSALS["weakening"] for step in scenario.steps if step.expect_failure)
+
+
+def test_custom_mask_scenario_keeps_case_order_and_weakening_ack():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "custom-mask")
+    assert len(scenario.steps) == 24  # fails if a case/check/lifecycle step is removed
+    lock_targets = {"rehearse", "release-plan"}
+    guarded = [step for step in scenario.steps if step.target in lock_targets and not step.expect_failure]
+    assert len(guarded) == 4
+    assert all("custom mask cases precede environment lock" in step.assertions for step in guarded)
+    refusal = next(step for step in scenario.steps if step.expect_failure)
+    assert refusal.target == "release-plan" and refusal.refusal == driver.REFUSALS["weakening"]
+    assert any(step.action == "add_ack" and step.value == "custom_mask_ack" for step in scenario.steps)
+
+
+def test_prepared_custom_mask_fixtures_use_real_loader_and_validator():
+    fixtures = ROOT / "shared/scripts/e2e/fixtures"
+    loaded = []
+    for version in ("v1", "v2"):
+        data = json.loads((fixtures / f"custom_mask_{version}.json").read_text())
+        assert custom_masks.mask_file_problems(data, data["treatment"]) == []
+        loaded.append(data)
+    assert loaded[0]["treatment"] == loaded[1]["treatment"] == "custom_e2e_suffix"
+    assert loaded[0]["partial"]["STRING"]["sql"] != loaded[1]["partial"]["STRING"]["sql"]
 
 
 def test_preconditions_are_not_split_into_characters():
