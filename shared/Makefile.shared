@@ -444,7 +444,8 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 # A new agent file is captured (import-new) before the governed-table record is
 # written: its tables come from the capture, so the first generate records them.
 # An agent whose committed capture is gone is refused before anything is written
-# (import-new --check); make capture replaces a capture on purpose.
+# (import-new --check), and so is every uncaptured agent in a shallow clone or
+# outside git, where history cannot tell; make capture replaces a capture on purpose.
 generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in the selected workspace environment (set SPACE="Name" to regenerate only one space; set MODE=governance|genie for self-service Genie deployments)
 	@echo "=== Generate ABAC Config ($(ENV)$(if $(SPACE), — space: $(SPACE),)$(if $(MODE), — mode: $(MODE),)) ==="
 	@if [ "$(ENV)" = "$(DEFAULT_ENV)" ]; then $(_AGENT_OWNERSHIP) import-new --check --env-dir "$(ENV_DIR)" --env "$(ENV)"; fi
@@ -473,7 +474,8 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 # table change is a governance-owned diff, design 18.1); no governance
 # drafting, no model call, no Terraform state written. A plain generate
 # captures only agents never captured before (import-new): it refuses one whose
-# committed capture is gone, and never re-captures.
+# committed capture is gone (or, in a shallow clone or outside git, any it cannot
+# tell), and never re-captures.
 override _AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
 capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/dev/agents/<agent>.space.json: SPACE="<agent>" (read-only)
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi

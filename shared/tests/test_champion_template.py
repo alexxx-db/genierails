@@ -57,7 +57,8 @@ class WorkspaceClient:
 
 
 @pytest.fixture
-def cloud(tmp_path):
+def cloud(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)  # temp-repo commits skip global hooks/signing
     overlay = tmp_path / "shared"
     overlay.mkdir()
     for entry in SHARED.iterdir():
@@ -68,8 +69,11 @@ def cloud(tmp_path):
     sdk.mkdir(parents=True)
     (sdk.parent / "__init__.py").write_text("")
     (sdk / "__init__.py").write_text(FAKE_SDK)
+    # The customer's repo is a git checkout: import-new refuses outside one.
     root = tmp_path / "aws"
     root.mkdir()
+    (root / ".gitignore").write_text(GITIGNORE)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
 
     def make(*args, cwd_root=root, **extra):
         env = {k: v for k, v in os.environ.items()
@@ -89,9 +93,6 @@ def _git(root, *args):
 
 
 def _commit(root, message):
-    if not (root / ".git").exists():
-        (root / ".gitignore").write_text(GITIGNORE)
-        _git(root, "init", "-q")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "--allow-empty", "-m", message)
 

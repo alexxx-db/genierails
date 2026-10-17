@@ -295,6 +295,7 @@ def test_generate_imports_only_agents_not_yet_captured(tmp_path):
                Old='genie_space_id = "old-1"\nacl_groups = ["a"]\n', Draft='acl_groups = ["a"]\n')
     old = agent_files.capture_path(env, "Old")
     old.write_text('{"curated": "in git"}\n')
+    _commit_checkout(env)
     calls = []
     getter = lambda path, query: calls.append(path) or _response()  # noqa: E731
     assert ownership.import_new(env, "dev", getter) == ["New"]
@@ -304,7 +305,13 @@ def test_generate_imports_only_agents_not_yet_captured(tmp_path):
     assert ownership.import_new(env, "prod", getter) == []
 
 
-def _git_repo(env):
+@pytest.fixture(autouse=True)
+def _no_global_git_config(monkeypatch):
+    """Temp-repo commits skip the user's global hooks and signing."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+
+
+def _commit_checkout(env):
     """Make the env's checkout a git repo and commit what is in it."""
     root = env.parent.parent
     git = ["git", "-C", str(root), "-c", "user.email=t@example.com", "-c", "user.name=t"]
@@ -321,11 +328,11 @@ def test_generate_refuses_an_agent_whose_committed_capture_is_gone(tmp_path, del
     capture = agent_files.capture_path(env, "Sales")
     capture.write_text('{"curated": "reviewed"}\n')
     (env / "agents" / "New.auto.tfvars").unlink()
-    _git_repo(env)
+    _commit_checkout(env)
     (env / "agents" / "New.auto.tfvars").write_text('genie_space_id = "new-1"\nacl_groups = ["a"]\n')
     capture.unlink()
     if deleted == "in a commit":
-        _git_repo(env)
+        _commit_checkout(env)
     calls = []
     getter = lambda path, query: calls.append(path) or _response()  # noqa: E731
     before = sorted(p.name for p in (env / "agents").iterdir())
@@ -348,7 +355,7 @@ def test_generate_refuses_an_agent_whose_committed_capture_is_gone(tmp_path, del
 
 def test_a_new_agent_in_a_git_checkout_is_captured_once(tmp_path):
     env = _env(tmp_path, New='genie_space_id = "new-1"\nacl_groups = ["a"]\n')
-    _git_repo(env)  # its settings file is committed; no capture ever was
+    _commit_checkout(env)  # its settings file is committed; no capture ever was
     calls = []
     getter = lambda path, query: calls.append(path) or _response()  # noqa: E731
 
@@ -357,8 +364,81 @@ def test_a_new_agent_in_a_git_checkout_is_captured_once(tmp_path):
     assert ownership.import_new(env, "dev", getter) == []
     assert calls == ["/api/2.0/genie/spaces/new-1"]
     assert not ownership.capture_committed(env, "New")
-    _git_repo(env)
-    assert ownership.capture_committed(env, "New")
+    _commit_checkout(env)
+    assert ownership.capture_committed(env, "New") == "agents/New.space.json"
+
+
+def _refused_untouched(env, message):
+    """import-new and import-new --check both refuse with message, before any read or write."""
+    calls = []
+    getter = lambda path, query: calls.append(path) or _response()  # noqa: E731
+    before = sorted(p.name for p in (env / "agents").iterdir())
+    for check in (True, False):
+        with pytest.raises(ownership.AgentError) as refused:
+            ownership.import_new(env, "dev", getter, check=check)
+        assert message in str(refused.value) and "Nothing was written." in str(refused.value)
+    assert calls == [] and sorted(p.name for p in (env / "agents").iterdir()) == before
+    return str(refused.value)
+
+
+def test_generate_refuses_in_a_shallow_clone_that_hides_a_deleted_capture(tmp_path):
+    env = _env(tmp_path / "origin", Sales='genie_space_id = "sales-1"\nacl_groups = ["a"]\n')
+    agent_files.capture_path(env, "Sales").write_text('{"curated": "reviewed"}\n')
+    _commit_checkout(env)
+    agent_files.capture_path(env, "Sales").unlink()
+    _commit_checkout(env)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{tmp_path / 'origin'}", str(clone)], check=True)
+    shallow = clone / "envs" / "dev"
+    # The depth-1 clone cannot see the capture's commit at all.
+    assert ownership.capture_committed(shallow, "Sales", "sales-1") == ""
+
+    message = _refused_untouched(shallow, "this is a shallow clone")
+    assert ('agents/Sales.space.json: fetch full history (git fetch --unshallow; in CI, checkout with '
+            'fetch-depth: 0) and retry, or capture it on purpose: make capture ENV=dev SPACE="Sales"') in message
+    # With full history it is the deleted capture it is.
+    subprocess.run(["git", "-C", str(clone), "fetch", "-q", "--unshallow"], check=True)
+    _refused_untouched(shallow, 'agents/Sales.space.json: restore it from git')
+
+
+def test_generate_refuses_outside_a_git_checkout(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    env = _env(tmp_path, Sales='genie_space_id = "sales-1"\nacl_groups = ["a"]\n', Draft='acl_groups = ["a"]\n')
+    message = _refused_untouched(env, "this is not a git checkout")
+    assert ('agents/Sales.space.json: run make generate in a git checkout of this repo, or capture it on '
+            'purpose: make capture ENV=dev SPACE="Sales"') in message and "Draft" not in message
+    # Nothing to import needs no history; make capture still works.
+    ownership.capture(env, "dev", "Sales", lambda path, query: _response())
+    assert ownership.import_new(env, "dev", lambda *a: pytest.fail("no GET")) == []
+
+
+def test_generate_refuses_when_git_fails(tmp_path, monkeypatch):
+    env = _env(tmp_path, Sales='genie_space_id = "sales-1"\nacl_groups = ["a"]\n')
+    _commit_checkout(env)
+    monkeypatch.setenv("PATH", str(tmp_path / "no-git"))
+    _refused_untouched(env, "git failed (")
+
+
+def test_generate_refuses_a_renamed_agent_whose_capture_was_committed(tmp_path):
+    env = _env(tmp_path, Sales='genie_space_id = "sales-1"\nacl_groups = ["a"]\n')
+    agent_files.capture_path(env, "Sales").write_text('{"curated": "reviewed"}\n')
+    _commit_checkout(env)
+    agents = env / "agents"
+    (agents / "Sales.auto.tfvars").rename(agents / "Revenue.auto.tfvars")
+    agent_files.capture_path(env, "Sales").unlink()
+    _commit_checkout(env)
+    assert ownership.capture_committed(env, "Revenue") == ""  # nothing at its own path
+    assert ownership.capture_committed(env, "Revenue", "sales-1") == "agents/Sales.space.json"
+
+    _refused_untouched(env, 'agents/Revenue.space.json: captured before as agents/Sales.space.json '
+                            '(same genie_space_id); restore it from git, or replace it with the live dev agent: '
+                            'make capture ENV=dev SPACE="Revenue"')
+    # Limitation: renamed together with a new genie_space_id, nothing ties it to
+    # the old capture, so it is a new agent and imports once.
+    (agents / "Revenue.auto.tfvars").write_text('genie_space_id = "revenue-1"\nacl_groups = ["a"]\n')
+    calls = []
+    assert ownership.import_new(env, "dev", lambda path, query: calls.append(path) or _response()) == ["Revenue"]
+    assert calls == ["/api/2.0/genie/spaces/revenue-1"]
 
 
 # ── Remap ────────────────────────────────────────────────────────────────────
