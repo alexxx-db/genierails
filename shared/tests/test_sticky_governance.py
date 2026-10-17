@@ -143,6 +143,79 @@ def test_manifest_stores_only_table_names(tmp_path, monkeypatch):
     assert "ssn" not in (env / "generated/governed_tables.json").read_text()
 
 
+# -- An agent configured only by ID: its tables are recorded under the ID ------
+
+ID_ONLY = ('governance_mode = "deterministic"\nuc_catalog = "prod"\n'
+           'genie_spaces = [{ genie_space_id = "s1" }, { genie_space_id = "s2", name = "B" }]\n')
+DISCOVERED = ('discovered_uc_tables = ["prod.sales.orders", "prod.sales.customers"]\n'
+              'discovered_table_agents = { "prod.sales.orders" = ["Payments"], "prod.sales.customers" = ["B"] }\n')
+
+
+def _id_only_env(tmp_path, discovered=DISCOVERED):
+    env = _env(tmp_path, tables=())
+    (env / "env.auto.tfvars").write_text(ID_ONLY)
+    (env / "generated/abac.auto.tfvars").write_text(PROMOTED + 'genie_space_id_to_name = { s1 = "Payments", s2 = "B" }\n')
+    if discovered:
+        (env / "data_access/discovered_uc_tables.auto.tfvars").write_text(discovered)
+    return env
+
+
+def test_record_keeps_each_id_only_agents_discovered_tables_under_its_id(tmp_path):
+    env = _id_only_env(tmp_path)
+
+    sticky.save_governed_tables(env, [CUSTOMERS])
+
+    # A governed table is never attributed to an agent that did not read it.
+    assert _manifest(env) == {"tables": [CUSTOMERS], "agent_tables": {"s1": [ORDERS], "s2": [CUSTOMERS]}}
+
+
+def test_record_without_the_ignored_discovery_keeps_the_committed_attribution(tmp_path):
+    env = _id_only_env(tmp_path)
+    sticky.save_governed_tables(env, [ORDERS])
+    (env / "data_access/discovered_uc_tables.auto.tfvars").unlink()
+
+    sticky.save_governed_tables(env, [ORDERS])
+
+    assert _manifest(env)["agent_tables"] == {"s1": [ORDERS], "s2": [CUSTOMERS]}
+    assert sticky.committed_agent_tables(env) == {"s1": [ORDERS], "s2": [CUSTOMERS]}
+
+
+def test_record_drops_the_attribution_of_an_agent_no_longer_configured(tmp_path):
+    env = _id_only_env(tmp_path)
+    sticky.save_governed_tables(env, [ORDERS])
+    (env / "data_access/discovered_uc_tables.auto.tfvars").unlink()
+    (env / "env.auto.tfvars").write_text(ID_ONLY.replace('{ genie_space_id = "s1" }, ', ""))
+
+    sticky.save_governed_tables(env, [ORDERS])
+
+    assert _manifest(env)["agent_tables"] == {"s2": [CUSTOMERS]}
+
+
+def test_single_id_only_agent_takes_unattributed_discovery(tmp_path):
+    env = _id_only_env(tmp_path, discovered='discovered_uc_tables = ["prod.sales.orders"]\n')
+    (env / "env.auto.tfvars").write_text(ID_ONLY.replace(', { genie_space_id = "s2", name = "B" }', ""))
+
+    sticky.save_governed_tables(env, [ORDERS])
+
+    assert _manifest(env)["agent_tables"] == {"s1": [ORDERS]}
+
+
+def test_inline_agents_with_listed_tables_keep_a_record_without_agent_tables(tmp_path):
+    env = _env(tmp_path)
+
+    sticky.save_governed_tables(env, [ORDERS])
+
+    assert _manifest(env) == {"tables": [ORDERS]}
+
+
+def test_id_only_agent_with_no_discovery_and_no_record_is_not_attributed(tmp_path):
+    env = _id_only_env(tmp_path, discovered=None)
+
+    sticky.save_governed_tables(env, [ORDERS])
+
+    assert _manifest(env) == {"tables": [ORDERS]}
+
+
 # -- A missing or edited manifest cannot drop or weaken governance ------------
 
 REFUSED = "governed_tables.json is missing but this env has recorded governance"

@@ -43,7 +43,7 @@ The layers are designed so that different teams can own different layers indepen
 | `envs/<env>/ddl/` | Workspace-only local or fetched DDL snapshots used during generation | No |
 | `envs/account/abac.auto.tfvars` | Shared account-owned config: `groups`, optional `group_members`, `tag_policies` | **Yes** |
 | `envs/<env>/data_access/abac.auto.tfvars` | Env-scoped governance config: `groups`, tag assignments, FGAC policies | **Yes** |
-| `envs/<env>/data_access/discovered_uc_tables.auto.tfvars` | Tool-owned, env-local Genie table discovery — the discovered table list **plus the table→exposing-agent attribution** that drives per-agent `SELECT` scoping; used by classification, grants, and masking | **Yes** |
+| `envs/<env>/data_access/discovered_uc_tables.auto.tfvars` | Tool-owned, env-local Genie table discovery — the discovered table list **plus the table→exposing-agent attribution** that drives per-agent `SELECT` scoping; used by classification, grants, and masking. A deterministic env's promotion reads the committed copy in `generated/governed_tables.json` (`agent_tables`) instead | **Yes** |
 | `envs/<env>/data_access/masking_functions.sql` | Env-scoped masking SQL deployed by the governance layer | **Yes** |
 | `envs/<env>/abac.auto.tfvars` | Workspace-owned config: group lookups and Genie config only | **Yes** |
 

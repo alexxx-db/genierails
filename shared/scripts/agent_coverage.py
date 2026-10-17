@@ -241,14 +241,17 @@ def query_inputs(runner: Path, env_name: str, env_dir: Path, apply_flags: str) -
 
 
 def agent_tables(env_dir: Path, agents: Mapping[str, Mapping]) -> dict[str, dict]:
-    """Add the tables make generate attributed to agents known only by ID."""
-    from table_readers import _discovered_attribution, full_name
+    """Add the tables make generate attributed to agents known only by ID
+    (in a deterministic env, the committed record: table_readers.attributed_tables)."""
+    from table_readers import attributed_tables, full_name
 
     uc_catalog = str(_load_hcl(env_dir / "env.auto.tfvars").get("uc_catalog") or "")
-    discovered = _discovered_attribution(env_dir)
+    attributed, by_id = attributed_tables(env_dir)
     resolved = {}
     for key, agent in agents.items():
-        tables = list(agent.get("tables") or []) or discovered.get(str(agent.get("name")), [])
+        # By genie_space_id in a deterministic env: two agents may share a name.
+        label = str(agent.get("genie_space_id") or "") if by_id else str(agent.get("name"))
+        tables = list(agent.get("tables") or []) or (attributed.get(label, []) if label else [])
         resolved[key] = {**agent, "tables": sorted({full_name(t, uc_catalog) for t in tables if t})}
     return resolved
 

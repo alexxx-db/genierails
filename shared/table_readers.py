@@ -177,31 +177,64 @@ def _discovered_attribution(env_dir: Path) -> dict[str, list[str]]:
     return by_agent
 
 
-def agents(env_dir: Path, cfg: Mapping | None = None) -> list[dict]:
-    """Configured agents: name, acl_groups (None when omitted) and fully qualified tables.
+def _agent_name(space: Mapping, id_to_name: Mapping) -> str:
+    space_id = str(space.get("genie_space_id") or "")
+    return str(space.get("name") or "") or str(id_to_name.get(space_id, "")) or space_id
 
-    A space's own uc_tables win; a space known only by ID takes the tables
-    make generate attributed to it (data_access/discovered_uc_tables.auto.tfvars).
+
+def attributed_tables(env_dir: Path, cfg: Mapping | None = None) -> tuple[dict[str, list[str]], bool]:
+    """(tables, by_id): the tables make generate attributed to agents known only by ID.
+
+    A deterministic env reads only the committed generated/governed_tables.json
+    agent_tables, keyed by genie_space_id (by_id is true), the same record
+    promote-to reads, so a clean clone and a laptop agree; the git-ignored
+    discovery file is never read. Names are only labels: two agents may share
+    one. A legacy env takes data_access/discovered_uc_tables.auto.tfvars, keyed
+    by agent name.
     """
     env_dir = Path(env_dir)
     cfg = env_config(env_dir, cfg)
+    if not deterministic(cfg):
+        return _discovered_attribution(env_dir), False
+    from scripts.sticky_governance import committed_agent_tables
+
+    return committed_agent_tables(env_dir), True
+
+
+def _agents(env_dir: Path, cfg: Mapping) -> list[dict]:
+    """agents(), plus each agent's genie_space_id and whether it is an ID-only
+    deterministic agent the committed record has no tables for."""
     generated = _load_hcl(env_dir / "generated" / "abac.auto.tfvars")
     id_to_name = generated.get("genie_space_id_to_name") or {}
-    discovered = _discovered_attribution(env_dir)
+    attributed, by_id = attributed_tables(env_dir, cfg)
     uc_catalog = str(cfg.get("uc_catalog") or "")
     result = []
     for space in cfg.get("genie_spaces") or []:
         if not isinstance(space, dict):
             continue
         space_id = str(space.get("genie_space_id") or "")
-        name = str(space.get("name") or "") or str(id_to_name.get(space_id, "")) or space_id
-        tables = list(space.get("uc_tables") or []) or discovered.get(name, [])
+        name = _agent_name(space, id_to_name)
+        listed = list(space.get("uc_tables") or [])
+        tables = listed or (attributed.get(space_id, []) if by_id else attributed.get(name, []))
         result.append({
             "name": name,
             "acl_groups": space.get("acl_groups"),
             "tables": sorted({full_name(t, uc_catalog) for t in tables if t}),
+            "genie_space_id": space_id,
+            "uncommitted": by_id and bool(space_id) and not listed and not tables,
         })
     return result
+
+
+def agents(env_dir: Path, cfg: Mapping | None = None) -> list[dict]:
+    """Configured agents: name, acl_groups (None when omitted) and fully qualified tables.
+
+    A space's own uc_tables win; a space known only by ID takes the tables
+    make generate attributed to it (attributed_tables).
+    """
+    env_dir = Path(env_dir)
+    return [{key: agent[key] for key in ("name", "acl_groups", "tables")}
+            for agent in _agents(env_dir, env_config(env_dir, cfg))]
 
 
 def access_problems(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
@@ -216,13 +249,19 @@ def access_problems(env_dir: Path, cfg: Mapping | None = None) -> list[str]:
         return []
     problems: list[str] = []
     readers = normalize(cfg.get(SETTING), str(cfg.get("uc_catalog") or ""))
-    for agent in agents(env_dir, cfg):
+    for agent in _agents(env_dir, cfg):
         groups = agent["acl_groups"]
         if groups is None:
             problems.append(f"agent {agent['name']} has no acl_groups: list the groups that may run it "
                             "([] means nobody)")
             continue
         if not groups:
+            continue
+        if agent["uncommitted"]:
+            problems.append(
+                f"agent {agent['name']}: generated/governed_tables.json has no agent_tables entry for "
+                f"genie_space_id {agent['genie_space_id']}; run make generate ENV={env_dir.name} "
+                "and commit generated/")
             continue
         if not agent["tables"]:
             problems.append(f"agent {agent['name']}: no tables are known for it; run make generate first")

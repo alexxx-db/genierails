@@ -115,6 +115,11 @@ so CODEOWNERS can require only the owners of what changed:
   table always changes a governance-owned file, and `make check` fails while
   that record is stale. The record grants nothing: `SELECT` comes only from
   `table_readers` ([access.md](access.md)).
+- An agent kept inline in `env.auto.tfvars` with only a `genie_space_id` is
+  recorded there too, under that ID, from the tables `make generate`
+  discovered. The discovery file is git-ignored, so this committed record is
+  what `make promote-to` and `make check` read: a fresh clone or CI promotes
+  the same tables as your laptop.
 - `make promote-to` writes agent output under `envs/<target>/agents/` and
   governance output under `envs/<target>/generated/`, and prints which kind it
   changed.

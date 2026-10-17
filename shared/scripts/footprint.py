@@ -74,16 +74,17 @@ def load_discovered_footprint(env_dir: str | Path) -> tuple[list[str], dict[str,
 
 
 def resolve_footprint(
-    env_dir: str | Path, env_file: str | Path | None = None
+    env_dir: str | Path, env_file: str | Path | None = None, *, discovered: bool = True
 ) -> list[str]:
-    """Return top-level, per-space, and discovered tables in stable order."""
+    """Return top-level, per-space, and (unless ``discovered`` is false)
+    discovered tables in stable order."""
     env_dir = Path(env_dir)
     config = load_hcl(Path(env_file)) if env_file is not None else load_env_config(env_dir)
     tables = list(config.get("uc_tables") or [])
     for space in config.get("genie_spaces") or []:
         tables.extend(space.get("uc_tables") or [])
-    discovered, _agents = load_discovered_footprint(env_dir)
-    tables.extend(discovered)
+    if discovered:
+        tables.extend(load_discovered_footprint(env_dir)[0])
     return list(dict.fromkeys(table for table in tables if table))
 
 
