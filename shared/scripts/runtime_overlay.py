@@ -190,7 +190,7 @@ def kept_policy_names(
     can't be listed, two older forms are deployed, or the promoted name is
     taken by a policy GenieRails doesn't manage.
     """
-    from remap_generated_config import remap_policy_name
+    from remap_generated_config import remap_policy_name, remote_policy_name
 
     sources: dict[str, list[str]] = {}
     for src, dest in catalog_map.items():
@@ -213,7 +213,7 @@ def kept_policy_names(
             raise OverlayError(
                 f"the policies on {catalog} couldn't be listed, so it is unknown whether {name} is deployed "
                 f"under an older name; refusing to plan a rename (#68). Check {catalog}'s credentials and retry")
-        deployed = [k for k in older if (catalog, k) in managed or f"{catalog}_{k}" in live]
+        deployed = [k for k in older if (catalog, k) in managed or remote_policy_name(catalog, k) in live]
         if len(deployed) > 1:
             raise OverlayError(f"{catalog} deploys {name} under several older names ({', '.join(deployed)})")
         if deployed:

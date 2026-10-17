@@ -14,6 +14,10 @@ import types
 import pytest
 
 from scripts.e2e import driver
+from scripts.remap_generated_config import remote_policy_name
+from scripts import custom_masks
+from governance_policies import build_model
+from weakening import GovernanceState, Protection, find_weakenings
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +67,19 @@ def test_every_executable_step_uses_public_make_target():
                 assert "terraform" not in step.command
 
 
+def test_every_scenario_action_has_a_handler():
+    used = {step.action for scenario in driver.SCENARIOS for step in scenario.steps if step.action}
+    assert used <= driver.HANDLED_ACTIONS
+
+
+def test_new_scenarios_never_require_fresh_verify_receipts_on_rehearse():
+    for scenario in driver.SCENARIOS:
+        if scenario.key not in {"tier-groupmap", "custom-mask"}: continue
+        for step in scenario.steps:
+            if step.target == "rehearse":
+                assert not any(isinstance(check, driver.AccessVerified) for check in step.assertions)
+
+
 def test_secret_fields_are_redacted():
     assert driver.redact({"client_secret": "nope", "nested": {"token": "bad", "ok": 1}}) == {
         "client_secret": "<redacted>", "nested": {"token": "<redacted>", "ok": 1}
@@ -84,6 +101,719 @@ def test_scenario_catalog_contains_plan_matrix_and_governance_only():
     assert {f"s{i}" for i in range(1, 17)} <= keys
     assert {"champion", "manifest", "migration", "migration-cutover"} <= keys
     assert next(s for s in driver.SCENARIOS if s.key == "s14").title == "Governance-only environment"
+    assert {"tier-groupmap", "custom-mask"} <= keys
+
+
+@pytest.mark.parametrize("cloud", ["aws", "azure"])
+@pytest.mark.parametrize("scenario", ["tier-groupmap", "custom-mask"])
+def test_new_day2_scenarios_dry_run_offline_with_every_step(tmp_path, monkeypatch, cloud, scenario):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dry-run must stay offline")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    out = tmp_path / cloud / scenario
+    assert driver.main(["--cloud", cloud, "--repo", str(ROOT), "--dry-run",
+                        "--scenarios", scenario, "--reports", str(out)]) == 0
+    report = json.loads((out / f"{scenario}.json").read_text())
+    expected = next(item for item in driver.SCENARIOS if item.key == scenario)
+    assert len(report["steps"]) == len(expected.steps)
+    assert all(item["status"] == "planned" for item in report["steps"])
+    assert not report["known_failure"]
+
+
+def test_tier_groupmap_keeps_all_four_day2_changes_and_guards():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "tier-groupmap")
+    signatures = [(step.action or step.target, step.expect_failure) for step in scenario.steps]
+    required = [
+        ("tier_add", False), ("rehearse", False), ("release-plan", False), ("release", False),
+        ("tier_remove", False), ("rehearse", False), ("release", False),
+        ("group_map_change", False), ("release-plan", True), ("add_group_map_ack", False),
+        ("release-plan", False), ("release", False), ("prod_acl_change", False),
+        ("check", False), ("release-plan", False), ("release", False),
+    ]
+    cursor = 0
+    for signature in required:
+        cursor = signatures.index(signature, cursor) + 1
+    assert len(scenario.steps) == 61  # deleting any declared acceptance step is a regression
+    assert {step.refusal for step in scenario.steps if step.expect_failure} == {
+        driver.REFUSALS["weakening"], driver.REFUSALS["group_map"]}
+
+
+def test_custom_mask_scenario_keeps_case_order_and_weakening_ack():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "custom-mask")
+    assert len(scenario.steps) == 37  # fails if a case/check/lifecycle step is removed
+    lock_targets = {"rehearse", "release-plan"}
+    guarded = [step for step in scenario.steps if step.target in lock_targets and not step.expect_failure]
+    assert len(guarded) == 10
+    assert all(any(isinstance(check, driver.OutputOrder) for check in step.assertions) for step in guarded)
+    releases = [step for step in scenario.steps if step.target == "release"]
+    assert len(releases) == 2 and all(any(isinstance(check, driver.OutputOrder)
+                                         for check in step.assertions) for step in releases)
+    refusal = next(step for step in scenario.steps if step.expect_failure)
+    assert refusal.target == "release-plan" and refusal.refusal == driver.REFUSALS["weakening"]
+    assert any(step.action == "add_ack" and step.value == "custom_mask_ack" for step in scenario.steps)
+
+
+def test_custom_mask_retirement_is_required_on_the_next_staged_run():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "custom-mask")
+    retire_steps = [(step.name, check.env, check.required, check.findings[0][2])
+                    for step in scenario.steps for check in step.assertions
+                    if isinstance(check, driver.ProtectionDelta)
+                    and check.findings[0][0] == "custom-retire"]
+    assert retire_steps == [
+        ("Rehearse custom-mask promotion merge", "dev", True, driver.FAILSAFE_STRING_VALUE),
+        ("Verify partial/full behavior and idempotence", "prod", True,
+         driver.FAILSAFE_STRING_VALUE),
+    ]
+    assert driver.FAILSAFE_STRING_VALUE == driver.resolve_column(
+        "fixture", ("class.not_in_library",), "STRING").value
+
+
+def test_custom_mask_preflight_requires_last_failsafe_string_column():
+    model = _failsafe_model()
+    snapshots = {
+        **_model_snapshot(model, "dev"),
+        **_model_snapshot(model, "prod", catalog=PROD_CATALOG),
+    }
+    values = {"custom_mask_column_dev": CUSTOM_COLUMN,
+              "custom_mask_column_prod": PROD_CUSTOM_COLUMN}
+    assert driver.custom_mask_preflight_problems(snapshots, values) == []
+    prod = snapshots["prod"]["uc"][PROD_CATALOG]
+    prod["governed_tags"].append({
+        "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "notes",
+        "column_name": "second_secret", "tag_name": "gr_treatment",
+        "tag_value": driver.FAILSAFE_STRING_VALUE,
+    })
+    problems = driver.custom_mask_preflight_problems(snapshots, values)
+    assert len(problems) == 1
+    assert "last fail-safe STRING column" in problems[0]
+    assert "second_secret" in problems[0]
+
+
+def test_new_fixture_actions_execute_with_real_hcl_and_mask_validators(tmp_path):
+    cloud = tmp_path / "aws"
+    for env in ("dev", "prod"):
+        root = cloud / "envs" / env
+        (root / "agents").mkdir(parents=True)
+        extra = 'group_map = { "dev_ops" = "prod_ops" }\n' if env == "prod" else "tag_treatments = {}\n"
+        table = f'{"devcat" if env == "dev" else "prodcat"}.s.t'
+        (root / "env.auto.tfvars").write_text(
+            'governance_mode = "deterministic"\naccess_tier_groups = ["ops", "viewers"]\n'
+            f'table_readers = {{ "{table}" = ["ops"] }}\n' + extra)
+        (root / "agents/pay.auto.tfvars").write_text(
+            'acl_groups = ["ops"]\nuc_tables = ["cat.s.t"]\n')
+    agent = cloud / "envs/prod/agents/pay.auto.tfvars"
+    repo = SimpleNamespace(runner=SimpleNamespace(cwd=cloud))
+    values = {"tier_group": "analysts", "group_map_source": "dev_ops", "mapped_group": "prod_new",
+              "tier_table_dev": "devcat.s.t", "tier_table_prod": "prodcat.s.t",
+              "prod_agent": "pay", "acl_group": "auditors",
+              "custom_mask_class": "class.postcode"}
+
+    tier_action = driver.fixture_action("add", "tier_add", "tier_group", "tier_table_dev",
+                                        "tier_table_prod", "prod_agent")
+    driver._run_action(tier_action, None, repo, values)
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["access_tier_groups"] == ["ops", "analysts", "viewers"]
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["table_readers"]["devcat.s.t"] == ["ops", "analysts"]
+    assert driver._load_hcl(cloud / "envs/dev/agents/pay.auto.tfvars")["acl_groups"] == ["ops", "analysts"]
+    driver._run_action(driver.fixture_action("remove", "tier_remove", "tier_group", "tier_table_dev",
+                                             "tier_table_prod", "prod_agent"), None, repo, values)
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["access_tier_groups"] == ["ops", "viewers"]
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["table_readers"]["prodcat.s.t"] == ["ops"]
+    assert driver._load_hcl(agent)["acl_groups"] == ["ops"]
+    driver._run_action(driver.fixture_action("map", "group_map_change", "group_map_source", "mapped_group"), None, repo, values)
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["group_map"] == {"dev_ops": "prod_new"}
+    driver._run_action(driver.fixture_action("acl", "prod_acl_change", "prod_agent", "acl_group"), None, repo, values)
+    assert driver._load_hcl(agent)["acl_groups"] == ["ops", "auditors"]
+
+    driver._run_action(driver.fixture_action("install", "custom_mask_install", "custom_mask_class"), None, repo, values)
+    mask_path = cloud / "envs/dev/custom_masks/custom_e2e_suffix.json"
+    v1 = json.loads(mask_path.read_text())
+    assert custom_masks.mask_file_problems(v1, v1["treatment"]) == []
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["tag_treatments"] == {
+        "class.postcode": "custom_e2e_suffix"}
+    driver._run_action(driver.fixture_action("change", "custom_mask_change"), None, repo, values)
+    v2 = json.loads(mask_path.read_text())
+    assert custom_masks.mask_file_problems(v2, v2["treatment"]) == []
+    assert v2["partial"]["STRING"]["sql"] != v1["partial"]["STRING"]["sql"]
+
+
+def test_ack_actions_add_and_remove_exact_entries(tmp_path):
+    cloud = tmp_path / "aws"; (cloud / "envs/prod").mkdir(parents=True)
+    repo = SimpleNamespace(runner=SimpleNamespace(cwd=cloud))
+    values = {"acks": "prod:reader:cat.s.t:g;;prod:weaken:cat.s.t.c:g",
+              "group_map_source": "dev", "mapped_group": "prod"}
+    driver._run_action(driver.action("add", "add_acks", "acks"), None, repo, values)
+    driver._run_action(driver.fixture_action("gm", "add_group_map_ack", "group_map_source", "mapped_group"), None, repo, values)
+    assert len((cloud / "envs/prod/ack.txt").read_text().splitlines()) == 3
+    driver._run_action(driver.action("remove", "remove_ack", "acks"), None, repo, values)
+    driver._run_action(driver.fixture_action("remove gm", "remove_group_map_ack", "group_map_source", "mapped_group"), None, repo, values)
+    assert (cloud / "envs/prod/ack.txt").read_text() == ""
+
+
+def test_tier_add_and_custom_install_fixtures_are_acknowledged_weakenings():
+    column, table, tier = "cat.s.t.postcode", "cat.s.t", "analysts"
+    before = GovernanceState(
+        columns={column: {tier: Protection("redacted", "redacted (failsafe)")}},
+        table_readers={table: set()})
+    tier_after = GovernanceState(
+        columns={column: {tier: Protection("partial", "partial (postcode)")}},
+        table_readers={table: {tier}})
+    issues = find_weakenings(before, tier_after, "prod")
+    assert {issue.ack_key for issue in issues} == {
+        f"prod:weaken:{column}:{tier}", f"prod:reader:{table}:{tier}"}
+    custom_after = GovernanceState(
+        columns={column: {tier: Protection("partial", "partial (custom_e2e_suffix)")}},
+        table_readers={table: set()})
+    (custom_issue,) = find_weakenings(before, custom_after, "prod")
+    assert custom_issue.ack_key == f"prod:weaken:{column}:{tier}"
+
+
+def _effect_snapshot(*, grants=(), runs=()):
+    by_agent = {}
+    for agent, principal in runs:
+        by_agent.setdefault(agent, []).append({"group_name": principal,
+                                                "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    return {"prod": {"uc": {"cat": {"table_grants": [
+        {"grantee": principal, "privilege_type": "SELECT", "table_catalog": "cat",
+         "table_schema": "s", "table_name": table} for principal, table in grants]}},
+        "agents": [{"name": agent, "space_id": f"space-{agent}", "acl": {"access_control_list": acl}}
+                   for agent, acl in by_agent.items()]}}
+
+
+LIVE_CATALOG = "genierails_dev_1"
+PROD_CATALOG = "genierails_prod_1"
+LIVE_SCHEMA = "dev_to_prod_demo"
+LIVE_TABLES = tuple(f"{LIVE_CATALOG}.{LIVE_SCHEMA}.{name}" for name in ("customers", "payments", "notes"))
+TIER_TABLE = LIVE_TABLES[0]
+CUSTOM_COLUMN = f"{TIER_TABLE}.postcode"
+PROD_TABLES = tuple(table.replace(LIVE_CATALOG + ".", PROD_CATALOG + ".", 1) for table in LIVE_TABLES)
+PROD_TIER_TABLE = PROD_TABLES[0]
+PROD_CUSTOM_COLUMN = f"{PROD_TIER_TABLE}.postcode"
+
+
+def _model_snapshot(model, env, *, grants=(), runs=(), catalog=LIVE_CATALOG):
+    """Realistic live snapshot: catalog policies inherited by all three demo tables."""
+    policies = []
+    for policy in model.fgac_policies:
+        policies.append({
+            # Terraform materializes `${catalog}_${for_each key}`; these are
+            # post-prefix names observed in the real dev plan and s13 snapshot.
+            "name": remote_policy_name(catalog, policy["name"]),
+            "column_mask": {"function_name":
+                f"{catalog}.{policy['function_schema']}.{policy['function_name']}"},
+            "match_values": re.findall(r"hasTagValue\('gr_treatment', '([^']+)'\)",
+                                       policy["match_condition"]),
+            "to_principals": policy["to_principals"],
+            "except_principals": policy["except_principals"],
+        })
+    functions = {policy["column_mask"]["function_name"] for policy in policies}
+    evidence = {
+        "governed_tags": [{
+            "catalog_name": catalog,
+            "schema_name": assignment["entity_name"].split(".")[1],
+            "table_name": assignment["entity_name"].split(".")[2],
+            "column_name": assignment["entity_name"].split(".")[3],
+            "tag_name": assignment["tag_key"], "tag_value": assignment["tag_value"],
+        } for assignment in model.tag_assignments],
+        "mask_functions": [{
+            "routine_catalog": name.split(".")[0], "routine_schema": name.split(".")[1],
+            "routine_name": name.split(".")[2], "definition_hash": name.split(".")[2],
+        } for name in sorted(functions)],
+        "abac_policies": [{"table": table.replace(LIVE_CATALOG + ".", catalog + ".", 1),
+                           "policies": json.loads(json.dumps(policies))}
+                          for table in LIVE_TABLES],
+        "table_grants": [{
+            "grantee": principal, "privilege_type": privilege,
+            "table_catalog": catalog, "table_schema": TIER_TABLE.split(".")[1],
+            "table_name": TIER_TABLE.split(".")[2],
+        } for principal, privilege in grants],
+    }
+    catalog_map = {LIVE_CATALOG: catalog} if catalog != LIVE_CATALOG else {}
+    return {env: {"uc": {catalog: evidence}, "catalog_map": catalog_map,
+                  "governed_catalogs": [catalog], "agents": [{
+        "name": "pay", "space_id": "space-pay", "acl": {"access_control_list": [{
+            "group_name": principal, "all_permissions": [{"permission_level": "CAN_RUN"}],
+        } for principal in runs]},
+    }]}}
+
+
+def _tier_model(tiers):
+    classes = {
+        f"{LIVE_TABLES[0]}.email": ["email_address"],
+        f"{LIVE_TABLES[0]}.birth_date": ["date_of_birth"],
+        f"{LIVE_TABLES[1]}.card": ["credit_card"],
+        f"{LIVE_TABLES[2]}.phone": ["phone_number"],
+    }
+    types = {column: ("DATE" if column.endswith("birth_date") else "STRING") for column in classes}
+    return build_model(classes, types, {"access_tier_groups": tiers})
+
+
+def _custom_model(tmp_path, version):
+    env = tmp_path / version
+    folder = env / "custom_masks"; folder.mkdir(parents=True)
+    source = ROOT / "shared/scripts/e2e/fixtures" / f"custom_mask_{version}.json"
+    (folder / "custom_e2e_suffix.json").write_bytes(source.read_bytes())
+    library = custom_masks.effective_library(env)
+    classes = {
+        CUSTOM_COLUMN: ["e2e_custom"],
+        f"{LIVE_TABLES[0]}.email": ["email_address"],
+        f"{LIVE_TABLES[1]}.card": ["credit_card"],
+        f"{LIVE_TABLES[2]}.phone": ["phone_number"],
+    }
+    return build_model(classes, {column: "STRING" for column in classes}, {
+        "access_tier_groups": ["admins", "ops", "viewers"],
+        "tag_treatments": {"class.e2e_custom": "custom_e2e_suffix"},
+    }, library=library)
+
+
+def _failsafe_model():
+    classes = {
+        CUSTOM_COLUMN: ["not_mapped_e2e"],
+        f"{LIVE_TABLES[0]}.email": ["email_address"],
+        f"{LIVE_TABLES[1]}.card": ["credit_card"],
+        f"{LIVE_TABLES[2]}.phone": ["phone_number"],
+    }
+    return build_model(classes, {column: "STRING" for column in classes},
+                       {"access_tier_groups": ["admins", "ops", "viewers"]})
+
+
+def _rendered_step_checks(scenario_key, step_name, values):
+    scenario = next(item for item in driver.SCENARIOS if item.key == scenario_key)
+    step = next(item for item in scenario.steps if item.name == step_name)
+    return scenario, [driver.render_check(check, values) for check in step.assertions]
+
+
+def _allowed_diff(scenario, checks, before, after, acks=()):
+    return driver.live_protection_diff(
+        scenario, before, after, allowed_adoptions={},
+        allowed_grants=driver.grant_allowances(checks, before, after),
+        allowed_weakening_findings=driver.weakening_finding_allowances(
+            checks, acks, before, after))
+
+
+def _retained_generation(new, old, env):
+    """Staged switch snapshot: old policies/functions remain until the next run."""
+    result = json.loads(json.dumps(new))
+    catalog = next(iter(result[env]["uc"]))
+    current = result[env]["uc"][catalog]
+    prior = old[env]["uc"][catalog]
+    old_by_table = {entry["table"]: entry["policies"] for entry in prior["abac_policies"]}
+    for entry in current["abac_policies"]:
+        entry["policies"].extend(json.loads(json.dumps(old_by_table[entry["table"]])))
+    current["mask_functions"].extend(json.loads(json.dumps(prior["mask_functions"])))
+    return result
+
+
+def test_live_effect_checks_enforce_exact_grant_and_can_run_diffs():
+    empty = _effect_snapshot()
+    added = _effect_snapshot(grants=(("analysts", "t"),), runs=(("pay", "analysts"),))
+    driver.verify_live_effect("tier_added", empty, added, ["analysts"])
+    driver.verify_live_effect("tier_removed", added, empty, ["analysts"])
+    mapped_before = _effect_snapshot(grants=(("prod_old", "t"),), runs=(("pay", "prod_old"),))
+    mapped_after = _effect_snapshot(grants=(("prod_ops", "t"),), runs=(("pay", "prod_ops"),))
+    driver.verify_live_effect("group_mapped", mapped_before, mapped_after, ["dev_ops", "prod_ops", "prod_old"])
+    acl = _effect_snapshot(runs=(("pay", "auditors"),))
+    driver.verify_live_effect("acl_only", empty, acl, ["pay", "auditors"])
+    with pytest.raises(RuntimeError, match="exclusively"):
+        driver.verify_live_effect("tier_added", empty,
+            _effect_snapshot(grants=(("analysts", "t"), ("stranger", "t")), runs=(("pay", "analysts"),)),
+            ["analysts"])
+
+
+def test_real_tier_and_group_map_fixtures_require_exact_allowances():
+    base_model = _tier_model(["admins", "ops", "viewers"])
+    added_model = _tier_model(["admins", "ops", "analysts", "viewers"])
+    base_dev = _model_snapshot(base_model, "dev", grants=(("admins", "SELECT"), ("ops", "SELECT")),
+                               runs=("admins", "ops"))
+    added_dev = _model_snapshot(added_model, "dev", grants=(("admins", "SELECT"), ("ops", "SELECT"),
+                                                               ("analysts", "SELECT")),
+                                runs=("admins", "ops", "analysts"))
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts",
+              "group_map_source": "dev_ops", "mapped_group": "prod_new",
+              "group_map_old_target": "prod_ops"}
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse added tier merge", values)
+    assert _allowed_diff(scenario, checks, base_dev, added_dev) == {}
+    assert "policies" in _allowed_diff(scenario, [c for c in checks if not isinstance(c, driver.ProtectionDelta)],
+                                        base_dev, added_dev)["dev"]
+    assert "widened_grants" in _allowed_diff(
+        scenario, [c for c in checks if not isinstance(c, driver.GrantDelta)], base_dev, added_dev)["dev"]
+    extra_dev = json.loads(json.dumps(added_dev))
+    extra_dev["dev"]["uc"][LIVE_CATALOG]["table_grants"].append({
+        "grantee": "stranger", "privilege_type": "SELECT", "table_catalog": LIVE_CATALOG,
+        "table_schema": LIVE_SCHEMA, "table_name": "customers"})
+    assert f"stranger SELECT {TIER_TABLE}" in _allowed_diff(
+        scenario, checks, base_dev, extra_dev)["dev"]["widened_grants"]
+
+    base = _model_snapshot(base_model, "prod", grants=(("admins", "SELECT"), ("ops", "SELECT")),
+                           runs=("admins", "ops"), catalog=PROD_CATALOG)
+    added = _model_snapshot(added_model, "prod", grants=(("admins", "SELECT"), ("ops", "SELECT"),
+                                                           ("analysts", "SELECT")),
+                            runs=("admins", "ops", "analysts"), catalog=PROD_CATALOG)
+    scenario, add_checks = _rendered_step_checks(
+        "tier-groupmap", "Release acknowledged tier addition", values)
+    acks = set(driver._ack_entries(values["tier_add_acks"]))
+    assert _allowed_diff(scenario, add_checks, base, added, acks) == {}
+    assert "policies" in _allowed_diff(scenario, add_checks, base, added)["prod"]
+
+    scenario, remove_checks = _rendered_step_checks(
+        "tier-groupmap", "Release tier removal", values)
+    assert _allowed_diff(scenario, remove_checks, added, base) == {}
+    assert "policies" in _allowed_diff(
+        scenario, [c for c in remove_checks if not isinstance(c, driver.ProtectionDelta)],
+        added, base)["prod"]
+    _, dev_remove_checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse removed tier merge", values)
+    assert _allowed_diff(scenario, dev_remove_checks, added_dev, base_dev) == {}
+
+    mapped_model = _tier_model(["admins", "prod_new", "viewers"])
+    mapped = _model_snapshot(mapped_model, "prod", grants=(("admins", "SELECT"), ("prod_new", "SELECT")),
+                             runs=("admins", "prod_new"), catalog=PROD_CATALOG)
+    old_model = _tier_model(["admins", "prod_ops", "viewers"])
+    old = _model_snapshot(old_model, "prod", grants=(("admins", "SELECT"), ("prod_ops", "SELECT")),
+                          runs=("admins", "prod_ops"), catalog=PROD_CATALOG)
+    scenario, map_checks = _rendered_step_checks(
+        "tier-groupmap", "Apply acknowledged group-map manifest", values)
+    map_ack = {"prod:weaken:group_map:dev_ops=prod_new"}
+    assert _allowed_diff(scenario, map_checks, old, mapped, map_ack) == {}
+    missing = _allowed_diff(scenario, map_checks, old, mapped)
+    assert "policies" in missing["prod"]
+    extra_mapped = json.loads(json.dumps(mapped))
+    extra_mapped["prod"]["agents"][0]["acl"]["access_control_list"].append({
+        "group_name": "stranger", "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    assert "stranger CAN_RUN genie:space-pay" in _allowed_diff(
+        scenario, map_checks, old, extra_mapped, map_ack)["prod"]["widened_grants"]
+    grant_widened = json.loads(json.dumps(mapped))
+    grant_widened["prod"]["uc"][PROD_CATALOG]["table_grants"].append({
+        "grantee": "account users", "privilege_type": "SELECT",
+        "table_catalog": PROD_CATALOG, "table_schema": LIVE_SCHEMA, "table_name": "customers"})
+    assert f"account users SELECT {PROD_TIER_TABLE}" in _allowed_diff(
+        scenario, map_checks, old, grant_widened, map_ack)["prod"]["widened_grants"]
+
+    acl_values = {**values, "acl_group": "auditors"}
+    scenario, acl_checks = _rendered_step_checks(
+        "tier-groupmap", "Apply isolated prod ACL release", acl_values)
+    acl_after = json.loads(json.dumps(mapped))
+    acl_after["prod"]["agents"][0]["acl"]["access_control_list"].append({
+        "group_name": "auditors", "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    assert _allowed_diff(scenario, acl_checks, mapped, acl_after) == {}
+    acl_after["prod"]["agents"][0]["acl"]["access_control_list"].append({
+        "group_name": "stranger", "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    assert "stranger CAN_RUN genie:space-pay" in _allowed_diff(
+        scenario, acl_checks, mapped, acl_after)["prod"]["widened_grants"]
+
+
+def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_path):
+    failsafe = _failsafe_model(); custom_v1 = _custom_model(tmp_path, "v1")
+    before_dev = _model_snapshot(failsafe, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
+    after_dev = _model_snapshot(custom_v1, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
+    retained_dev = _retained_generation(after_dev, before_dev, "dev")
+    values = {"custom_mask_column_dev": CUSTOM_COLUMN,
+              "custom_mask_column_prod": PROD_CUSTOM_COLUMN,
+              "custom_install_ack": f"prod:weaken:{PROD_CUSTOM_COLUMN}:ops",
+              "custom_mask_ack": f"prod:weaken:{PROD_CUSTOM_COLUMN}:ops"}
+    scenario, dev_checks = _rendered_step_checks(
+        "custom-mask", "Run committed cases read-only before the dev lock", values)
+    assert _allowed_diff(scenario, dev_checks, before_dev, retained_dev) == {}
+    without = [check for check in dev_checks if not isinstance(check, driver.ProtectionDelta)]
+    assert set(_allowed_diff(scenario, without, before_dev, retained_dev)["dev"]) == {"columns"}
+    _, retire_dev_checks = _rendered_step_checks(
+        "custom-mask", "Rehearse custom-mask promotion merge", values)
+    assert _allowed_diff(scenario, retire_dev_checks, retained_dev, after_dev) == {}
+    assert set(_allowed_diff(scenario, [], retained_dev, after_dev)["dev"]) == {"masks", "policies"}
+
+    before = _model_snapshot(failsafe, "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                             catalog=PROD_CATALOG)
+    after = _model_snapshot(custom_v1, "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                            catalog=PROD_CATALOG)
+    retained_prod = _retained_generation(after, before, "prod")
+    scenario, prod_checks = _rendered_step_checks(
+        "custom-mask", "Release prepared custom mask", values)
+    ack = {values["custom_install_ack"]}
+    assert _allowed_diff(scenario, prod_checks, before, retained_prod, ack) == {}
+    assert set(_allowed_diff(scenario, prod_checks, before, retained_prod)["prod"]) == {"columns"}
+    _, maintain_checks = _rendered_step_checks(
+        "custom-mask", "Verify partial/full behavior and idempotence", values)
+    assert _allowed_diff(scenario, maintain_checks, retained_prod, after) == {}
+    assert driver.failed_checks(driver.evaluate_checks(
+        maintain_checks, driver.CheckContext(after, after, ROOT)))
+    before_extra, after_extra = json.loads(json.dumps(before)), json.loads(json.dumps(after))
+    before_extra["prod"]["uc"][PROD_CATALOG]["governed_tags"].append({
+        "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "other",
+        "column_name": "secret", "tag_name": "gr_treatment",
+        "tag_value": "unmapped_redact__string__455f4485",
+    })
+    remaining = _allowed_diff(scenario, prod_checks, before_extra, after_extra, ack)
+    assert any(f"{PROD_CATALOG}.{LIVE_SCHEMA}.other.secret" in item
+               for item in remaining["prod"]["columns"])
+
+    custom_v2 = _custom_model(tmp_path, "v2")
+    v2 = _model_snapshot(custom_v2, "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                         catalog=PROD_CATALOG)
+    _, change_checks = _rendered_step_checks(
+        "custom-mask", "Release acknowledged custom-mask change", values)
+    ctx = driver.CheckContext(after, v2, ROOT, acknowledged=frozenset())
+    missing_ack = next(result for result in driver.evaluate_checks(change_checks, ctx)
+                       if result["check"].startswith("acknowledged-weakening"))
+    assert missing_ack["problems"]
+    ctx = dataclasses.replace(ctx, acknowledged=frozenset({values["custom_mask_ack"]}))
+    ack_result = next(result for result in driver.evaluate_checks(change_checks, ctx)
+                      if result["check"].startswith("acknowledged-weakening"))
+    assert ack_result["problems"] == []
+
+    assert _allowed_diff(scenario, change_checks, after, v2,
+                         {values["custom_mask_ack"]}) == {}
+
+
+def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_widening(tmp_path):
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts"}
+    base = _model_snapshot(_tier_model(["admins", "ops", "viewers"]), "prod",
+                           grants=(("admins", "SELECT"), ("ops", "SELECT")), runs=("admins", "ops"),
+                           catalog=PROD_CATALOG)
+    added = _model_snapshot(_tier_model(["admins", "ops", "analysts", "viewers"]), "prod",
+                            grants=(("admins", "SELECT"), ("ops", "SELECT"), ("analysts", "SELECT")),
+                            runs=("admins", "ops", "analysts"), catalog=PROD_CATALOG)
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Release acknowledged tier addition", values)
+    acks = set(driver._ack_entries(values["tier_add_acks"]))
+
+    handwritten_before, handwritten_after = json.loads(json.dumps(base)), json.loads(json.dumps(added))
+    generated_function = next(
+        policy["column_mask"]["function_name"]
+        for policy in handwritten_before["prod"]["uc"][PROD_CATALOG]["abac_policies"][0]["policies"]
+        if policy["column_mask"]["function_name"].endswith("_full"))
+    handwritten_function = re.sub(r"__[0-9a-f]{8}_full$", "__ffffffff_full", generated_function)
+    for snapshot, principals in ((handwritten_before, []), (handwritten_after, ["analysts"])):
+        snapshot["prod"]["uc"][PROD_CATALOG]["abac_policies"][0]["policies"].append({
+            "name": "customer_handwritten_full", "column_mask": {"function_name": handwritten_function},
+            "match_values": [], "to_principals": ["account users"], "except_principals": principals})
+    remaining = _allowed_diff(scenario, checks, handwritten_before, handwritten_after, acks)
+    assert any("newly exempts analysts" in item for item in remaining["prod"]["policies"])
+
+    cross_before, cross_after = json.loads(json.dumps(base)), json.loads(json.dumps(added))
+    cross_before["prod"]["uc"]["other_catalog"] = json.loads(json.dumps(
+        cross_before["prod"]["uc"][PROD_CATALOG]))
+    cross_after["prod"]["uc"]["other_catalog"] = json.loads(json.dumps(
+        cross_after["prod"]["uc"][PROD_CATALOG]))
+    for snapshot in (cross_before, cross_after):
+        snapshot["prod"]["catalog_map"] = {
+            LIVE_CATALOG: PROD_CATALOG,
+            "genierails_dev_2": "other_catalog",
+        }
+        evidence = snapshot["prod"]["uc"]["other_catalog"]
+        for entry in evidence["abac_policies"]:
+            entry["table"] = entry["table"].replace(PROD_CATALOG + ".", "other_catalog.", 1)
+            for policy in entry["policies"]:
+                policy["name"] = re.sub(rf"^{PROD_CATALOG}_", "other_catalog_", policy["name"])
+                policy["name"] = policy["name"].replace(LIVE_CATALOG, "genierails_dev_2")
+    remaining = _allowed_diff(scenario, checks, cross_before, cross_after, acks)
+    raw = driver.protection_diff(cross_before["prod"], cross_after["prod"], include_grants=False)
+    expected_other = sorted(item for item in raw["policies"] if item.startswith("other_catalog."))
+    assert remaining == {"prod": {"policies": expected_other}}
+
+    dev_scenario, dev_checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse added tier merge", values)
+    assert "policies" in _allowed_diff(dev_scenario, dev_checks, base, added)["prod"]
+
+    extra_level = json.loads(json.dumps(added))
+    for entry in extra_level["prod"]["uc"][PROD_CATALOG]["abac_policies"]:
+        for policy in entry["policies"]:
+            if policy["column_mask"]["function_name"].endswith("_partial"):
+                policy["except_principals"].append("analysts")
+    remaining = _allowed_diff(scenario, checks, base, extra_level, acks)
+    assert any("partial: newly exempts analysts" in item for item in remaining["prod"]["policies"])
+
+    failsafe = _model_snapshot(_failsafe_model(), "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                               catalog=PROD_CATALOG)
+    custom = _model_snapshot(_custom_model(tmp_path, "v1"), "prod",
+                             grants=(("ops", "SELECT"),), runs=("ops",), catalog=PROD_CATALOG)
+    custom_clean = json.loads(json.dumps(custom))
+    for snapshot, digest in ((failsafe, "old"), (custom, "new")):
+        evidence = snapshot["prod"]["uc"][PROD_CATALOG]
+        value = "unmapped_redact__string__ffffffff"
+        evidence["governed_tags"].append({
+            "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "notes",
+            "column_name": "other", "tag_name": "gr_treatment", "tag_value": value})
+        evidence["mask_functions"].append({
+            "routine_catalog": PROD_CATALOG, "routine_schema": LIVE_SCHEMA,
+            "routine_name": f"gr_mask_{value}_full", "definition_hash": digest})
+        for entry in evidence["abac_policies"]:
+            entry["policies"].append({
+                "name": f"{PROD_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
+                "column_mask": {"function_name":
+                    f"{PROD_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
+                "match_values": [value], "to_principals": ["account users"], "except_principals": []})
+    custom_values = {"custom_mask_column_dev": CUSTOM_COLUMN,
+                     "custom_mask_column_prod": PROD_CUSTOM_COLUMN,
+                     "custom_install_ack": f"prod:weaken:{PROD_CUSTOM_COLUMN}:ops"}
+    custom_scenario, custom_checks = _rendered_step_checks(
+        "custom-mask", "Release prepared custom mask", custom_values)
+    remaining = _allowed_diff(custom_scenario, custom_checks, failsafe, custom,
+                              {custom_values["custom_install_ack"]})
+    assert any("definition changed" in item for item in remaining["prod"]["masks"])
+
+    wrong_generation_before = json.loads(json.dumps(custom_clean))
+    wrong_generation_after = json.loads(json.dumps(custom_clean))
+    value = "unmapped_redact__string__ffffffff"
+    for snapshot in (wrong_generation_before,):
+        evidence = snapshot["prod"]["uc"][PROD_CATALOG]
+        evidence["mask_functions"].append({
+            "routine_catalog": PROD_CATALOG, "routine_schema": LIVE_SCHEMA,
+            "routine_name": f"gr_mask_{value}_full", "definition_hash": "wrong-generation"})
+        for entry in evidence["abac_policies"]:
+            entry["policies"].append({
+                "name": f"{PROD_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
+                "column_mask": {"function_name":
+                    f"{PROD_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
+                "match_values": [value], "to_principals": ["account users"],
+                "except_principals": []})
+    _, maintain_checks = _rendered_step_checks(
+        "custom-mask", "Verify partial/full behavior and idempotence", custom_values)
+    retire = next(check for check in maintain_checks if isinstance(check, driver.ProtectionDelta))
+    actual = driver.protection_diff(wrong_generation_before["prod"],
+                                    wrong_generation_after["prod"], include_grants=False)
+    assert driver._finding_matches(retire.findings[0], actual,
+                                   wrong_generation_before["prod"],
+                                   wrong_generation_after["prod"]) == set()
+    assert _allowed_diff(custom_scenario, maintain_checks,
+                         wrong_generation_before, wrong_generation_after)
+
+
+def test_protection_allowance_filter_is_strictly_environment_scoped():
+    base = _model_snapshot(_tier_model(["admins", "ops", "viewers"]), "dev")
+    added = _model_snapshot(_tier_model(["admins", "ops", "analysts", "viewers"]), "dev")
+    before = {"dev": base["dev"], "prod": json.loads(json.dumps(base["dev"]))}
+    after = {"dev": added["dev"], "prod": json.loads(json.dumps(added["dev"]))}
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": TIER_TABLE, "prod_agent": "pay"}
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse added tier merge", values)
+    remaining = _allowed_diff(scenario, checks, before, after)
+    assert "prod" in remaining and "policies" in remaining["prod"]
+    assert "dev" not in remaining
+
+
+def test_tier_allowance_covers_exact_changes_in_every_governed_catalog():
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts"}
+    base_model = _tier_model(["admins", "ops", "viewers"])
+    added_model = _tier_model(["admins", "ops", "analysts", "viewers"])
+    before = _model_snapshot(base_model, "prod", catalog=PROD_CATALOG)
+    after = _model_snapshot(added_model, "prod", catalog=PROD_CATALOG)
+    second_dev, second_prod = "gr_e2e_s14_20261016", "gr_e2e_s14p_20261016"
+    for target, model in ((before, base_model), (after, added_model)):
+        second = _model_snapshot(model, "prod", catalog=second_prod)["prod"]
+        for entry in second["uc"][second_prod]["abac_policies"]:
+            for policy in entry["policies"]:
+                policy["name"] = policy["name"].replace(LIVE_CATALOG, second_dev)
+        target["prod"]["uc"].update(second["uc"])
+        target["prod"]["catalog_map"].update({second_dev: second_prod})
+        target["prod"]["governed_catalogs"].append(second_prod)
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Release acknowledged tier addition", values)
+    acks = set(driver._ack_entries(values["tier_add_acks"]))
+    assert _allowed_diff(scenario, checks, before, after, acks) == {}
+
+    extra = json.loads(json.dumps(after))
+    policy = next(p for entry in extra["prod"]["uc"][second_prod]["abac_policies"]
+                  for p in entry["policies"]
+                  if p["column_mask"]["function_name"].endswith("_partial"))
+    policy["except_principals"].append("analysts")
+    remaining = _allowed_diff(scenario, checks, before, extra, acks)
+    assert any(item.startswith(second_prod + ".") and "partial: newly exempts analysts" in item
+               for item in remaining["prod"]["policies"])
+
+
+def test_tier_preflight_requires_catalog_map_for_kept_source_names():
+    snapshot = _model_snapshot(_tier_model(["admins", "ops", "viewers"]), "prod",
+                               catalog=PROD_CATALOG)
+    assert driver.tier_groupmap_preflight_problems(snapshot) == []
+    snapshot["prod"]["catalog_map"] = {}
+    problems = driver.tier_groupmap_preflight_problems(snapshot)
+    assert problems and "requires catalog_map" in problems[0]
+    assert LIVE_CATALOG in problems[0] and PROD_CATALOG in problems[0]
+
+
+def test_e2e_policy_name_helper_is_pinned_to_policy_resource_expression():
+    source = (ROOT / "shared/modules/data_access/main.tf").read_text()
+    block = re.search(
+        r'resource\s+"databricks_policy_info"\s+"policies"\s*\{(?P<body>.*?\n\})',
+        source, re.S)
+    assert block
+    expression = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', block["body"])
+    assert expression and expression.group(1) == "${each.value.catalog}_${each.key}"
+    assert remote_policy_name("prod", "key") == "prod_key"
+
+
+def test_exact_policy_name_accepts_terraform_prefix_and_kept_dev_source():
+    raw = "genierails_prod_1.dev_to_prod_demo.gr_mask_genierails_dev_1_email_partial__string__f86256b2_full"
+    fact = {
+        "values": {"email_partial__string__f86256b2"},
+        "raw_functions": {raw},
+        "allowed_catalogs": {"genierails_prod_1", "genierails_dev_1"},
+        "policy_names": {
+            "genierails_prod_1_gr_mask_genierails_dev_1_email_partial__string__f86256b2_full"},
+    }
+    key = ("genierails_prod_1.dev_to_prod_demo.customers", "genierails_prod_1",
+           "email_partial", "string", "full")
+    assert driver._has_exact_generated_policy_name(key, fact)
+    assert not driver._has_exact_generated_policy_name(
+        key, {**fact, "policy_names": {"customer_handwritten_full"}})
+
+@pytest.mark.parametrize("finding", [
+    ("policies", "*", "full: newly exempts analysts"),
+    ("policies", "catalog:cat.s.t", "exempts analysts"),
+    ("policies", "catalog:cat.s.t", "s"),
+    ("custom-adoption", "cat.s.t.postcode", "unmapped_redact"),
+    ("custom-retire", "cat.s.t.postcode", "x"),
+])
+def test_protection_delta_shape_rejects_wildcard_or_inexact_keys(finding):
+    assert driver._shape_problems(driver.ProtectionDelta("dev", (finding,)))
+
+
+def test_custom_mask_log_contract_is_executable():
+    checks = driver.custom_mask_checks("***CD")
+    output = ("=== Custom mask cases (dev): 1 adopted mask(s), read-only on the SQL warehouse ===\n"
+              "PASS custom_e2e_suffix (STRING): 3 exact-output cases; expected outputs include '***CD'\n"
+              "=== GenieRails environment lock acquired (dev, rehearse) ===\n"
+              "all deterministic tiers matched their exact expected output across 3 row(s)\n")
+    ctx = driver.CheckContext({}, {}, ROOT, output=output)
+    assert driver.failed_checks(driver.evaluate_checks(checks, ctx)) == []
+    broken = dataclasses.replace(ctx, output=output.replace("=== Custom mask cases", "=== cases"))
+    assert "before" in driver.failed_checks(driver.evaluate_checks(checks, broken))[0]
+
+
+@pytest.mark.parametrize("scenario_key", ["tier-groupmap", "custom-mask"])
+def test_every_new_merge_is_rehearsed_before_a_later_release_plan(scenario_key):
+    scenario = next(item for item in driver.SCENARIOS if item.key == scenario_key)
+    for index, step in enumerate(scenario.steps):
+        if step.action != "local_merge": continue
+        later_plan = next((i for i in range(index + 1, len(scenario.steps))
+                           if scenario.steps[i].target == "release-plan"), None)
+        if later_plan is None: continue
+        assert any(candidate.target == "rehearse" and not candidate.expect_failure
+                   for candidate in scenario.steps[index + 1:later_plan]), step.name
+
+
+def test_group_map_refusal_is_anchored_to_product_path():
+    message = "ERROR: make release-plan refused: group_map changed since the last apply, which is a weakening."
+    assert re.search(driver.REFUSALS["group_map"], message)
+    assert driver.REFUSAL_SOURCE_ANCHORS[driver.REFUSALS["group_map"]][0] == "shared/group_map.py"
+
+
+def test_prepared_custom_mask_fixtures_use_real_loader_and_validator():
+    fixtures = ROOT / "shared/scripts/e2e/fixtures"
+    loaded = []
+    for version in ("v1", "v2"):
+        data = json.loads((fixtures / f"custom_mask_{version}.json").read_text())
+        assert custom_masks.mask_file_problems(data, data["treatment"]) == []
+        loaded.append(data)
+    assert loaded[0]["treatment"] == loaded[1]["treatment"] == "custom_e2e_suffix"
+    assert loaded[0]["partial"]["STRING"]["sql"] != loaded[1]["partial"]["STRING"]["sql"]
 
 
 def test_preconditions_are_not_split_into_characters():
@@ -1799,7 +2529,9 @@ def test_every_real_scenario_check_has_an_evaluator_and_dry_run_passes(tmp_path,
     assert all(driver.check_problems(s) == [] for s in driver.SCENARIOS)
     assert driver.main(["--cloud", cloud, "--repo", str(ROOT), "--dry-run", "--reports", str(tmp_path)]) == 0
     assert set(driver.EVALUATORS) == {driver.GrantDelta, driver.AccessLevel, driver.AccessVerified,
-                                      driver.DiffLimitedTo, driver.Unchanged, driver.AgentIdUnchanged}
+                                      driver.DiffLimitedTo, driver.Unchanged, driver.AgentIdUnchanged,
+                                      driver.OutputContains, driver.OutputOrder,
+                                      driver.AcknowledgedWeakening, driver.ProtectionDelta}
 
 
 def test_dry_run_fails_on_a_free_text_assertion(tmp_path, monkeypatch, capsys):
