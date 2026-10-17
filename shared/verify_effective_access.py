@@ -2746,6 +2746,49 @@ def load_spec_from_file(path: Path) -> VerificationSpec:
     return spec
 
 
+def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: VerificationSpec) -> list[str]:
+    """Describe policy-derived principal expectations omitted or weakened by a spec."""
+    rank = {"raw": 0, "partial": 1, "full": 2}
+
+    def expectations(check: ColumnMaskCheck) -> dict[str, str]:
+        if check.expected_tiers:
+            return dict(check.expected_tiers)
+        return ({p: "full" for p in check.masked_principals}
+                | {p: "raw" for p in check.unmasked_principals})
+
+    explicit_by_column: dict[tuple[str, str], dict[str, str]] = {}
+    for check in explicit.column_masks:
+        current = explicit_by_column.setdefault((check.table.lower(), check.column.lower()), {})
+        for principal, tier in expectations(check).items():
+            if tier in rank and (principal not in current or rank[tier] > rank.get(current[principal], -1)):
+                current[principal] = tier
+
+    missing = []
+    for check in derived.column_masks:
+        actual = explicit_by_column.get((check.table.lower(), check.column.lower()), {})
+        for principal, expected in expectations(check).items():
+            supplied = actual.get(principal)
+            if supplied is None:
+                missing.append(f"{check.table}.{check.column}: {principal} expected {expected} (missing)")
+            elif supplied not in rank or rank[supplied] < rank[expected]:
+                missing.append(f"{check.table}.{check.column}: {principal} expected {expected}, got {supplied}")
+    explicit_rows: dict[str, dict[str, str]] = {}
+    for check in explicit.row_filters:
+        current = explicit_rows.setdefault(check.table.lower(), {})
+        current.update({p: "restricted" for p in check.restricted_principals})
+        for principal in check.unrestricted_principals:
+            current.setdefault(principal, "unrestricted")
+    for check in derived.row_filters:
+        actual = explicit_rows.get(check.table.lower(), {})
+        for principal in check.restricted_principals:
+            if actual.get(principal) != "restricted":
+                missing.append(f"{check.table}: {principal} expected restricted row access (missing or weakened)")
+        for principal in check.unrestricted_principals:
+            if principal not in actual:
+                missing.append(f"{check.table}: {principal} expected unrestricted row baseline (missing)")
+    return sorted(set(missing))
+
+
 def load_spec_from_tfvars(
     tfvars_file: Path,
     account_tfvars_file: Optional[Path] = None,
@@ -2931,6 +2974,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Derive the spec from a data_access abac.auto.tfvars.")
     p.add_argument("--account-tfvars", type=Path,
                    help="Optional account abac.auto.tfvars (source of group names).")
+    p.add_argument("--minimum-from-tfvars", type=Path,
+                   help="Gate only: require --spec to include every check derived from these tfvars.")
+    p.add_argument("--minimum-env-file", type=Path,
+                   help="Gate only: env settings used to derive the minimum spec.")
+    p.add_argument("--minimum-account-tfvars", type=Path,
+                   help="Gate only: account groups used to derive the minimum spec.")
     p.add_argument("--key-column", default="",
                    help="Row-pairing key for every masked table that has this column "
                         "(VERIFY_KEY_COLUMN / verify_key_column; optional).")
@@ -3062,6 +3111,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         spec = _load_spec_from_args(args, load_key_map(args.env_file))
         validate_spec_identifiers(spec)
+        if args.minimum_from_tfvars:
+            minimum = load_spec_from_tfvars(
+                args.minimum_from_tfvars, args.minimum_account_tfvars,
+                env_file=args.minimum_env_file,
+                key_column=args.key_column,
+                key_column_by_table=load_key_map(args.minimum_env_file),
+            )
+            required = required_mask_columns_from_tfvars(args.minimum_from_tfvars)
+            minimum.column_masks = [
+                check for check in minimum.column_masks
+                if (check.table.lower(), check.column.lower()) in required
+            ]
+            weaker = weaker_explicit_spec_checks(minimum, spec)
+            if weaker:
+                raise ValueError("ERROR: explicit verification spec is weaker than the policy-derived "
+                                 "gate spec; missing or weakened check(s): " + "; ".join(weaker))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 

@@ -149,7 +149,7 @@ Options (see `Makefile.shared`):
 |---|---|
 | `ENV=<env>` | Workspace env whose `data_access` config to verify (default `dev`) |
 | `VERIFY_KEY_COLUMN=<c>` | Optional override: the row-pairing key for every masked table that has this column (default: [picked per table](#how-genierails-picks-the-row-pairing-key)) |
-| `VERIFY_SPEC=<file.json>` | Explicit JSON spec instead of `--from-tfvars` derivation |
+| `VERIFY_SPEC=<file.json>` | Explicit JSON spec. A standalone read-only `verify-access` accepts a free-form spec and prints that it is not a gate. Rehearse, release, maintain, and staged apply gates refuse it before applying unless it contains every policy-derived column/principal expectation at the same or a stricter (`raw` < `partial` < `full`) level; it may add checks. |
 | `WAREHOUSE_ID=<id>` | Pin a specific SQL warehouse |
 | `KEEP_PRINCIPALS=1` | Leave the provisioned test principals in place (debugging) |
 

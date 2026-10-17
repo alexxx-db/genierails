@@ -43,10 +43,48 @@ from verify_effective_access import (  # noqa: E402
     evaluate_effective_access,
     load_spec_from_file,
     load_spec_from_tfvars,
+    weaker_explicit_spec_checks,
     main,
     verify_effective_access_live,
     write_result_file,
 )
+
+
+def test_gate_spec_must_name_every_derived_principal_and_not_weaken_tiers():
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (),
+        expected_tiers=(("finance", "raw"), ("analyst", "partial"), ("viewer", "full")))])
+    omitted = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (),
+        expected_tiers=(("finance", "raw"), ("viewer", "full")))])
+    weakened = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (),
+        expected_tiers=(("finance", "raw"), ("analyst", "raw"), ("viewer", "full")))])
+    assert weaker_explicit_spec_checks(derived, omitted) == [
+        "cat.sch.people.email: analyst expected partial (missing)"]
+    assert weaker_explicit_spec_checks(derived, weakened) == [
+        "cat.sch.people.email: analyst expected partial, got raw"]
+
+
+def test_gate_spec_may_add_checks_and_make_expectations_stricter():
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (), expected_tiers=(("analyst", "partial"),))])
+    explicit = VerificationSpec(column_masks=[
+        ColumnMaskCheck("cat.sch.people", "email", "id", (), (),
+                        expected_tiers=(("analyst", "full"), ("extra-tier", "full"))),
+        ColumnMaskCheck("cat.sch.people", "phone", "id", ("extra-tier",), ()),
+    ])
+    assert weaker_explicit_spec_checks(derived, explicit) == []
+    assert {c.column for c in explicit.column_masks} == {"email", "phone"}
+
+
+def test_gate_spec_cannot_drop_or_weaken_a_derived_row_filter_principal():
+    derived = VerificationSpec(row_filters=[RowFilterCheck(
+        "cat.sch.orders", ("regional",), ("global",))])
+    explicit = VerificationSpec(row_filters=[RowFilterCheck(
+        "cat.sch.orders", (), ("regional", "global"))])
+    assert weaker_explicit_spec_checks(derived, explicit) == [
+        "cat.sch.orders: regional expected restricted row access (missing or weakened)"]
 
 
 def _tiered_check():

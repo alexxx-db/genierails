@@ -129,6 +129,18 @@ def test_a_keyless_spec_check_is_keyed_live(tmp_path):
     assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, keyless)) == 0
 
 
+def test_a_spec_covering_the_column_but_omitting_a_real_tier_refuses(tmp_path, capsys):
+    env = _env(tmp_path, policies=TAGGED)
+    only_admin = {"column_masks": [
+        {**_mask("cat.sch.customers", "ssn"), "masked_principals": []},
+        {**_mask("cat.sch.notes", "free_text"), "masked_principals": []},
+    ]}
+    assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, only_admin)) == 1
+    err = capsys.readouterr().err
+    assert "weaker than the policy-derived gate spec" in err
+    assert "analysts expected full (missing)" in err
+
+
 def test_before_derivation_a_keyed_mask_spec_passes_and_is_rechecked_later(tmp_path):
     # Prod's promoted config has no tag assignments until release derives them,
     # so the pre-lock check can only demand keyed mask checks; the re-check
@@ -207,6 +219,23 @@ def test_release_refuses_before_its_lock(tmp_path):
     result = _release(env, overrides, f"VERIFY_SPEC={spec}")
     assert result.returncode != 0
     assert "nothing was applied" in result.stderr
+    assert _names(log) == ["release-helper require-mask-proof"]
+
+
+def test_release_refuses_an_omitted_real_tier_before_apply(tmp_path):
+    env = _env(tmp_path, policies=TAGGED)
+    only_admin = {"column_masks": [
+        {**_mask("cat.sch.customers", "ssn"), "masked_principals": []},
+        {**_mask("cat.sch.notes", "free_text"), "masked_principals": []},
+    ]}
+    spec = _spec(tmp_path, only_admin)
+    account = tmp_path / "account"
+    account.mkdir()
+    (account / "abac.auto.tfvars").write_text('groups = { analysts = {} }\n')
+    log, overrides = _recorders(tmp_path)
+    result = _release(env, overrides, f"VERIFY_SPEC={spec}", f"ACCOUNT_ENV_DIR={account}")
+    assert result.returncode != 0
+    assert "analysts expected full (missing)" in result.stderr
     assert _names(log) == ["release-helper require-mask-proof"]
 
 

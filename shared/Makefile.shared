@@ -827,6 +827,9 @@ _apply-account-locked:
 override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= && \
 	$(MAKE) validate-generated ENV="$(ENV)" && \
 	$(MAKE) coverage-gate ENV="$(ENV)" && \
+	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)" && \
+		key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
+		$(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac"; fi && \
 	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
 	$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 	$(_SAVE_VERIFY_KEY) && \
@@ -1146,6 +1149,7 @@ _release-manifest: _guard-not-ci-apply
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
+	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_REQUIRE_MASK_PROOF) || exit 1; \
 	imports="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field imports.count)" || exit 1; \
 	if [ "$$imports" != 0 ] && [ "$$imports" != null ]; then \
 		echo "=== Import existing resources ($(ENV)): the manifest's recorded imports and stale-tag cleanups ==="; \
@@ -1240,6 +1244,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 	$(MAKE) derive-assignments ENV="$(ENV)" || exit 1; \
 	$(MAKE) coverage-gate ENV="$(ENV)" || exit 1; \
 	$(MAKE) validate-generated ENV="$(ENV)" || exit 1; \
+	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)"; key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac" || exit 1; fi; \
 	$(_RUN_AUDIT_RULEBOOK); \
 	if [ $$audit_rc -ne 0 ]; then \
 		if [ $$audit_rc -eq 1 ]; then \
@@ -1623,6 +1628,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 		else \
 			echo "=== Skipping promote (no $(ENV_DIR)/generated/abac.auto.tfvars) ==="; \
 		fi; \
+		if [ -n "$(VERIFY_SPEC)" ]; then key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_REQUIRE_MASK_PROOF) || exit 1; fi; \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
 		$(MAKE) --no-print-directory TARGET_ENV="$(ENV)" _guard-data-access-config; \
 		$(MAKE) --no-print-directory _apply-account-for-workspace ENV="$(ENV)"; \
@@ -1650,6 +1656,7 @@ apply-governance: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target
 	else \
 		echo "=== Skipping promote (no $(ENV_DIR)/generated/abac.auto.tfvars) ==="; \
 	fi; \
+	if [ -n "$(VERIFY_SPEC)" ]; then key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_REQUIRE_MASK_PROOF) || exit 1; fi; \
 	$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
 	$(MAKE) --no-print-directory TARGET_ENV="$(ENV)" _guard-data-access-config; \
 	$(MAKE) --no-print-directory _apply-account-for-workspace ENV="$(ENV)"; \
@@ -1899,7 +1906,8 @@ test-unit: ## Run fast unit tests (no Databricks/LLM/Terraform required) — use
 #   VERIFY_KEY_COLUMN=<c>  optional: row-pairing key for every masked table that has
 #                          this column (default: picked and proven per table; a
 #                          verify_key_columns entry in env.auto.tfvars wins)
-#   VERIFY_SPEC=<file>     explicit JSON spec (overrides --from-tfvars derivation)
+#   VERIFY_SPEC=<file>     explicit JSON spec (free-form here; applying gates require
+#                          every derived check with the same or stricter expectation)
 #   WAREHOUSE_ID=<id>      pin a specific SQL warehouse
 #   KEEP_PRINCIPALS=1      leave the provisioned test principals in place (debug)
 #   VERIFY_REQUIRE_MASKS=1 fail when a masked table has no provable key (make release sets it)
@@ -1917,6 +1925,7 @@ override _VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_
 # make release sets VERIFY_REQUIRE_MASKS=1: a mask check whose table has no
 # provable row-pairing key fails instead of letting the release report success.
 override _VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)
+override _VERIFY_MINIMUM_FLAG = $(if $(and $(VERIFY_SPEC),$(filter 1,$(VERIFY_REQUIRE_MASKS))),--minimum-from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --minimum-env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)" --minimum-account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars",)
 
 verify-access-spec: _guarded-bootstrap _guard-workspace-target ## Print the derived effective-access checks (no workspace/cluster needed)
 	@key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
@@ -1946,11 +1955,15 @@ _verify-access-keys-readonly: _guard-workspace-target
 	$(_VERIFY_KEYS_CHECK)
 
 verify-access: _guarded-bootstrap _guard-workspace-target ## Verify masking/row-filters take effect via per-tier test principals (LIVE workspace)
+	@if [ -n "$(VERIFY_SPEC)" ] && [ "$(VERIFY_REQUIRE_MASKS)" != 1 ]; then \
+		echo "NOTE: VERIFY_SPEC is free-form for standalone verify-access; this read-only run is not an apply/release gate."; \
+	fi
 	@rm -f "$(_VERIFY_RESULT)"
 	@key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
 	warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --terraform-runner "$(ROOT_RUNNER)" --env-name "$(ENV)")" && \
 	cd "$(SHARED_ROOT)" && GENIERAILS_LIVE_VERIFY=1 python3 verify_effective_access.py \
 		$(_VERIFY_SPEC_FLAG) $(_VERIFY_KEY_FLAGS) --warehouse-id "$$warehouse_id" $(_VERIFY_KEEP_FLAG) $(_VERIFY_REQUIRE_FLAG) \
+		$(_VERIFY_MINIMUM_FLAG) \
 		--auth-file "$(ENV_DIR)/auth.auto.tfvars" --live --result-file "$(_VERIFY_RESULT)"
 
 test-quickstart: _bootstrap _guard-workspace-target ## Scenario: single space, single catalog (quickstart flow)
