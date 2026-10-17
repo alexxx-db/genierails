@@ -1649,3 +1649,64 @@ tag_assignments = [
 """)
         assert main(["--from-tfvars", str(tfvars), "--key-column", "id", "--require-mask-checks"]) == 2
         assert "cannot tell which columns" in capsys.readouterr().err
+
+
+class TestResultChecks:
+    """The result file reports, per check and principal, the access each run proved."""
+
+    def _spec(self):
+        tiered = ColumnMaskCheck(
+            table="cat.sch.people", column="ssn", key_column="id",
+            masked_principals=("analyst",), unmasked_principals=(DEFAULT_ADMIN_TIER,),
+            policy_name="mask_ssn", expected_tiers=(("analyst", "partial"), (DEFAULT_ADMIN_TIER, "raw")),
+            partial_function="cat.gov.partial", full_function="cat.gov.full")
+        legacy = ColumnMaskCheck(
+            table="cat.sch.people", column="email", key_column="id",
+            masked_principals=("analyst",), unmasked_principals=("raw_group",), policy_name="mask_email")
+        rows = RowFilterCheck(table="cat.sch.people", restricted_principals=("analyst",),
+                              unrestricted_principals=("raw_group",), policy_name="rf")
+        return VerificationSpec(column_masks=[tiered, legacy], row_filters=[rows]), tiered, legacy, rows
+
+    def _write(self, tmp_path, report, spec):
+        path = tmp_path / "result.json"
+        write_result_file(path, report, spec)
+        return __import__("json").loads(path.read_text())
+
+    def test_a_pass_reports_each_principal_at_its_expected_level(self, tmp_path):
+        spec, tiered, legacy, rows = self._spec()
+        report = EffectiveAccessReport()
+        for check in (tiered, legacy, rows):
+            report.add(CheckResult(check.describe().split()[0], check.describe(), PASS, "ok"))
+        payload = self._write(tmp_path, report, spec)
+        assert payload["passed"] is True
+        by_column = {(c["kind"], c["column"]): c for c in payload["checks"]}
+        assert by_column[("column-mask", "ssn")]["principals"] == {
+            "analyst": {"expected": "partial", "observed": "partial"},
+            DEFAULT_ADMIN_TIER: {"expected": "raw", "observed": "raw"}}
+        assert by_column[("column-mask", "ssn")]["full_function"] == "cat.gov.full"
+        assert by_column[("column-mask", "email")]["principals"]["analyst"]["observed"] == "masked"
+        assert by_column[("row-filter", "")]["principals"]["analyst"]["observed"] == "restricted"
+
+    def test_a_leak_reports_raw_and_does_not_change_the_verdict(self, tmp_path):
+        spec, tiered, legacy, rows = self._spec()
+        report = EffectiveAccessReport()
+        report.add(CheckResult("column-mask", tiered.describe(), FAIL, "leak",
+                               {"raw_leaks_by_principal": {"analyst": 3}}))
+        payload = self._write(tmp_path, report, spec)
+        assert payload["passed"] is False
+        ssn = next(c for c in payload["checks"] if c["column"] == "ssn")
+        assert ssn["status"] == FAIL
+        assert ssn["principals"]["analyst"] == {"expected": "partial", "observed": "raw"}
+        assert ssn["principals"][DEFAULT_ADMIN_TIER]["observed"] == "unproven"
+        not_run = [c for c in payload["checks"] if c["column"] != "ssn"]
+        assert {c["status"] for c in not_run} == {"NOT VERIFIED"}
+        assert all(p["observed"] == "unproven" for c in not_run for p in c["principals"].values())
+
+    def test_mismatch_and_inconclusive_are_never_reported_as_the_expected_level(self, tmp_path):
+        spec, tiered, _legacy, _rows = self._spec()
+        report = EffectiveAccessReport()
+        report.add(CheckResult("column-mask", tiered.describe(), INCONCLUSIVE, "no rows",
+                               {"mismatches_by_principal": {"analyst": 1}}))
+        ssn = next(c for c in self._write(tmp_path, report, spec)["checks"] if c["column"] == "ssn")
+        assert ssn["principals"]["analyst"]["observed"] == "mismatch"
+        assert ssn["principals"][DEFAULT_ADMIN_TIER]["observed"] == "unproven"

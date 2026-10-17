@@ -35,9 +35,10 @@ Two named Day-2 scenarios extend that matrix:
   supplied non-secret class, promotes it, and verifies it through rehearsal
   and release. It then substitutes the independently tested v2 fixture and
   proves the SQL/generation change is refused until its exact weakening ack.
-  For rehearsal, planning and release, the driver checks the exact fixture
-  output and exact-tier verification text occur after the read-only case header
-  and before the environment-lock marker. Both fixtures are already adopted governance JSON with `tested_sha256`; the
+  For rehearsal, planning and release, the driver checks the read-only case
+  header and exact fixture output precede the environment-lock marker; release
+  additionally evaluates the typed exact-tier verification result. Both fixtures are
+  already adopted governance JSON with `tested_sha256`; the
   scenario never drafts, tests, adopts, or otherwise calls an AI helper.
 
 Always inspect the plan first; this neither loads auth nor invokes `make`:
@@ -114,13 +115,64 @@ failure is `ERROR`. S13 runs every refusal command with `CI=true` and without
 Scenario values: `agent_a`, `wrong_agent`, `table` (covered), `uncovered_table`,
 `treatment`, `ack_entry` (an exact `prod:<kind>:...` line), `manifest`,
 `tampered_manifest`, and the 40-hex commits `u`, `o`, `r`, `r_plus_1`, `x`, `y`.
+The typed checks below add: champion `acl_groups`, `dev_tables`, `prod_tables`;
+S2 `mask_column`; S3 `new_table_principals`, `dev_table`, `prod_table`; S4
+`new_column`; S5 `secret_column`; and `agent_a` for champion, S3 and S16. S6's
+`reader_principal` and `reader_table` come from `ack_entry`
+(`prod:reader:<cat.sch.table>:<principal>`). A comma-separated value
+(`acl_groups=a,b`) stands for every combination.
+
+### Typed checks
+
+A step's `assertions=` and a scenario's `checks=` hold typed checks from a
+small vocabulary, never free text. Each has an evaluator that runs in live runs;
+a step's checks fail that step, a scenario's checks fail the scenario after its
+final snapshot. `--dry-run` lists them and exits non-zero if any check has no
+evaluator or is malformed (unknown env or component, wildcards in a grant, an
+unknown level). Their `{placeholders}` are required values.
+
+| Check | Passes when |
+| --- | --- |
+| `GrantDelta(env, added=, may_add=, revoked=)` | Grants added since the baseline are exactly `added` plus a subset of `may_add`, and those revoked are exactly `revoked`. |
+| `AccessLevel(env, target, principal, level)` | The step's verify-access result shows `principal` (`*` = every one checked) at `raw`, `partial`, `full`, `redacted` or `masked` on every checked column under `target`. |
+| `AccessVerified(env, target)` | That result has PASS for every check under `target`, each principal at its expected tier. `ADOPTED_COLUMNS` means every column migrate-plan adopted. |
+| `DiffLimitedTo(env, component, selectors)` | Every changed `uc` resource, `agents` space, `receipts` or `state_serials` path matches a selector. |
+| `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
+| `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
+| `OutputContains(text)` / `OutputOrder(before, after)` | The command emitted exact deterministic evidence, in the required pre-lock order. |
+| `AcknowledgedWeakening(env, entries, findings)` | Only the named protection findings are permitted, and only after every exact acknowledgement key is committed or recorded by release. |
+
+A grant is `(principal, privilege, securable)`: a table, schema or catalog, or
+`agent:<key>` for Genie CAN_RUN. `USE_CATALOG`/`USE_SCHEMA` on a table mean its
+catalog/schema. Every protection check includes UC grants and non-inherited
+CAN_RUN. After each applying step, each release phase and at the scenario end, a
+new grant that no check of the scenario declares in `added` or `may_add` fails,
+including in S8/S9, which may otherwise weaken protection. The restore and
+final checks allow no new grant. Example:
+
+```python
+_scenario("s6", ..., checks=(
+    GrantDelta("dev"),
+    GrantDelta("prod", added=(("{reader_principal}", "SELECT", "{reader_table}"),),
+               may_add=_business_grants("{reader_principal}", "{reader_table}")),
+))
+```
+
+Access checks read `<cloud>/envs/<env>/generated/.verify_access.json`, the file
+`release`, `rehearse` and `verify-access` write. A file the step did not rewrite
+is stale and fails the check. The file's `checks` list gives, per column and
+principal, the expected tier and what the run proved (`raw`, `mismatch`,
+`fail-closed` or `unproven` when it did not prove the expected tier).
+`redacted` means `full` through a never-raw (`unmapped_redact`) mask.
+
 `tier-groupmap` additionally needs `tier_group`, `group_map_source`,
-`mapped_group`, `prod_agent` (the committed agent filename stem), and
+`mapped_group`, `prod_agent` (the committed agent filename stem), `tier_table`, and
 `acl_group`, plus `tier_add_acks`: the exact acknowledgement lines printed by
 the initial refused tier plan, separated by `;;` (normally one `prod:reader:`
 and one `prod:weaken:` entry for the one-table fixture). The driver derives the one exact
 `prod:weaken:group_map:<source>=<mapped_group>` acknowledgement. `custom-mask` needs
-`custom_mask_class` (for example `class.postcode`), `custom_install_ack`, and
+`custom_mask_class` (for example `class.postcode`), `custom_mask_column`,
+`custom_install_ack`, and
 `custom_mask_ack` (the
 exact `prod:weaken:<column>:<principal>` line printed by the weakening check).
 All named groups must already be real account groups. A unit governance-state
@@ -165,7 +217,7 @@ guard only sees what the log says: a wholly quiet internal exposure still cannot
 be observed, so the engine must preserve its internal masks-before-access
 ordering. The driver then
 re-snapshots dev and prod. A column that lost a tag, a removed mask or policy, a
-newly exempted or uncovered principal, or a new grant compared with the
+newly exempted or uncovered principal, or a new grant or CAN_RUN compared with the
 scenario's baseline is `RESTORE FAILED`. `<reports>/final-protection.json`
 repeats that check against the run's first baseline. Logs and reports redact
 secret-named keys, every value in the cloud's auth files, `Authorization`,

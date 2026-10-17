@@ -2993,6 +2993,69 @@ def _load_spec_from_args(args, key_map: Mapping[str, str]) -> VerificationSpec:
     raise SystemExit("Provide either --spec or --from-tfvars.")
 
 
+NOT_VERIFIED = "NOT VERIFIED"
+
+
+def _observed_access(expected: Mapping[str, str], result: Optional[CheckResult]) -> dict[str, dict[str, str]]:
+    """Per principal: the access level the spec expects and what this run proved.
+
+    ``observed`` is the expected level only when the check PASSed; ``raw`` when
+    the check proved that principal saw raw values; ``mismatch`` when its output
+    was not the expected function's; ``fail-closed`` for an accepted moving
+    principal; otherwise ``unproven``. Read-only reporting: it never changes
+    the check's status.
+    """
+    evidence = result.evidence if result else {}
+    leaks = {**(evidence.get("leaks_by_principal") or {}), **(evidence.get("raw_leaks_by_principal") or {})}
+    mismatches = evidence.get("mismatches_by_principal") or {}
+    accepted = set(evidence.get("accepted_fail_closed") or ())
+    out: dict[str, dict[str, str]] = {}
+    for principal, level in sorted(expected.items()):
+        if principal in leaks:
+            observed = "raw"
+        elif principal in mismatches:
+            observed = "mismatch"
+        elif principal in accepted:
+            observed = "fail-closed"
+        elif result is not None and result.status == PASS:
+            observed = level
+        else:
+            observed = "unproven"
+        out[principal] = {"expected": level, "observed": observed}
+    return out
+
+
+def result_checks(report: EffectiveAccessReport, spec: Any = None) -> list[dict[str, Any]]:
+    """One entry per spec check, with the per-principal access it proved."""
+    results = {r.target: r for r in report.results}
+    out: list[dict[str, Any]] = []
+    for check in getattr(spec, "column_masks", []):
+        result = results.get(check.describe())
+        if check.expected_tiers:
+            expected = dict(check.expected_tiers)
+        else:
+            expected = {**{p: "raw" for p in check.unmasked_principals},
+                        **{p: "masked" for p in check.masked_principals}}
+        out.append({
+            "kind": "column-mask", "table": check.table, "column": check.column,
+            "policy": check.policy_name,
+            "status": result.status if result else NOT_VERIFIED,
+            "mask_function": check.mask_function, "partial_function": check.partial_function,
+            "full_function": check.full_function,
+            "principals": _observed_access(expected, result),
+        })
+    for check in getattr(spec, "row_filters", []):
+        result = results.get(check.describe())
+        expected = {**{p: "unrestricted" for p in check.unrestricted_principals},
+                    **{p: "restricted" for p in check.restricted_principals}}
+        out.append({
+            "kind": "row-filter", "table": check.table, "column": "", "policy": check.policy_name,
+            "status": result.status if result else NOT_VERIFIED,
+            "principals": _observed_access(expected, result),
+        })
+    return out
+
+
 def write_result_file(path: Optional[Path], report: EffectiveAccessReport, spec: Any = None) -> None:
     """Machine-readable proof of a live run: the key proven for each table.
 
@@ -3021,6 +3084,7 @@ def write_result_file(path: Optional[Path], report: EffectiveAccessReport, spec:
         "row_filter_checks_passed": sum(
             1 for r in report.results if r.kind == "row-filter" and r.status == PASS),
     }
+    payload["checks"] = result_checks(report, spec)
     cleanup_failures = [
         {"target": r.target, "detail": r.detail, "evidence": r.evidence}
         for r in report.results if r.kind == "cleanup" and r.status == FAIL
