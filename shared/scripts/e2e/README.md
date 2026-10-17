@@ -22,6 +22,25 @@ are issued only as public `make` targets. Read-only snapshots cover UC grants,
 column tags, effective ABAC policies, mask functions, Genie exports and ACLs,
 Terraform serials, receipts, and manifests.
 
+Two named Day-2 scenarios extend that matrix:
+
+- `tier-groupmap` adds and removes an `access_tier_groups` tier, changes a
+  prod `group_map` with an exact acknowledgement, and finishes with an
+  isolated prod-only agent `acl_groups` PR. Rehearse/release effective-access
+  output plus read-only grant/ACL snapshots prove the tier behavior. The driver
+  requires the new tier's SELECT and CAN_RUN to be the only widenings, requires
+  their exact reader/weakening acknowledgements, proves removal revokes both,
+  and proves the remap/ACL releases change only their named principals.
+- `custom-mask` installs the committed `fixtures/custom_mask_v1.json`, maps a
+  supplied non-secret class, promotes it, and verifies it through rehearsal
+  and release. It then substitutes the independently tested v2 fixture and
+  proves the SQL/generation change is refused until its exact weakening ack.
+  For rehearsal, planning and release, the driver checks the read-only case
+  header and exact fixture output precede the environment-lock marker; release
+  additionally evaluates the typed exact-tier verification result. Both fixtures are
+  already adopted governance JSON with `tested_sha256`; the
+  scenario never drafts, tests, adopts, or otherwise calls an AI helper.
+
 Always inspect the plan first; this neither loads auth nor invokes `make`:
 
 ```bash
@@ -126,6 +145,9 @@ unknown level). Their `{placeholders}` are required values.
 | `DiffLimitedTo(env, component, selectors)` | Every changed `uc` resource, `agents` space, `receipts` or `state_serials` path matches a selector. |
 | `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
 | `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
+| `OutputContains(text)` / `OutputOrder(before, after)` | The command emitted exact deterministic evidence, in the required pre-lock order. |
+| `ProtectionDelta(env, findings)` | Only the named environment, resource and exact policy/custom-adoption effect is permitted. Required deltas also fail when the named finding is absent. |
+| `AcknowledgedWeakening(env, entries, findings)` | The same exact protection keys are permitted only after every exact acknowledgement key is committed or recorded by release. |
 
 A grant is `(principal, privilege, securable)`: a table, schema or catalog, or
 `agent:<key>` for Genie CAN_RUN. `USE_CATALOG`/`USE_SCHEMA` on a table mean its
@@ -149,6 +171,43 @@ is stale and fails the check. The file's `checks` list gives, per column and
 principal, the expected tier and what the run proved (`raw`, `mismatch`,
 `fail-closed` or `unproven` when it did not prove the expected tier).
 `redacted` means `full` through a never-raw (`unmapped_redact`) mask.
+
+`tier-groupmap` additionally needs `tier_group`, `group_map_source`,
+`mapped_group`, `prod_agent` (the committed agent filename stem), `tier_table_dev` and
+`tier_table_prod` (exact three-part keys in their respective environments' `table_readers`), and
+`acl_group`, plus `tier_add_acks`: the exact acknowledgement lines printed by
+the initial refused tier plan, separated by `;;` (normally one `prod:reader:`
+and one `prod:weaken:` entry for the governed grant target). Catalog-level ABAC policies are
+reported once for every table that inherits them; protection allowances expand only across
+the exact generated policy identities and tables in the committed governed-catalog set.
+An ungoverned catalog remains outside the allowance. Prod preflight also requires every
+kept dev-source policy name to have its exact committed `catalog_map` entry. The driver derives the one exact
+`prod:weaken:group_map:<source>=<mapped_group>` acknowledgement. `custom-mask` needs
+`custom_mask_class` (for example `class.postcode`), `custom_mask_column_dev`,
+`custom_mask_column_prod`,
+`custom_install_ack`, and
+`custom_mask_ack` (the
+exact `prod:weaken:<column>:<principal>` line printed by the weakening check).
+All named groups must already be real account groups. A unit governance-state
+fixture proves both tier addition and fail-safe-to-custom-mask adoption are
+weakenings, so neither positive release is attempted before its refusal and
+exact acknowledgement. Tier removal deliberately needs no weakening acknowledgement:
+it revokes access and strengthens protection. Custom-mask adoption retains the staged
+The named columns must be dedicated `gr_e2e_*` fixture columns in catalogs isolated from
+other fail-safe STRING fixtures. The custom-mask preflight refuses before any mutation
+and names every conflicting column unless each named column is the only fail-safe STRING
+column in its catalog. Adoption retains that fail-safe generation
+until the next successful run; its later policy/function retirement
+has a separate, exact required protection delta on the next dev rehearse and prod maintain.
+Tier addition/removal updates only that exact table's readers and the named agent's
+`acl_groups`, and reverses both fixture edits on removal. The scenarios run
+unchanged with `--cloud aws` and `--cloud azure`; their final restoration uses
+the standard forward-release lifecycle. It derives and commits an exact reverse
+group-map acknowledgement from the product checker, releases the baseline,
+then removes that temporary acknowledgement. The baseline tree removes all
+authored tier/ACL/custom-mask fixtures. Account groups are pre-existing inputs,
+not created by the driver. Any restore failure stops the run as `RESTORE FAILED`
+and reports the manual forward-release commands; it never claims cleanup passed.
 
 Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
 (`databricks_workspace_host`, `databricks_client_id`,

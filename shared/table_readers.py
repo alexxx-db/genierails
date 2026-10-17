@@ -28,6 +28,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from governed_tables_record import committed_agent_tables
+
 SETTING = "table_readers"
 # Built-in principals that would reach everyone. Never a reader, never raw-exempt.
 EVERYONE = frozenset({"account users", "users"})
@@ -196,8 +198,6 @@ def attributed_tables(env_dir: Path, cfg: Mapping | None = None) -> tuple[dict[s
     cfg = env_config(env_dir, cfg)
     if not deterministic(cfg):
         return _discovered_attribution(env_dir), False
-    from scripts.sticky_governance import committed_agent_tables
-
     return committed_agent_tables(env_dir), True
 
 
