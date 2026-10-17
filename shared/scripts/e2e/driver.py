@@ -249,6 +249,7 @@ class ProtectionDelta:
     """
     env: str
     findings: tuple[ProtectionKey, ...]
+    required: bool = True
     kind: ClassVar[str] = "protection-delta"
     snapshots: ClassVar[bool] = True
 
@@ -512,17 +513,17 @@ SCENARIOS: tuple[Scenario, ...] = (
        ("Forward-release the pinned baseline through the same bounded staged lifecycle.",)),
     _scenario("tier-groupmap", "Tier, group-map and prod-only ACL changes", (
         "Disposable dev/prod groups named by tier_group and mapped_group exist; prod_agent names a committed agent fixture.",
-        "The fixture has three ordered tiers, one governed table, and effective-access verification rows for every tier.",
+        "The fixture has three ordered tiers, group_map_source is the middle tier, one governed table is the grant target, and effective-access verification rows cover every tier.",
     ), (
         fixture_action("Capture baseline access", "snapshot_checkpoint", "tier-baseline"),
         fixture_action("Add a new tier group", "tier_add", "tier_group"),
         mk("Regenerate for the added tier", "generate", "dev"), AUTHOR_MERGE,
         mk("Check added tier PR", "check", "dev"),
         mk("Rehearse added tier merge", "rehearse", "dev", assertions=(
-            GrantDelta("dev", may_add=(("{tier_group}", "SELECT", "{tier_table}"),
-                                       ("{tier_group}", "CAN_RUN", "agent:{prod_agent}"),
-                                       *_business_grants("{tier_group}", "{tier_table}"))),
-            ProtectionDelta("dev", (("policies", "{tier_table}",
+            GrantDelta("dev", added=(("{tier_group}", "SELECT", "{tier_table}"),
+                                     ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
+                       may_add=_business_grants("{tier_group}", "{tier_table}")),
+            ProtectionDelta("dev", (("policies", "catalog:{tier_table}",
                                      "full: newly exempts {tier_group}"),)),
         )),
         mk("Promote added tier", "promote-to", "prod"), AUTHOR_MERGE,
@@ -535,7 +536,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan acknowledged tier addition", "release-plan", "prod"),
         mk("Release acknowledged tier addition", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             AcknowledgedWeakening("prod", "{tier_add_acks}", ((
-                "policies", "{tier_table}", "full: newly exempts {tier_group}"),)),
+                "policies", "catalog:{tier_table}", "full: newly exempts {tier_group}"),)),
             GrantDelta("prod", added=(("{tier_group}", "SELECT", "{tier_table}"),
                                       ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
                        may_add=_business_grants("{tier_group}", "{tier_table}")),
@@ -550,7 +551,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
         mk("Check removed tier PR", "check", "dev"),
         mk("Rehearse removed tier merge", "rehearse", "dev", assertions=(
-            ProtectionDelta("dev", (("policies", "{tier_table}",
+            ProtectionDelta("dev", (("policies", "catalog:{tier_table}",
                                      "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Promote removed tier", "promote-to", "prod"), AUTHOR_MERGE,
@@ -560,7 +561,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Release tier removal", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             GrantDelta("prod", revoked=(("{tier_group}", "SELECT", "{tier_table}"),
                                         ("{tier_group}", "CAN_RUN", "agent:{prod_agent}"))),
-            ProtectionDelta("prod", (("policies", "{tier_table}",
+            ProtectionDelta("prod", (("policies", "catalog:{tier_table}",
                                       "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Maintain removed tier", "maintain", "prod"),
@@ -580,8 +581,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan only the acknowledged group-map effect", "release-plan", "prod"),
         mk("Apply acknowledged group-map manifest", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             AcknowledgedWeakening("prod", "prod:weaken:group_map:{group_map_source}={mapped_group}", (
-                ("policies", "{tier_table}", "full: newly exempts {mapped_group}"),
-                ("policies", "{tier_table}", "partial: no longer applies to {group_map_old_target}"),
+                ("policies", "catalog:{tier_table}", "full: newly exempts {mapped_group}"),
+                ("policies", "catalog:{tier_table}", "partial: no longer applies to {group_map_old_target}"),
             )),
             GrantDelta("prod", added=(("{mapped_group}", "SELECT", "{tier_table}"),
                                       ("{mapped_group}", "CAN_RUN", "agent:{prod_agent}")),
@@ -626,7 +627,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Promote adopted mask byte-for-byte", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check promoted custom mask", "check", "prod"),
         mk("Rehearse custom-mask promotion merge", "rehearse", "dev",
-           assertions=custom_mask_checks("***CD")),
+           assertions=custom_mask_checks("***CD") + (ProtectionDelta("dev", ((
+               "custom-retire", "{custom_mask_column}", "unmapped_redact__string__455f4485"),), required=False),)),
         mk("Refuse unacknowledged custom-mask install weakening", "release-plan", "prod", fail=True,
            refusal=REFUSALS["weakening"], refusal_in_ci=False),
         action("Write exact custom-mask install acknowledgement", "add_ack", "custom_install_ack"), AUTHOR_MERGE,
@@ -663,7 +665,9 @@ SCENARIOS: tuple[Scenario, ...] = (
            assertions=custom_mask_checks("**BCD", verify=True) + (
                AcknowledgedWeakening("prod", "{custom_mask_ack}", ((
                    "custom-generation", "{custom_mask_column}",
-                   "custom_e2e_suffix->custom_e2e_suffix"),)),)),
+                   "custom_e2e_suffix->custom_e2e_suffix"),)),
+               ProtectionDelta("prod", (("custom-retire", "{custom_mask_column}",
+                                         "unmapped_redact__string__455f4485"),), required=False),)),
         mk("Verify changed partial/full behavior", "maintain", "prod"),
         action("Remove custom-mask change acknowledgement", "remove_ack", "custom_mask_ack"), AUTHOR_MERGE,
         mk("Rehearse custom-mask ack cleanup merge", "rehearse", "dev",
@@ -1453,6 +1457,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 key = ((str(entry.get("table")), str(catalog), *normalized) if normalized
                        else (str(entry.get("table")), str(catalog), str(policy.get("name"))))
                 fact = {"function": {normalized or (function,)},
+                        "policy_names": {str(policy.get("name"))},
                         "masks": {normalized_function},
                         "raw_functions": {function},
                         "values": set(policy.get("match_values") or []) or
@@ -1465,6 +1470,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 prior = result["policies"].get(key)
                 if prior:
                     prior["function"].update(fact["function"])
+                    prior["policy_names"].update(fact["policy_names"])
                     prior["masks"].update(fact["masks"])
                     prior["raw_functions"].update(fact["raw_functions"])
                     prior["values"].update(fact["values"])
@@ -1720,9 +1726,35 @@ def _finding_matches(key: ProtectionKey, actual: Mapping[str, list[str]],
     """Concrete findings selected by one narrow semantic protection key."""
     category, resource, change = key
     if category == "policies":
-        return {(category, finding) for finding in actual.get(category, ())
-                if finding.startswith(resource + " ") and finding.endswith(change)}
-    if category not in {"custom-adoption", "custom-generation"}: return set()
+        anchor = resource.removeprefix("catalog:")
+        catalog = anchor.split(".", 1)[0]
+        match = re.fullmatch(r"(partial|full): (newly exempts|no longer applies to) (\S+)", change)
+        if not match: return set()
+        level, effect, principal = match.groups()
+        left, right = _protection(before), _protection(after)
+        selected = set()
+        facts = right["policies"] if effect == "newly exempts" else left["policies"]
+        for policy_key in set(left["policies"]) | set(right["policies"]):
+            if len(policy_key) != 5 or policy_key[1] != catalog or policy_key[4] != level: continue
+            fact = facts.get(policy_key)
+            if not fact or not _has_exact_generated_policy_name(policy_key, fact): continue
+            label = " ".join((policy_key[0], *policy_key[2:]))
+            finding = f"{label}: {effect} {principal}"
+            if finding in actual.get("policies", ()): selected.add(("policies", finding))
+        return selected
+    if category not in {"custom-adoption", "custom-generation", "custom-retire"}: return set()
+    if category == "custom-retire":
+        parsed_retirement = parse_treatment_value(change)
+        if not parsed_retirement: return set()
+        treatment, sql_type, _ = parsed_retirement
+        left_column = _protection(before)["columns"].get((resource, "gr_treatment"))
+        right_column = _protection(after)["columns"].get((resource, "gr_treatment"))
+        if (not isinstance(left_column, tuple) or not isinstance(right_column, tuple)
+                or not left_column[0].startswith("custom_") or not right_column[0].startswith("custom_")):
+            return set()
+        return _retired_generation_findings(resource.split(".", 1)[0], treatment, sql_type,
+                                             change,
+                                             actual, before, after)
     old_prefix, separator, new_prefix = change.partition("->")
     if not separator: return set()
     left, right = _protection(before), _protection(after)
@@ -1738,15 +1770,40 @@ def _finding_matches(key: ProtectionKey, actual: Mapping[str, list[str]],
     selected: set[tuple[str, str]] = set()
     exact_column = f"{resource} gr_treatment never-raw {old_raw} -> {new_raw}"
     if exact_column in actual.get("columns", ()): selected.add(("columns", exact_column))
-    old_normalized = "__".join(old[:2]) if isinstance(old, tuple) else old_raw
-    selected |= {("masks", finding) for finding in actual.get("masks", ()) if old_normalized in finding}
-    table = resource.rsplit(".", 1)[0]
+    selected |= _retired_generation_findings(resource.split(".", 1)[0], old[0], old[1], old_raw,
+                                              actual, before, after)
+    return selected
+
+
+def _has_exact_generated_policy_name(policy_key: tuple[Any, ...], fact: Mapping[str, Any]) -> bool:
+    """A generated policy name must encode its catalog and exact raw generation."""
+    if len(policy_key) != 5: return False
+    catalog, level = policy_key[1], policy_key[4]
+    expected = {f"gr_mask_{catalog}_{raw.rsplit('.', 1)[-1].removeprefix('gr_mask_').removesuffix('_' + level)}_{level}"
+                for raw in fact["raw_functions"]}
+    return fact.get("policy_names") == expected
+
+
+def _retired_generation_findings(catalog: str, treatment: str, sql_type: str, raw_value: str,
+                                  actual: Mapping[str, list[str]], before: Mapping[str, Any],
+                                  after: Mapping[str, Any]) -> set[tuple[str, str]]:
+    """Exact policy/mask removals for generations present before and absent after."""
+    left, right = _protection(before), _protection(after)
+    selected: set[tuple[str, str]] = set()
     for policy_key, fact in left["policies"].items():
-        if policy_key[0] != table or old_raw not in fact["values"]: continue
-        label = f"{policy_key[0]} {policy_key[2]}" if len(policy_key) == 3 else " ".join(
-            (policy_key[0], *policy_key[2:]))
+        if (len(policy_key) != 5 or policy_key[1:4] != (catalog, treatment, sql_type)
+                or policy_key in right["policies"] or not _has_exact_generated_policy_name(policy_key, fact)
+                or not any(raw_value in raw for raw in fact["raw_functions"])):
+            continue
+        label = " ".join((policy_key[0], *policy_key[2:]))
         finding = f"{label}: removed"
         if finding in actual.get("policies", ()): selected.add(("policies", finding))
+        # A normalized mask name omits the generation, but it is selected only
+        # through this exact retired policy fact, whose raw function contains it.
+        for normalized in fact["masks"]:
+            if any(raw in left["mask_names"] and raw not in right["mask_names"]
+                   for raw in fact["raw_functions"]):
+                if normalized in actual.get("masks", ()): selected.add(("masks", normalized))
     return selected
 
 
@@ -1924,8 +1981,31 @@ def _shape_problems(check: Any) -> list[str]:
             if not (isinstance(finding, tuple) and len(finding) == 3
                     and all(isinstance(part, str) and part.strip() for part in finding)):
                 problems.append(f"protection finding {finding!r} must be (category, resource, exact change)")
-            elif finding[0] not in {"policies", "custom-adoption", "custom-generation"}:
+            elif finding[0] not in {"policies", "custom-adoption", "custom-generation", "custom-retire"}:
                 problems.append(f"protection finding category {finding[0]!r} is not supported")
+                continue
+            else:
+                category, resource, change = finding
+                identifier = r"[A-Za-z0-9_][A-Za-z0-9_-]*"
+                table = rf"{identifier}\.{identifier}\.{identifier}"
+                column = rf"{table}\.{identifier}"
+                treatment = r"[a-z][a-z0-9_]*"
+                principal = r"[^\s*?\[\]]+"
+                table_resource = bool(re.fullmatch(rf"catalog:{table}", resource)
+                                      or re.fullmatch(r"catalog:\{[a-z_][a-z0-9_]*\}", resource))
+                column_resource = bool(re.fullmatch(column, resource)
+                                       or re.fullmatch(r"\{[a-z_][a-z0-9_]*\}", resource))
+                if category == "policies" and (not table_resource
+                        or not re.fullmatch(
+                            rf"(?:partial|full): (?:newly exempts|no longer applies to) {principal}", change)):
+                    problems.append(f"policy finding {finding!r} must name a catalog anchor and exact level/effect/principal")
+                elif category in {"custom-adoption", "custom-generation"} and (
+                        not column_resource
+                        or not re.fullmatch(rf"{treatment}->{treatment}", change)):
+                    problems.append(f"custom finding {finding!r} must name one column and exact old->new treatments")
+                elif category == "custom-retire" and (not column_resource
+                        or not parse_treatment_value(change)):
+                    problems.append(f"retire finding {finding!r} must name one column and exact treatment__type__generation")
     return problems
 
 
@@ -2085,14 +2165,16 @@ def _eval_acknowledged_weakening(check: AcknowledgedWeakening, ctx: CheckContext
     return problems + _protection_delta_problems(check.env, check.findings, ctx)
 
 
-def _protection_delta_problems(env: str, keys: Iterable[ProtectionKey], ctx: CheckContext) -> list[str]:
+def _protection_delta_problems(env: str, keys: Iterable[ProtectionKey], ctx: CheckContext,
+                               *, required: bool = True) -> list[str]:
+    if not required: return []
     actual = protection_diff(ctx.before.get(env, {}), ctx.after.get(env, {}), include_grants=False)
     return [f"{env}: expected protection finding was not produced: {key!r}" for key in keys
             if not _finding_matches(key, actual, ctx.before.get(env, {}), ctx.after.get(env, {}))]
 
 
 def _eval_protection_delta(check: ProtectionDelta, ctx: CheckContext) -> list[str]:
-    return _protection_delta_problems(check.env, check.findings, ctx)
+    return _protection_delta_problems(check.env, check.findings, ctx, required=check.required)
 
 
 def file_signature(path: Path) -> tuple[int, str] | None:
