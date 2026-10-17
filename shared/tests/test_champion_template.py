@@ -163,6 +163,32 @@ def test_readme_prod_flow_seeds_acl_groups_and_a_clean_clone_checks(cloud, tmp_p
         assert "OK: promote-to ENV=prod CHECK=1: committed files match." in _out(result), _out(result)
 
 
+def _tree(root):
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*"))
+            if p.is_file() and ".git" not in p.parts}
+
+
+def test_generate_refuses_a_deleted_committed_capture_and_writes_nothing(cloud):
+    dev, _agent = _readme_dev_setup(cloud)
+    assert cloud("generate", "ENV=dev").returncode == 0
+    _commit(cloud.root, "dev")
+    capture = dev / "agents" / f"{AGENT}.space.json"
+    capture.unlink()
+    before = _tree(cloud.root)
+
+    result = cloud("generate", "ENV=dev")
+
+    assert result.returncode != 0
+    assert (f'agents/{AGENT}.space.json: restore it from git, or replace it with the live dev agent: '
+            f'make capture ENV=dev SPACE="{AGENT}"') in result.stderr, _out(result)
+    assert "Captured:" not in result.stdout
+    assert _tree(cloud.root) == before  # generated/, the record and the capture: nothing written
+    # make capture is the explicit way back; then generate runs again.
+    assert cloud("capture", "ENV=dev", f"SPACE={AGENT}").returncode == 0
+    assert cloud("generate", "ENV=dev").returncode == 0
+    assert _git(cloud.root, "status", "--porcelain") == ""
+
+
 def test_unfilled_acl_groups_is_refused_before_anything_runs(cloud):
     dev, _agent = _readme_dev_setup(cloud, acl_groups='["<group-that-may-run-the-agent>"]')
 

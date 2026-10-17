@@ -96,7 +96,11 @@
   checks agent files (an unfilled ID or `acl_groups` group stops every guarded
   target), `make generate` captures a new agent before writing
   `generated/governed_tables.json` so its first run records the agent's tables,
-  and `make enable-classification` accepts an agent kept in a file. The e2e
+  and `make enable-classification` accepts an agent kept in a file.
+  `make generate` imports only agents whose capture was never committed: if a
+  committed `agents/<agent>.space.json` is gone, it stops before writing
+  anything and points to `make capture ENV=dev SPACE="<agent>"`, instead of
+  quietly re-capturing the live dev UI config. The e2e
   driver's champion writes agent A's file from the required `dev_agent_id` and
   `acl_groups` values. **Upgrade:** none; existing env files are not changed.
 
