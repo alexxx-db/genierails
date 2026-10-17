@@ -110,9 +110,9 @@ def write_legacy_state(env_dir: Path, *, policies=None, grants=("regional", "mas
 
 
 def opt_in(env_dir: Path, *, readers=("regional", "masked"), acl_groups=("regional",), ack=(), tiers=None,
-           columns=("email",)):
+           columns=("email",), deployer=""):
     """The committed opt-in: deterministic generated config, table_readers, the agent and ack.txt."""
-    write_env(env_dir, columns=columns, **({"tiers": tiers} if tiers else {}))
+    write_env(env_dir, columns=columns, deployer=deployer, **({"tiers": tiers} if tiers else {}))
     with (env_dir / "env.auto.tfvars").open("a") as f:
         f.write(f'table_readers = {{ "cat.sch.t" = {json.dumps(list(readers))} }}\n')
         acl = "" if acl_groups is None else f", acl_groups = {json.dumps(list(acl_groups))}"
@@ -533,7 +533,7 @@ def test_the_cutover_stages_new_policies_first_and_keeps_legacy_until_a_later_re
                    f'module.data_access.databricks_entity_tag_assignment.treatment["columns|{COLUMN}|gr_treatment"]']
     assert cutover.calls == ["create", "inventory:create/restore", "verify-access:create", "switch",
                              "inventory:switch", "verify-access:switch", "grant"]
-    # Before the switch, columns still on the legacy value are checked by the legacy checks.
+    # Before the switch, columns still on the legacy value use legacy checks.
     assert cutover.verify_envs[0]["governance_mode"] == "legacy"
     assert cutover.verify_envs[1]["governance_mode"] == "deterministic"
     state = live_state(env_dir)
@@ -557,6 +557,41 @@ def test_the_cutover_stages_new_policies_first_and_keeps_legacy_until_a_later_re
     assert cutover.apply() == 0
     assert "retire" in cutover.calls and "drop-functions" in cutover.calls and cutover.dropped == []
     assert LEGACY_POLICY not in {p["name"] for p in live_policies(live_state(env_dir))}
+
+
+def test_rehearse_retry_resumes_at_verify_created_without_create_or_tag_moves(cutover, env_dir):
+    """Offline model of the AWS rehearsal that failed in verify-created."""
+    opt_in(env_dir)
+    cutover.legacy = migration.legacy_generation(migration.deployment(env_dir))
+    cutover.fail_verify = {"create"}
+    assert cutover.apply() == 1
+    assert cutover.calls[-1] == "verify-access:create"
+    moves_before = (env_dir / "state_tool.log").read_text().splitlines()
+    assert len(moves_before) == 1
+
+    cutover.calls.clear()
+    assert cutover.apply() == 0
+    assert cutover.calls[0] == "inventory:create/restore"
+    assert "create" not in cutover.calls
+    assert (env_dir / "state_tool.log").read_text().splitlines() == moves_before
+
+
+def test_migration_real_specs_alias_deployer_in_legacy_create_and_deterministic_switch(cutover, env_dir):
+    """AWS shape: the deployer is in policy EXCEPT lists and real specs validate."""
+    deployer = "82bb9d6d-da56-489d-aaaf-98f6177132c9"
+    opt_in(env_dir, deployer=deployer)
+    generated = hcl2.loads((env_dir / "generated" / "abac.auto.tfvars").read_text())
+    masks = [p for p in generated["fgac_policies"] if p["policy_type"] == "POLICY_TYPE_COLUMN_MASK"]
+    assert masks and any(deployer in (p.get("except_principals") or []) for p in masks)
+
+    cutover.legacy = migration.legacy_generation(migration.deployment(env_dir))
+    cutover.validate_real_specs = True
+    assert cutover.apply() == 0
+    assert [env["governance_mode"] for env in cutover.verify_envs] == ["legacy", "deterministic"]
+    assert len(cutover.verify_specs) == 2
+    for spec in cutover.verify_specs:
+        assert deployer not in spec.principals
+        assert deployer not in spec.principal_memberships
 
 
 def test_a_refused_migration_changes_nothing(cutover, env_dir):
@@ -591,7 +626,8 @@ def test_an_interrupted_adoption_resumes(cutover, env_dir, monkeypatch):
 
 
 def test_saved_plans_take_one_manifest_per_changing_phase(cutover, env_dir, tmp_path):
-    opt_in(env_dir)
+    deployer = "82bb9d6d-da56-489d-aaaf-98f6177132c9"
+    opt_in(env_dir, deployer=deployer)
     cutover.legacy = migration.legacy_generation(migration.deployment(env_dir))
     controller = cutover.controller()
     adopt = tmp_path / "plan0"
@@ -608,6 +644,10 @@ def test_saved_plans_take_one_manifest_per_changing_phase(cutover, env_dir, tmp_
     assert [s["phase"] for s in phases["steps"]] == ["create", "verify-created"] and not phases["final"]
     assert phases["transition"]["from"] == cutover.legacy["fingerprint"]
     assert controller.apply_saved(first) == spa.MORE_PHASES
+    # The adopted generation retains legacy expectations, while its deployer
+    # is still recognized as the admin baseline by the real verifier.
+    assert cutover.verify_envs[-1]["governance_mode"] == "legacy"
+    assert cutover.verify_envs[-1]["deployer_principal_id"] == deployer
     second = tmp_path / "plan2"
     assert controller.plan(second) == 0
     assert [s["phase"] for s in json.loads((second / spa.PHASES_FILE).read_text())["steps"]] == \
@@ -748,6 +788,36 @@ def _crash_after_one_move(env_dir: Path, monkeypatch):
     state = live_state(env_dir)
     assert len(_attrs(state, "treatment")) == 1 and len(_attrs(state, "assignments")) == 1
     assert migration.load_record(env_dir)["status"] == "adopting"  # written before the move
+
+
+def test_adopting_marker_is_fsynced_before_the_first_state_move(env_dir, monkeypatch):
+    """The no-way-back record is durable, not merely visible in page cache."""
+    write_legacy_state(env_dir)
+    opt_in(env_dir)
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def tracked_fsync(fd):
+        events.append("fsync")
+        return real_fsync(fd)
+
+    def tracked_replace(source, target):
+        events.append("replace")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(pg.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(pg.os, "replace", tracked_replace)
+
+    def stop_at_first_move(command, *addresses):
+        assert command == "state-mv"
+        assert migration.load_record(env_dir)["status"] == "adopting"
+        events.append("state-mv")
+        assert events == ["fsync", "replace", "fsync", "state-mv"]
+        raise KeyboardInterrupt("stop before changing fake state")
+
+    with pytest.raises(KeyboardInterrupt):
+        migration.adopt(env_dir, ENV, terraform=stop_at_first_move)
 
 
 def test_an_interrupted_adoption_already_refuses_legacy_applies(cutover, env_dir, monkeypatch):

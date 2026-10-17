@@ -28,6 +28,7 @@ from scripts import environment_lock
 from scripts import policy_generations as pg
 from scripts import staged_policy_apply as spa
 from scripts import staged_policy_verify as spv
+from verify_effective_access import load_spec_from_tfvars, validate_spec_identifiers
 
 SHARED = Path(__file__).resolve().parents[1]
 TIERS = ["raw", "regional", "masked"]
@@ -144,13 +145,14 @@ else:
 
 # -- the env -------------------------------------------------------------------
 def write_env(env_dir: Path, *, tiers=TIERS, versions=None, columns=("email",), classes=("email_address",),
-              mode="deterministic", exempt=()):
+              mode="deterministic", exempt=(), deployer=""):
     """Write a generated deterministic config (and its env) and return its generation."""
     env_dir.mkdir(parents=True, exist_ok=True)
     settings = {"access_tier_groups": list(tiers), "treatment_versions": versions or {},
                 "raw_exempt_principals": list(exempt)}
     model = build_model({f"cat.sch.t.{c}": list(classes) for c in columns},
-                        {f"cat.sch.t.{c}": "STRING" for c in columns}, settings)
+                        {f"cat.sch.t.{c}": "STRING" for c in columns}, settings,
+                        deployer_principal=deployer)
     generated = env_dir / "generated"
     generated.mkdir(exist_ok=True)
     (generated / "abac.auto.tfvars").write_text("tag_policies = [\n]\ntag_assignments = [\n]\nfgac_policies = [\n]\n")
@@ -160,6 +162,7 @@ def write_env(env_dir: Path, *, tiers=TIERS, versions=None, columns=("email",), 
         f'governance_mode = "{mode}"\n'
         + f"access_tier_groups = {json.dumps(list(tiers))}\n"
         + f"raw_exempt_principals = {json.dumps(list(exempt))}\n"
+        + (f'deployer_principal_id = "{deployer}"\n' if deployer else "")
         + (f"treatment_versions = {spa._hcl_value(versions)}\n" if versions else ""))
     layer = env_dir / "data_access"
     layer.mkdir(exist_ok=True)
@@ -268,6 +271,8 @@ class Harness:
         monkeypatch.setattr(pg, "RUNNER", runner)
         self.calls: list[str] = []
         self.verify_envs: list[dict] = []
+        self.verify_specs = []
+        self.validate_real_specs = False
         self.fail_verify: set[str] = set()
         self.crash_after: str = ""
         self.invariant_problems: list[str] = []
@@ -328,10 +333,15 @@ class Harness:
             record = pg.load_stage_record(self.env_dir)
             self.calls.append(f"verify-access:{record['stage']}")
             self.verify_envs.append(hcl2.loads(Path(env["GENIERAILS_VERIFY_ENV_FILE"]).read_text()))
-            if not self.simulate_access:
-                return SimpleNamespace(returncode=0)
-            problems = simulated_verify_access(self.env_dir, Path(env["GENIERAILS_VERIFY_TFVARS"]),
-                                               Path(env["GENIERAILS_VERIFY_ENV_FILE"]))
+            if self.validate_real_specs:
+                spec = load_spec_from_tfvars(
+                    Path(env["GENIERAILS_VERIFY_TFVARS"]),
+                    env_file=Path(env["GENIERAILS_VERIFY_ENV_FILE"]), key_column="id")
+                validate_spec_identifiers(spec)
+                self.verify_specs.append(spec)
+            problems = [] if not self.simulate_access else simulated_verify_access(
+                self.env_dir, Path(env["GENIERAILS_VERIFY_TFVARS"]),
+                Path(env["GENIERAILS_VERIFY_ENV_FILE"]))
             if record["stage"] in self.fail_verify:
                 self.fail_verify.discard(record["stage"])
                 problems.append("injected verification failure")

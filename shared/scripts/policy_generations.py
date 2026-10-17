@@ -170,11 +170,24 @@ def ledger_dir(env_dir: Path) -> Path:
 
 
 def write_json(path: Path, value: dict) -> Path:
-    """Write ``value`` atomically: a crash leaves the old file or the new one."""
+    """Write ``value`` atomically and durably before returning.
+
+    The migration's ``adopting`` record is the no-way-back marker.  Its caller
+    must be able to start the first state move knowing both the file contents
+    and the directory entry survived a host crash.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    with open(tmp, "w") as handle:
+        handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
     return path
 
 
