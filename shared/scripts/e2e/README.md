@@ -96,6 +96,53 @@ failure is `ERROR`. S13 runs every refusal command with `CI=true` and without
 Scenario values: `agent_a`, `wrong_agent`, `table` (covered), `uncovered_table`,
 `treatment`, `ack_entry` (an exact `prod:<kind>:...` line), `manifest`,
 `tampered_manifest`, and the 40-hex commits `u`, `o`, `r`, `r_plus_1`, `x`, `y`.
+The typed checks below add: champion `acl_groups`, `dev_tables`, `prod_tables`;
+S2 `mask_column`; S3 `new_table_principals`, `dev_table`, `prod_table`; S4
+`new_column`; S5 `secret_column`; and `agent_a` for champion, S3 and S16. S6's
+`reader_principal` and `reader_table` come from `ack_entry`
+(`prod:reader:<cat.sch.table>:<principal>`). A comma-separated value
+(`acl_groups=a,b`) stands for every combination.
+
+### Typed checks
+
+A step's `assertions=` and a scenario's `checks=` hold typed checks from a
+small vocabulary, never free text. Each has an evaluator that runs in live runs;
+a step's checks fail that step, a scenario's checks fail the scenario after its
+final snapshot. `--dry-run` lists them and exits non-zero if any check has no
+evaluator or is malformed (unknown env or component, wildcards in a grant, an
+unknown level). Their `{placeholders}` are required values.
+
+| Check | Passes when |
+| --- | --- |
+| `GrantDelta(env, added=, may_add=, revoked=)` | Grants added since the baseline are exactly `added` plus a subset of `may_add`, and those revoked are exactly `revoked`. |
+| `AccessLevel(env, target, principal, level)` | The step's verify-access result shows `principal` (`*` = every one checked) at `raw`, `partial`, `full`, `redacted` or `masked` on every checked column under `target`. |
+| `AccessVerified(env, target)` | That result has PASS for every check under `target`, each principal at its expected tier. `ADOPTED_COLUMNS` means every column migrate-plan adopted. |
+| `DiffLimitedTo(env, component, selectors)` | Every changed `uc` resource, `agents` space, `receipts` or `state_serials` path matches a selector. |
+| `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
+| `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
+
+A grant is `(principal, privilege, securable)`: a table, schema or catalog, or
+`agent:<key>` for Genie CAN_RUN. `USE_CATALOG`/`USE_SCHEMA` on a table mean its
+catalog/schema. Every protection check includes UC grants and non-inherited
+CAN_RUN. After each applying step, each release phase and at the scenario end, a
+new grant that no check of the scenario declares in `added` or `may_add` fails,
+including in S8/S9, which may otherwise weaken protection. The restore and
+final checks allow no new grant. Example:
+
+```python
+_scenario("s6", ..., checks=(
+    GrantDelta("dev"),
+    GrantDelta("prod", added=(("{reader_principal}", "SELECT", "{reader_table}"),),
+               may_add=_business_grants("{reader_principal}", "{reader_table}")),
+))
+```
+
+Access checks read `<cloud>/envs/<env>/generated/.verify_access.json`, the file
+`release`, `rehearse` and `verify-access` write. A file the step did not rewrite
+is stale and fails the check. The file's `checks` list gives, per column and
+principal, the expected tier and what the run proved (`raw`, `mismatch`,
+`fail-closed` or `unproven` when it did not prove the expected tier).
+`redacted` means `full` through a never-raw (`unmapped_redact`) mask.
 
 Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
 (`databricks_workspace_host`, `databricks_client_id`,
@@ -127,7 +174,7 @@ guard only sees what the log says: a wholly quiet internal exposure still cannot
 be observed, so the engine must preserve its internal masks-before-access
 ordering. The driver then
 re-snapshots dev and prod. A column that lost a tag, a removed mask or policy, a
-newly exempted or uncovered principal, or a new grant compared with the
+newly exempted or uncovered principal, or a new grant or CAN_RUN compared with the
 scenario's baseline is `RESTORE FAILED`. `<reports>/final-protection.json`
 repeats that check against the run's first baseline. Logs and reports redact
 secret-named keys, every value in the cloud's auth files, `Authorization`,
