@@ -11,6 +11,8 @@ conclusively proves the policy took effect. Anything it could not verify
 (missing data, failed query, no overlap, all-null values, empty spec) is
 NON-PASSING (FAIL or INCONCLUSIVE) and blocks the gate.
 """
+import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -43,10 +45,160 @@ from verify_effective_access import (  # noqa: E402
     evaluate_effective_access,
     load_spec_from_file,
     load_spec_from_tfvars,
+    weaker_explicit_spec_checks,
     main,
     verify_effective_access_live,
     write_result_file,
 )
+
+
+def test_gate_spec_must_name_every_derived_principal_and_not_weaken_tiers():
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (),
+        expected_tiers=(("finance", "raw"), ("analyst", "partial"), ("viewer", "full")))])
+    omitted = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (),
+        expected_tiers=(("finance", "raw"), ("viewer", "full")))])
+    weakened = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (),
+        expected_tiers=(("finance", "raw"), ("analyst", "raw"), ("viewer", "full")))])
+    assert weaker_explicit_spec_checks(derived, omitted) == [
+        "cat.sch.people.email: analyst expected partial (missing)"]
+    assert weaker_explicit_spec_checks(derived, weakened) == [
+        "cat.sch.people.email: analyst expected partial, got raw"]
+
+
+def test_gate_spec_may_add_checks_and_make_expectations_stricter():
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "cat.sch.people", "email", "id", (), (), expected_tiers=(("analyst", "partial"),))])
+    explicit = VerificationSpec(column_masks=[
+        ColumnMaskCheck("cat.sch.people", "email", "id", (), (),
+                        expected_tiers=(("analyst", "full"), ("extra-tier", "full"))),
+        ColumnMaskCheck("cat.sch.people", "phone", "id", ("extra-tier",), ()),
+    ])
+    assert weaker_explicit_spec_checks(derived, explicit) == []
+    assert {c.column for c in explicit.column_masks} == {"email", "phone"}
+
+
+def test_gate_spec_cannot_drop_or_weaken_a_derived_row_filter_principal():
+    derived = VerificationSpec(row_filters=[RowFilterCheck(
+        "cat.sch.orders", ("regional",), ("global",))])
+    explicit = VerificationSpec(row_filters=[RowFilterCheck(
+        "cat.sch.orders", (), ("regional", "global"))])
+    assert weaker_explicit_spec_checks(derived, explicit) == [
+        "cat.sch.orders: regional expected restricted row access (missing or weakened)"]
+
+
+def _derived_gate_spec():
+    tiers = (("finance", "raw"), ("analyst", "partial"),
+             ("viewer", "full"), ("__admin__", "raw"))
+    return VerificationSpec(
+        column_masks=[ColumnMaskCheck(
+            "c.s.p", "ssn", "id", (), (), expected_tiers=tiers,
+            partial_function="c.s.mask_partial", full_function="c.s.mask_full")],
+        principal_memberships={"finance": ("finance",), "analyst": ("analyst",),
+                               "viewer": ("viewer",), "__admin__": ("__admin__",)},
+    )
+
+
+def test_gate_rejects_tiered_check_replaced_by_untiered_probe_p1():
+    explicit = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", ("analyst", "viewer"), ("finance", "__admin__"))])
+    problems = weaker_explicit_spec_checks(_derived_gate_spec(), explicit)
+    assert any("tiered exact-output check replaced by an untiered check" in p for p in problems)
+
+
+def test_gate_rejects_changed_expected_output_function_probe_p2():
+    check = _derived_gate_spec().column_masks[0]
+    explicit = VerificationSpec(column_masks=[replace(check, full_function=check.partial_function)])
+    assert any("full_function expected c.s.mask_full, got c.s.mask_partial" in p
+               for p in weaker_explicit_spec_checks(_derived_gate_spec(), explicit))
+
+
+def test_gate_rejects_changed_effective_memberships_probe_p3():
+    derived = _derived_gate_spec()
+    explicit = VerificationSpec(
+        column_masks=[replace(derived.column_masks[0], expected_tiers=(
+            ("finance", "raw"), ("analyst", "full"),
+            ("viewer", "full"), ("__admin__", "raw")))],
+        principal_memberships={"analyst": ()},
+    )
+    assert any("analyst memberships expected ['analyst'], got []" in p
+               for p in weaker_explicit_spec_checks(derived, explicit))
+
+
+def test_gate_rejects_added_moving_principal_probe_p4():
+    derived = _derived_gate_spec()
+    explicit = VerificationSpec(column_masks=[replace(
+        derived.column_masks[0], moving_principals=("analyst",))],
+        principal_memberships=derived.principal_memberships)
+    assert any("moving_principals may not add ['analyst']" in p
+               for p in weaker_explicit_spec_checks(derived, explicit))
+
+
+def test_minimum_from_tfvars_cli_refuses_a_weaker_explicit_spec(tmp_path):
+    tfvars = tmp_path / "abac.auto.tfvars"
+    tfvars.write_text('''fgac_policies = [{
+      name = "mask", policy_type = "POLICY_TYPE_COLUMN_MASK", catalog = "cat",
+      to_principals = ["analysts"], match_condition = "hasTagValue('gr_treatment', 'redact')",
+      function_name = "mask_redact", function_catalog = "cat", function_schema = "sch"
+    }]
+    tag_assignments = [{ entity_type = "columns", entity_name = "cat.sch.t.ssn",
+                         tag_key = "gr_treatment", tag_value = "redact" }]
+    ''')
+    env_file = tmp_path / "env.auto.tfvars"
+    env_file.write_text('governance_mode = "legacy"\n')
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text('''{"column_masks": [{"table": "cat.sch.t", "column": "ssn",
+      "unmasked_principals": ["__admin__"]}]}''')
+    with pytest.raises(SystemExit, match="analysts expected full"):
+        main(["--spec", str(spec_file), "--minimum-from-tfvars", str(tfvars),
+              "--minimum-env-file", str(env_file), "--print-spec"])
+
+
+@pytest.mark.parametrize("partial,full", [
+    ("c.s.identity", "c.s.identity"),
+    ("c.s.mask_ssn", "c.s.identity"),
+])
+def test_gate_rejects_legacy_check_tiered_with_non_policy_functions_p8(tmp_path, partial, full):
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", ("analyst",), ("finance",), mask_function="c.s.mask_ssn")])
+    explicit = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", (), (), expected_tiers=(("analyst", "full"), ("finance", "raw")),
+        partial_function=partial, full_function=full)])
+    assert any("untiered check may become tiered" in p
+               for p in weaker_explicit_spec_checks(derived, explicit))
+
+
+def test_gate_allows_legacy_check_tiered_with_the_policy_function_p8b():
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", ("analyst",), ("finance",), mask_function="c.s.mask_ssn")])
+    explicit = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", (), (), expected_tiers=(("analyst", "full"), ("finance", "raw")),
+        partial_function="C.S.MASK_SSN", full_function="c.s.mask_ssn")])
+    assert weaker_explicit_spec_checks(derived, explicit) == []
+
+
+@pytest.mark.parametrize("payload,field", [
+    ({"bogus_top_level": 1}, "root.bogus_top_level"),
+    ({"column_masks": [{"table": "c.s.p", "column": "ssn", "skip": True}]},
+     "column_masks[0].skip"),
+    ({"column_masks": [{"table": "c.s.p", "column": "ssn", "expected_tier": {}}]},
+     "column_masks[0].expected_tier"),
+])
+def test_gate_spec_strict_loader_rejects_unknown_fields_p9(tmp_path, payload, field):
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=re.escape(field)):
+        load_spec_from_file(path, strict=True)
+
+
+def test_gate_spec_strict_loader_rejects_unknown_tier_on_added_principal_p10(tmp_path):
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps({"column_masks": [{
+        "table": "c.s.p", "column": "ssn", "expected_tiers": {"extra": "bogus"}}]}))
+    with pytest.raises(ValueError, match="unknown tier value.*extra.*bogus"):
+        load_spec_from_file(path, strict=True)
 
 
 def _tiered_check():
