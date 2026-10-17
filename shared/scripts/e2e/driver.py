@@ -48,7 +48,9 @@ IMPORT_UNSET_LOG = re.compile(
 )
 IMPORT_UNSET_SOURCE_ANCHORS = ("Cleared tag {tkey} on", "; clearing tag")
 TAG_VALUE_MATCH = re.compile(r"hasTagValue\(\s*'gr_treatment'\s*,\s*'([^']*)'\s*\)", re.I)
-CONDITION_FIELDS = ("condition", "when_condition", "match_columns")
+# PolicyInfo fields in the pinned databricks-sdk. The condition inside each
+# MatchColumn is covered by match_columns; PolicyInfo has no top-level condition.
+CONDITION_FIELDS = ("when_condition", "match_columns")
 ABSENT_CONDITION = "absent"
 LEGACY_REDACTED_TREATMENTS = frozenset({"redact", "compensation_redacted"})
 GIT_IDENTITY = {"GIT_AUTHOR_NAME": "genierails-e2e", "GIT_AUTHOR_EMAIL": "genierails-e2e@localhost",
@@ -575,7 +577,7 @@ def _snapshot_policy(policy: Mapping[str, Any], table: str) -> dict[str, Any]:
     """Keep condition integrity evidence without persisting live SQL text."""
     result = dict(policy)
     name = str(result.get("name") or "<unnamed>")
-    for field in ("condition", "when_condition"):
+    for field in ("when_condition",):
         value = result.pop(field, None)
         result[f"{field}_hash"] = (ABSENT_CONDITION if value is None else
                                     _condition_hash(value, f"{table} {name} {field}"))
@@ -584,18 +586,21 @@ def _snapshot_policy(policy: Mapping[str, Any], table: str) -> dict[str, Any]:
         if not isinstance(columns, list):
             raise RuntimeError(f"{table} {name} match_columns: policy condition is unreadable")
         hashed = []
+        match_values: set[str] = set()
         for index, column in enumerate(columns):
+            if hasattr(column, "as_dict"):
+                column = column.as_dict()
             if not isinstance(column, Mapping):
                 raise RuntimeError(f"{table} {name} match_columns[{index}]: policy condition is unreadable")
             item = {k: v for k, v in column.items() if k != "condition"}
+            match_values.update(TAG_VALUE_MATCH.findall(str(column.get("condition") or "")))
             item["condition_hash"] = _condition_hash(
                 column.get("condition"), f"{table} {name} match_columns[{index}]")
             hashed.append(item)
         result["match_columns_hash"] = hashlib.sha256(
             json.dumps(sorted(hashed, key=lambda item: json.dumps(item, sort_keys=True)),
                        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        result["match_values"] = sorted({value for column in columns
-                                         for value in TAG_VALUE_MATCH.findall(str(column.get("condition") or ""))})
+        result["match_values"] = sorted(match_values)
     else:
         result["match_columns_hash"] = ABSENT_CONDITION
     return result
@@ -814,7 +819,7 @@ def parse_migration_mappings(output: str) -> dict[str, Adoption]:
             current = None
             continue
         policy_change = re.fullmatch(
-            r"\s+reviewed policy condition:\s+(\S+)\s+(condition|when_condition|match_columns)\s+(absent|[0-9a-f]{64})\s*", line)
+            r"\s+reviewed policy condition:\s+(\S+)\s+(when_condition|match_columns)\s+(absent|[0-9a-f]{64})\s*", line)
         if declaration_location and policy_change:
             adoption = mappings[declaration_location]
             mappings[declaration_location] = dataclasses.replace(
