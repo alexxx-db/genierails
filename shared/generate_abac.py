@@ -60,7 +60,7 @@ from access_tier_groups import (
     persisted_access_tier_groups,
     render as render_access_tier_groups,
 )
-from genie_space_placeholder import placeholder_error
+from genie_space_placeholder import agent_files_placeholder_error, placeholder_error
 from walkthrough_marker import follows_walkthrough
 from sensitivity_source import (
     ClassificationSource,
@@ -350,7 +350,7 @@ def load_auth_config(
         env_cfg = with_agents(env_file, env_cfg)
     except AgentFileError as exc:
         raise ValueError(str(exc)) from exc
-    placeholder = placeholder_error(
+    placeholder = agent_files_placeholder_error(env_file.parent) or placeholder_error(
         env_cfg, env_file, allow_access_tier_placeholders=allow_access_tier_placeholders
     )
     if placeholder:
