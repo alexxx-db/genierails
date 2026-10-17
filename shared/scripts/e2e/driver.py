@@ -11,7 +11,9 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import fnmatch
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -20,7 +22,7 @@ import subprocess
 import sys
 import signal
 import time
-from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
+from typing import Any, Callable, ClassVar, Iterable, Iterator, Mapping, Protocol, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from governance_policies import FAILSAFE_TREATMENT, is_never_raw, parse_treatment_value
@@ -84,7 +86,8 @@ class Step:
     extra_env: tuple[tuple[str, str | None], ...] = ()
     action: str | None = None
     value: str | None = None
-    assertions: tuple[str, ...] = ()
+    # Typed checks (GrantDelta, AccessLevel, ...) evaluated over this step.
+    assertions: tuple[Any, ...] = ()
     refusal_in_ci: bool = True
 
 
@@ -99,6 +102,8 @@ class Scenario:
     requires: tuple[str, ...] = ()
     known_failure: str | None = None
     read_only: bool = False
+    # Typed checks evaluated over the whole scenario (baseline to final snapshot).
+    checks: tuple[Any, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,10 +118,100 @@ class Adoption:
     mask_definitions: tuple[tuple[str, str], ...] = ()
 
 
+# Typed checks. Each has an evaluator in EVALUATORS that runs during live runs;
+# --dry-run fails on any assertion without one. String fields may hold
+# {placeholders} from --value, and the fields of a grant may hold
+# comma-separated lists (one grant per combination).
+ENVS = ("dev", "prod")
+SNAPSHOT_COMPONENTS = ("uc", "agents", "state_serials", "receipts")
+ACCESS_LEVELS = ("raw", "partial", "full", "redacted", "masked")
+# An access target meaning every column the scenario's migrate-plan adopted.
+ADOPTED_COLUMNS = "@migrate-plan"
+Grant = tuple[str, str, str]  # (principal, privilege, securable)
+
+
+@dataclasses.dataclass(frozen=True)
+class GrantDelta:
+    """The exact grant change in ``env``: every ``added`` grant is new, nothing
+    else is granted except ``may_add`` (named grants a fixture may already hold),
+    and nothing is revoked except ``revoked``. ``added`` and ``may_add`` are also
+    the only widening the per-step protection checks permit. The securable
+    ``agent:<key>`` is that Genie agent (CAN_RUN); USE_CATALOG and USE_SCHEMA
+    entries name a table and mean its catalog or schema."""
+    env: str
+    added: tuple[Grant, ...] = ()
+    may_add: tuple[Grant, ...] = ()
+    revoked: tuple[Grant, ...] = ()
+    kind: ClassVar[str] = "grant-delta"
+    snapshots: ClassVar[bool] = True
+
+
+@dataclasses.dataclass(frozen=True)
+class AccessLevel:
+    """verify-access proved ``principal`` ("*": every principal it checked) sees
+    ``level`` in every check of ``target`` (a table or a column). ``redacted`` is
+    ``full`` through a never-raw treatment; ``masked`` is anything but raw."""
+    env: str
+    target: str
+    principal: str
+    level: str
+    kind: ClassVar[str] = "access-level"
+    snapshots: ClassVar[bool] = False
+
+
+@dataclasses.dataclass(frozen=True)
+class AccessVerified:
+    """verify-access checked ``target`` (a table, a column or ADOPTED_COLUMNS) and
+    every principal saw exactly the tier the spec expects for it."""
+    env: str
+    target: str
+    kind: ClassVar[str] = "access-verified"
+    snapshots: ClassVar[bool] = False
+
+
+@dataclasses.dataclass(frozen=True)
+class DiffLimitedTo:
+    """Only the selected resources of a snapshot component changed in ``env``.
+    Selectors: agent keys (agents), securables or function names, each covering
+    what is under it (uc), or paths (state_serials, receipts); globs allowed."""
+    env: str
+    component: str
+    selectors: tuple[str, ...]
+    kind: ClassVar[str] = "diff-limited-to"
+    snapshots: ClassVar[bool] = True
+
+
+@dataclasses.dataclass(frozen=True)
+class Unchanged:
+    """No selected resource of a snapshot component changed in ``env``."""
+    env: str
+    component: str
+    selectors: tuple[str, ...] = ("*",)
+    kind: ClassVar[str] = "unchanged"
+    snapshots: ClassVar[bool] = True
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentIdUnchanged:
+    """Agent ``agent`` keeps exactly its space ID(s): it was not recreated, so
+    the conversations that live in that space are retained."""
+    env: str
+    agent: str
+    kind: ClassVar[str] = "agent-id-unchanged"
+    snapshots: ClassVar[bool] = True
+
+
+def with_checks(steps: Sequence[Step], name: str, *checks: Any) -> tuple[Step, ...]:
+    """``steps`` with ``checks`` added to the step called ``name``."""
+    if name not in {step.name for step in steps}: raise ValueError(f"no step named {name!r}")
+    return tuple(dataclasses.replace(step, assertions=step.assertions + checks) if step.name == name else step
+                 for step in steps)
+
+
 def mk(name: str, target: str, env: str | None = None, *,
        args: Sequence[str] = (), fail: bool = False, refusal: str | None = None,
        extra_env: Mapping[str, str | None] | None = None,
-       assertions: Sequence[str] = (), refusal_in_ci: bool = True) -> Step:
+       assertions: Sequence[Any] = (), refusal_in_ci: bool = True) -> Step:
     command = ("make", target) + ((f"ENV={env}",) if env else ()) + tuple(args)
     return Step(name, command, env, target, expect_failure=fail, refusal=refusal,
                 extra_env=tuple((extra_env or {}).items()),
@@ -177,9 +272,17 @@ DAY2 = (
 
 def _scenario(key: str, title: str, pre: Sequence[str], lead: Sequence[Step], passed: Sequence[str],
               restore: Sequence[str], requires: Sequence[str] = (), known_failure: str | None = None,
-              read_only: bool = False) -> Scenario:
+              read_only: bool = False, checks: Sequence[Any] = ()) -> Scenario:
     return Scenario(key, title, tuple(pre), tuple(lead), tuple(passed), tuple(restore), tuple(requires),
-                    known_failure, read_only)
+                    known_failure, read_only, tuple(checks))
+
+
+def _business_grants(principals: str, tables: str) -> tuple[Grant, ...]:
+    """The usage grants a table's SELECT needs, which a fixture may already hold."""
+    return ((principals, "USE_CATALOG", tables), (principals, "USE_SCHEMA", tables))
+
+
+APPLY_RELEASE = "Apply approved manifest"
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -196,47 +299,79 @@ SCENARIOS: tuple[Scenario, ...] = (
     ) + DAY2[3:], (
         "Prod grants, masks, tags, agent export/ACL and receipts match committed governance.",
         "Second release-plan and maintain are idempotent; agent ID and conversations are stable.",
-    ), ("Release delete=true for disposable agents; remove governed fixtures through reviewed lifecycle changes.",)),
+    ), ("Release delete=true for disposable agents; remove governed fixtures through reviewed lifecycle changes.",),
+        checks=(
+            GrantDelta("prod", added=(("{acl_groups}", "CAN_RUN", "agent:{agent_a}"),
+                                      ("{acl_groups}", "SELECT", "{prod_tables}")),
+                       may_add=_business_grants("{acl_groups}", "{prod_tables}")),
+            # Dev A exists before the run, so its access may already be in place.
+            GrantDelta("dev", may_add=(("{acl_groups}", "CAN_RUN", "agent:{agent_a}"),
+                                       ("{acl_groups}", "SELECT", "{dev_tables}"),
+                                       *_business_grants("{acl_groups}", "{dev_tables}"))),
+        )),
     _scenario("s1", "Promote A while B has unfinished dev edits", (
         "A and B have released captured baselines; make an unmistakable UI-only edit to dev B.",
     ), (Step("Curate only A", human_prompt="Curate dev A and leave B unfinished."),
         mk("Capture A only", "capture", "dev", args=("SPACE={agent_a}",)), AUTHOR_MERGE) + DAY2, (
         "Only A changes; dev B remains UI-edited and prod B stays byte-identical with stable conversations.",
-    ), ("Revert/capture A through lifecycle; manually discard or separately capture B edit.",)),
+    ), ("Revert/capture A through lifecycle; manually discard or separately capture B edit.",),
+        checks=(DiffLimitedTo("dev", "agents", ("{agent_a}",)), DiffLimitedTo("prod", "agents", ("{agent_a}",)),
+                AgentIdUnchanged("prod", "{agent_a}"))),
     _scenario("s2", "Mask-only change while B is mid-curation", ("Begin an uncaptured edit to dev B; review a mask version/override change.",),
         (Step("Leave B mid-curation", human_prompt="Leave B's UI edit uncaptured and apply the reviewed config edit."),
-         mk("Regenerate governance", "generate", "dev"), AUTHOR_MERGE) + DAY2,
+         mk("Regenerate governance", "generate", "dev"), AUTHOR_MERGE)
+        + with_checks(DAY2, APPLY_RELEASE, AccessVerified("prod", "{mask_column}")),
         ("Only governance changes; B config, ID and conversations do not change; staged replacement never exposes raw data.",),
-        ("Revert governance change through the same lifecycle.",), ("Staged policy operation may require step 6 operation targets.",)),
+        ("Revert governance change through the same lifecycle.",), ("Staged policy operation may require step 6 operation targets.",),
+        checks=(Unchanged("dev", "agents"), Unchanged("prod", "agents"))),
     _scenario("s3", "Agent adds a new table", ("Create uniquely prefixed, classified dev/prod test table pair.",),
         (Step("Add table to A", human_prompt="Add the dev table to A in the UI and review classification."),
          mk("Capture A", "capture", "dev", args=("SPACE={agent_a}",)), mk("Generate governance", "generate", "dev"),
-         AUTHOR_MERGE) + DAY2,
+         AUTHOR_MERGE) + with_checks(DAY2, APPLY_RELEASE, AccessVerified("prod", "{prod_table}")),
         ("Unreadable table is refused; once readers are reviewed, prod is masked before access and identifiers are remapped.",),
-        ("Remove table from A, capture/release, ungovern, then drop disposable fixtures.",)),
+        ("Remove table from A, capture/release, ungovern, then drop disposable fixtures.",),
+        checks=(
+            # new_table_principals: A's acl_groups plus the table's reviewed readers.
+            GrantDelta("prod", added=(("{new_table_principals}", "SELECT", "{prod_table}"),),
+                       may_add=_business_grants("{new_table_principals}", "{prod_table}")),
+            GrantDelta("dev", may_add=(("{new_table_principals}", "SELECT", "{dev_table}"),
+                                       *_business_grants("{new_table_principals}", "{dev_table}"))),
+            DiffLimitedTo("prod", "agents", ("{agent_a}",)), AgentIdUnchanged("prod", "{agent_a}"),
+        )),
     _scenario("s4", "New sensitive column appears in prod", ("Add a known-class prefixed column via an approved external fixture migration.",),
-        (mk("Maintain released commit", "maintain", "prod"), mk("Prove idempotence", "maintain", "prod")),
+        (mk("Maintain released commit", "maintain", "prod"),
+         mk("Verify every tier of the new column", "verify-access", "prod",
+            assertions=(AccessVerified("prod", "{new_column}"),)),
+         mk("Prove idempotence", "maintain", "prod")),
         ("Known class is masked in one run for every tier; no Genie update occurs.",),
-        ("Remove disposable column through its owning migration.",)),
+        ("Remove disposable column through its owning migration.",), checks=(Unchanged("prod", "agents"),)),
     _scenario("s5", "Unmapped class fail-safe", ("Add prefixed unknown_secret with an unmapped class tag; no acknowledgement.",),
         (mk("Plan protected release", "release-plan", "prod"),
-         mk("Apply protected release", "release", "prod", args=("MANIFEST={manifest}",)),
+         mk("Apply protected release", "release", "prod", args=("MANIFEST={manifest}",),
+            assertions=(AccessLevel("prod", "{secret_column}", "*", "redacted"),)),
          mk("Maintain fail-safe", "maintain", "prod"),
          mk("Scaffold reviewed treatment", "scaffold-treatments", "dev", args=("TREATMENT={treatment}",)),
          AUTHOR_MERGE),
         ("Gap is reported and every principal sees never-raw redaction; new access is blocked.",),
-        ("Promote a reviewed mapping or remove the fixture tag/column; prove no stale fail-safe policy.",)),
+        ("Promote a reviewed mapping or remove the fixture tag/column; prove no stale fail-safe policy.",),
+        checks=(GrantDelta("dev"), GrantDelta("prod"))),
     _scenario("s6", "table_readers widening requires acknowledgement", ("Prepare a prod-owned reader widening with stale coverage and no matching ack.",),
         (mk("Refuse stale/unacknowledged widening", "release-plan", "prod", fail=True, refusal=REFUSALS["weakening"], refusal_in_ci=False),
          action("Write exact reviewed acknowledgement", "add_ack", "ack_entry"),
          action("Commit and merge acknowledgement on the driver's local main", "local_merge")) + DAY2,
         ("Negative plan creates no applicable manifest; exact reviewed ack permits only the named grant.",),
-        ("Revert reader and acknowledgement through lifecycle; verify only GenieRails-owned SELECT is revoked.",)),
+        ("Revert reader and acknowledgement through lifecycle; verify only GenieRails-owned SELECT is revoked.",),
+        # reader_principal and reader_table come from ack_entry (prod:reader:<table>:<principal>).
+        checks=(GrantDelta("dev"),
+                GrantDelta("prod", added=(("{reader_principal}", "SELECT", "{reader_table}"),),
+                           may_add=_business_grants("{reader_principal}", "{reader_table}")))),
     _scenario("s7", "Detach agent", ("A is released, detached=true and acl_groups=[] have been released.",),
         (mk("Refuse wrong commit/agent", "detach-agent", "prod", args=("SPACE={wrong_agent}",), fail=True, refusal=REFUSALS["detach"], refusal_in_ci=False),
          mk("Detach A state only", "detach-agent", "prod", args=("SPACE={agent_a}",))) + DAY2[:2],
         ("Only A resource addresses leave state; live space, conversations, grants and masks remain.",),
-        ("Use documented adoption/reattachment; otherwise retain disposable agent for explicit cleanup.",)),
+        ("Use documented adoption/reattachment; otherwise retain disposable agent for explicit cleanup.",),
+        checks=(GrantDelta("prod"), Unchanged("prod", "uc"), Unchanged("prod", "agents"),
+                AgentIdUnchanged("prod", "{agent_a}"))),
     _scenario("s8", "Stop governing a table", ("Disposable table is in governed list; prepare each covering-source negative case.",),
         (mk("Refuse while covered", "ungovern", "dev", args=("TABLE={table}", "YES=1"), fail=True, refusal=REFUSALS["covered"], refusal_in_ci=False),
          mk("Edit governed list", "ungovern", "dev", args=("TABLE={uncovered_table}", "YES=1")), AUTHOR_MERGE) + DAY2,
@@ -277,7 +412,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     _scenario("s14", "Governance-only environment", ("Test env has prefixed uc_tables, no agent files/IDs, initially no table_readers.",),
         (mk("Setup", "setup", "dev"), mk("Generate governance only", "generate", "dev"), AUTHOR_MERGE) + DAY2,
         ("No Genie resource/CAN_RUN is created; first run grants no SELECT, reviewed second run grants only table_readers.",),
-        ("Remove readers, ungovern, then remove disposable tables.",)),
+        ("Remove readers, ungovern, then remove disposable tables.",),
+        # The run models the first, reader-less release: no grant changes at all.
+        checks=(GrantDelta("dev"), GrantDelta("prod"), Unchanged("dev", "agents"), Unchanged("prod", "agents"))),
     _scenario("s15", "Two PRs merged then one promotion", ("X changes A; Y changes governance/B; ordered merge commits are available.",),
         (action("Checkout merge X", "checkout_value", "x"), mk("Rehearse X", "rehearse", "dev"),
          action("Checkout merge Y", "checkout_value", "y"), mk("Rehearse Y", "rehearse", "dev")) + DAY2[2:],
@@ -286,7 +423,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     _scenario("s16", "Prod UI drift overwritten; conversations retained", ("Released prod A has a conversation and a recorded unsupported UI edit.",),
         (Step("Make prod drift", human_prompt="Record A export/conversation IDs and make a recognizable prod UI edit."),) + DAY2,
         ("Overwrite report names drift; config equals Git after remap; ID/conversations remain; no recreation.",),
-        ("Restore desired content via dev UI, capture and lifecycle.",)),
+        ("Restore desired content via dev UI, capture and lifecycle.",),
+        checks=(DiffLimitedTo("prod", "agents", ("{agent_a}",)), AgentIdUnchanged("prod", "{agent_a}"))),
     _scenario("manifest", "Manifest tamper and concurrency refusals", ("Disposable fixtures and an approved manifest exist.",),
         (mk("Refuse tampered manifest", "release", "prod", args=("MANIFEST={tampered_manifest}",), fail=True, refusal=REFUSALS["tamper"], refusal_in_ci=False),),
         ("Commit, plan bytes, serial, live snapshot and kept-name changes each invalidate the old manifest; locks serialize applies.",),
@@ -302,7 +440,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Review prod migration mapping", "migrate-plan", "prod"),
         mk("Rehearse dev adoption", "rehearse", "dev"),
         mk("Plan prod adopt-only release", "release-plan", "prod"),
-        mk("Apply prod adopt-only release", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Apply prod adopt-only release", "release", "prod", args=("MANIFEST={manifest}",),
+           assertions=(AccessVerified("prod", ADOPTED_COLUMNS),)),
     ), ("Legacy values are adopted into deterministic values without weaker protection or raw exposure.",),
        ("Forward-release the pinned baseline through the same bounded staged lifecycle.",)),
 )
@@ -745,7 +884,10 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
             missing.append(step.value or "")
         for name in (n for part in step.command for n in PLACEHOLDER.findall(part)):
             if not values.get(name) and name not in produced: missing.append(name)
+        for name in (n for check in step.assertions for n in check_placeholders(check)):
+            if not values.get(name): missing.append(name)
         if step.target == "release-plan" and not step.expect_failure: produced.add("manifest")
+    missing += [n for check in scenario.checks for n in check_placeholders(check) if not values.get(n)]
     for step in scenario.steps:
         if step.action == "checkout_value" and values.get(step.value or "") and not re.fullmatch(r"[0-9a-fA-F]{40}", values[step.value or ""]):
             missing.append(f"{step.value} (must be a 40-hex commit)")
@@ -845,7 +987,8 @@ def scenario_plan(scenario: Scenario, targets: set[str]) -> list[dict[str, Any]]
         planned.append({"name": step.name, "command": " ".join(step.command), "human_prompt": step.human_prompt,
                         "expect_failure": step.expect_failure, "refusal": step.refusal,
                         "action": step.action, "status": "skip" if missing else "planned",
-                        "skip_reason": marker if missing else None, "assertions": list(step.assertions)})
+                        "skip_reason": marker if missing else None,
+                        "assertions": [describe_check(check) for check in step.assertions]})
     return planned
 
 
@@ -1072,16 +1215,39 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                         prior["conditions"].setdefault(field, set()).update(hashes)
                 else:
                     result["policies"][key] = fact
-        for kind in ("catalog_grants", "schema_grants", "table_grants"):
-            for row in evidence.get(kind) or []:
-                securable = ".".join(str(row[k]) for k in ("table_catalog", "table_schema", "table_name",
-                                                           "catalog_name", "schema_name") if row.get(k))
-                result["grants"].add(f"{row.get('grantee')} {row.get('privilege_type')} {securable}")
+    result["grants"] = _grant_facts(snapshot)
     for fact in result["policies"].values():
         fact["function"] = tuple(sorted(fact["function"]))
         fact["masks"] = tuple(sorted(fact["masks"]))
         fact["conditions"] = {field: tuple(sorted(hashes)) for field, hashes in fact["conditions"].items()}
     return result
+
+
+def _grant_facts(snapshot: Mapping[str, Any]) -> set[Grant]:
+    """UC grants and direct Genie CAN_RUN as (principal, privilege, securable)."""
+    facts: set[Grant] = set()
+    uc = snapshot.get("uc", {})
+    for evidence in uc.values() if isinstance(uc, Mapping) else []:
+        if not isinstance(evidence, Mapping): continue
+        for kind in ("catalog_grants", "schema_grants", "table_grants"):
+            for row in evidence.get(kind) or []:
+                securable = ".".join(str(row[k]) for k in ("table_catalog", "table_schema", "table_name",
+                                                           "catalog_name", "schema_name") if row.get(k))
+                facts.add((str(row.get("grantee")), str(row.get("privilege_type")), securable))
+    for agent in snapshot.get("agents") or []:
+        acl = agent.get("acl") if isinstance(agent, Mapping) else None
+        for entry in (acl or {}).get("access_control_list") or []:
+            principal = entry.get("group_name") or entry.get("user_name") or entry.get("service_principal_name")
+            if any(p.get("permission_level") == "CAN_RUN" and not p.get("inherited")
+                   for p in entry.get("all_permissions") or []):
+                facts.add((str(principal), "CAN_RUN", f"genie:{agent.get('space_id')}"))
+    return facts
+
+
+def _grant_key(grant: Sequence[str]) -> Grant:
+    """information_schema spells USE_SCHEMA as ``USE SCHEMA``; compare either."""
+    principal, privilege, securable = grant
+    return (principal.strip(), re.sub(r"[\s_]+", " ", privilege.strip().upper()), securable.strip())
 
 
 def _normalized_mask(name: str) -> tuple[str, str, str] | None:
@@ -1156,9 +1322,11 @@ def _excused_legacy(before: Mapping[str, Any], after: Mapping[str, Any],
 
 
 def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, include_grants: bool = False,
-                    allowed_adoptions: Mapping[str, Adoption] | None = None) -> dict[str, list[str]]:
+                    allowed_adoptions: Mapping[str, Adoption] | None = None,
+                    allowed_grants: Iterable[Grant] = ()) -> dict[str, list[str]]:
     """What is weaker in ``current``: a column untagged, a mask or policy gone,
-    a principal newly exempted or no longer covered, and (optionally) a grant added."""
+    a principal newly exempted or no longer covered, and (optionally) a grant
+    or CAN_RUN added that is not one of the exact ``allowed_grants``."""
     before, after = _protection(baseline), _protection(current)
     allowed_adoptions = allowed_adoptions or {}
     verified_adoptions = _verified_adoptions(before, after, allowed_adoptions)
@@ -1247,18 +1415,36 @@ def protection_diff(baseline: Mapping[str, Any], current: Mapping[str, Any], *, 
             policies += [f"{label}: no longer applies to {p}" for p in sorted(was["to"] - now["to"])]
             policies += [f"{label}: newly exempts {p}" for p in sorted(now["except"] - was["except"])]
     if policies: weaker["policies"] = policies
-    widened = sorted(after["grants"] - before["grants"])
+    allowed = {_grant_key(grant) for grant in allowed_grants}
+    widened = sorted(" ".join(grant) for grant in after["grants"] - before["grants"]
+                     if _grant_key(grant) not in allowed)
     if include_grants and widened: weaker["widened_grants"] = widened
     return weaker
 
 
 def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any], *,
                          allowed_adoptions: Mapping[str, Mapping[str, Adoption]] | None = None,
+                         allowed_grants: Mapping[str, Iterable[Grant]] | None = None,
                          **kwargs: Any) -> dict[str, Any]:
-    adoptions = allowed_adoptions or {}
+    adoptions, grants = allowed_adoptions or {}, allowed_grants or {}
     return {env: weak for env in sorted(baseline)
             if (weak := protection_diff(baseline[env], current.get(env, {}),
-                                        allowed_adoptions=adoptions.get(env), **kwargs))}
+                                        allowed_adoptions=adoptions.get(env),
+                                        allowed_grants=grants.get(env, ()), **kwargs))}
+
+
+def live_protection_diff(scenario: Scenario, before: Mapping[str, Any], after: Mapping[str, Any], *,
+                         allowed_adoptions: Mapping[str, Mapping[str, Adoption]],
+                         allowed_grants: Mapping[str, Iterable[Grant]]) -> dict[str, Any]:
+    """The step/phase/scenario-end check: weaker protection or any grant or
+    CAN_RUN widening beyond the scenario's declared GrantDelta. A scenario that
+    is expected to weaken protection is still held to its grant allowance."""
+    weak = protection_diff_envs(before, after, include_grants=True, allowed_adoptions=allowed_adoptions,
+                                allowed_grants=allowed_grants)
+    if scenario.key in WEAKENING_EXPECTED:
+        weak = {env: {"widened_grants": found["widened_grants"]}
+                for env, found in weak.items() if "widened_grants" in found}
+    return weak
 
 
 def unexpected_changes(scenario: str, before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, list[str]]:
@@ -1276,6 +1462,321 @@ def release_plan_workspace_diff(before: Mapping[str, Any], after: Mapping[str, A
                   if key != "receipts"}
             for env in ("dev", "prod")
             if any(key != "receipts" for key in snapshot_diff(before.get(env, {}), after.get(env, {})))}
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckContext:
+    """What checks are evaluated over: one step, or a whole scenario."""
+    before: Mapping[str, Any]
+    after: Mapping[str, Any]
+    cloud_root: Path
+    # Per env, the verify-access result file's signature when the span began.
+    verify_before: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    adoptions: Mapping[str, Mapping[str, Adoption]] = dataclasses.field(default_factory=dict)
+
+
+VERIFY_RESULT = Path("generated") / ".verify_access.json"
+READER_ACK = re.compile(r"[^:\s]+:reader:(?P<table>[^:\s]+):(?P<principal>[^:#,\n]+)")
+
+
+def derived_values(values: Mapping[str, str]) -> dict[str, str]:
+    """Values that checks read from other values: S6's reader grant is its ack."""
+    match = READER_ACK.fullmatch(values.get("ack_entry", ""))
+    derived = {"reader_table": match["table"], "reader_principal": match["principal"]} if match else {}
+    return {**values, **derived}
+
+
+def describe_check(check: Any) -> str:
+    if not (dataclasses.is_dataclass(check) and hasattr(check, "kind")): return repr(check)
+    return f"{check.kind}(" + ", ".join(f"{f.name}={getattr(check, f.name)!r}" for f in dataclasses.fields(check)) + ")"
+
+
+def check_placeholders(check: Any) -> set[str]:
+    found: set[str] = set()
+    def walk(value: Any) -> None:
+        if isinstance(value, str): found.update(PLACEHOLDER.findall(value))
+        elif isinstance(value, tuple):
+            for item in value: walk(item)
+    if dataclasses.is_dataclass(check):
+        for f in dataclasses.fields(check): walk(getattr(check, f.name))
+    return found
+
+
+def render_check(check: Any, values: Mapping[str, str]) -> Any:
+    def one(value: Any) -> Any:
+        if isinstance(value, tuple): return tuple(one(item) for item in value)
+        if not isinstance(value, str): return value
+        missing = sorted({name for name in PLACEHOLDER.findall(value) if not values.get(name)})
+        if missing: raise ValueError(f"unresolved placeholder(s): {', '.join(missing)}")
+        return PLACEHOLDER.sub(lambda m: values[m.group(1)], value)
+    return dataclasses.replace(check, **{f.name: one(getattr(check, f.name)) for f in dataclasses.fields(check)})
+
+
+def _shape_problems(check: Any) -> list[str]:
+    problems = [] if check.env in ENVS else [f"env must be one of {', '.join(ENVS)}"]
+    if isinstance(check, (DiffLimitedTo, Unchanged)):
+        if check.component not in SNAPSHOT_COMPONENTS:
+            problems.append(f"component must be one of {', '.join(SNAPSHOT_COMPONENTS)}")
+        if not check.selectors or not all(isinstance(s, str) and s for s in check.selectors):
+            problems.append("needs at least one non-empty selector")
+        if isinstance(check, DiffLimitedTo) and "*" in check.selectors:
+            problems.append("a '*' selector limits nothing")
+    if isinstance(check, (AccessLevel, AccessVerified)) and not check.target:
+        problems.append("needs a table or column target")
+    if isinstance(check, AccessLevel):
+        if check.level not in ACCESS_LEVELS: problems.append(f"level must be one of {', '.join(ACCESS_LEVELS)}")
+        if not check.principal: problems.append("needs a principal (or '*')")
+    if isinstance(check, AgentIdUnchanged) and not check.agent:
+        problems.append("needs an agent key")
+    if isinstance(check, GrantDelta):
+        for grant in (*check.added, *check.may_add, *check.revoked):
+            if not (isinstance(grant, tuple) and len(grant) == 3
+                    and all(isinstance(part, str) and part.strip() for part in grant)):
+                problems.append(f"grant {grant!r} must be (principal, privilege, securable)")
+            elif any(ch in part for part in grant for ch in "*?[") or grant[2] == "agent:":
+                problems.append(f"grant {grant!r} must name one principal, privilege and securable exactly")
+    return problems
+
+
+def check_problems(scenario: Scenario) -> list[str]:
+    """Every check a scenario carries that has no evaluator or is malformed."""
+    located = [(f"step {step.name!r}", check) for step in scenario.steps for check in step.assertions]
+    located += [("scenario", check) for check in scenario.checks]
+    problems = []
+    for where, check in located:
+        if type(check) not in EVALUATORS:
+            problems.append(f"{where}: {describe_check(check)} has no evaluator; use a typed check "
+                            f"({', '.join(sorted(kind.kind for kind in EVALUATORS))})")
+        else:
+            problems += [f"{where}: {describe_check(check)}: {p}" for p in _shape_problems(check)]
+    return problems
+
+
+def _agent_space_ids(snapshot: Mapping[str, Any], key: str) -> set[str]:
+    """Space IDs recorded for an agent key (``a``, ``a.auto``, ``a.space``) or a literal space ID."""
+    return {str(agent.get("space_id")) for agent in snapshot.get("agents") or []
+            if isinstance(agent, Mapping)
+            and (str(agent.get("space_id")) == key or str(agent.get("name") or "").split(".", 1)[0] == key)}
+
+
+def _expand_grants(grants: Iterable[Grant], *snapshots: Mapping[str, Any]) -> tuple[set[Grant], list[str]]:
+    expanded: set[Grant] = set(); problems: list[str] = []
+    for grant in grants:
+        for principal, privilege, securable in itertools.product(*(
+                [item.strip() for item in part.split(",") if item.strip()] for part in grant)):
+            key = _grant_key((principal, privilege, securable))
+            if securable.startswith("agent:"):
+                ids = set().union(*(_agent_space_ids(snap, securable[len("agent:"):]) for snap in snapshots))
+                if not ids: problems.append(f"{securable} has no space ID in the snapshots")
+                expanded |= {(key[0], key[1], f"genie:{space_id}") for space_id in ids}
+            elif key[1] in ("USE CATALOG", "USE SCHEMA"):
+                parts = securable.split(".")
+                expanded.add((key[0], key[1], ".".join(parts[:1 if key[1] == "USE CATALOG" else 2])))
+            else:
+                expanded.add(key)
+    return expanded, problems
+
+
+def grant_allowances(checks: Iterable[Any], before: Mapping[str, Any],
+                     after: Mapping[str, Any]) -> dict[str, set[Grant]]:
+    """Per env, the exact grants the scenario's GrantDelta checks expect or permit."""
+    allowed: dict[str, set[Grant]] = {}
+    for check in checks:
+        if isinstance(check, GrantDelta):
+            grants, _ = _expand_grants((*check.added, *check.may_add),
+                                       before.get(check.env, {}), after.get(check.env, {}))
+            allowed.setdefault(check.env, set()).update(grants)
+    return allowed
+
+
+def _eval_grant_delta(check: GrantDelta, ctx: CheckContext) -> list[str]:
+    snaps = (ctx.before.get(check.env, {}), ctx.after.get(check.env, {}))
+    before, after = ({_grant_key(g) for g in _grant_facts(snap)} for snap in snaps)
+    required, problems = _expand_grants(check.added, *snaps)
+    optional, _ = _expand_grants(check.may_add, *snaps)
+    revoked, revoke_problems = _expand_grants(check.revoked, *snaps)
+    added, removed = after - before, before - after
+    show = lambda grants: ", ".join(" ".join(g) for g in sorted(grants))
+    problems += revoke_problems
+    if required - added: problems.append(f"{check.env}: expected grant(s) not newly added: {show(required - added)}")
+    if added - required - optional:
+        problems.append(f"{check.env}: unexpected grant(s) added: {show(added - required - optional)}")
+    if revoked - removed: problems.append(f"{check.env}: expected revoke(s) missing: {show(revoked - removed)}")
+    if removed - revoked: problems.append(f"{check.env}: unexpected grant(s) revoked: {show(removed - revoked)}")
+    return problems
+
+
+def _uc_identity(kind: str, row: Mapping[str, Any], catalog: str) -> str:
+    if kind.endswith("_grants"):
+        return ".".join(str(row[k]) for k in ("table_catalog", "table_schema", "table_name",
+                                              "catalog_name", "schema_name") if row.get(k))
+    if kind == "governed_tags":
+        return ".".join(str(row.get(k)) for k in ("catalog_name", "schema_name", "table_name", "column_name"))
+    if kind == "mask_functions":
+        return ".".join(str(row.get(k)) for k in ("routine_catalog", "routine_schema", "routine_name"))
+    if kind == "abac_policies":
+        return str(row.get("table"))
+    return catalog
+
+
+def _component_items(snapshot: Mapping[str, Any], component: str) -> dict[str, list[str]]:
+    """A snapshot component as resource identity -> its canonical facts."""
+    items: dict[str, set[str]] = {}
+    def add(identity: str, value: Any) -> None:
+        items.setdefault(identity, set()).add(json.dumps(canonical(value), sort_keys=True, default=str))
+    data = snapshot.get(component)
+    if component == "agents":
+        # One live space, however many local files name it.
+        for agent in data or []:
+            if isinstance(agent, Mapping):
+                add(str(agent.get("space_id")), {"export": agent.get("export"), "acl": agent.get("acl")})
+    elif component == "uc":
+        for catalog, evidence in (data or {}).items():
+            for kind, rows in (evidence or {}).items() if isinstance(evidence, Mapping) else []:
+                for row in rows or []:
+                    add(_uc_identity(kind, row, str(catalog)) if isinstance(row, Mapping) else str(catalog), {kind: row})
+    elif isinstance(data, Mapping):
+        for key, value in data.items(): add(str(key), value)
+    else:
+        for row in data or []: add(str(row.get("path")) if isinstance(row, Mapping) else str(row), row)
+    return {identity: sorted(values) for identity, values in items.items()}
+
+
+def _changed_resources(check: DiffLimitedTo | Unchanged, ctx: CheckContext) -> tuple[list[str], list[str]]:
+    """(changed resources the selectors cover, changed resources they don't)."""
+    before = ctx.before.get(check.env, {}); after = ctx.after.get(check.env, {})
+    selectors = list(check.selectors)
+    if check.component == "agents":
+        selectors = [space_id for key in check.selectors
+                     for space_id in (_agent_space_ids(before, key) | _agent_space_ids(after, key) or {key})]
+    left, right = _component_items(before, check.component), _component_items(after, check.component)
+    changed = sorted(k for k in set(left) | set(right) if left.get(k) != right.get(k))
+    covered = lambda identity: any(identity == s or identity.startswith(s + ".") or fnmatch.fnmatchcase(identity, s)
+                                   for s in selectors)
+    return [k for k in changed if covered(k)], [k for k in changed if not covered(k)]
+
+
+def _eval_diff_limited_to(check: DiffLimitedTo, ctx: CheckContext) -> list[str]:
+    outside = _changed_resources(check, ctx)[1]
+    return [f"{check.env} {check.component} changed outside {list(check.selectors)}: {', '.join(outside)}"] if outside else []
+
+
+def _eval_unchanged(check: Unchanged, ctx: CheckContext) -> list[str]:
+    inside = _changed_resources(check, ctx)[0]
+    return [f"{check.env} {check.component} changed: {', '.join(inside)}"] if inside else []
+
+
+def _eval_agent_id_unchanged(check: AgentIdUnchanged, ctx: CheckContext) -> list[str]:
+    before = _agent_space_ids(ctx.before.get(check.env, {}), check.agent)
+    after = _agent_space_ids(ctx.after.get(check.env, {}), check.agent)
+    if not before:
+        return [f"{check.env} agent {check.agent!r} has no space ID in the baseline snapshot; its stability is unproven"]
+    if after != before:
+        return [f"{check.env} agent {check.agent!r} space ID {sorted(before)} -> {sorted(after)}: recreated or lost"]
+    return []
+
+
+def file_signature(path: Path) -> tuple[int, str] | None:
+    try:
+        return path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def verify_signatures(cloud_root: Path) -> dict[str, tuple[int, str] | None]:
+    return {env: file_signature(cloud_root / "envs" / env / VERIFY_RESULT) for env in ENVS}
+
+
+def _verify_entries(check: AccessLevel | AccessVerified, ctx: CheckContext,
+                    kinds: Sequence[str]) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """The verify-access result entries for a check's target, written during the span."""
+    path = ctx.cloud_root / "envs" / check.env / VERIFY_RESULT
+    signature = file_signature(path)
+    if signature is None:
+        return [], [f"{check.env}: no verify-access result at {path}"]
+    if signature == ctx.verify_before.get(check.env):
+        return [], [f"{check.env}: verify-access result was not rewritten during this span (stale)"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return [], [f"{check.env}: verify-access result is not JSON"]
+    entries = data.get("checks") if isinstance(data, Mapping) else None
+    if not isinstance(entries, list):
+        return [], [f"{check.env}: verify-access result has no per-check access results"]
+    targets = sorted(ctx.adoptions.get(check.env, {})) if check.target == ADOPTED_COLUMNS else [check.target]
+    if not targets:
+        return [], [f"{check.env}: no migrate-plan adoption was recorded to verify"]
+    matched: list[Mapping[str, Any]] = []; problems: list[str] = []
+    for target in targets:
+        found = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("kind") in kinds
+                 and target.lower() in (str(entry.get("table")).lower(),
+                                        f"{entry.get('table')}.{entry.get('column')}".lower())]
+        if not found: problems.append(f"{check.env}: verify-access did not check {target}")
+        matched += found
+    return matched, problems
+
+
+def _entry_label(entry: Mapping[str, Any]) -> str:
+    return f"{entry.get('kind')} {entry.get('table')}" + (f".{entry['column']}" if entry.get("column") else "")
+
+
+def _never_raw_function(function: Any) -> bool:
+    normalized = _normalized_mask(str(function or "").rsplit(".", 1)[-1])
+    return bool(normalized) and normalized[2] == "full" and is_never_raw(normalized[0])
+
+
+def _has_level(entry: Mapping[str, Any], access: Mapping[str, Any], level: str) -> bool:
+    observed = access.get("observed")
+    if level == "masked": return observed in ("partial", "full", "masked")
+    if level == "redacted": return observed == "full" and _never_raw_function(entry.get("full_function"))
+    return observed == level
+
+
+def _eval_access_level(check: AccessLevel, ctx: CheckContext) -> list[str]:
+    entries, problems = _verify_entries(check, ctx, ("column-mask",))
+    for entry in entries:
+        principals = entry.get("principals") or {}
+        chosen = principals if check.principal == "*" else {
+            p: v for p, v in principals.items() if p == check.principal}
+        if not chosen:
+            problems.append(f"{_entry_label(entry)}: verify-access checked no principal {check.principal!r}")
+        wrong = {p: v.get("observed") for p, v in chosen.items() if not _has_level(entry, v, check.level)}
+        if wrong:
+            problems.append(f"{_entry_label(entry)}: not {check.level} for {wrong}")
+    return problems
+
+
+def _eval_access_verified(check: AccessVerified, ctx: CheckContext) -> list[str]:
+    entries, problems = _verify_entries(check, ctx, ("column-mask", "row-filter"))
+    for entry in entries:
+        principals = entry.get("principals") or {}
+        if entry.get("status") != "PASS":
+            problems.append(f"{_entry_label(entry)}: verify-access status {entry.get('status')}")
+        if not principals:
+            problems.append(f"{_entry_label(entry)}: no principal was checked")
+        wrong = {p: f"{v.get('observed')} (expected {v.get('expected')})" for p, v in principals.items()
+                 if v.get("observed") != v.get("expected")}
+        if wrong:
+            problems.append(f"{_entry_label(entry)}: {wrong}")
+    return problems
+
+
+EVALUATORS: Mapping[type, Callable[[Any, CheckContext], list[str]]] = {
+    GrantDelta: _eval_grant_delta,
+    AccessLevel: _eval_access_level,
+    AccessVerified: _eval_access_verified,
+    DiffLimitedTo: _eval_diff_limited_to,
+    Unchanged: _eval_unchanged,
+    AgentIdUnchanged: _eval_agent_id_unchanged,
+}
+
+
+def evaluate_checks(checks: Iterable[Any], ctx: CheckContext) -> list[dict[str, Any]]:
+    return [{"check": describe_check(check), "problems": EVALUATORS[type(check)](check, ctx)} for check in checks]
+
+
+def failed_checks(results: Iterable[Mapping[str, Any]]) -> list[str]:
+    return [f"{r['check']}: {'; '.join(r['problems'])}" for r in results if r["problems"]]
 
 
 def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[str, str]) -> None:
@@ -1377,6 +1878,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
     for item in args.value:
         if "=" not in item or not item.split("=", 1)[0]: raise SystemExit(f"--value must be KEY=VALUE, got {item!r}")
         key, value = item.split("=", 1); values[key] = value
+    values = derived_values(values)
     if args.dry_run:
         # Dry-run is hermetic: source parsing only, but it resolves the selected
         # cloud entry point and describes every reason a live scenario cannot run.
@@ -1384,8 +1886,11 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
         target_text = cloud_makefile.read_text(encoding="utf-8") + "\n" + (
             repo_root / "shared" / "Makefile.shared").read_text(encoding="utf-8")
         targets = set(re.findall(r"^([a-zA-Z0-9][\w.-]*):(?:\s|$)", target_text, re.M))
+        unevaluable = False
         for scenario in selected:
             plan = scenario_plan(scenario, targets)
+            problems = check_problems(scenario)
+            unevaluable |= bool(problems)
             gates = [step.human_prompt for step in scenario.steps if step.human_prompt]
             missing_values = unresolved_values(scenario, values)
             refusals = [{"step": step.name, "pattern": step.refusal,
@@ -1404,14 +1909,19 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                        "target_source": str(cloud_makefile), "steps": plan, "snapshot_diff": {},
                        "human_gates": gates, "missing_values": missing_values,
-                       "refusal_patterns": refusals, "would_not_run": would_not_run}
+                       "refusal_patterns": refusals, "would_not_run": would_not_run,
+                       "checks": [describe_check(check) for check in scenario.checks],
+                       "check_problems": problems}
+            if problems: payload["status"] = "ERROR"
             write_report(reports, scenario, payload)
             known = f" — KNOWN FAILURE until {scenario.known_failure}" if scenario.known_failure else ""
             print(f"[{scenario.key}] {scenario.title}{known}" + (" — NOT RUN live (see report)" if payload["would_not_run"] else ""))
             for item in payload["steps"]:
                 suffix = f" — SKIP ({item['skip_reason']})" if item["status"] == "skip" else ""
                 print(f"  {item['command'] or ('[' + item['action'] + ']' if item['action'] else '[human pause]')}{suffix}")
-        return 0
+            for problem in problems:
+                print(f"  ERROR: {problem}")
+        return 1 if unevaluable else 0
     if not args.confirm_live: raise SystemExit("live execution requires --confirm-live")
     if not args.checkout: raise SystemExit("live execution requires explicit --checkout")
     if not args.commit or not re.fullmatch(r"[0-9a-fA-F]{40}", args.commit):
@@ -1459,15 +1969,17 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             if any(s.human_prompt for s in scenario.steps) and (args.non_interactive or not sys.stdin.isatty()):
                 blocked.append("human UI gate needs an interactive TTY and a typed confirmation")
             missing_values = unresolved_values(scenario, values)
-            if blocked or missing_values:
+            unevaluable = check_problems(scenario)
+            if blocked or missing_values or unevaluable:
                 for item in plan:
                     if item["status"] == "planned": item["status"] = "NOT RUN"
-                status = "NOT RUN" if blocked else "ERROR"
+                status = "NOT RUN" if blocked and not unevaluable else "ERROR"
                 failed |= status == "ERROR"
+                error = ("; ".join(unevaluable) if unevaluable else
+                         f"unresolved placeholder(s): {', '.join(missing_values)}" if missing_values and not blocked else None)
                 write_report(reports, scenario, {"scenario": scenario.key, "status": status, "cloud": args.cloud,
                     "commit": args.commit, "known_failure": scenario.known_failure, "blocked_by": blocked,
-                    "error": f"unresolved placeholder(s): {', '.join(missing_values)}" if missing_values and not blocked else None,
-                    "steps": plan, "snapshot_diff": {}}, runner.secrets)
+                    "error": error, "steps": plan, "snapshot_diff": {}}, runner.secrets)
                 continue
             before: dict[str, Any] = {}
             after: dict[str, Any] = {}
@@ -1485,11 +1997,15 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             stop = False
             confirmations: list[dict[str, str]] = []
             allowed_adoptions: dict[str, dict[str, Adoption]] = {}
+            scenario_checks = [render_check(check, values) for check in scenario.checks]
+            declared_checks: list[Any] = list(scenario_checks)
+            scenario_check_results: list[dict[str, Any]] = []
             try:
                 # Pin: every scenario starts at exactly the requested commit.
                 repo.switch(repo.baseline, f"{scenario.key}-pin")
                 if not remote_ready:
                     repo.init_remote(); remote_ready = True
+                scenario_verify = verify_signatures(cloud_root)
                 before = capture()
                 if not run_baseline: run_baseline = before
                 for index, (step, item) in enumerate(zip(scenario.steps, plan), 1):
@@ -1503,9 +2019,13 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         _run_action(step, scenario, repo, values)
                         item["status"] = "passed"; continue
                     argv2 = [render(part, {**values, "manifest": manifest}) for part in step.command]
+                    step_checks = [render_check(check, {**values, "manifest": manifest}) for check in step.assertions]
+                    declared_checks.extend(step_checks)
+                    step_snapshots = any(check.snapshots for check in step_checks)
                     applying = step.target in APPLYING
                     if applying: repo.require_clean(label)
-                    step_before = capture() if (step.expect_failure or applying) else None
+                    step_verify = verify_signatures(cloud_root)
+                    step_before = capture() if (step.expect_failure or applying or step_snapshots) else None
                     # Assume a mutation from the moment an applying command
                     # starts (it may be interrupted half-way); a refusal that
                     # held with an unchanged snapshot takes the assumption back.
@@ -1539,8 +2059,10 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         successful_step_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
                         if step.target == "release-plan" and release_plan_workspace_diff(step_before, step_after):
                             item["status"] = "ERROR"; item["assertion"] = "successful release-plan changed the snapshot"; ok = False
-                        weak_step = protection_diff_envs(step_before, step_after, allowed_adoptions=allowed_adoptions)
-                        if weak_step and scenario.key not in WEAKENING_EXPECTED:
+                        weak_step = live_protection_diff(
+                            scenario, step_before, step_after, allowed_adoptions=allowed_adoptions,
+                            allowed_grants=grant_allowances(declared_checks, step_before, step_after))
+                        if weak_step:
                             item["status"] = "ERROR"
                             if "assertion" not in item:
                                 item["assertion"] = f"successful apply weakened protection: {weak_step}"
@@ -1577,23 +2099,33 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             if deterministic_env(cloud_root, "prod") and import_unset_treatment(
                                     plan_result.stdout + "\n" + phase_release.stdout):
                                 raise RuntimeError(f"release phase {phase} attempted to clear gr_treatment")
-                            weak_phase = protection_diff_envs(phase_plan_after, phase_after,
-                                                              allowed_adoptions=allowed_adoptions)
-                            if weak_phase and scenario.key not in WEAKENING_EXPECTED:
+                            weak_phase = live_protection_diff(
+                                scenario, phase_plan_after, phase_after, allowed_adoptions=allowed_adoptions,
+                                allowed_grants=grant_allowances(declared_checks, phase_plan_after, phase_after))
+                            if weak_phase:
                                 raise RuntimeError(f"release phase {phase} weakened protection: {weak_phase}")
                             phase_output = plan_result.stdout + "\n" + phase_release.stdout
                         else:
                             if release_needs_another_phase(phase_output):
                                 raise RuntimeError(f"release exceeded {MAX_RELEASE_PHASES} phases")
+                    if step_checks:
+                        item["checks"] = evaluate_checks(step_checks, CheckContext(
+                            step_before or {}, capture() if step_snapshots else {}, cloud_root,
+                            step_verify, allowed_adoptions))
+                        if failures := failed_checks(item["checks"]):
+                            item["status"] = "ERROR"; item["assertion"] = "; ".join(failures)
+                            raise RuntimeError(f"step did not satisfy its checks: {step.name}: {'; '.join(failures)}")
                     if applying: repo.require_clean(f"after-{label}")
                 after = capture()
-                if scenario.key not in WEAKENING_EXPECTED:
-                    weak = protection_diff_envs(before, after, allowed_adoptions=allowed_adoptions)
-                    if weak: raise RuntimeError(f"protection became weaker: {weak}")
+                weak = live_protection_diff(scenario, before, after, allowed_adoptions=allowed_adoptions,
+                                            allowed_grants=grant_allowances(declared_checks, before, after))
+                if weak: raise RuntimeError(f"protection became weaker or access widened: {weak}")
+                scenario_check_results = evaluate_checks(scenario_checks, CheckContext(
+                    before, after, cloud_root, scenario_verify, allowed_adoptions))
+                if failures := failed_checks(scenario_check_results):
+                    raise RuntimeError(f"scenario checks failed: {'; '.join(failures)}")
                 unexpected = unexpected_changes(scenario.key, before, after)
                 if unexpected: raise RuntimeError(f"unexpected snapshot components changed: {unexpected}")
-                if scenario.key == "s4" and canonical(before["prod"].get("agents")) != canonical(after["prod"].get("agents")):
-                    raise RuntimeError("S4 changed Genie agents")
             except KeyboardInterrupt as exc:
                 scenario_status = "interrupted"; error_message = f"interrupted ({exc or 'SIGINT'})"; failed = True; stop = True
             except HumanAbort as exc:
@@ -1653,6 +2185,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                 payload = {"scenario": scenario.key, "status": scenario_status, "error": error_message,
                            "known_failure": scenario.known_failure,
                            "cloud": args.cloud, "commit": args.commit, "steps": plan, "confirmations": confirmations,
+                           "checks": scenario_check_results,
                            "before": before, "after": after, "restored": restored,
                            "restored_lifecycle": restored_lifecycle,
                            "manual_restore_commands": manual_restore_commands,
