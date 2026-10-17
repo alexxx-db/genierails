@@ -36,7 +36,7 @@ import generate_abac
 from agent_files import AgentFileError
 from deterministic_governance import validate_config
 from governance_policies import DeterministicGovernanceError, build_model, column_types_from_ddl
-from scripts import coverage_fix, promotion_txn
+from scripts import agent_ownership as ownership, coverage_fix, promotion_txn
 from scripts import scaffold_treatments as scaffold
 from tests import test_deterministic_check_promote as base
 from tests.terraform_helpers import TIMEOUT, shared_copy, skip_if_providers_unavailable
@@ -582,11 +582,8 @@ def test_split_agent_files_moves_every_inline_agent_with_the_same_terraform_inpu
 
 
 @pytest.mark.parametrize("entry, message", [
-    ('{ genie_space_id = "01ef0c" }', "has no name"),
     ('{ name = "Payments", genie_space_id = "1", declared_footprint = ["c.s.t"] }', "sets declared_footprint"),
     ('{ name = "Payments", genie_space_id = "1", delete = true }', "has delete = true"),
-    ('{ name = "../x", genie_space_id = "1" }', "is not allowed"),
-    ('{ name = "A b", genie_space_id = "1" }, { name = "a-b", genie_space_id = "2" }', "share the Terraform key"),
 ])
 def test_split_agent_files_refuses_any_entry_that_would_change_the_plan(tmp_path, entry, message):
     env = _legacy_env(tmp_path, f"genie_spaces = [{entry}]\n")
@@ -595,6 +592,116 @@ def test_split_agent_files_refuses_any_entry_that_would_change_the_plan(tmp_path
         agent_files.split(env)
     assert {p: p.read_bytes() for p in env.rglob("*") if p.is_file()} == before
     assert not (env / "agents").exists()
+
+
+@pytest.mark.parametrize("entry, expected_file, expected_key, display_name", [
+    ('{ genie_space_id = "01ef0c" }', "01ef0c", "01ef0c", ""),
+    ('{ name = "GenieRails Dev-to-Prod Walkthrough (louis_genierails_prod.dev_to_prod_demo)", '
+     'genie_space_id = "01ef0d" }',
+     "genierails_dev_to_prod_walkthrough_louis_genierails_prod_dev_to_prod_demo",
+     "genierails_dev_to_prod_walkthrough_louis_genierails_prod_dev_to_prod_demo",
+     "GenieRails Dev-to-Prod Walkthrough (louis_genierails_prod.dev_to_prod_demo)"),
+])
+def test_split_agent_files_preserves_address_and_display_for_legacy_names(
+        tmp_path, entry, expected_file, expected_key, display_name):
+    env = _legacy_env(tmp_path, f"genie_spaces = [{entry}]\n")
+    assert agent_files.split(env) == [expected_file]
+    agent = agent_files.load(env, expected_file)
+    assert agent["key"] == expected_key
+    assert agent["display_name"] == display_name
+    assert agent_files.merged_config(env)["genie_spaces"][0]["name"] == display_name
+
+
+def test_split_agent_files_accepts_explicit_key_to_filename_mapping(tmp_path):
+    env = _legacy_env(tmp_path, 'genie_spaces = [{ genie_space_id = "01ef0c" }]\n')
+    assert agent_files.split(env, "01ef0c=walkthrough") == ["walkthrough"]
+    agent = agent_files.load(env, "walkthrough")
+    assert agent["key"] == "01ef0c"
+    assert agent["display_name"] == ""
+
+
+@pytest.mark.parametrize("entries, expected", [
+    # Two titles that sanitize alike: the root keeps the first plain, the second --<ID>.
+    ('{ name = "A b", genie_space_id = "01ef01" }, { name = "a-b", genie_space_id = "01ef02" }',
+     {"A b": "a_b", "a-b": "a_b--01ef02"}),
+    # Not created yet (no ID): the second is --<list index>.
+    ('{ name = "A b" }, { name = "a-b" }', {"A b": "a_b", "a-b": "a_b--1"}),
+])
+def test_split_agent_files_keeps_the_disambiguated_key_of_titles_that_sanitize_alike(tmp_path, entries, expected):
+    env = _legacy_env(tmp_path, f"genie_spaces = [{entries}]\n")
+    assert agent_files.terraform_keys(hcl2.loads((env / "env.auto.tfvars").read_text())["genie_spaces"]) == \
+        list(expected.values())
+    agent_files.split(env)
+    assert {a["name"]: a["key"] for a in agent_files.load_all(env)} == expected
+
+
+def test_split_agent_files_keeps_promoted_duplicate_titles_apart(tmp_path):
+    env = _legacy_env(tmp_path, PROD_ENV + 'genie_spaces = [{ name = "A b" }, { name = "a-b" }]\n', name="prod")
+    agent_files.split(env)
+    assert {a["name"]: a["key"] for a in agent_files.load_all(env)} == {"A b": "a_b", "a-b": "a_b--1"}
+    assert [s["key"] for s in agent_files.merged_config(env)["genie_spaces"]] == ["a_b", "a_b--1"]
+
+
+@pytest.mark.parametrize("entry", ['{ genie_space_id = "AB/CD" }', '{ genie_space_id = "-01ef" }'])
+def test_split_agent_files_refuses_a_key_no_agent_file_can_hold(tmp_path, entry):
+    env = _legacy_env(tmp_path, f"genie_spaces = [{entry}]\n")
+    before = {p: p.read_bytes() for p in env.rglob("*") if p.is_file()}
+    with pytest.raises(AgentFileError, match="keep it inline"):
+        agent_files.split(env)
+    assert {p: p.read_bytes() for p in env.rglob("*") if p.is_file()} == before
+    assert not (env / "agents").exists()
+
+
+def test_split_agent_files_self_check_compares_the_terraform_key(tmp_path, monkeypatch):
+    env = _legacy_env(tmp_path, 'genie_spaces = [{ name = "A b", genie_space_id = "1" }, { name = "a-b" }]\n')
+    before = {p: p.read_bytes() for p in env.rglob("*") if p.is_file()}
+    render = agent_files._render_agent
+    monkeypatch.setattr(agent_files, "_render_agent",
+                        lambda space, key: render(space, key.replace("--1", "--2")))
+    with pytest.raises(AgentFileError, match="would not match the inline ones"):
+        agent_files.split(env)
+    assert {p: p.read_bytes() for p in env.rglob("*") if p.is_file()} == before
+    assert not (env / "agents").exists()
+
+
+@pytest.mark.parametrize("ids, expected", [
+    (("01ef0a", "01ef0b"), {"Card Ops": "card_ops", "card-ops": "card_ops--01ef0b"}),
+    (("", ""), {"Card Ops": "card_ops", "card-ops": "card_ops--1"}),
+])
+def test_an_already_split_env_with_file_names_that_sanitize_alike_still_loads(tmp_path, ids, expected):
+    env = _legacy_env(tmp_path, "")
+    (env / "agents").mkdir()
+    for name, space_id in zip(expected, ids):
+        (env / "agents" / f"{name}.auto.tfvars").write_text(f'genie_space_id = "{space_id}"\nacl_groups = []\n')
+    assert {a["name"]: a["key"] for a in agent_files.load_all(env)} == expected
+
+
+def test_an_agent_files_key_comes_from_its_file_name_never_its_title(tmp_path):
+    env = _legacy_env(tmp_path, "")
+    (env / "agents").mkdir()
+    (env / "agents" / "sales.auto.tfvars").write_text('name = "Sales Analytics"\nacl_groups = []\n')
+    agent = agent_files.load(env, "sales")
+    assert (agent["key"], agent["display_name"]) == ("sales", "Sales Analytics")
+    assert agent_files.merged_config(env)["genie_spaces"][0] == {
+        "key": "sales", "name": "Sales Analytics", "genie_space_id": "", "sql_warehouse_id": "",
+        "uc_tables": [], "acl_groups": [], "detached": False}
+
+
+@pytest.mark.parametrize("key", ["a/b", " ", "", "-x", "a b", 7])
+def test_an_agent_files_explicit_key_must_be_one_terraform_can_use(tmp_path, key):
+    env = _legacy_env(tmp_path, "")
+    (env / "agents").mkdir()
+    (env / "agents" / "x.auto.tfvars").write_text(f"key = {json.dumps(key)}\nacl_groups = []\n")
+    with pytest.raises(AgentFileError, match="key"):
+        agent_files.load_all(env)
+
+
+def test_two_agent_files_with_one_explicit_key_are_refused(tmp_path):
+    env = _legacy_env(tmp_path, 'genie_spaces = [{ name = "Ops" }]\n')
+    (env / "agents").mkdir()
+    (env / "agents" / "x.auto.tfvars").write_text('key = "ops"\nacl_groups = []\n')
+    with pytest.raises(AgentFileError, match="share Terraform key 'ops'"):
+        agent_files.load_all(env)
 
 
 def test_split_agent_files_keeps_a_promoted_envs_agent_ids_out_of_git(tmp_path):
@@ -616,8 +723,10 @@ def test_make_split_agent_files_is_explicit_and_reports_the_move(tmp_path):
     (bin_dir / "python3").write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
     (bin_dir / "python3").chmod(0o755)
 
+    environ = base._env(tmp_path)
+    environ["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
     result = subprocess.run(["make", "--no-print-directory", "-C", str(cloud), "split-agent-files", "ENV=dev"],
-                            text=True, capture_output=True, env=base._env(tmp_path), timeout=120)
+                            text=True, capture_output=True, env=environ, timeout=120)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "moved 'Payments' -> envs/dev/agents/Payments.auto.tfvars" in result.stdout
@@ -625,14 +734,72 @@ def test_make_split_agent_files_is_explicit_and_reports_the_move(tmp_path):
     assert agent_files.names(env) == ["Card Ops", "Payments"]
 
 
+def _make_split(tmp_path: Path, text: str, *args: str, **environ: str) -> tuple:
+    cloud = tmp_path / "aws"
+    env = cloud / "envs" / "dev"
+    env.mkdir(parents=True)
+    (env / "env.auto.tfvars").write_text(text)
+    shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
+    (tmp_path / "shared").symlink_to(SHARED)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+    (bin_dir / "python3").chmod(0o755)
+    process_env = base._env(tmp_path, **environ)
+    process_env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    before = {p.relative_to(env): p.read_bytes() for p in env.rglob("*") if p.is_file()}
+    result = subprocess.run(["make", "--no-print-directory", "-C", str(cloud), "split-agent-files", "ENV=dev", *args],
+                            text=True, capture_output=True, env=process_env, timeout=120)
+    return env, before, result
+
+
+def test_make_split_agent_files_names_files_with_agent_file_names(tmp_path):
+    env, _, result = _make_split(tmp_path, 'genie_spaces = [{ genie_space_id = "01ef0c" }]\n',
+                                 "AGENT_FILE_NAMES=01ef0c=walkthrough", KEY="01ef0c=from-the-shell")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert agent_files.names(env) == ["walkthrough"]
+    assert agent_files.load(env, "walkthrough")["key"] == "01ef0c"
+
+
+@pytest.mark.parametrize("mapping, message", [
+    ("01ef0c", "must be existing-terraform-key=agent-file-name"),
+    ("nope=walkthrough", "unknown Terraform key(s): nope"),
+    ("01ef0c=../x", "is not allowed"),
+])
+def test_make_split_agent_files_refuses_a_bad_mapping_writing_nothing(tmp_path, mapping, message):
+    env, before, result = _make_split(tmp_path, 'genie_spaces = [{ genie_space_id = "01ef0c" }]\n',
+                                      f"AGENT_FILE_NAMES={mapping}")
+    assert result.returncode != 0 and message in result.stderr, result.stdout + result.stderr
+    guard = Path("generated") / ".governance.guard"  # make's own runtime marker
+    assert {p.relative_to(env): p.read_bytes() for p in env.rglob("*")
+            if p.is_file() and p.relative_to(env) != guard} == before
+
+
+def test_make_split_agent_files_refuses_ci_without_writing(tmp_path):
+    cloud = tmp_path / "aws"
+    env = cloud / "envs" / "dev"
+    env.mkdir(parents=True)
+    (env / "env.auto.tfvars").write_text(LEGACY_DEV)
+    shutil.copy2(ROOT / "aws" / "Makefile", cloud / "Makefile")
+    (tmp_path / "shared").symlink_to(SHARED)
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    environ = base._env(tmp_path, CI="true")
+    result = subprocess.run(["make", "--no-print-directory", "-C", str(cloud), "split-agent-files", "ENV=dev"],
+                            text=True, capture_output=True, env=environ, timeout=120)
+    assert result.returncode != 0
+    assert "cannot run in CI" in result.stderr
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
 # Terraform's view: the roots' own locals, evaluated by terraform console
 # through terraform_layer.sh (which passes the agent var-file exactly as plan
 # does). Every Genie resource is keyed off local.merged_spaces; every grant,
 # classification and attribution off the data_access table locals.
 WORKSPACE_EXPR = "jsonencode(local.merged_spaces)"
+# data_access never reads an entry's key (the workspace root's), so it is left out.
 DATA_ACCESS_EXPR = ("jsonencode({ tables = sort(local.full_effective_uc_tables), "
                     "agents = { for t, a in local.table_agents : t => sort(a) }, "
-                    "spaces = sort([for s in var.genie_spaces : jsonencode(s)]) })")
+                    "spaces = sort([for s in var.genie_spaces : jsonencode({ for k, v in s : k => v if k != \"key\" })]) })")
 
 
 @pytest.fixture(scope="module")
@@ -685,6 +852,66 @@ def test_after_split_agent_files_terraform_sees_exactly_the_same_agents(console_
     assert agent_files.names(env) and hcl2.loads((env / "env.auto.tfvars").read_text())["genie_spaces"] == []
     for layer, expr in (("workspace", WORKSPACE_EXPR), ("data_access", DATA_ACCESS_EXPR)):
         assert _console(console_shared, env, layer, expr) == inline[layer], layer
+
+
+# The real workspace root (roots/workspace merged_spaces, which keys every Genie
+# resource and .genie_space_id_<key>): splitting keeps every key and value.
+REAL_ROOT_SPLITS = {
+    "unnamed": ('{ genie_space_id = "01ef0c" }', "", {"01ef0c"}),
+    "unnamed, file named": ('{ genie_space_id = "01ef0c" }', "01ef0c=walkthrough", {"01ef0c"}),
+    "disallowed title": (
+        '{ name = "GenieRails Dev-to-Prod Walkthrough (louis_genierails_prod.dev_to_prod_demo)", '
+        'genie_space_id = "01ef0d" }', "",
+        {"genierails_dev_to_prod_walkthrough_louis_genierails_prod_dev_to_prod_demo"}),
+    "titles that sanitize alike": ('{ name = "A b", genie_space_id = "01ef01" }, '
+                                   '{ name = "a-b", genie_space_id = "01ef02" }', "", {"a_b", "a_b--01ef02"}),
+    "titles that sanitize alike, not created": ('{ name = "A b" }, { name = "a-b" }', "", {"a_b", "a_b--1"}),
+}
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+@pytest.mark.parametrize("case", list(REAL_ROOT_SPLITS))
+def test_the_real_workspace_root_keys_every_split_agent_as_before(console_shared, tmp_path, case):
+    entries, file_names, keys = REAL_ROOT_SPLITS[case]
+    env = _console_env(tmp_path, f"genie_spaces = [{entries}]\n")
+    inline = _console(console_shared, env, "workspace", WORKSPACE_EXPR)
+    assert set(inline) == keys
+
+    agent_files.split(env, file_names)
+
+    assert _console(console_shared, env, "workspace", WORKSPACE_EXPR) == inline
+    # Every script reads and writes the ID file Terraform's create resource uses.
+    assert {ownership.id_file(env, name).name for name in agent_files.names(env)} == {
+        f".genie_space_id_{key}" for key in keys}
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_retitling_a_split_agent_keeps_its_terraform_key(console_shared, tmp_path):
+    env = _console_env(tmp_path, 'genie_spaces = [{ name = "A b" }, { name = "a-b" }]\n')
+    agent_files.split(env)
+    settings = env / "agents" / "a-b.auto.tfvars"
+    settings.write_text(settings.read_text().replace('name           = "a-b"', 'name           = "Card Ops"'))
+
+    spaces = _console(console_shared, env, "workspace", WORKSPACE_EXPR)
+
+    assert set(spaces) == {"a_b", "a_b--1"} and spaces["a_b--1"]["name"] == "Card Ops"
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_the_real_workspace_root_still_evaluates_the_legacy_single_agent(console_shared, tmp_path):
+    env = _console_env(tmp_path, 'genie_space_title = "Sales Space"\ngenie_space_id = "01ef0f"\n')
+    spaces = _console(console_shared, env, "workspace", WORKSPACE_EXPR)
+    assert set(spaces) == {"sales_space"} and spaces["sales_space"]["genie_space_id"] == "01ef0f"
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_the_real_workspace_root_keys_alike_file_names_as_the_scripts_do(console_shared, tmp_path):
+    env = _console_env(tmp_path, "")
+    (env / "agents").mkdir()
+    (env / "agents" / "Card Ops.auto.tfvars").write_text('genie_space_id = "01ef0a"\nacl_groups = []\n')
+    (env / "agents" / "card-ops.auto.tfvars").write_text('genie_space_id = "01ef0b"\nacl_groups = []\n')
+    spaces = _console(console_shared, env, "workspace", WORKSPACE_EXPR)
+    assert set(spaces) == {a["key"] for a in agent_files.load_all(env)} == {"card_ops", "card_ops--01ef0b"}
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")

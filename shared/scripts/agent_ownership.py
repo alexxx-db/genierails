@@ -171,7 +171,13 @@ def _get_space(api, space_id: str) -> dict:
 # ── IDs ──────────────────────────────────────────────────────────────────────
 
 def id_file(env_dir: Path, name: str) -> Path:
-    return env_dir / f".genie_space_id_{agent_files.space_key(name)}"
+    """.genie_space_id_<key>, the file the workspace root's create resource reads and writes."""
+    return env_dir / f".genie_space_id_{agent_files.key_of(env_dir, name)}"
+
+
+def display_title(agent: dict) -> str:
+    """The title the workspace root creates the agent with (its display name)."""
+    return agent["display_name"] or agent["name"]
 
 
 def _legacy_id(env_dir: Path, name: str) -> str:
@@ -286,7 +292,7 @@ def receipt_agents(env_dir: Path, manifest: dict | None = None) -> dict[str, dic
     result = {}
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
-        key = agent_files.space_key(name)
+        key = agent["key"]
         entry = planned.get(name) or {}
         capture = agent_files.capture_path(env_dir, name)
         space_id = agent_id(env_dir, name)
@@ -376,7 +382,7 @@ BINDINGS = ("create", "adopt", "existing")
 
 def binding_now(env_dir: Path, agent: dict) -> tuple[str, str | None]:
     """(binding, create resource ID) as the state and ID files are now."""
-    created = create_instance(env_dir, agent_files.space_key(agent["name"]))
+    created = create_instance(env_dir, agent["key"])
     space_id = agent_id(env_dir, agent["name"])
     if not space_id:
         return "create", None
@@ -409,7 +415,8 @@ def verify_created(env_dir: Path, name: str, key: str, expected: str | None) -> 
         raise AgentError(f"the create resource for {name!r} names the ID file {named}, not {path}; "
                          "its config was not pushed")
     if adopted_marker(env_dir, name).exists():
-        raise AgentError(f"creating {name!r} adopted an existing agent titled {name!r} instead of creating one "
+        raise AgentError(f"creating {name!r} adopted an existing agent titled "
+                         f"{display_title(agent_files.load(env_dir, name))!r} instead of creating one "
                          f"({adopted_marker(env_dir, name).name}); its config was not pushed")
     record = recorded_id(env_dir, key)
     if record is None:
@@ -430,7 +437,7 @@ def verify_created(env_dir: Path, name: str, key: str, expected: str | None) -> 
 
 def adopted_marker(env_dir: Path, name: str) -> Path:
     """genie_space.sh create writes this when it title-adopts an agent instead of creating one."""
-    return Path(env_dir) / f".genie_adopted_{agent_files.space_key(name)}"
+    return Path(env_dir) / f".genie_adopted_{agent_files.key_of(env_dir, name)}"
 
 
 def _title_matches(api, title: str) -> list[str]:
@@ -467,7 +474,7 @@ def restore_ids(env_dir: Path, env: str, api=None) -> list[str]:
     restored = []
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
-        key = agent_files.space_key(name)
+        key = agent["key"]
         if agent["genie_space_id"] or agent["delete"]:
             continue
         path = id_file(env_dir, name)
@@ -562,8 +569,9 @@ def _push(api, name: str, space_id: str, desired: dict, current: dict | None) ->
 
 # ── delete = true needs a committed acknowledgement ──────────────────────────
 
-def delete_ack_key(env: str, name: str) -> str:
-    return f"{env}:delete-agent:{agent_files.space_key(name)}"
+def delete_ack_key(env: str, key: str) -> str:
+    """The ack line for deleting the agent with Terraform key ``key``."""
+    return f"{env}:delete-agent:{key}"
 
 
 def _ack_keys(env_dir: Path, env: str) -> set[str]:
@@ -580,7 +588,7 @@ def _ack_keys(env_dir: Path, env: str) -> set[str]:
 
 def delete_consequences(env_dir: Path, env: str) -> dict[str, str]:
     """ack key -> consequence, for every agent with delete = true (release_gate reconciles them)."""
-    return {delete_ack_key(env, a["name"]): f"deletes Genie agent {a['name']} and its conversations"
+    return {delete_ack_key(env, a["key"]): f"deletes Genie agent {a['name']} and its conversations"
             for a in agent_files.load_all(env_dir) if a["delete"]}
 
 
@@ -604,7 +612,7 @@ def reactivation_consequences(env_dir: Path, env: str) -> dict[str, str]:
     detached = {str(entry.get("key") or agent_files.space_key(name))
                 for name, entry in previous.items() if isinstance(entry, dict)
                 and (entry.get("detached") is True or entry.get("lifecycle") == "detached")}
-    active = {agent_files.space_key(agent["name"]): agent["name"]
+    active = {agent["key"]: agent["name"]
               for agent in agent_files.load_all(env_dir)
               if not agent["detached"] and not agent["delete"]}
     return {f"{env}:revive-agent:{key}": f"reactivates detached Genie agent {active[key]}"
@@ -613,8 +621,7 @@ def reactivation_consequences(env_dir: Path, env: str) -> dict[str, str]:
 
 def check_detach_acks(env_dir: Path, env: str) -> list[str]:
     keys = _ack_keys(env_dir, env)
-    configured = {agent_files.space_key(agent["name"]): agent
-                  for agent in agent_files.load_all(env_dir)}
+    configured = {agent["key"]: agent for agent in agent_files.load_all(env_dir)}
     invalid = sorted(key for key in keys if key.startswith(f"{env}:detached-agent:")
                      and (key.rsplit(":", 1)[-1] not in configured
                           or not configured[key.rsplit(":", 1)[-1]]["detached"]
@@ -668,11 +675,11 @@ def sync(env_dir: Path, env: str, api=None) -> dict[str, list[str]]:
 def _planned(agent: dict, env_dir: Path, env: str) -> dict:
     """What release will do to one agent, from committed files and local runtime files only."""
     name = agent["name"]
-    key = agent_files.space_key(name)
+    key = agent["key"]
     space_id = agent_id(env_dir, name)
     if agent["delete"]:
         # A promoted env's agents are create-path agents: the saved workspace plan trashes them.
-        return {"action": "delete", "key": key, "genie_space_id": space_id, "ack": delete_ack_key(env, name),
+        return {"action": "delete", "key": key, "genie_space_id": space_id, "ack": delete_ack_key(env, key),
                 "via": "saved workspace plan" if promoted(env_dir) or not agent["genie_space_id"] else "api"}
     capture = agent_files.capture_path(env_dir, name)
     if agent["detached"] or not capture.is_file():
@@ -731,12 +738,13 @@ def _require_new(env_dir: Path, name: str, key: str, api) -> None:
     if create_instance(env_dir, key) is not None:
         raise AgentError(f"the workspace state already holds the create resource for {name!r}, which "
                          "release-plan planned as new")
+    created_title = display_title(agent_files.load(env_dir, name))
     if adopted_marker(env_dir, name).exists():
         raise AgentError(f"{adopted_marker(env_dir, name).name} exists: an earlier create adopted an agent "
-                         f"titled {name!r}. Check it, then delete that marker and re-run release-plan")
-    matches = _title_matches(api, name)
+                         f"titled {created_title!r}. Check it, then delete that marker and re-run release-plan")
+    matches = _title_matches(api, created_title)
     if matches:
-        raise AgentError(f"a live agent titled {name!r} already exists ({', '.join(matches)}), so creating "
+        raise AgentError(f"a live agent titled {created_title!r} already exists ({', '.join(matches)}), so creating "
                          f"{name!r} would adopt it by title. If it is this agent, write its ID into "
                          f"{id_file(env_dir, name)} and re-run release-plan (it then shows what release "
                          "overwrites); otherwise rename one of them")
@@ -866,7 +874,7 @@ def delete_agents(env_dir: Path, env: str, api=None) -> list[str]:
         api = api or _api(env_dir)
         api.do("DELETE", SPACE_API.format(agent["genie_space_id"]))
         deleted.append(agent["name"])
-        print(f"Genie agent {agent['name']} ({agent['genie_space_id']}): deleted ({delete_ack_key(env, agent['name'])}).")
+        print(f"Genie agent {agent['name']} ({agent['genie_space_id']}): deleted ({delete_ack_key(env, agent['key'])}).")
     return deleted
 
 
@@ -968,7 +976,7 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
         _run(runner, env_dir, env, "state-rm", address)
         print(f"  forgot {address}")
     print(f"Detached {name}: {len(addresses)} state address(es) removed; the agent and its conversations stay.")
-    key = agent_files.space_key(name)
+    key = agent["key"]
     print(f"  Next: a governance-reviewed PR that adds {env}:detached-agent:{key} to ack.txt, "
           f"removes only agents/{name}.space.json, and keeps detached agents/{name}.auto.tfvars — "
           f"then runs make promote-to ENV={env} and commits governed_tables.json; its plan must show no "
@@ -982,10 +990,11 @@ def configured_keys(env_dir: Path) -> set[str]:
     """Every key the workspace root may use for a configured (or deleting) agent."""
     cfg = agent_files._load_hcl(env_dir / "env.auto.tfvars")
     keys: set[str] = set()
-    for space in cfg.get("genie_spaces") or []:
-        if isinstance(space, dict):
-            keys |= agent_files.agent_keys({"name": str(space.get("name") or ""),
-                                            "genie_space_id": str(space.get("genie_space_id") or "")})
+    inline = [space for space in cfg.get("genie_spaces") or [] if isinstance(space, dict)]
+    keys |= set(agent_files.terraform_keys(inline))
+    for space in inline:
+        keys |= agent_files.agent_keys({"name": str(space.get("name") or ""),
+                                        "genie_space_id": str(space.get("genie_space_id") or "")})
     title = str(cfg.get("genie_space_title") or "")
     if title or cfg.get("genie_space_id"):
         keys.add(agent_files.space_key(title or "Genie Space"))

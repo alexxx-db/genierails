@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sys
 import os
 import shlex
@@ -103,9 +104,9 @@ def test_loader_merges_agent_files_into_genie_spaces(tmp_path):
     spaces = agent_files.merged_config(env)["genie_spaces"]
     assert spaces == [
         {"name": "Ops", "genie_space_id": "", "sql_warehouse_id": "wh", "uc_tables": ["c.s.t"],
-         "acl_groups": [], "detached": False},
+         "acl_groups": [], "key": "ops", "detached": False},
         {"name": "Sales", "genie_space_id": "id-1", "sql_warehouse_id": "", "uc_tables": [],
-         "acl_groups": ["analysts"], "detached": False},
+         "acl_groups": ["analysts"], "key": "sales", "detached": False},
     ]
     # Idempotent: merging an already merged config changes nothing.
     assert agent_files.merged_config(env, agent_files.merged_config(env))["genie_spaces"] == spaces
@@ -1644,3 +1645,174 @@ def test_legacy_delete_rechecks_its_ack_immediately_before_delete(tmp_path):
     with pytest.raises(ownership.AgentError, match="stale line"):
         ownership.delete_agents(prod, "prod", api)
     assert api.calls == []
+
+
+# ── PR #160: every script keys an agent by its Terraform key, never its file name ──
+
+def _split(tmp_path: Path, name: str, env_cfg: str, file_names: str = "") -> Path:
+    env_dir = tmp_path / "envs" / name
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text(env_cfg)
+    agent_files.split(env_dir, file_names)
+    return env_dir
+
+
+def test_a_renamed_split_file_keeps_its_key_for_ids_markers_acks_state_and_receipts(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    dev = _split(tmp_path, "dev", 'genie_spaces = [{ genie_space_id = "01ef0c" }]\n', "01ef0c=walkthrough")
+    agent = agent_files.load(dev, "walkthrough")
+    assert agent["key"] == "01ef0c"
+    assert ownership.id_file(dev, "walkthrough").name == ".genie_space_id_01ef0c"
+    assert ownership.adopted_marker(dev, "walkthrough").name == ".genie_adopted_01ef0c"
+    _created(dev, "01ef0c", "01ef0c")
+    assert ownership.binding_now(dev, agent) == ("existing", "tfdata-01ef0c")
+    assert ownership.verify_created(dev, "walkthrough", agent["key"], "01ef0c") == "01ef0c"
+    receipt = ownership.receipt_agents(dev)["walkthrough"]
+    assert (receipt["key"], receipt["create_resource_id"], receipt["created_space_id"]) == (
+        "01ef0c", "tfdata-01ef0c", "01ef0c")
+    settings = dev / "agents" / "walkthrough.auto.tfvars"
+    settings.write_text(settings.read_text() + "delete = true\n")
+    assert ownership.delete_consequences(dev, "dev") == {
+        "dev:delete-agent:01ef0c": "deletes Genie agent walkthrough and its conversations"}
+    assert ownership._planned(agent_files.load(dev, "walkthrough"), dev, "dev")["ack"] == "dev:delete-agent:01ef0c"
+
+
+def _alike_prod(tmp_path, monkeypatch) -> tuple[Path, dict]:
+    """A promoted prod whose two titles sanitize alike, split: 'A b' is a_b, 'a-b' is a_b--1."""
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    prod = _split(tmp_path, "prod", 'governance_mode = "deterministic"\npromote_from = "dev"\n'
+                  'genie_spaces = [{ name = "A b", acl_groups = ["a"] }, { name = "a-b", acl_groups = ["a"] }]\n')
+    payloads = {"A b": {"version": 1, "who": "A b"}, "a-b": {"version": 1, "who": "a-b"}}
+    for name, payload in payloads.items():
+        ownership.write_payload(payload, agent_files.capture_path(prod, name))
+    _created(prod, "a_b", "prod-first")
+    _created(prod, "a_b--1", "prod-second")
+    return prod, payloads
+
+
+def test_titles_that_sanitize_alike_never_share_an_id_file_or_a_push(tmp_path, monkeypatch, release_lock):
+    prod, payloads = _alike_prod(tmp_path, monkeypatch)
+    assert ownership.agent_id(prod, "A b") == "prod-first"
+    assert ownership.agent_id(prod, "a-b") == "prod-second"
+    receipt = ownership.receipt_agents(prod)
+    assert {n: (e["key"], e["genie_space_id"], e["create_resource_id"]) for n, e in receipt.items()} == {
+        "A b": ("a_b", "prod-first", "tfdata-a_b"), "a-b": ("a_b--1", "prod-second", "tfdata-a_b--1")}
+    api = FakeGenie({"prod-first": {"version": 0}, "prod-second": {"version": 0}})
+    manifest = _manifest(tmp_path, prod, api)
+    ownership.sync_manifest(prod, "prod", manifest, api)
+    assert api.spaces == {"prod-first": payloads["A b"], "prod-second": payloads["a-b"]}
+
+
+def test_recovery_of_one_of_two_alike_titles_restores_only_its_own_id_file(tmp_path, monkeypatch):
+    prod, payloads = _alike_prod(tmp_path, monkeypatch)
+    sha = ownership._sha(ownership.render(payloads["a-b"]))
+    _step9_receipt(prod, "c1", {"a-b": _released("prod-second", key="a_b--1", config_sha256=sha,
+                                                 create_resource_id="tfdata-a_b--1")})
+    (prod / ".genie_space_id_a_b--1").unlink()
+    api = FakeGenie({"prod-second": payloads["a-b"], "prod-first": payloads["A b"]})
+    assert ownership.restore_ids(prod, "prod", api) == ["a-b"]
+    assert (prod / ".genie_space_id_a_b--1").read_text() == "prod-second\n"
+    assert (prod / ".genie_space_id_a_b").read_text() == "prod-first\n"
+
+
+def test_detaching_one_of_two_alike_titles_forgets_only_its_addresses(tmp_path, monkeypatch):
+    prod, _ = _alike_prod(tmp_path, monkeypatch)
+    lines = [f'module.workspace.terraform_data.genie_space["{k}"]' for k in ("a_b", "a_b--1")]
+    assert ownership.agent_addresses(lines, agent_files.load(prod, "a-b")) == [lines[1]]
+    assert ownership.agent_addresses(lines, agent_files.load(prod, "A b")) == [lines[0]]
+
+
+def test_a_new_split_agent_is_checked_against_live_agents_by_its_display_title(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    title = "Walk (prod_cat.demo)"
+    prod = _split(tmp_path, "prod", 'governance_mode = "deterministic"\npromote_from = "dev"\n'
+                  f'genie_spaces = [{{ name = "{title}", acl_groups = ["a"] }}]\n')
+    ownership.write_payload(_payload(), agent_files.capture_path(prod, "walk_prod_cat_demo"))
+    with pytest.raises(ownership.AgentError, match=re.escape(f"a live agent titled {title!r} already exists")):
+        ownership.plan(prod, "prod", tmp_path, FakeGenie({}, titles={"old-1": title}))
+
+
+# promote-to carries the display name and the target's own key.
+
+def _split_dev(tmp_path, entries: str, *, id_to_name: dict | None = None, file_names: str = "") -> Path:
+    dev = _split(tmp_path, "dev", f"genie_spaces = [{entries}]\n", file_names)
+    for name in agent_files.names(dev):
+        ownership.write_payload(_payload(), agent_files.capture_path(dev, name))
+    if id_to_name:
+        (dev / "generated").mkdir()
+        (dev / "generated" / "abac.auto.tfvars").write_text(
+            "genie_space_id_to_name = " + json.dumps(id_to_name).replace(":", " =") + "\n")
+    return dev
+
+
+def _prod_dir(tmp_path, text: str = "") -> Path:
+    prod = tmp_path / "envs" / "prod"
+    prod.mkdir(parents=True, exist_ok=True)
+    (prod / "env.auto.tfvars").write_text(text)
+    return prod
+
+
+def _files(env_dir: Path) -> dict:
+    return {p.relative_to(env_dir): p.read_bytes() for p in env_dir.rglob("*") if p.is_file()}
+
+
+def test_promote_carries_the_remapped_display_name_and_the_targets_key(tmp_path):
+    dev = _split_dev(tmp_path, '{ name = "Walk (dev_cat.demo)", genie_space_id = "01ef0d" }')
+    prod = _prod_dir(tmp_path)
+    assert agent_promote.promote(dev, prod, {"dev_cat": "prod_cat"}) == ["walk_dev_cat_demo"]
+    seeded = agent_files.load(prod, "walk_dev_cat_demo")
+    assert (seeded["display_name"], seeded["key"]) == ("Walk (prod_cat.demo)", "walk_prod_cat_demo")
+    assert agent_files.merged_config(prod)["genie_spaces"][0]["name"] == "Walk (prod_cat.demo)"
+    first = _files(prod)
+    agent_promote.promote(dev, prod, {"dev_cat": "prod_cat"})
+    assert _files(prod) == first, "the next promotion matches the agent it seeded"
+
+
+def test_promote_titles_an_unnamed_agent_from_its_ids_title_never_its_id(tmp_path):
+    dev = _split_dev(tmp_path, '{ genie_space_id = "01ef0c" }', file_names="01ef0c=walkthrough",
+                     id_to_name={"01ef0c": "Walk (dev_cat.demo)"})
+    prod = _prod_dir(tmp_path)
+    agent_promote.promote(dev, prod, {"dev_cat": "prod_cat"})
+    seeded = agent_files.load(prod, "walkthrough")
+    assert (seeded["display_name"], seeded["key"]) == ("Walk (prod_cat.demo)", "walk_prod_cat_demo")
+    assert "01ef0c" not in (prod / "agents" / "walkthrough.auto.tfvars").read_text()
+
+
+def test_promote_refuses_an_unnamed_agent_it_cannot_title(tmp_path):
+    dev = _split_dev(tmp_path, '{ genie_space_id = "01ef0c" }')
+    prod = _prod_dir(tmp_path)
+    with pytest.raises(AgentFileError, match="add name ="):
+        agent_promote.promote(dev, prod, {})
+    assert _files(prod) == {Path("env.auto.tfvars"): b""}
+
+
+def test_promote_refuses_while_the_target_keeps_the_remapped_title_inline(tmp_path):
+    dev = _split_dev(tmp_path, '{ name = "Walk (dev_cat.demo)", genie_space_id = "01ef0d" }')
+    prod = _prod_dir(tmp_path, 'genie_spaces = [{ name = "Walk (prod_cat.demo)" }]\n')
+    before = _files(prod)
+    with pytest.raises(AgentFileError, match="Run make split-agent-files ENV=prod"):
+        agent_promote.promote(dev, prod, {"dev_cat": "prod_cat"})
+    assert _files(prod) == before
+
+
+def test_promote_matches_a_target_split_on_its_own_and_seeds_no_second_agent(tmp_path, capsys):
+    dev = _split_dev(tmp_path, '{ name = "Walk (dev_cat.demo)", genie_space_id = "01ef0d" }')
+    prod = _split(tmp_path, "prod", 'genie_spaces = [{ name = "Walk (prod_cat.demo)", acl_groups = ["prod_a"] }]\n')
+    assert agent_files.names(prod) == ["walk_prod_cat_demo"]
+    agent_promote.promote(dev, prod, {"dev_cat": "prod_cat"})
+    assert agent_files.names(prod) == ["walk_prod_cat_demo"]
+    assert (prod / "agents" / "walk_prod_cat_demo.space.json").is_file()
+    assert agent_files.load(prod, "walk_prod_cat_demo")["acl_groups"] == ["prod_a"]
+    out = capsys.readouterr().out
+    assert "walk_dev_cat_demo -> walk_prod_cat_demo: promoted" in out and "only in prod" not in out
+
+
+def test_promote_keeps_two_titles_that_sanitize_alike_as_two_target_agents(tmp_path):
+    dev = _split_dev(tmp_path, '{ name = "A b", genie_space_id = "01ef01" }, { name = "a-b", genie_space_id = "01ef02" }')
+    prod = _prod_dir(tmp_path)
+    agent_promote.promote(dev, prod, {})
+    assert {a["name"]: (a["display_name"], a["key"]) for a in agent_files.load_all(prod)} == {
+        "A b": ("A b", "a_b"), "a-b": ("a-b", "a_b--2")}
+    first = _files(prod)
+    agent_promote.promote(dev, prod, {})
+    assert _files(prod) == first

@@ -19,9 +19,17 @@ An agent file holds:
                                  # <env>:delete-agent:<key> in envs/<env>/ack.txt
     uc_tables        = []        # optional; else the captured payload's tables
     sql_warehouse_id = ""        # optional per-agent warehouse
+    name             = ""        # optional display title (default: the file name)
+    key              = ""        # optional immutable Terraform key (make
+                                 # split-agent-files writes it to keep the
+                                 # pre-split address); never change it
 
-The agent's name is the file name. Its captured config, written by make
-capture, is <agent>.space.json beside it.
+The file name is the agent's name. Its captured config, written by make
+capture, is <agent>.space.json beside it. The agent's Terraform key -- its
+resource addresses, .genie_space_id_<key>, .genie_adopted_<key> and its ack
+lines -- is its explicit key, else the file name sanitized (disambiguated as
+roots/workspace does for two that sanitize alike); never its display name, so
+retitling an agent never moves it. load_all resolves it once for every reader.
 """
 
 from __future__ import annotations
@@ -38,9 +46,12 @@ import hcl2
 AGENTS_DIR = "agents"
 SETTINGS_SUFFIX = ".auto.tfvars"
 CAPTURE_SUFFIX = ".space.json"
-KEYS = {"genie_space_id", "acl_groups", "detached", "delete", "uc_tables", "sql_warehouse_id"}
+KEYS = {"key", "name", "genie_space_id", "acl_groups", "detached", "delete", "uc_tables", "sql_warehouse_id"}
 # A name becomes a file name and a Terraform key: no paths, no quotes.
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]*")
+# An explicit key names state addresses and .genie_space_id_<key>: the shapes
+# roots/workspace produces (sanitized name, name--<id|index>, an agent ID).
+KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 # Workspace-root resources keyed by the agent's key (modules/workspace).
 STATE_RESOURCES = (
     "genie_space", "genie_space_acls", "genie_space_acls_removal_only",
@@ -68,6 +79,13 @@ def _load_hcl(path: Path) -> dict:
             return hcl2.load(handle)
     except Exception as exc:  # hcl2 raises lark errors
         raise AgentFileError(f"{path}: not valid HCL ({exc})") from exc
+
+
+def check_key(key: str) -> str:
+    if not KEY.fullmatch(key or ""):
+        raise AgentFileError(
+            f"Terraform key {key!r} is not allowed: use letters, digits, '_' or '-', starting with a letter or digit")
+    return key
 
 
 def check_name(name: str) -> str:
@@ -103,7 +121,15 @@ def names(env_dir: Path) -> list[str]:
 
 
 def load(env_dir: Path, name: str) -> dict[str, Any]:
-    """One agent's settings, validated, with defaults filled in."""
+    """One agent's settings, validated, with defaults filled in and its Terraform key resolved."""
+    settings_path(env_dir, name)
+    for agent in load_all(env_dir):
+        if agent["name"] == name:
+            return agent
+    raise AgentFileError(f"{settings_path(env_dir, name)} not found")
+
+
+def _load_file(env_dir: Path, name: str) -> dict[str, Any]:
     path = settings_path(env_dir, name)
     raw = _load_hcl(path)
     unknown = sorted(set(raw) - KEYS)
@@ -118,8 +144,19 @@ def load(env_dir: Path, name: str) -> dict[str, Any]:
     tables = raw.get("uc_tables") or []
     if not isinstance(tables, list) or not all(isinstance(t, str) and t for t in tables):
         raise AgentFileError(f"{path}: uc_tables must be a list of table names")
+    for text in ("key", "name"):
+        if text in raw and not isinstance(raw[text], str):
+            raise AgentFileError(f"{path}: {text} must be a string")
+    if "key" in raw:
+        try:
+            check_key(raw["key"])
+        except AgentFileError as exc:
+            raise AgentFileError(f"{path}: {exc}") from exc
     agent = {
         "name": name,
+        "display_name": raw.get("name", name),
+        "key": raw.get("key", ""),  # resolved by load_all
+        "explicit_key": "key" in raw,
         "genie_space_id": str(raw.get("genie_space_id") or "").strip(),
         "acl_groups": list(acl) if acl is not None else None,
         "detached": bool(raw.get("detached", False)),
@@ -127,11 +164,6 @@ def load(env_dir: Path, name: str) -> dict[str, Any]:
         "uc_tables": list(tables),
         "sql_warehouse_id": str(raw.get("sql_warehouse_id") or "").strip(),
     }
-    if agent["genie_space_id"] and promoted(env_dir):
-        raise AgentFileError(
-            f"{path}: genie_space_id must be empty in {Path(env_dir).name}: a promoted env's agent IDs live in "
-            "its Terraform state and release receipt, never in git (to adopt an existing agent, write its ID "
-            f"into {Path(env_dir).name}/.genie_space_id_{space_key(name)}; release-plan then shows it)")
     if agent["detached"] and agent["delete"]:
         raise AgentFileError(f"{path}: set detached or delete, not both")
     if agent["detached"] and agent["acl_groups"] != []:
@@ -154,9 +186,51 @@ def captured_tables(env_dir: Path, name: str) -> list[str]:
     return sorted({str(t.get("identifier")) for t in tables if isinstance(t, dict) and t.get("identifier")})
 
 
+def terraform_keys(spaces: list) -> list[str]:
+    """roots/workspace merged_spaces' for_each key for each genie_spaces entry, in order.
+
+    An explicit key wins; otherwise the sanitized name (else the agent ID),
+    suffixed --<agent ID, else list index> when an earlier entry has the same one.
+    """
+    keys, bases = [], []
+    for index, space in enumerate(spaces):
+        space = space if isinstance(space, dict) else {}
+        base = space_key(str(space.get("name") or "")) or str(space.get("genie_space_id") or "")
+        if space.get("key"):
+            keys.append(str(space["key"]))
+        else:
+            keys.append(base if base not in bases else f"{base}--{space.get('genie_space_id') or index}")
+        bases.append(base)
+    return keys
+
+
+def _resolve_keys(inline: list, agents: list[dict]) -> None:
+    """Give every agent file its Terraform key, as the workspace root had it before keys were explicit.
+
+    The root then saw the inline entries followed by the (not deleted) agent
+    files, each named by its file name; a deleted agent kept the key it had
+    while it was still listed. A file without key that sanitizes like an
+    earlier entry or any explicit key gets the root's --<id|index> suffix.
+    """
+    explicit = {agent["key"] for agent in agents if agent["explicit_key"]}
+    for include_deleted in (False, True):
+        bases = [space_key(str(s.get("name") or "")) or str(s.get("genie_space_id") or "")
+                 for s in inline if isinstance(s, dict)]
+        index = len(inline)
+        for agent in agents:
+            if agent["delete"] and not include_deleted:
+                continue
+            base = space_key(agent["name"])
+            if (agent["delete"] == include_deleted) and not agent["explicit_key"]:
+                taken = base in bases or base in explicit
+                agent["key"] = f"{base}--{agent['genie_space_id'] or index}" if taken else base
+            bases.append(agent["key"].split("--", 1)[0] if agent["explicit_key"] else base)
+            index += 1
+
+
 def load_all(env_dir: Path) -> list[dict[str, Any]]:
     env_dir = Path(env_dir)
-    result = [load(env_dir, name) for name in names(env_dir)]
+    result = [_load_file(env_dir, name) for name in names(env_dir)]
     folder = agents_dir(env_dir)
     if folder.is_dir():
         orphans = sorted(p.name[: -len(CAPTURE_SUFFIX)] for p in folder.glob(f"*{CAPTURE_SUFFIX}")
@@ -165,7 +239,38 @@ def load_all(env_dir: Path) -> list[dict[str, Any]]:
             raise AgentFileError(
                 f"{folder}: captured config without settings for {', '.join(orphans)}; "
                 f"add agents/<agent>{SETTINGS_SUFFIX} (genie_space_id, acl_groups)")
+    if not result:
+        return result
+    inline = [s for s in (_load_hcl(env_dir / "env.auto.tfvars").get("genie_spaces") or []) if isinstance(s, dict)]
+    _resolve_keys(inline, result)
+    by_key: dict[str, list[str]] = {}
+    for key, space in zip(terraform_keys(inline), inline):
+        by_key.setdefault(key, []).append(f"env.auto.tfvars genie_spaces {space.get('name') or key!r}")
+    for agent in result:
+        by_key.setdefault(agent["key"], []).append(f"{AGENTS_DIR}/{agent['name']}{SETTINGS_SUFFIX}")
+    duplicates = {key: owners for key, owners in by_key.items() if len(owners) > 1}
+    if duplicates:
+        key, owners = sorted(duplicates.items())[0]
+        raise AgentFileError(f"{env_dir}: {' and '.join(owners)} share Terraform key {key!r}; "
+                             "give one a distinct key")
+    for agent in result:
+        if agent["genie_space_id"] and promoted(env_dir):
+            raise AgentFileError(
+                f"{settings_path(env_dir, agent['name'])}: genie_space_id must be empty in {env_dir.name}: a "
+                "promoted env's agent IDs live in its Terraform state and release receipt, never in git (to "
+                f"adopt an existing agent, write its ID into {env_dir.name}/.genie_space_id_{agent['key']}; "
+                "release-plan then shows it)")
     return result
+
+
+def key_of(env_dir: Path, name: str) -> str:
+    """The Terraform key of agent ``name``: its agent file's, else its inline entry's (by name)."""
+    env_dir = Path(env_dir)
+    if name in names(env_dir):
+        return load(env_dir, name)["key"]
+    inline = [s for s in (_load_hcl(env_dir / "env.auto.tfvars").get("genie_spaces") or []) if isinstance(s, dict)]
+    matches = [key for key, s in zip(terraform_keys(inline), inline) if str(s.get("name") or "") == name]
+    return matches[0] if len(matches) == 1 else space_key(name)
 
 
 def merged_config(env_dir: Path, cfg: dict | None = None) -> dict:
@@ -180,7 +285,7 @@ def merged_config(env_dir: Path, cfg: dict | None = None) -> dict:
     inline = {str(s.get("name") or "") for s in spaces} - {""}
     for agent in load_all(env_dir):
         entry = _space_entry(agent) | {"detached": agent["detached"]}
-        if agent["name"] in inline:
+        if agent["name"] in inline or agent["display_name"] in inline:
             if entry in spaces:
                 continue  # cfg is already a merge
             raise AgentFileError(
@@ -213,13 +318,15 @@ def captured_names(env_dir: Path) -> set[str]:
 
 def _space_entry(agent: dict) -> dict:
     entry = {
-        "name": agent["name"],
+        "name": agent["display_name"],
         "genie_space_id": agent["genie_space_id"],
         "sql_warehouse_id": agent["sql_warehouse_id"],
         "uc_tables": agent["uc_tables"],
     }
     if agent["acl_groups"] is not None:
         entry["acl_groups"] = agent["acl_groups"]
+    # Always explicit, so the root keys the agent exactly as every script does.
+    entry["key"] = agent["key"]
     return entry
 
 
@@ -249,8 +356,10 @@ def state_keys(env_dir: Path) -> set[str]:
 
 
 def agent_keys(agent: dict) -> set[str]:
-    """Keys the workspace root may give this agent (plain, or disambiguated by ID)."""
-    base = space_key(agent["name"]) or agent["genie_space_id"]
+    """Keys the workspace root may give this agent: its resolved key, else (an inline entry) plain or by ID."""
+    if agent.get("key"):
+        return {agent["key"]}
+    base = space_key(agent.get("name", "")) or agent["genie_space_id"]
     keys = {base}
     if agent.get("genie_space_id"):
         keys.add(f"{base}--{agent['genie_space_id']}")
@@ -272,13 +381,13 @@ def terraform_spaces(env_dir: Path, layer: str) -> list[dict] | None:
     cfg = merged_config(env_dir)
     in_state = state_keys(env_dir) if layer == "workspace" else set()
     spaces = []
-    from_files = set(names(env_dir))
+    file_by_key = {agent["key"]: agent["name"] for agent in load_all(env_dir)}
     for space in cfg.get("genie_spaces") or []:
         detached = space.pop("detached", False)
         if detached and layer == "workspace" and not (agent_keys(space) & in_state):
             continue
-        if layer == "workspace" and space.get("name") in from_files:
-            space["captured"] = capture_path(env_dir, space["name"]).is_file()
+        if layer == "workspace" and space.get("key") in file_by_key:
+            space["captured"] = capture_path(env_dir, file_by_key[space["key"]]).is_file()
         spaces.append(space)
     return spaces
 
@@ -330,8 +439,12 @@ def _top_level_list(text: str, key: str) -> tuple[int, int] | None:
     return None
 
 
-def _render_agent(space: dict) -> str:
-    lines = [f"# {space['name']}: moved from env.auto.tfvars genie_spaces by make split-agent-files.",
+def _render_agent(space: dict, key: str) -> str:
+    title = str(space.get("name") or "")
+    lines = [f"# {title or space.get('genie_space_id')}: moved from env.auto.tfvars genie_spaces by make split-agent-files.",
+             "# key preserves the pre-split Terraform resource addresses; do not change it.",
+             f"key            = {json.dumps(key)}",
+             f"name           = {json.dumps(title)}",
              f"genie_space_id = {json.dumps(str(space.get('genie_space_id') or ''))}"]
     if space.get("acl_groups") is not None:
         lines.append("acl_groups     = [" + ", ".join(json.dumps(g) for g in space["acl_groups"]) + "]")
@@ -354,27 +467,42 @@ def _as_terraform(space: dict) -> dict:
     }
 
 
-def split_problems(env_dir: Path, spaces: list) -> list[str]:
+def _keyed(spaces: list) -> dict[str, dict]:
+    """genie_spaces entries by their workspace-root key, as Terraform types them."""
+    return dict(zip(terraform_keys(spaces), map(_as_terraform, spaces)))
+
+
+def _parse_file_names(value: str) -> dict[str, str]:
+    """AGENT_FILE_NAMES syntax: comma-separated ``existing-terraform-key=agent-file-name`` pairs."""
+    result = {}
+    for item in filter(None, (part.strip() for part in value.split(","))):
+        old, sep, filename = item.partition("=")
+        if not sep or not old or not filename:
+            raise AgentFileError("AGENT_FILE_NAMES must be existing-terraform-key=agent-file-name "
+                                 "(comma-separate mappings)")
+        if old in result:
+            raise AgentFileError(f"AGENT_FILE_NAMES maps {old!r} more than once")
+        result[old] = check_name(filename)
+    return result
+
+
+def split_problems(env_dir: Path, spaces: list, filenames: list[str], inline_keys: list[str]) -> list[str]:
     problems = []
     keys: dict[str, list[str]] = {}
-    for name in names(env_dir):
-        keys.setdefault(space_key(name), []).append(name)
+    for agent in load_all(env_dir):
+        keys.setdefault(agent["key"], []).append(agent["name"])
     for index, space in enumerate(spaces):
         if not isinstance(space, dict):
             problems.append(f"genie_spaces[{index}] is not an object")
             continue
         name = str(space.get("name") or "")
         label = f"genie_spaces[{index}] ({name or space.get('genie_space_id') or 'no name'})"
-        if not name:
-            problems.append(
-                f"{label} has no name. Its Terraform key is its genie_space_id, and an agent file is "
-                "keyed by its name, so moving it would replace the agent; set name only together with "
-                "a terraform state mv to the new key, or keep it inline")
+        if not inline_keys[index]:
+            problems.append(f"{label} has neither a name nor genie_space_id, so it has no stable Terraform key")
             continue
-        try:
-            check_name(name)
-        except AgentFileError as exc:
-            problems.append(f"{label}: {exc}")
+        if not KEY.fullmatch(inline_keys[index]):
+            problems.append(f"{label}: its Terraform key {inline_keys[index]!r} can't name an agent file's "
+                            "key (letters, digits, '_' and '-' only); keep it inline")
             continue
         extra = sorted(set(space) - SPLIT_KEYS - {"delete"})
         if extra:
@@ -390,10 +518,11 @@ def split_problems(env_dir: Path, spaces: list) -> list[str]:
         if str(space.get("genie_space_id") or "").strip() and promoted(env_dir):
             problems.append(
                 f"{label} has a genie_space_id, which a promoted env keeps in its Terraform state, "
-                f"never in git; move it to .genie_space_id_{space_key(name)} first")
-        if settings_path(env_dir, name).exists() or capture_path(env_dir, name).exists():
-            problems.append(f"{label}: {AGENTS_DIR}/{name}.* already exists")
-        keys.setdefault(space_key(name), []).append(name)
+                f"never in git; move it to .genie_space_id_{inline_keys[index]} first")
+        filename = filenames[index]
+        if settings_path(env_dir, filename).exists() or capture_path(env_dir, filename).exists():
+            problems.append(f"{label}: {AGENTS_DIR}/{filename}.* already exists")
+        keys.setdefault(inline_keys[index], []).append(filename)
     for key, owners in sorted(keys.items()):
         if len(owners) > 1:
             problems.append(f"agents {', '.join(repr(o) for o in owners)} share the Terraform key {key!r}; "
@@ -401,7 +530,7 @@ def split_problems(env_dir: Path, spaces: list) -> list[str]:
     return problems
 
 
-def split(env_dir: Path) -> list[str]:
+def split(env_dir: Path, file_names: str = "") -> list[str]:
     """Move every inline genie_spaces entry into agents/<name>.auto.tfvars.
 
     Refuses, writing nothing, unless every entry can move with exactly the
@@ -416,29 +545,42 @@ def split(env_dir: Path) -> list[str]:
     spaces = before.get("genie_spaces") or []
     if not spaces:
         return []
-    problems = split_problems(env_dir, spaces)
+    mapping = _parse_file_names(file_names)
+    inline_keys = terraform_keys(spaces)
+    unknown = sorted(set(mapping) - set(inline_keys))
+    if unknown:
+        raise AgentFileError(f"{env_file}: nothing was moved: AGENT_FILE_NAMES refers to unknown Terraform "
+                             f"key(s): {', '.join(unknown)}")
+    filenames = []
+    for space, key in zip(spaces, inline_keys):
+        title = str(space.get("name") or "") if isinstance(space, dict) else ""
+        default = title if NAME.fullmatch(title) and ".." not in title else key
+        filenames.append(mapping.get(key, default))
+    if len({f.lower() for f in filenames}) != len(filenames):
+        raise AgentFileError(f"{env_file}: nothing was moved: two agents map to the same agent-file name "
+                             "(file names differing only in case collide on macOS); name them with "
+                             "AGENT_FILE_NAMES='existing-key=file-name,...'")
+    problems = split_problems(env_dir, spaces, filenames, inline_keys)
     span = _top_level_list(text, "genie_spaces")
     if span is None and not problems:
         problems.append("genie_spaces is not a top-level list in env.auto.tfvars; move the agents by hand")
     if problems:
         raise AgentFileError(f"{env_file}: nothing was moved:\n  - " + "\n  - ".join(problems))
-    expected = sorted((_as_terraform(s) for s in merged_config(env_dir, before).get("genie_spaces") or []),
-                      key=lambda s: s["name"])
+    expected = _keyed(merged_config(env_dir, before).get("genie_spaces") or [])
     folder = agents_dir(env_dir)
     created_dir = not folder.exists()
     written = []
     try:
         folder.mkdir(exist_ok=True)
-        for space in spaces:
-            path = settings_path(env_dir, space["name"])
-            path.write_text(_render_agent(space))
+        for space, filename, key in zip(spaces, filenames, inline_keys):
+            path = settings_path(env_dir, filename)
+            path.write_text(_render_agent(space, key))
             written.append(path)
         env_file.write_text(text[:span[0]] + SPLIT_COMMENT + "\ngenie_spaces = []\n" + text[span[1]:])
         after = _load_hcl(env_file)
         same_settings = ({k: v for k, v in after.items() if k != "genie_spaces"}
                          == {k: v for k, v in before.items() if k != "genie_spaces"})
-        moved = sorted((_as_terraform(s) for s in merged_config(env_dir).get("genie_spaces") or []),
-                       key=lambda s: s["name"])
+        moved = _keyed(merged_config(env_dir).get("genie_spaces") or [])
         if not same_settings or moved != expected:
             raise AgentFileError(f"{env_file}: the moved agents would not match the inline ones; nothing was moved")
     except BaseException:
@@ -448,7 +590,7 @@ def split(env_dir: Path) -> list[str]:
         if created_dir and folder.is_dir() and not any(folder.iterdir()):
             folder.rmdir()
         raise
-    return [space["name"] for space in spaces]
+    return filenames
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -458,13 +600,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="envs/<env> (the workspace env dir, not data_access/)")
     parser.add_argument("--layer", choices=("workspace", "data_access"), default="workspace")
     parser.add_argument("--var-file", dest="var_file", type=Path)
+    parser.add_argument("--file-names", default="",
+                        help="split: existing-terraform-key=agent-file-name pairs (AGENT_FILE_NAMES)")
     args = parser.parse_args(argv)
     try:
         if args.command == "validate":
             merged_config(args.env_dir)
             return 0
         if args.command == "split":
-            moved = split(args.env_dir)
+            moved = split(args.env_dir, args.file_names)
             env = args.env_dir.name
             if not moved:
                 print(f"envs/{env}/env.auto.tfvars has no inline genie_spaces; nothing to move.")

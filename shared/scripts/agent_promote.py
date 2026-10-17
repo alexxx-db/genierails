@@ -10,9 +10,13 @@ receipt, so a removed detached agent cannot be silently recreated.
   warehouse ID are replaced on identifier boundaries inside string values,
   never in keys or prose; every item ID is kept).
 - agents/<agent>.auto.tfvars is env-owned: the first promotion seeds it
-  (acl_groups from the source, genie_space_id empty because the target's ID
-  lives in its state and release receipt); later promotions keep it and print
-  how its acl_groups differ from the source's.
+  (the remapped display name, the target's own key, acl_groups from the
+  source, genie_space_id empty because the target's ID lives in its state and
+  release receipt); later promotions keep it and print how its acl_groups
+  differ from the source's.
+- A source agent is the target agent with the same file name, else the one
+  with its remapped title, else the one with that title's Terraform key; so a
+  target split on its own is never seeded a second agent.
 
     agent_promote.py --source-dir envs/dev --dest-dir envs/prod --catalog-map dev_cat=prod_cat
 """
@@ -81,10 +85,13 @@ def _hcl_list(values: list[str]) -> str:
     return "[" + ", ".join(json.dumps(v) for v in values) + "]"
 
 
-def seed_settings(agent: dict, catalogs: dict[str, str]) -> str:
+def seed_settings(agent: dict, catalogs: dict[str, str], title: str, key: str) -> str:
     lines = [
         f"# {agent['name']} in this env. Env-owned: promote-to wrote it once and never overwrites it.",
         "# The agent's ID lives in this env's Terraform state and release receipt, not here.",
+        "# key is this env's Terraform key for the agent; do not change it.",
+        f"key            = {json.dumps(key)}",
+        f"name           = {json.dumps(title)}",
         'genie_space_id = ""',
         f"acl_groups     = {_hcl_list(agent['acl_groups'] or [])}",
     ]
@@ -102,7 +109,7 @@ def warehouse_map(source_dir: Path, dest_dir: Path) -> dict[str, str]:
 
 def detached_dest_keys(dest_dir: Path) -> set[str]:
     agents = agent_files.load_all(dest_dir)
-    configured = {agent_files.space_key(agent["name"]): agent for agent in agents}
+    configured = {agent["key"]: agent for agent in agents}
     path = dest_dir / "ack.txt"
     acked: set[str] = set()
     if path.is_file():
@@ -120,25 +127,88 @@ def detached_dest_keys(dest_dir: Path) -> set[str]:
     return acked | {key for key, agent in configured.items() if agent["detached"]}
 
 
-def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path) -> set[str]:
+def _id_to_name(env_dir: Path) -> dict:
+    for path in (env_dir / "generated" / "abac.auto.tfvars", env_dir / "abac.auto.tfvars"):
+        found = agent_files._load_hcl(path).get("genie_space_id_to_name")
+        if isinstance(found, dict) and found:
+            return found
+    return {}
+
+
+def target_title(agent: dict, catalogs: dict[str, str], id_to_name: dict) -> str:
+    """The source agent's title as the target shows it: its display name (else its ID's title), remapped."""
+    title = agent["display_name"] or str(id_to_name.get(agent["genie_space_id"]) or "")
+    if not title:
+        raise AgentFileError(
+            f"{agent['_dir'].name}/agents/{agent['name']}{agent_files.SETTINGS_SUFFIX} has no name and its ID "
+            f"{agent['genie_space_id'] or '(none)'} has no title in genie_space_id_to_name, so promote-to can't "
+            "title it in the target; add name = \"<title>\" there (its key keeps the address); nothing was written")
+    return remap_string(title, catalogs, {})
+
+
+def match_targets(source_agents: list[dict], dest_dir: Path, catalogs: dict[str, str]) -> dict[str, dict]:
+    """source agent name -> its target agent: {"name", "key", "title", "new"} (refuses ambiguity)."""
+    existing = agent_files.load_all(dest_dir)
+    id_to_name = _id_to_name(source_agents[0]["_dir"]) if source_agents else {}
+    taken = {agent["key"] for agent in existing}
+    claimed: dict[str, str] = {}
+    result = {}
+    for agent in source_agents:
+        if not agent_files.capture_path(agent["_dir"], agent["name"]).is_file():
+            continue  # not promoted (promote reports it)
+        title = target_title(agent, catalogs, id_to_name)
+        by_name = [t for t in existing if t["name"] == agent["name"]]
+        by_title = [t for t in existing if t["display_name"] == title]
+        by_key = [t for t in existing if t["key"] == agent_files.space_key(title)]
+        candidates = by_name or by_title or by_key
+        others = [t["name"] for t in by_title if by_name and t["name"] != by_name[0]["name"]]
+        if len(candidates) > 1 or others:
+            names = sorted({t["name"] for t in candidates} | set(others))
+            raise AgentFileError(
+                f"{agent['name']!r} ({title!r} in {dest_dir.name}) matches more than one {dest_dir.name} agent "
+                f"({', '.join(names)}); rename one in a PR so each agent has one counterpart; nothing was written")
+        if candidates:
+            target = candidates[0]
+            match = {"name": target["name"], "key": target["key"], "title": title, "new": False}
+        else:
+            if agent["name"] in agent_files.names(dest_dir):
+                raise AgentFileError(f"{dest_dir.name}/agents/{agent['name']}.* is another agent; nothing was written")
+            key = agent_files.space_key(title)
+            if not agent_files.KEY.fullmatch(key):
+                key = agent_files.space_key(agent["name"])
+            base, n = key, 2
+            while key in taken:
+                key, n = f"{base}--{n}", n + 1
+            match = {"name": agent["name"], "key": key, "title": title, "new": True}
+        if match["name"] in claimed:
+            raise AgentFileError(f"{claimed[match['name']]!r} and {agent['name']!r} both map to {dest_dir.name}'s "
+                                 f"agent {match['name']!r}; nothing was written")
+        claimed[match["name"]] = agent["name"]
+        taken.add(match["key"])
+        result[agent["name"]] = match
+    return result
+
+
+def refuse_detached_recreation(source_agents: list[dict], dest_dir: Path, targets: dict[str, dict]) -> set[str]:
     """Refuse before writing when promotion would resurrect a detached target agent.
 
     A detached target settings file is the committed tombstone left by the
-    two-step detach flow. Identity is its normalized Terraform ``space_key``,
-    not its display name, so spelling/case variants cannot adopt it again.
+    two-step detach flow. Identity is the target agent's Terraform key (its
+    match from match_targets), not its display name, so spelling/case
+    variants cannot adopt it again.
     """
     tombstones = {
-        agent_files.space_key(agent["name"]): agent["name"]
+        agent["key"]: agent["name"]
         for agent in agent_files.load_all(dest_dir)
         if agent["detached"]
     }
     keys = detached_dest_keys(dest_dir)
     blocked = sorted(
-        (agent["name"], tombstones[agent_files.space_key(agent["name"])])
+        (agent["name"], tombstones.get(targets[agent["name"]]["key"], targets[agent["name"]]["name"]))
         for agent in source_agents
         if not agent["detached"] and not agent["delete"]
         and agent_files.capture_path(agent["_dir"], agent["name"]).is_file()
-        and agent_files.space_key(agent["name"]) in keys
+        and targets[agent["name"]]["key"] in keys
     )
     if blocked:
         source_env = source_agents[0]["_dir"].name
@@ -164,19 +234,26 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
     if not source_agents:
         return []
     source_agents = [agent | {"_dir": source_dir} for agent in source_agents]
-    detached_keys = refuse_detached_recreation(source_agents, dest_dir)
     # A target still in the legacy layout keeps these agents inline, with its
     # own (env-owned) acl_groups; carrying them as files would replace those
     # silently. Moving them is the explicit, reviewed make split-agent-files.
-    inline = {agent_files.space_key(str(space.get("name") or ""))
-              for space in agent_files._load_hcl(dest_dir / "env.auto.tfvars").get("genie_spaces") or []
-              if isinstance(space, dict) and space.get("name")}
-    clash = sorted(agent["name"] for agent in source_agents if agent_files.space_key(agent["name"]) in inline)
+    # An inline agent is matched by its key and title, as remapped for the target.
+    spaces = [space for space in agent_files._load_hcl(dest_dir / "env.auto.tfvars").get("genie_spaces") or []
+              if isinstance(space, dict)]
+    inline = set(agent_files.terraform_keys(spaces)) | {str(space.get("name") or "") for space in spaces} - {""}
+    id_to_name = _id_to_name(source_dir)
+    clash = sorted(agent["name"] for agent in source_agents
+                   if agent_files.space_key(agent["name"]) in inline
+                   or (agent_files.capture_path(source_dir, agent["name"]).is_file()
+                       and ({target_title(agent, catalogs, id_to_name),
+                             agent_files.space_key(target_title(agent, catalogs, id_to_name))} & inline)))
     if clash:
         raise AgentFileError(
             f"{dest_dir.name} still has {', '.join(repr(n) for n in clash)} inline in env.auto.tfvars "
             f"genie_spaces, while {source_dir.name} keeps them in agents/ files. Run make split-agent-files "
             f"ENV={dest_dir.name}, review and commit it, then promote again; nothing was changed")
+    targets = match_targets(source_agents, dest_dir, catalogs)
+    detached_keys = refuse_detached_recreation(source_agents, dest_dir, targets)
     warehouses = warehouse_map(source_dir, dest_dir)
     folder = agent_files.agents_dir(dest_dir)
     folder.mkdir(parents=True, exist_ok=True)
@@ -188,25 +265,26 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
             print(f"  {name}: not captured in {source_dir.name} yet (make capture ENV={source_dir.name} "
                   f'SPACE="{name}"); not promoted')
             continue
-        key = agent_files.space_key(name)
-        dest_captures = {agent_files.space_key(path.name.removesuffix(".space.json"))
-                         for path in agent_files.agents_dir(dest_dir).glob("*.space.json")}
-        if key in detached_keys and key not in dest_captures:
+        target = targets[name]
+        if target["key"] in detached_keys and not agent_files.capture_path(dest_dir, target["name"]).is_file():
             print(f"  {name}: detached in {dest_dir.name}; not promoted (its tombstone is kept)")
             continue
         payload = json.loads(capture.read_text())
-        (folder / capture.name).write_text(render(remap_payload(payload, catalogs, warehouses)))
-        settings = agent_files.settings_path(dest_dir, name)
-        if not settings.is_file():
-            settings.write_text(seed_settings(agent, catalogs))
-            print(f"  {name}: promoted; seeded agents/{settings.name} (acl_groups from {source_dir.name})")
+        agent_files.capture_path(dest_dir, target["name"]).write_text(
+            render(remap_payload(payload, catalogs, warehouses)))
+        settings = agent_files.settings_path(dest_dir, target["name"])
+        label = name if target["name"] == name else f"{name} -> {target['name']}"
+        if target["new"]:
+            settings.write_text(seed_settings(agent, catalogs, target["title"], target["key"]))
+            print(f"  {label}: promoted; seeded agents/{settings.name} (acl_groups from {source_dir.name})")
         else:
-            kept = agent_files.load(dest_dir, name)["acl_groups"]
+            kept = agent_files.load(dest_dir, target["name"])["acl_groups"]
             note = "" if kept == agent["acl_groups"] else (
                 f"; {dest_dir.name} keeps acl_groups {kept} ({source_dir.name} has {agent['acl_groups']})")
-            print(f"  {name}: promoted{note}")
+            print(f"  {label}: promoted{note}")
         carried.append(name)
-    gone = sorted(set(agent_files.names(dest_dir)) - {a["name"] for a in source_agents})
+    gone = sorted(set(agent_files.names(dest_dir)) - {t["name"] for t in targets.values()}
+                  - {a["name"] for a in source_agents})
     for name in gone:
         print(f"  {name}: only in {dest_dir.name}; kept (remove it with the two-step detach, or delete = true)")
     return carried
