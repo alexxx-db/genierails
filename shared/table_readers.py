@@ -38,6 +38,7 @@ def is_everyone(name: object) -> bool:
     return isinstance(name, str) and " ".join(name.split()).lower() in EVERYONE
 # Agents whose first-import proposal was already written (committed record).
 PROPOSED_RECORD = Path("generated") / "table_readers_proposed.json"
+GOVERNED_TABLES_RECORD = Path("generated") / "governed_tables.json"
 
 
 class TableReadersError(ValueError):
@@ -182,6 +183,26 @@ def _agent_name(space: Mapping, id_to_name: Mapping) -> str:
     return str(space.get("name") or "") or str(id_to_name.get(space_id, "")) or space_id
 
 
+def _is_table(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) == 3 and all(parts) and not any(c in name for c in "*?[]")
+
+
+def _committed_agent_tables(env_dir: Path) -> dict[str, list[str]]:
+    """The deterministic governed-table record's agent_tables ({} when absent)."""
+    try:
+        raw = json.loads((Path(env_dir) / GOVERNED_TABLES_RECORD).read_text())
+    except (OSError, ValueError):
+        return {}
+    value = raw.get("agent_tables") if isinstance(raw, dict) else None
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: list(tables) for key, tables in value.items()
+        if isinstance(tables, list) and all(isinstance(t, str) and _is_table(t) for t in tables)
+    }
+
+
 def attributed_tables(env_dir: Path, cfg: Mapping | None = None) -> tuple[dict[str, list[str]], bool]:
     """(tables, by_id): the tables make generate attributed to agents known only by ID.
 
@@ -196,9 +217,7 @@ def attributed_tables(env_dir: Path, cfg: Mapping | None = None) -> tuple[dict[s
     cfg = env_config(env_dir, cfg)
     if not deterministic(cfg):
         return _discovered_attribution(env_dir), False
-    from scripts.sticky_governance import committed_agent_tables
-
-    return committed_agent_tables(env_dir), True
+    return _committed_agent_tables(env_dir), True
 
 
 def _agents(env_dir: Path, cfg: Mapping) -> list[dict]:
