@@ -14,6 +14,7 @@ import types
 import pytest
 
 from scripts.e2e import driver
+from scripts.remap_generated_config import remote_policy_name
 from scripts import custom_masks
 from governance_policies import build_model
 from weakening import GovernanceState, Protection, find_weakenings
@@ -152,6 +153,21 @@ def test_custom_mask_scenario_keeps_case_order_and_weakening_ack():
     assert any(step.action == "add_ack" and step.value == "custom_mask_ack" for step in scenario.steps)
 
 
+def test_custom_mask_retirement_is_required_on_the_next_staged_run():
+    scenario = next(s for s in driver.SCENARIOS if s.key == "custom-mask")
+    retire_steps = [(step.name, check.env, check.required, check.findings[0][2])
+                    for step in scenario.steps for check in step.assertions
+                    if isinstance(check, driver.ProtectionDelta)
+                    and check.findings[0][0] == "custom-retire"]
+    assert retire_steps == [
+        ("Rehearse custom-mask promotion merge", "dev", True, driver.FAILSAFE_STRING_VALUE),
+        ("Verify partial/full behavior and idempotence", "prod", True,
+         driver.FAILSAFE_STRING_VALUE),
+    ]
+    assert driver.FAILSAFE_STRING_VALUE == driver.resolve_column(
+        "fixture", ("class.not_in_library",), "STRING").value
+
+
 def test_new_fixture_actions_execute_with_real_hcl_and_mask_validators(tmp_path):
     cloud = tmp_path / "aws"
     for env in ("dev", "prod"):
@@ -159,21 +175,29 @@ def test_new_fixture_actions_execute_with_real_hcl_and_mask_validators(tmp_path)
         (root / "agents").mkdir(parents=True)
         extra = 'group_map = { "dev_ops" = "prod_ops" }\n' if env == "prod" else "tag_treatments = {}\n"
         (root / "env.auto.tfvars").write_text(
-            'governance_mode = "deterministic"\naccess_tier_groups = ["ops", "viewers"]\n' + extra)
+            'governance_mode = "deterministic"\naccess_tier_groups = ["ops", "viewers"]\n'
+            'table_readers = { "cat.s.t" = ["ops"] }\n' + extra)
+        (root / "agents/pay.auto.tfvars").write_text(
+            'acl_groups = ["ops"]\nuc_tables = ["cat.s.t"]\n')
     agent = cloud / "envs/prod/agents/pay.auto.tfvars"
-    agent.write_text('acl_groups = ["prod_ops"]\nuc_tables = ["cat.s.t"]\n')
     repo = SimpleNamespace(runner=SimpleNamespace(cwd=cloud))
     values = {"tier_group": "analysts", "group_map_source": "dev_ops", "mapped_group": "prod_new",
-              "prod_agent": "pay", "acl_group": "auditors", "custom_mask_class": "class.postcode"}
+              "tier_table": "cat.s.t", "prod_agent": "pay", "acl_group": "auditors",
+              "custom_mask_class": "class.postcode"}
 
-    driver._run_action(driver.fixture_action("add", "tier_add", "tier_group"), None, repo, values)
+    tier_action = driver.fixture_action("add", "tier_add", "tier_group", "tier_table", "prod_agent")
+    driver._run_action(tier_action, None, repo, values)
     assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["access_tier_groups"] == ["ops", "analysts", "viewers"]
-    driver._run_action(driver.fixture_action("remove", "tier_remove", "tier_group"), None, repo, values)
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["table_readers"]["cat.s.t"] == ["ops", "analysts"]
+    assert driver._load_hcl(cloud / "envs/dev/agents/pay.auto.tfvars")["acl_groups"] == ["ops", "analysts"]
+    driver._run_action(driver.fixture_action("remove", "tier_remove", "tier_group", "tier_table", "prod_agent"), None, repo, values)
     assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["access_tier_groups"] == ["ops", "viewers"]
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["table_readers"]["cat.s.t"] == ["ops"]
+    assert driver._load_hcl(agent)["acl_groups"] == ["ops"]
     driver._run_action(driver.fixture_action("map", "group_map_change", "group_map_source", "mapped_group"), None, repo, values)
     assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["group_map"] == {"dev_ops": "prod_new"}
     driver._run_action(driver.fixture_action("acl", "prod_acl_change", "prod_agent", "acl_group"), None, repo, values)
-    assert driver._load_hcl(agent)["acl_groups"] == ["prod_ops", "auditors"]
+    assert driver._load_hcl(agent)["acl_groups"] == ["ops", "auditors"]
 
     driver._run_action(driver.fixture_action("install", "custom_mask_install", "custom_mask_class"), None, repo, values)
     mask_path = cloud / "envs/dev/custom_masks/custom_e2e_suffix.json"
@@ -243,7 +267,9 @@ def _model_snapshot(model, env, *, grants=(), runs=()):
     policies = []
     for policy in model.fgac_policies:
         policies.append({
-            "name": policy["name"],
+            # Terraform materializes `${catalog}_${for_each key}`; these are
+            # post-prefix names observed in the real dev plan and s13 snapshot.
+            "name": remote_policy_name(catalog, policy["name"]),
             "column_mask": {"function_name":
                 f"{policy['function_catalog']}.{policy['function_schema']}.{policy['function_name']}"},
             "match_values": re.findall(r"hasTagValue\('gr_treatment', '([^']+)'\)",
@@ -459,13 +485,19 @@ def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_
     assert _allowed_diff(scenario, retire_dev_checks, retained_dev, after_dev) == {}
     assert set(_allowed_diff(scenario, [], retained_dev, after_dev)["dev"]) == {"masks", "policies"}
 
-    before = {"prod": before_dev["dev"]}; after = {"prod": after_dev["dev"]}
+    before = {"prod": before_dev["dev"]}
+    retained_prod = {"prod": retained_dev["dev"]}
+    after = {"prod": after_dev["dev"]}
     scenario, prod_checks = _rendered_step_checks(
         "custom-mask", "Release prepared custom mask", values)
     ack = {values["custom_install_ack"]}
-    assert _allowed_diff(scenario, prod_checks, before, after, ack) == {}
-    assert set(_allowed_diff(scenario, prod_checks, before, after)["prod"]) == {
-        "columns", "masks", "policies"}
+    assert _allowed_diff(scenario, prod_checks, before, retained_prod, ack) == {}
+    assert set(_allowed_diff(scenario, prod_checks, before, retained_prod)["prod"]) == {"columns"}
+    _, maintain_checks = _rendered_step_checks(
+        "custom-mask", "Verify partial/full behavior and idempotence", values)
+    assert _allowed_diff(scenario, maintain_checks, retained_prod, after) == {}
+    assert driver.failed_checks(driver.evaluate_checks(
+        maintain_checks, driver.CheckContext(after, after, ROOT)))
     before_extra, after_extra = json.loads(json.dumps(before)), json.loads(json.dumps(after))
     before_extra["prod"]["uc"][LIVE_CATALOG]["governed_tags"].append({
         "catalog_name": LIVE_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "other",
@@ -489,15 +521,10 @@ def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_
                       if result["check"].startswith("acknowledged-weakening"))
     assert ack_result["problems"] == []
 
-    retained_prod_v1 = {"prod": _retained_generation(after_dev, before_dev, "dev")["dev"]}
     v2_dev = _model_snapshot(custom_v2, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
-    retained_prod_v2 = {"prod": _retained_generation(v2_dev, after_dev, "dev")["dev"]}
-    assert _allowed_diff(scenario, change_checks, retained_prod_v1, retained_prod_v2,
+    v2_prod = {"prod": v2_dev["dev"]}
+    assert _allowed_diff(scenario, change_checks, after, v2_prod,
                          {values["custom_mask_ack"]}) == {}
-    no_retire = [check for check in change_checks
-                 if not isinstance(check, driver.ProtectionDelta)]
-    assert set(_allowed_diff(scenario, no_retire, retained_prod_v1, retained_prod_v2,
-                             {values["custom_mask_ack"]})["prod"]) == {"masks", "policies"}
 
 
 def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_widening(tmp_path):
@@ -513,10 +540,14 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
     acks = set(driver._ack_entries(values["tier_add_acks"]))
 
     handwritten_before, handwritten_after = json.loads(json.dumps(base)), json.loads(json.dumps(added))
-    generated_function = handwritten_before["prod"]["uc"][LIVE_CATALOG]["abac_policies"][0]["policies"][0]["column_mask"]["function_name"]
+    generated_function = next(
+        policy["column_mask"]["function_name"]
+        for policy in handwritten_before["prod"]["uc"][LIVE_CATALOG]["abac_policies"][0]["policies"]
+        if policy["column_mask"]["function_name"].endswith("_full"))
+    handwritten_function = re.sub(r"__[0-9a-f]{8}_full$", "__ffffffff_full", generated_function)
     for snapshot, principals in ((handwritten_before, []), (handwritten_after, ["analysts"])):
         snapshot["prod"]["uc"][LIVE_CATALOG]["abac_policies"][0]["policies"].append({
-            "name": "customer_handwritten_full", "column_mask": {"function_name": generated_function},
+            "name": "customer_handwritten_full", "column_mask": {"function_name": handwritten_function},
             "match_values": [], "to_principals": ["account users"], "except_principals": principals})
     remaining = _allowed_diff(scenario, checks, handwritten_before, handwritten_after, acks)
     assert any("newly exempts analysts" in item for item in remaining["prod"]["policies"])
@@ -530,12 +561,22 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
         evidence = snapshot["prod"]["uc"]["other_catalog"]
         for entry in evidence["abac_policies"]:
             entry["table"] = entry["table"].replace(LIVE_CATALOG + ".", "other_catalog.", 1)
+            for policy in entry["policies"]:
+                policy["name"] = re.sub(rf"^{LIVE_CATALOG}_", "other_catalog_", policy["name"])
     remaining = _allowed_diff(scenario, checks, cross_before, cross_after, acks)
     assert any("newly exempts analysts" in item for item in remaining["prod"]["policies"])
 
     dev_scenario, dev_checks = _rendered_step_checks(
         "tier-groupmap", "Rehearse added tier merge", values)
     assert "policies" in _allowed_diff(dev_scenario, dev_checks, base, added)["prod"]
+
+    extra_level = json.loads(json.dumps(added))
+    for entry in extra_level["prod"]["uc"][LIVE_CATALOG]["abac_policies"]:
+        for policy in entry["policies"]:
+            if policy["column_mask"]["function_name"].endswith("_partial"):
+                policy["except_principals"].append("analysts")
+    remaining = _allowed_diff(scenario, checks, base, extra_level, acks)
+    assert any("partial: newly exempts analysts" in item for item in remaining["prod"]["policies"])
 
     failsafe = _model_snapshot(_failsafe_model(), "prod", grants=(("ops", "SELECT"),), runs=("ops",))
     custom = _model_snapshot(_custom_model(tmp_path, "v1"), "prod",
@@ -551,7 +592,7 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
             "routine_name": f"gr_mask_{value}_full", "definition_hash": digest})
         for entry in evidence["abac_policies"]:
             entry["policies"].append({
-                "name": f"gr_mask_{LIVE_CATALOG}_{value}_full",
+                "name": f"{LIVE_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
                 "column_mask": {"function_name":
                     f"{LIVE_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
                 "match_values": [value], "to_principals": ["account users"], "except_principals": []})
@@ -562,6 +603,41 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
     remaining = _allowed_diff(custom_scenario, custom_checks, failsafe, custom,
                               {custom_values["custom_install_ack"]})
     assert any("definition changed" in item for item in remaining["prod"]["masks"])
+
+    wrong_generation_before = json.loads(json.dumps(custom))
+    wrong_generation_after = json.loads(json.dumps(custom))
+    value = "unmapped_redact__string__ffffffff"
+    for snapshot in (wrong_generation_before,):
+        evidence = snapshot["prod"]["uc"][LIVE_CATALOG]
+        evidence["mask_functions"].append({
+            "routine_catalog": LIVE_CATALOG, "routine_schema": LIVE_SCHEMA,
+            "routine_name": f"gr_mask_{value}_full", "definition_hash": "wrong-generation"})
+        for entry in evidence["abac_policies"]:
+            entry["policies"].append({
+                "name": f"{LIVE_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
+                "column_mask": {"function_name":
+                    f"{LIVE_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
+                "match_values": [value], "to_principals": ["account users"],
+                "except_principals": []})
+    _, maintain_checks = _rendered_step_checks(
+        "custom-mask", "Verify partial/full behavior and idempotence", custom_values)
+    assert _allowed_diff(custom_scenario, maintain_checks,
+                         wrong_generation_before, wrong_generation_after)
+
+
+def test_exact_policy_name_accepts_terraform_prefix_and_kept_dev_source():
+    raw = "genierails_prod_1.dev_to_prod_demo.gr_mask_genierails_dev_1_email_partial__string__f86256b2_full"
+    fact = {
+        "values": {"email_partial__string__f86256b2"},
+        "raw_functions": {raw},
+        "policy_names": {
+            "genierails_prod_1_gr_mask_genierails_dev_1_email_partial__string__f86256b2_full"},
+    }
+    key = ("genierails_prod_1.dev_to_prod_demo.customers", "genierails_prod_1",
+           "email_partial", "string", "full")
+    assert driver._has_exact_generated_policy_name(key, fact)
+    assert not driver._has_exact_generated_policy_name(
+        key, {**fact, "policy_names": {"customer_handwritten_full"}})
 
 @pytest.mark.parametrize("finding", [
     ("policies", "*", "full: newly exempts analysts"),

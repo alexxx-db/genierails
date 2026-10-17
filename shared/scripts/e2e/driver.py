@@ -25,9 +25,10 @@ import time
 from typing import Any, Callable, ClassVar, Iterable, Iterator, Mapping, Protocol, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from governance_policies import FAILSAFE_TREATMENT, is_never_raw, parse_treatment_value
+from governance_policies import FAILSAFE_TREATMENT, is_never_raw, parse_treatment_value, resolve_column
 from access_tier_groups import _assignment_spans
 from scripts.scaffold_treatments import write_tag_treatments
+from scripts.remap_generated_config import remote_policy_name
 
 
 DESIGN_SOURCE = "shared/docs/design/deterministic-governance.md"
@@ -80,6 +81,7 @@ WEAKENING_EXPECTED = frozenset({"s8", "s9"})
 # `make setup GITIGNORE=customer` writes (scripts/customer_gitignore.py BEGIN).
 CUSTOMER_GITIGNORE_MARKER = "# >>> GenieRails customer repo (make setup GITIGNORE=customer"
 CUSTOMER_ENVS = ("dev", "prod")
+FAILSAFE_STRING_VALUE = resolve_column("e2e.fixture.column", ("class.e2e_unknown",), "STRING").value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -516,7 +518,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         "The fixture has three ordered tiers, group_map_source is the middle tier, one governed table is the grant target, and effective-access verification rows cover every tier.",
     ), (
         fixture_action("Capture baseline access", "snapshot_checkpoint", "tier-baseline"),
-        fixture_action("Add a new tier group", "tier_add", "tier_group"),
+        fixture_action("Add a new tier group", "tier_add", "tier_group", "tier_table", "prod_agent"),
         mk("Regenerate for the added tier", "generate", "dev"), AUTHOR_MERGE,
         mk("Check added tier PR", "check", "dev"),
         mk("Rehearse added tier merge", "rehearse", "dev", assertions=(
@@ -547,7 +549,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         action("Remove tier acknowledgements", "remove_ack", "tier_add_acks"), AUTHOR_MERGE,
         mk("Rehearse tier-ack cleanup merge", "rehearse", "dev"),
         fixture_action("Capture access before tier removal", "snapshot_checkpoint", "tier-added"),
-        fixture_action("Remove the tier group", "tier_remove", "tier_group"),
+        fixture_action("Remove the tier group", "tier_remove", "tier_group", "tier_table", "prod_agent"),
         mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
         mk("Check removed tier PR", "check", "dev"),
         mk("Rehearse removed tier merge", "rehearse", "dev", assertions=(
@@ -627,8 +629,10 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Promote adopted mask byte-for-byte", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check promoted custom mask", "check", "prod"),
         mk("Rehearse custom-mask promotion merge", "rehearse", "dev",
-           assertions=custom_mask_checks("***CD") + (ProtectionDelta("dev", ((
-               "custom-retire", "{custom_mask_column}", "unmapped_redact__string__455f4485"),), required=False),)),
+           assertions=custom_mask_checks("***CD") + (
+               ProtectionDelta("dev", (("custom-retire", "{custom_mask_column}",
+                                         FAILSAFE_STRING_VALUE),)),
+           )),
         mk("Refuse unacknowledged custom-mask install weakening", "release-plan", "prod", fail=True,
            refusal=REFUSALS["weakening"], refusal_in_ci=False),
         action("Write exact custom-mask install acknowledgement", "add_ack", "custom_install_ack"), AUTHOR_MERGE,
@@ -641,7 +645,9 @@ SCENARIOS: tuple[Scenario, ...] = (
                AcknowledgedWeakening("prod", "{custom_install_ack}",
                                      (("custom-adoption", "{custom_mask_column}",
                                        "unmapped_redact->custom_e2e_suffix"),)),)),
-        mk("Verify partial/full behavior and idempotence", "maintain", "prod"),
+        mk("Verify partial/full behavior and idempotence", "maintain", "prod", assertions=(
+            ProtectionDelta("prod", (("custom-retire", "{custom_mask_column}",
+                                      FAILSAFE_STRING_VALUE),)),)),
         action("Remove custom-mask install acknowledgement", "remove_ack", "custom_install_ack"), AUTHOR_MERGE,
         mk("Rehearse custom-mask install ack cleanup", "rehearse", "dev",
            assertions=custom_mask_checks("***CD")),
@@ -663,11 +669,11 @@ SCENARIOS: tuple[Scenario, ...] = (
            assertions=custom_mask_checks("**BCD")),
         mk("Release acknowledged custom-mask change", "release", "prod", args=("MANIFEST={manifest}",),
            assertions=custom_mask_checks("**BCD", verify=True) + (
-               AcknowledgedWeakening("prod", "{custom_mask_ack}", ((
-                   "custom-generation", "{custom_mask_column}",
-                   "custom_e2e_suffix->custom_e2e_suffix"),)),
-               ProtectionDelta("prod", (("custom-retire", "{custom_mask_column}",
-                                         "unmapped_redact__string__455f4485"),), required=False),)),
+               AcknowledgedWeakening("prod", "{custom_mask_ack}", (
+                   ("custom-generation", "{custom_mask_column}",
+                    "custom_e2e_suffix->custom_e2e_suffix"),
+               )),
+           )),
         mk("Verify changed partial/full behavior", "maintain", "prod"),
         action("Remove custom-mask change acknowledgement", "remove_ack", "custom_mask_ack"), AUTHOR_MERGE,
         mk("Rehearse custom-mask ack cleanup merge", "rehearse", "dev",
@@ -1776,12 +1782,26 @@ def _finding_matches(key: ProtectionKey, actual: Mapping[str, list[str]],
 
 
 def _has_exact_generated_policy_name(policy_key: tuple[Any, ...], fact: Mapping[str, Any]) -> bool:
-    """A generated policy name must encode its catalog and exact raw generation."""
+    """Match Terraform's ``${catalog}_${for_each key}`` remote policy name.
+
+    The for_each key is the generated function basename.  It may retain the
+    source (dev) catalog after promotion, exactly as the runtime overlay does.
+    """
     if len(policy_key) != 5: return False
     catalog, level = policy_key[1], policy_key[4]
-    expected = {f"gr_mask_{catalog}_{raw.rsplit('.', 1)[-1].removeprefix('gr_mask_').removesuffix('_' + level)}_{level}"
-                for raw in fact["raw_functions"]}
-    return fact.get("policy_names") == expected
+    values = fact.get("values") or set()
+    names = fact.get("policy_names") or set()
+    # Terraform prefixes the generated for_each key with the deployed catalog.
+    # The key's embedded catalog may remain the promotion source, so validate
+    # it around the exact deterministic treatment value rather than replacing it.
+    key_shape = re.compile(
+        rf"gr_mask_.+_(?:{'|'.join(re.escape(str(v)) for v in values)})_{level}")
+    prefix = catalog + "_"
+    return bool(values) and bool(names) and all(
+        name.startswith(prefix)
+        and key_shape.fullmatch(key := name.removeprefix(prefix)) is not None
+        and remote_policy_name(catalog, key) == name
+        for name in names)
 
 
 def _retired_generation_findings(catalog: str, treatment: str, sql_type: str, raw_value: str,
@@ -2358,7 +2378,7 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
         repo.local_merge(scenario.key)
         return
     if step.action in {"tier_add", "tier_remove"}:
-        group = values[step.fixture_args[0]]
+        group, table, agent = (values[name] for name in step.fixture_args)
         for env in ("dev", "prod"):
             path = repo.runner.cwd / "envs" / env / "env.auto.tfvars"
             cfg = _load_hcl(path)
@@ -2373,6 +2393,30 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
                 if group not in updated: raise RuntimeError(f"tier_group {group!r} is absent in {env}")
                 updated.remove(group)
             _replace_hcl_setting(path, "access_tier_groups", updated)
+            cfg = _load_hcl(path)
+            readers = cfg.get("table_readers")
+            if not isinstance(readers, dict) or table not in readers or not isinstance(readers[table], list):
+                raise RuntimeError(f"{path}: tier fixture needs exact table_readers[{table!r}]")
+            table_groups = list(readers[table])
+            if step.action == "tier_add":
+                if group in table_groups: raise RuntimeError(f"tier_group {group!r} already reads {table} in {env}")
+                table_groups.append(group)
+            else:
+                if group not in table_groups: raise RuntimeError(f"tier_group {group!r} does not read {table} in {env}")
+                table_groups.remove(group)
+            _replace_hcl_setting(path, "table_readers", {**readers, table: table_groups})
+            agent_path = repo.runner.cwd / "envs" / env / "agents" / f"{agent}.auto.tfvars"
+            agent_cfg = _load_hcl(agent_path)
+            acl = agent_cfg.get("acl_groups")
+            if not isinstance(acl, list) or not all(isinstance(item, str) for item in acl):
+                raise RuntimeError(f"{agent_path}: acl_groups must be an explicit list")
+            if step.action == "tier_add":
+                if group in acl: raise RuntimeError(f"tier_group {group!r} already has CAN_RUN in {env}")
+                acl = [*acl, group]
+            else:
+                if group not in acl: raise RuntimeError(f"tier_group {group!r} has no CAN_RUN in {env}")
+                acl = [item for item in acl if item != group]
+            _replace_hcl_setting(agent_path, "acl_groups", acl)
         return
     if step.action == "group_map_change":
         path = repo.runner.cwd / "envs" / "prod" / "env.auto.tfvars"

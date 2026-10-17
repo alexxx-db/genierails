@@ -140,7 +140,7 @@ unknown level). Their `{placeholders}` are required values.
 | `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
 | `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
 | `OutputContains(text)` / `OutputOrder(before, after)` | The command emitted exact deterministic evidence, in the required pre-lock order. |
-| `ProtectionDelta(env, findings)` | Only the named environment, resource and exact policy/custom-adoption effect is permitted. `required=False` permits a conditional staged-retirement finding without requiring it when no retirement is due. |
+| `ProtectionDelta(env, findings)` | Only the named environment, resource and exact policy/custom-adoption effect is permitted. Required deltas also fail when the named finding is absent. |
 | `AcknowledgedWeakening(env, entries, findings)` | The same exact protection keys are permitted only after every exact acknowledgement key is committed or recorded by release. |
 
 A grant is `(principal, privilege, securable)`: a table, schema or catalog, or
@@ -167,7 +167,8 @@ principal, the expected tier and what the run proved (`raw`, `mismatch`,
 `redacted` means `full` through a never-raw (`unmapped_redact`) mask.
 
 `tier-groupmap` additionally needs `tier_group`, `group_map_source`,
-`mapped_group`, `prod_agent` (the committed agent filename stem), `tier_table`, and
+`mapped_group`, `prod_agent` (the committed agent filename stem), `tier_table` (an exact
+three-part table key present in both environments' `table_readers`), and
 `acl_group`, plus `tier_add_acks`: the exact acknowledgement lines printed by
 the initial refused tier plan, separated by `;;` (normally one `prod:reader:`
 and one `prod:weaken:` entry for the governed grant target). Catalog-level ABAC policies are
@@ -184,7 +185,9 @@ weakenings, so neither positive release is attempted before its refusal and
 exact acknowledgement. Tier removal deliberately needs no weakening acknowledgement:
 it revokes access and strengthens protection. Custom-mask adoption retains the staged
 fail-safe generation until the next successful run; its later policy/function retirement
-has a separate, exact conditional protection delta. The scenarios run
+has a separate, exact required protection delta on the next dev rehearse and prod maintain.
+Tier addition/removal updates only that exact table's readers and the named agent's
+`acl_groups`, and reverses both fixture edits on removal. The scenarios run
 unchanged with `--cloud aws` and `--cloud azure`; their final restoration uses
 the standard forward-release lifecycle. It derives and commits an exact reverse
 group-map acknowledgement from the product checker, releases the baseline,
