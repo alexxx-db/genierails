@@ -394,10 +394,12 @@ def test_deterministic_spec_refuses_deployer_principal_id_equal_to_a_tier_group(
         load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
 
 
-def test_legacy_spec_keeps_deployer_principal_id_unaliased(tmp_path):
+def test_legacy_generation_spec_aliases_deployer_without_deterministic_expectations(tmp_path):
     tfvars, env = _deployer_excepted_tfvars(tmp_path, "")
     spec = load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
-    assert DEPLOYER_APP_ID in spec.principals
+    assert DEPLOYER_APP_ID not in spec.principals
+    assert all(DEPLOYER_APP_ID not in c.masked_principals + c.unmasked_principals
+               for c in spec.column_masks)
     assert all(not c.expected_tiers for c in spec.column_masks)
 
 

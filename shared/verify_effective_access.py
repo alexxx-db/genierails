@@ -2783,9 +2783,12 @@ def load_spec_from_tfvars(
     governance = {**data, **env_data}
     deterministic = _as_str(governance.get("governance_mode")) == "deterministic"
     # Deterministic generation exempts the deployer SP (an application ID, not
-    # a group) from every mask. The admin baseline authenticates as that
-    # deployer, so check it as DEFAULT_ADMIN_TIER rather than as a tier group.
-    deployer = _as_str(governance.get("deployer_principal_id")) if deterministic else ""
+    # a group) from every mask.  A migration's verify-created input deliberately
+    # uses legacy semantics while its columns still carry legacy values, but the
+    # admin baseline still authenticates as this deployer.  Alias it regardless
+    # of the historical generation mode rather than treating its UUID as a
+    # group.  Deterministic tier expectations below remain mode-gated.
+    deployer = _as_str(governance.get("deployer_principal_id"))
     # Fail closed rather than alias a real group (or a policy target) away.
     configured_groups = {*groups, *_as_list(governance.get("access_tier_groups")),
                          *_as_list(governance.get("raw_exempt_principals"))}

@@ -486,7 +486,7 @@ def adopt(env_dir: Path, env: str, *, terraform: Callable[..., int] | None = Non
         "moves": [t for _, t in dep["moves"]], "forget": forget,
     })
     for source, target in dep["moves"]:
-        print(f"  terraform state mv '{source}' '{target}'")
+        print(f"  terraform state mv '{source}' '{target}'", flush=True)
         if terraform("state-mv", source, target):
             raise Refused(f"terraform state mv {source} failed; the state is as the moves above left it. "
                           "Re-run the same command to resume")
