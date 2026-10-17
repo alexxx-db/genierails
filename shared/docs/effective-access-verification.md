@@ -149,7 +149,7 @@ Options (see `Makefile.shared`):
 |---|---|
 | `ENV=<env>` | Workspace env whose `data_access` config to verify (default `dev`) |
 | `VERIFY_KEY_COLUMN=<c>` | Optional override: the row-pairing key for every masked table that has this column (default: [picked per table](#how-genierails-picks-the-row-pairing-key)) |
-| `VERIFY_SPEC=<file.json>` | Explicit JSON spec instead of `--from-tfvars` derivation |
+| `VERIFY_SPEC=<file.json>` | Explicit JSON spec. A standalone read-only `verify-access` accepts a free-form spec and prints that it is not a gate. Applying gates require it to preserve all derived proof semantics; see below. |
 | `WAREHOUSE_ID=<id>` | Pin a specific SQL warehouse |
 | `KEEP_PRINCIPALS=1` | Leave the provisioned test principals in place (debugging) |
 
@@ -167,9 +167,9 @@ passes* above), so it drops into a CI pipeline.
 
 ### Explicit spec (`--spec`)
 
-When the derived spec doesn't match your data (e.g. you want to hand-pick
-tiers), provide a JSON spec. A check's `key_column` overrides the pick for its
-table; leave it out to have the key picked as above:
+For a standalone, read-only `make verify-access`, a JSON spec may freely
+hand-pick checks. A check's `key_column` overrides the pick for its table;
+leave it out to have the key picked as above:
 
 ```json
 {
@@ -193,6 +193,26 @@ table; leave it out to have the key picked as above:
   ]
 }
 ```
+
+When `VERIFY_SPEC` reaches an applying gate (rehearse, release-plan, release,
+maintain, apply/apply-governance, or a staged-policy verification), it may add
+checks but cannot redefine what the policy-derived checks prove. Each derived
+check must remain tiered when derived as tiered; `partial_function`,
+`full_function`, effective `principal_memberships`, raw/unrestricted
+baselines, mask function, any configured pairing key, and comparison-error
+exceptions must be preserved. Masked expectations may only move toward a more
+protective tier (`partial` to `full`); raw and unrestricted baselines are exact
+positive assertions and cannot be replaced by masked/restricted assertions.
+Unknown or unverifiable fields are refused before mutation with the missing or
+changed check named.
+
+The controller also compares the spec with each staged render. During a policy
+generation change, `verify-created` proves the still-live old generation and
+therefore can refuse an explicit spec after the additive `create` phase but
+before any tag switch, principal move, retirement, or access grant. Because a
+single explicit spec must satisfy both old and desired generations, omit
+`VERIFY_SPEC` for a tier move whose generations require incompatible exact
+expectations; the derived verifier covers both automatically.
 
 ## How it is tested
 

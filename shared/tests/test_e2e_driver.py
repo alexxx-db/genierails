@@ -129,6 +129,35 @@ class FakeSnapshots:
         return snapshot()
 
 
+CHAMPION_VALUES = ("--value", "agent_a=a", "--value", "acl_groups=analysts",
+                   "--value", "prod_tables=cat.s.t", "--value", "dev_tables=cat.s.t")
+# The columns VERIFY_PASS proves, as the scenario values that name them.
+CHECKED_COLUMNS = ("--value", "new_column=cat.s.t.ssn", "--value", "secret_column=cat.s.t.cvv")
+
+
+def verify_entry(column, principals, *, status="PASS", full_function=None):
+    """One per-check entry of the verify-access result file (verify_effective_access.result_checks)."""
+    return {"kind": "column-mask", "table": "cat.s.t", "column": column, "policy": "p", "status": status,
+            "mask_function": "", "partial_function": "",
+            "full_function": full_function or "cat.s.gr_mask_email_partial__string__11111111_full",
+            "principals": {p: {"expected": e, "observed": o} for p, (e, o) in principals.items()}}
+
+
+VERIFY_PASS = {"passed": True, "checks": [
+    verify_entry("ssn", {"analysts": ("partial", "partial"), "__admin__": ("raw", "raw")}),
+    verify_entry("cvv", {"analysts": ("full", "full"), "__admin__": ("full", "full")},
+                 full_function="cat.s.gr_mask_unmapped_redact__string__22222222_full"),
+]}
+VERIFYING = ("rehearse", "release", "verify-access")
+
+
+def write_verify_result(cloud_root, argv, payload):
+    env = next((a.split("=", 1)[1] for a in argv if a.startswith("ENV=")), "dev")
+    path = Path(cloud_root) / "envs" / env / "generated" / ".verify_access.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
 def live_args(tmp_path, scenario, *extra):
     checkout = tmp_path / "checkout"
     (checkout / "aws").mkdir(parents=True, exist_ok=True)
@@ -136,12 +165,12 @@ def live_args(tmp_path, scenario, *extra):
     return ["--cloud", "aws", "--repo", str(checkout), "--checkout", str(checkout),
             "--commit", COMMIT, "--state-dir", str(tmp_path / "state"),
             "--reports", str(tmp_path / "reports"), "--scenarios", scenario,
-            "--confirm-live", *extra]
+            "--confirm-live", *CHECKED_COLUMNS, *extra]
 
 
 def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False, refuse=None,
                     drift_after_make=False, on_make=None, staged_release=False,
-                    staged_releases=None, migrate_rc=0, import_unset=False):
+                    staged_releases=None, migrate_rc=0, import_unset=False, verify_result=VERIFY_PASS):
     state = {"makes": 0, "releases": 0, "plans": 0}
 
     def run(argv, **kwargs):
@@ -188,6 +217,8 @@ def fake_subprocess(calls, *, unrelated=False, no_manifest=False, secrets=False,
                 rc, text = 2, "unrelated syntax error\n"
             if refuse and refuse[0](argv):
                 rc, text = 2, refuse[1]
+            if rc == 0 and argv[1] in VERIFYING and verify_result is not None:
+                write_verify_result(kwargs["cwd"], argv, verify_result)
             if secrets:
                 text += ('payload {"token": "dapiSECRET123"}\nAuthorization: Bearer dapiSECRET456\n'
                          "client secret is file-secret-value\n")
@@ -607,6 +638,144 @@ def test_live_policy_mask_function_definition_change_is_weaker():
     ]}
 
 
+@pytest.mark.parametrize("field", ["when_condition", "match_columns"])
+def test_live_policy_condition_rewrite_is_weaker_unless_exactly_reviewed(field):
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    policy_before = baseline["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    policy_after = current["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    policy_before[f"{field}_hash"] = "a" * 64
+    policy_after[f"{field}_hash"] = "b" * 64
+    weak = driver.protection_diff(baseline, current)
+    assert weak == {"policies": [
+        "louis_serverless.dev_to_prod_demo.payments "
+        "louis_serverless_gr_mask_louis_serverless_redact: "
+        f"louis_serverless_gr_mask_louis_serverless_redact {field} changed or became unreadable"
+    ]}
+    adoption = driver.Adoption("redact", "redact", "mask_redact", policy_conditions=((
+        "louis_serverless_gr_mask_louis_serverless_redact", field, "b" * 64),))
+    assert driver.protection_diff(
+        baseline, current, allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": adoption}) == {}
+
+
+def test_reviewed_mask_body_change_requires_function_and_new_hash():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    function = "louis_serverless.dev_to_prod_demo.mask_redact"
+    current["uc"]["louis_serverless"]["mask_functions"][0]["definition_hash"] = "b" * 64
+    assert driver.protection_diff(baseline, current)["masks"] == [f"{function}: definition changed"]
+    adoption = driver.Adoption("redact", "redact", "mask_redact",
+                               mask_definitions=((function, "b" * 64),))
+    assert driver.protection_diff(
+        baseline, current, allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": adoption}) == {}
+    for declared_name, declared_hash in ((function, "c" * 64), ("mask_redact", "b" * 64),
+                                          ("x.y.mask_redact", "b" * 64)):
+        wrong = driver.Adoption("redact", "redact", "mask_redact",
+                                mask_definitions=((declared_name, declared_hash),))
+        assert driver.protection_diff(
+            baseline, current,
+            allowed_adoptions={"louis_serverless.dev_to_prod_demo.payments.cvv": wrong})["masks"] == [
+                f"{function}: definition changed"]
+
+
+def test_policy_condition_declaration_requires_exact_name_field_and_hash():
+    name = "louis_serverless_gr_mask_louis_serverless_redact"
+    location = "louis_serverless.dev_to_prod_demo.payments.cvv"
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    before = baseline["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    after = current["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    before["when_condition_hash"], after["when_condition_hash"] = "a" * 64, "b" * 64
+    for declared_name, field, digest in ((name, "when_condition", "c" * 64),
+                                          ("other", "when_condition", "b" * 64),
+                                          (name, "match_columns", "b" * 64)):
+        adoption = driver.Adoption("redact", "redact", "mask_redact",
+                                   policy_conditions=((declared_name, field, digest),))
+        assert driver.protection_diff(baseline, current, allowed_adoptions={location: adoption})["policies"]
+
+
+def test_saved_prod_policy_gaining_false_when_condition_is_weaker():
+    baseline = azure_legacy_mid_migration_snapshot()
+    current = azure_legacy_mid_migration_snapshot()
+    for snapshot_value in (baseline, current):
+        entry = snapshot_value["uc"]["louis_serverless"]["abac_policies"][0]
+        raw = dict(entry["policies"][0])
+        raw.setdefault("when_condition", None)
+        raw.setdefault("match_columns", None)
+        entry["policies"] = [driver._snapshot_policy(raw, entry["table"])]
+    entry = current["uc"]["louis_serverless"]["abac_policies"][0]
+    raw = azure_legacy_mid_migration_snapshot()["uc"]["louis_serverless"]["abac_policies"][0]["policies"][0]
+    raw.update({"when_condition": "false", "match_columns": raw.get("match_columns")})
+    entry["policies"] = [driver._snapshot_policy(raw, entry["table"])]
+    assert "when_condition changed" in driver.protection_diff(baseline, current)["policies"][0]
+
+
+def test_migration_report_parses_exact_reviewed_live_changes():
+    digest = "b" * 64
+    mapping = driver.parse_migration_mappings(
+        "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+        "    mask today: mask_ssn: legacy sql\n"
+        f"    reviewed policy condition: policy_name when_condition {digest}\n"
+        f"    reviewed mask definition: cat.s.mask_ssn {digest}\n")
+    adoption = mapping["cat.s.t.ssn"]
+    assert adoption.policy_conditions == (("policy_name", "when_condition", digest),)
+    assert adoption.mask_definitions == (("cat.s.mask_ssn", digest),)
+
+
+def test_reviewed_lines_only_bind_to_their_contiguous_mapping_block():
+    digest = "b" * 64
+    mapping = driver.parse_migration_mappings(
+        "  cat.s.t.ssn: masked_ssn -> email_partial__string__11111111\n"
+        "    mask today: mask_ssn: legacy sql\n"
+        "    account users: redacted -> redacted\n"
+        f"    reviewed mask definition: cat.s.mask_ssn {digest}\n")
+    assert mapping["cat.s.t.ssn"].mask_definitions == ()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("when_condition", ""), ("match_columns", [{"alias": "x"}]),
+])
+def test_policy_snapshot_fails_closed_when_condition_is_unreadable(field, value):
+    policy = {"name": "governed", "column_mask": {"function_name": "cat.s.mask_ssn"}, field: value}
+    with pytest.raises(RuntimeError, match="policy condition is unreadable"):
+        driver._snapshot_policy(policy, "cat.s.t")
+
+
+def test_policy_snapshot_hashes_conditions_without_persisting_sql():
+    policy = driver._snapshot_policy({
+        "name": "governed", "when_condition": "true",
+        "match_columns": [{"alias": "sensitive", "condition": "hasTagValue('pii', 'ssn')"}],
+        "column_mask": {"function_name": "cat.s.mask_ssn"},
+    }, "cat.s.t")
+    assert all(policy[f"{field}_hash"] for field in driver.CONDITION_FIELDS)
+    assert policy["match_values"] == []
+    assert "hasTagValue" not in json.dumps(policy)
+
+
+def test_policy_snapshot_records_absent_conditions_explicitly():
+    policy = driver._snapshot_policy({"name": "governed"}, "cat.s.t")
+    assert {policy[f"{field}_hash"] for field in driver.CONDITION_FIELDS} == {driver.ABSENT_CONDITION}
+
+
+def test_generated_policy_condition_declaration_uses_real_policy_name():
+    def snap(condition):
+        policy = driver._snapshot_policy({
+            "name": "gr_mask_real_policy", "when_condition": condition, "match_columns": None,
+            "to_principals": ["account users"],
+            "column_mask": {"function_name": "cat.s.gr_mask_email_partial__string__11111111_partial"},
+        }, "cat.s.t")
+        return {"uc": {"cat": {"governed_tags": [], "mask_functions": [],
+            "abac_policies": [{"table": "cat.s.t", "policies": [policy]}]}}}
+    baseline, current = snap("x"), snap("y")
+    digest = driver.hashlib.sha256(b"y").hexdigest()
+    exact = driver.Adoption("old", "new", "legacy",
+        policy_conditions=(("gr_mask_real_policy", "when_condition", digest),))
+    treatment = driver.Adoption("old", "new", "legacy",
+        policy_conditions=(("email_partial", "when_condition", digest),))
+    assert driver.protection_diff(baseline, current, allowed_adoptions={"cat.s.t.c": exact}) == {}
+    assert driver.protection_diff(baseline, current, allowed_adoptions={"cat.s.t.c": treatment})["policies"]
+
+
 def test_live_policy_missing_definition_hash_is_weaker_when_snapshot_has_hashes():
     baseline = snapshot(masks=("mask_ssn", "mask_other"))
     current = snapshot(masks=("mask_ssn", "mask_other"))
@@ -670,7 +839,7 @@ def test_closed_stdin_at_gate_is_not_run_and_aborts_the_run(tmp_path, live, monk
     monkeypatch.setattr(driver.sys.stdin, "isatty", lambda: True)
     def eof(_): raise EOFError
     monkeypatch.setattr("builtins.input", eof)
-    driver.main(live_args(tmp_path, "s16,manifest"), snapshot_factory=FakeSnapshots)
+    driver.main(live_args(tmp_path, "s16,manifest", "--value", "agent_a=a"), snapshot_factory=FakeSnapshots)
     report = json.loads((tmp_path / "reports" / "s16.json").read_text())
     assert report["status"] == "NOT RUN" and "stdin closed" in report["error"]
     assert report["steps"][1]["status"] == "planned"
@@ -681,7 +850,7 @@ def test_wrong_human_confirmation_is_error_and_reported(tmp_path, live, monkeypa
     live()
     monkeypatch.setattr(driver.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "not-champion")
-    assert driver.main(live_args(tmp_path, "champion"), snapshot_factory=FakeSnapshots) == 1
+    assert driver.main(live_args(tmp_path, "champion", *CHAMPION_VALUES), snapshot_factory=FakeSnapshots) == 1
     report = json.loads((tmp_path / "reports" / "champion.json").read_text())
     assert report["status"] == "ERROR"
     assert "exact token" in report["error"]
@@ -759,8 +928,36 @@ elif target == "release-plan":
 elif target == "release":
     if not pathlib.Path(kv["MANIFEST"]).is_file(): print("release: no manifest"); sys.exit(1)
     flag.unlink(missing_ok=True)
+    ack = pathlib.Path("envs/prod/ack.txt")
+    (state / "released.json").write_text(json.dumps({{
+        "ack": ack.read_text() if ack.exists() else "",
+        "abac": pathlib.Path("envs/prod/generated/abac.auto.tfvars").read_text()}}))
+if target in ("rehearse", "release", "verify-access"):
+    result = pathlib.Path("envs") / kv.get("ENV", "dev") / "generated" / ".verify_access.json"
+    result.parent.mkdir(parents=True, exist_ok=True); result.write_text(os.environ["FAKE_VERIFY_RESULT"])
 print(f"{{target}} ok")
 '''
+
+
+CAN_RUN_ACL = {"access_control_list": [
+    {"group_name": "analysts", "all_permissions": [{"permission_level": "CAN_RUN", "inherited": False}]}]}
+
+
+class ReleasedSnapshots(FakeSnapshots):
+    """Prod access follows what the fake make last released: the ack's reader, or champion's agent."""
+    def __init__(self, _cloud_root, state):
+        super().__init__()
+        self.released = Path(state).parent / "released.json"
+
+    def capture(self, env):
+        if env != "prod" or not self.released.exists():
+            return snapshot()
+        released = json.loads(self.released.read_text())
+        if "regenerated" in released["abac"]:
+            snap = snapshot(grants=("analysts",))
+            snap["agents"] = [{"name": "a.auto", "space_id": "space-a", "export": {}, "acl": CAN_RUN_ACL}]
+            return snap
+        return snapshot(grants=("g",) if "prod:reader:cat.s.t:g" in released["ack"] else ())
 
 
 @pytest.fixture
@@ -777,9 +974,10 @@ def sim(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_MAKE_LOG", str(tmp_path / "make.log"))
     monkeypatch.setenv("FAKE_TARGETS", json.dumps(sorted(REAL_TARGETS)))
+    monkeypatch.setenv("FAKE_VERIFY_RESULT", json.dumps(VERIFY_PASS))
     monkeypatch.delenv("CI", raising=False)
     args = ["--cloud", "aws", "--repo", str(checkout), "--checkout", str(checkout), "--commit", baseline,
-            "--state-dir", str(state), "--reports", str(tmp_path / "reports"), "--confirm-live"]
+            "--state-dir", str(state), "--reports", str(tmp_path / "reports"), "--confirm-live", *CHECKED_COLUMNS]
 
     def log():
         path = tmp_path / "make.log"
@@ -824,7 +1022,7 @@ def _genierails_checkout(checkout, *, customer, commit_envs=True):
 def test_simulated_live_s6_merges_ack_on_driver_branch_and_restores(sim):
     (sim.state / "widening").write_text("")
     rc = driver.main([*sim.args, "--scenarios", "s6", "--value", "ack_entry=prod:reader:cat.s.t:g"],
-                     snapshot_factory=FakeSnapshots)
+                     snapshot_factory=ReleasedSnapshots)
     report = json.loads((sim.reports / "s6.json").read_text())
     assert rc == 0, report["error"]
     assert report["status"] == "passed" and report["restored_lifecycle"] is True
@@ -858,7 +1056,7 @@ def test_driver_remote_is_removed_after_a_passing_run_and_a_rerun_works(sim, tmp
         (sim.state / "widening").write_text("")
         args = list(sim.args); args[args.index("--reports") + 1] = str(tmp_path / f"reports-{run}")
         rc = driver.main([*args, "--scenarios", "s6", "--value", "ack_entry=prod:reader:cat.s.t:g"],
-                         snapshot_factory=FakeSnapshots)
+                         snapshot_factory=ReleasedSnapshots)
         report = json.loads((tmp_path / f"reports-{run}" / "s6.json").read_text())
         assert rc == 0 and report["status"] == "passed", report["error"]
         assert driver.E2E_REMOTE not in _remotes(sim.checkout)
@@ -906,7 +1104,7 @@ def test_foreign_driver_remote_is_refused_and_kept(sim, tmp_path):
 def test_simulated_live_champion_commits_generate_then_promotion(sim, monkeypatch):
     monkeypatch.setattr(driver.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "champion")
-    rc = driver.main([*sim.args, "--scenarios", "champion,s4"], snapshot_factory=FakeSnapshots)
+    rc = driver.main([*sim.args, "--scenarios", "champion,s4", *CHAMPION_VALUES], snapshot_factory=ReleasedSnapshots)
     champion = json.loads((sim.reports / "champion.json").read_text())
     assert rc == 0, champion["error"]
     assert champion["status"] == "passed" and len(champion["confirmations"]) == 2
@@ -1153,7 +1351,7 @@ def test_policy_function_missing_from_routines_fails_closed(routine_rows):
                 manifest=SimpleNamespace(schema=SimpleNamespace(
                     columns=[SimpleNamespace(name=n) for n in names])),
                 result=SimpleNamespace(data_array=rows, next_chunk_index=None))
-    policy = SimpleNamespace(as_dict=lambda: {
+    policy = SimpleNamespace(when_condition=None, match_columns=None, as_dict=lambda: {
         "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
     client = SimpleNamespace(statement_execution=Statement(),
                              policies=SimpleNamespace(list_policies=lambda *_a, **_k: [policy]))
@@ -1179,7 +1377,7 @@ def test_mask_snapshot_hashes_definition_without_persisting_body():
                 manifest=SimpleNamespace(schema=SimpleNamespace(
                     columns=[SimpleNamespace(name=n) for n in names])),
                 result=SimpleNamespace(data_array=rows, next_chunk_index=None))
-    row_policy = SimpleNamespace(as_dict=lambda: {
+    row_policy = SimpleNamespace(when_condition="false", match_columns=None, as_dict=lambda: {
         "name": "secure_rows", "row_filter": {"function_name": "cat.s.secure_rows"}})
     client = SimpleNamespace(statement_execution=Statement(),
                              policies=SimpleNamespace(list_policies=lambda *_a, **_k: [row_policy]))
@@ -1187,6 +1385,35 @@ def test_mask_snapshot_hashes_definition_without_persisting_body():
     assert routine["routine_name"] == "secure_rows"
     assert routine["definition_hash"] == driver.hashlib.sha256(body.encode()).hexdigest()
     assert "routine_definition" not in routine
+
+
+def test_live_snapshot_hashes_sdk_condition_fields_omitted_by_as_dict():
+    body = "RETURN 'redacted'"
+    class Statement:
+        def execute_statement(self, *, statement, **_):
+            if "information_schema.routines" in statement:
+                names = ("routine_catalog", "routine_schema", "routine_name", "routine_type", "routine_definition")
+                rows = [["cat", "s", "mask_ssn", "FUNCTION", body]]
+            elif "information_schema.tables" in statement:
+                names, rows = ("table_catalog", "table_schema", "table_name"), [["cat", "s", "t"]]
+            else:
+                names, rows = (), []
+            return SimpleNamespace(status=SimpleNamespace(state="SUCCEEDED"), statement_id="x",
+                manifest=SimpleNamespace(schema=SimpleNamespace(columns=[SimpleNamespace(name=n) for n in names])),
+                result=SimpleNamespace(data_array=rows, next_chunk_index=None))
+    from databricks.sdk.service.catalog import PolicyInfo
+    raw = dict(azure_legacy_mid_migration_snapshot()["uc"]["louis_serverless"]
+               ["abac_policies"][0]["policies"][0])
+    raw.update({"name": "mask_ssn_p", "when_condition": "false",
+                "column_mask": {"function_name": "cat.s.mask_ssn"}})
+    policy = PolicyInfo.from_dict(raw)
+    client = SimpleNamespace(statement_execution=Statement(),
+        policies=SimpleNamespace(list_policies=lambda *_a, **_k: [policy]))
+    captured = driver._sql_snapshots(client, "wh", "cat")["abac_policies"][0]["policies"][0]
+    assert captured["when_condition_hash"] == driver.hashlib.sha256(b"false").hexdigest()
+    assert len(captured["match_columns_hash"]) == 64
+    assert captured["match_values"] == ["redact"]
+    assert "when_condition" not in captured
 
 
 def _deterministic_snapshot(value, *, policy_value=None):
@@ -1560,3 +1787,344 @@ def test_import_unset_log_guard_is_anchored_to_import_script_literals():
 
 def test_another_phase_signal_accepts_needs_form():
     assert driver.release_needs_another_phase("adoption needs another release-plan")
+
+
+# --- Typed, evaluated checks -------------------------------------------------------
+
+def ctx(before=None, after=None, cloud_root=Path("/nonexistent"), **kwargs):
+    return driver.CheckContext(before or {}, after or {}, cloud_root, **kwargs)
+
+
+def agent(name, space_id, export=None, acl=None):
+    return {"name": name, "space_id": space_id, "export": export or {"title": name}, "acl": acl or {}}
+
+
+def with_agents(*agents, grants=()):
+    snap = snapshot(grants=grants)
+    snap["agents"] = list(agents)
+    return snap
+
+
+@pytest.mark.parametrize("cloud", ["aws", "azure"])
+def test_every_real_scenario_check_has_an_evaluator_and_dry_run_passes(tmp_path, cloud):
+    assert all(driver.check_problems(s) == [] for s in driver.SCENARIOS)
+    assert driver.main(["--cloud", cloud, "--repo", str(ROOT), "--dry-run", "--reports", str(tmp_path)]) == 0
+    assert set(driver.EVALUATORS) == {driver.GrantDelta, driver.AccessLevel, driver.AccessVerified,
+                                      driver.DiffLimitedTo, driver.Unchanged, driver.AgentIdUnchanged}
+
+
+def test_dry_run_fails_on_a_free_text_assertion(tmp_path, monkeypatch, capsys):
+    s1 = next(s for s in driver.SCENARIOS if s.key == "s1")
+    steps = (dataclasses.replace(s1.steps[0], assertions=("Only A changes",)), *s1.steps[1:])
+    monkeypatch.setattr(driver, "SCENARIOS", (dataclasses.replace(s1, steps=steps),))
+    assert driver.main(["--cloud", "aws", "--repo", str(ROOT), "--dry-run", "--scenarios", "s1",
+                        "--reports", str(tmp_path)]) == 1
+    report = json.loads((tmp_path / "s1.json").read_text())
+    assert report["status"] == "ERROR" and "has no evaluator" in report["check_problems"][0]
+    assert "'Only A changes' has no evaluator" in capsys.readouterr().out
+
+
+def test_dry_run_fails_on_an_unknown_check_type_at_scenario_level(tmp_path, monkeypatch):
+    @dataclasses.dataclass(frozen=True)
+    class ConversationsRetained:  # typed, but nothing evaluates it
+        env: str = "prod"
+        kind = "conversations-retained"
+    s16 = next(s for s in driver.SCENARIOS if s.key == "s16")
+    monkeypatch.setattr(driver, "SCENARIOS", (dataclasses.replace(s16, checks=(ConversationsRetained(),)),))
+    assert driver.main(["--cloud", "aws", "--repo", str(ROOT), "--dry-run", "--scenarios", "s16",
+                        "--reports", str(tmp_path)]) == 1
+
+
+@pytest.mark.parametrize("check, problem", [
+    (driver.GrantDelta("prod", added=(("*", "SELECT", "cat.s.t"),)), "exactly"),
+    (driver.GrantDelta("prod", may_add=(("g", "SELECT", "cat.s.*"),)), "exactly"),
+    (driver.GrantDelta("prod", added=(("g", "SELECT"),)), "(principal, privilege, securable)"),
+    (driver.GrantDelta("qa"), "env must be"),
+    (driver.DiffLimitedTo("prod", "agents", ("*",)), "limits nothing"),
+    (driver.Unchanged("prod", "grants"), "component must be"),
+    (driver.AccessLevel("prod", "cat.s.t.c", "*", "hidden"), "level must be"),
+    (driver.AgentIdUnchanged("prod", ""), "agent key"),
+])
+def test_malformed_checks_are_refused_before_anything_runs(tmp_path, live, monkeypatch, check, problem):
+    s4 = next(s for s in driver.SCENARIOS if s.key == "s4")
+    monkeypatch.setattr(driver, "SCENARIOS", (dataclasses.replace(s4, checks=(check,)),))
+    assert problem in driver.check_problems(driver.SCENARIOS[0])[0]
+    calls = live()
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert report["status"] == "ERROR" and problem in report["error"]
+    assert not makes(calls)
+
+
+def test_check_placeholders_are_required_values_before_anything_runs(tmp_path, live):
+    s6 = next(s for s in driver.SCENARIOS if s.key == "s6")
+    assert {"reader_principal", "reader_table"} <= set(driver.unresolved_values(s6, {}))
+    assert driver.unresolved_values(s6, driver.derived_values({"ack_entry": "prod:reader:cat.s.t:g"})) == []
+    calls = live()
+    args = live_args(tmp_path, "s4")
+    at = args.index("new_column=cat.s.t.ssn"); del args[at - 1:at + 1]
+    assert driver.main(args, snapshot_factory=FakeSnapshots) == 1
+    assert "new_column" in json.loads((tmp_path / "reports/s4.json").read_text())["error"]
+    assert not makes(calls)
+
+
+def test_reader_ack_is_the_s6_grant_allowance():
+    assert driver.derived_values({"ack_entry": "prod:reader:cat.s.t:account users"}) == {
+        "ack_entry": "prod:reader:cat.s.t:account users", "reader_table": "cat.s.t",
+        "reader_principal": "account users"}
+    # A non-reader ack names no grant, so S6's reader grant stays unresolved.
+    assert "reader_table" not in driver.derived_values({"ack_entry": "prod:weaken:cat.s.t.c:etl"})
+
+
+# GrantDelta and grant widening (gap 1).
+def test_grant_delta_exact_added_and_may_add():
+    check = driver.GrantDelta("prod", added=(("g", "SELECT", "cat.s.t"),),
+                              may_add=(("g", "USE_SCHEMA", "cat.s.t"),))
+    base = {"prod": snapshot()}
+    assert driver._eval_grant_delta(check, ctx(base, {"prod": snapshot(grants=("g",))})) == []
+    with_schema = snapshot(grants=("g",))
+    with_schema["uc"]["cat"]["schema_grants"] = [
+        {"grantee": "g", "privilege_type": "USE SCHEMA", "catalog_name": "cat", "schema_name": "s"}]
+    assert driver._eval_grant_delta(check, ctx(base, {"prod": with_schema})) == []
+
+
+@pytest.mark.parametrize("after_grants, expected", [
+    ((), "expected grant(s) not newly added: g SELECT cat.s.t"),
+    (("g", "eve"), "unexpected grant(s) added: eve SELECT cat.s.t"),
+])
+def test_grant_delta_deliberate_breaks(after_grants, expected):
+    check = driver.GrantDelta("prod", added=(("g", "SELECT", "cat.s.t"),))
+    problems = driver._eval_grant_delta(check, ctx({"prod": snapshot()}, {"prod": snapshot(grants=after_grants)}))
+    assert any(expected in p for p in problems)
+
+
+def test_empty_grant_delta_refuses_revocation_and_widening():
+    check = driver.GrantDelta("prod")
+    revoked = driver._eval_grant_delta(check, ctx({"prod": snapshot(grants=("g",))}, {"prod": snapshot()}))
+    assert revoked == ["prod: unexpected grant(s) revoked: g SELECT cat.s.t"]
+    assert driver._eval_grant_delta(check, ctx({"prod": snapshot()}, {"prod": snapshot()})) == []
+
+
+def test_grant_delta_lists_expand_and_agent_securable_is_can_run():
+    check = driver.GrantDelta("prod", added=(("a1,a2", "CAN_RUN", "agent:a"),))
+    acl = {"access_control_list": [
+        {"group_name": g, "all_permissions": [{"permission_level": "CAN_RUN", "inherited": False}]}
+        for g in ("a1", "a2")]}
+    before = {"prod": with_agents(agent("a.auto", "space-a"))}
+    after = {"prod": with_agents(agent("a.auto", "space-a", acl=acl))}
+    assert driver._eval_grant_delta(check, ctx(before, after)) == []
+    one = {"prod": with_agents(agent("a.auto", "space-a", acl={"access_control_list": acl["access_control_list"][:1]}))}
+    assert "a2 CAN RUN genie:space-a" in driver._eval_grant_delta(check, ctx(before, one))[0]
+
+
+def test_inherited_can_run_is_not_a_grant_and_new_can_run_is_widening():
+    inherited = {"access_control_list": [
+        {"group_name": "admins", "all_permissions": [{"permission_level": "CAN_RUN", "inherited": True}]}]}
+    base = with_agents(agent("a", "space-a"))
+    assert driver.protection_diff(base, with_agents(agent("a", "space-a", acl=inherited)), include_grants=True) == {}
+    widened = driver.protection_diff(base, with_agents(agent("a", "space-a", acl=CAN_RUN_ACL)), include_grants=True)
+    assert widened == {"widened_grants": ["analysts CAN_RUN genie:space-a"]}
+
+
+def test_allowed_grants_permit_only_the_named_grant():
+    widened = driver.protection_diff(snapshot(), snapshot(grants=("g", "eve")), include_grants=True,
+                                     allowed_grants={("g", "SELECT", "cat.s.t")})
+    assert widened == {"widened_grants": ["eve SELECT cat.s.t"]}
+
+
+def test_weakening_scenarios_are_still_held_to_their_grant_allowance():
+    s8 = next(s for s in driver.SCENARIOS if s.key == "s8")
+    before, after = {"prod": snapshot()}, {"prod": snapshot(masks=(), grants=("eve",))}
+    assert driver.live_protection_diff(s8, before, after, allowed_adoptions={}, allowed_grants={}) == {
+        "prod": {"widened_grants": ["eve SELECT cat.s.t"]}}
+    assert driver.live_protection_diff(s8, before, {"prod": snapshot(masks=())},
+                                       allowed_adoptions={}, allowed_grants={}) == {}
+
+
+def test_successful_apply_that_widens_a_grant_fails_the_step(tmp_path, live):
+    state = {"widened": False}
+    def on_make(argv):
+        if argv[1] == "maintain" and not state.get("done"): state.update(widened=True, done=True)
+        elif argv[1] == "rehearse": state["widened"] = False
+    class Dynamic(FakeSnapshots):
+        def capture(self, env): return snapshot(grants=("eve",) if state["widened"] and env == "prod" else ())
+    live(on_make=on_make)
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=Dynamic) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert report["steps"][0]["status"] == "ERROR"
+    assert "widened_grants" in report["steps"][0]["assertion"] and "eve SELECT cat.s.t" in report["steps"][0]["assertion"]
+
+
+def test_simulated_s6_widening_to_another_principal_fails(sim):
+    class WrongReader(ReleasedSnapshots):
+        def capture(self, env):
+            snap = super().capture(env)
+            return snapshot(grants=("h",)) if snap["uc"]["cat"]["table_grants"] else snap
+    (sim.state / "widening").write_text("")
+    rc = driver.main([*sim.args, "--scenarios", "s6", "--value", "ack_entry=prod:reader:cat.s.t:g"],
+                     snapshot_factory=WrongReader)
+    report = json.loads((sim.reports / "s6.json").read_text())
+    assert rc == 1 and report["status"] == "ERROR"
+    step = next(item for item in report["steps"] if item["name"] == driver.APPLY_RELEASE)
+    assert "h SELECT cat.s.t" in step["assertion"]
+
+
+# AccessLevel / AccessVerified on verify-access results (gap 2).
+def access_ctx(tmp_path, payload, env="prod", *, stale=False):
+    write_verify_result(tmp_path, [f"ENV={env}"], payload)
+    before = driver.verify_signatures(tmp_path) if stale else {}
+    return ctx(cloud_root=tmp_path, verify_before=before)
+
+
+def test_access_level_redacted_for_every_principal(tmp_path):
+    check = driver.AccessLevel("prod", "cat.s.t.cvv", "*", "redacted")
+    assert driver._eval_access_level(check, access_ctx(tmp_path, VERIFY_PASS)) == []
+    # Full but through a raw-capable treatment is not redaction.
+    partial = driver.AccessLevel("prod", "cat.s.t.ssn", "analysts", "redacted")
+    assert "not redacted" in driver._eval_access_level(partial, access_ctx(tmp_path, VERIFY_PASS))[0]
+
+
+@pytest.mark.parametrize("observed", ["raw", "mismatch", "unproven"])
+def test_access_level_deliberate_break_wrong_tier(tmp_path, observed):
+    payload = {"checks": [verify_entry("cvv", {"analysts": ("full", observed), "__admin__": ("full", "full")},
+                                       status="FAIL", full_function="cat.s.gr_mask_unmapped_redact__string__22222222_full")]}
+    problems = driver._eval_access_level(driver.AccessLevel("prod", "cat.s.t.cvv", "*", "redacted"),
+                                         access_ctx(tmp_path, payload))
+    assert problems == [f"column-mask cat.s.t.cvv: not redacted for {{'analysts': '{observed}'}}"]
+
+
+def test_access_level_for_a_named_principal_and_masked(tmp_path):
+    assert driver._eval_access_level(driver.AccessLevel("prod", "cat.s.t.ssn", "analysts", "partial"),
+                                     access_ctx(tmp_path, VERIFY_PASS)) == []
+    assert driver._eval_access_level(driver.AccessLevel("prod", "cat.s.t.ssn", "analysts", "masked"),
+                                     access_ctx(tmp_path, VERIFY_PASS)) == []
+    assert driver._eval_access_level(driver.AccessLevel("prod", "cat.s.t.ssn", "__admin__", "masked"),
+                                     access_ctx(tmp_path, VERIFY_PASS))
+    assert "no principal 'nobody'" in driver._eval_access_level(
+        driver.AccessLevel("prod", "cat.s.t.ssn", "nobody", "raw"), access_ctx(tmp_path, VERIFY_PASS))[0]
+
+
+@pytest.mark.parametrize("payload, stale, expected", [
+    (VERIFY_PASS, True, "not rewritten during this span (stale)"),
+    ({"passed": True, "masked_tables": ["cat.s.t"]}, False, "no per-check access results"),
+    ({"checks": [VERIFY_PASS["checks"][1]]}, False, "did not check cat.s.t.ssn"),
+    (None, False, "no verify-access result"),
+])
+def test_access_verified_deliberate_breaks(tmp_path, payload, stale, expected):
+    check = driver.AccessVerified("prod", "cat.s.t.ssn")
+    context = access_ctx(tmp_path, payload, stale=stale) if payload is not None else ctx(cloud_root=tmp_path)
+    assert expected in driver._eval_access_verified(check, context)[0]
+
+
+def test_access_verified_requires_pass_and_every_expected_tier(tmp_path):
+    check = driver.AccessVerified("prod", "cat.s.t")
+    assert driver._eval_access_verified(check, access_ctx(tmp_path, VERIFY_PASS)) == []
+    inconclusive = {"checks": [verify_entry("ssn", {"analysts": ("partial", "unproven")}, status="INCONCLUSIVE")]}
+    problems = driver._eval_access_verified(check, access_ctx(tmp_path, inconclusive))
+    assert problems[0].endswith("verify-access status INCONCLUSIVE") and "unproven (expected partial)" in problems[1]
+
+
+def test_access_verified_adopted_columns_come_from_migrate_plan(tmp_path):
+    adoption = driver.Adoption("masked_ssn", "email_partial__string__11111111", "mask_masked_ssn")
+    check = driver.AccessVerified("prod", driver.ADOPTED_COLUMNS)
+    write_verify_result(tmp_path, ["ENV=prod"], VERIFY_PASS)
+    assert driver._eval_access_verified(check, ctx(cloud_root=tmp_path, adoptions={"prod": {"cat.s.t.ssn": adoption}})) == []
+    other = ctx(cloud_root=tmp_path, adoptions={"prod": {"cat.s.u.ssn": adoption}})
+    assert "did not check cat.s.u.ssn" in driver._eval_access_verified(check, other)[0]
+    assert "no migrate-plan adoption" in driver._eval_access_verified(check, ctx(cloud_root=tmp_path))[0]
+
+
+def test_s5_release_must_prove_redaction_for_every_principal(tmp_path, live):
+    leaked = {"checks": [verify_entry("cvv", {"analysts": ("full", "raw")}, status="FAIL",
+                                      full_function="cat.s.gr_mask_unmapped_redact__string__22222222_full")]}
+    live(verify_result=leaked)
+    assert driver.main(live_args(tmp_path, "s5", "--value", "treatment=reviewed"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/s5.json").read_text())
+    step = report["steps"][1]
+    assert step["status"] == "ERROR" and "not redacted for {'analysts': 'raw'}" in step["assertion"]
+    other = tmp_path / "ok"
+    live()
+    assert driver.main(live_args(other, "s5", "--value", "treatment=reviewed"), snapshot_factory=FakeSnapshots) == 0
+    passed = json.loads((other / "reports/s5.json").read_text())
+    assert passed["steps"][1]["checks"][0]["problems"] == []
+    assert [c["problems"] for c in passed["checks"]] == [[], []]
+
+
+def test_s4_verify_step_fails_when_the_new_column_was_not_checked(tmp_path, live):
+    live(verify_result={"checks": [VERIFY_PASS["checks"][1]]})
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert report["steps"][1]["command"] == "make verify-access ENV=prod"
+    assert "did not check cat.s.t.ssn" in report["steps"][1]["assertion"]
+
+
+def test_s4_verify_step_fails_when_verify_access_wrote_nothing(tmp_path, live):
+    stale = tmp_path / "checkout/aws"
+    write_verify_result(stale, ["ENV=prod"], VERIFY_PASS)
+    live(verify_result=None)
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=FakeSnapshots) == 1
+    assert "stale" in json.loads((tmp_path / "reports/s4.json").read_text())["steps"][1]["assertion"]
+
+
+# DiffLimitedTo / Unchanged / AgentIdUnchanged (gap 3).
+def test_diff_limited_to_agent_a_passes_and_b_change_fails():
+    before = {"prod": with_agents(agent("a.auto", "space-a"), agent("b.auto", "space-b"))}
+    a_changed = {"prod": with_agents(agent("a.auto", "space-a", {"title": "new"}), agent("b.auto", "space-b"))}
+    b_changed = {"prod": with_agents(agent("a.auto", "space-a"), agent("b.auto", "space-b", {"title": "ui"}))}
+    check = driver.DiffLimitedTo("prod", "agents", ("a",))
+    assert driver._eval_diff_limited_to(check, ctx(before, a_changed)) == []
+    assert driver._eval_diff_limited_to(check, ctx(before, b_changed)) == [
+        "prod agents changed outside ['a']: space-b"]
+
+
+def test_one_space_named_by_several_sources_is_one_resource():
+    before = {"prod": with_agents(agent("a.auto", "space-a"), agent("genie_space", "space-a", {"title": "a.auto"}))}
+    detached = {"prod": with_agents(agent("a.auto", "space-a"))}
+    assert driver._eval_unchanged(driver.Unchanged("prod", "agents"), ctx(before, detached)) == []
+
+
+def test_uc_selectors_cover_resources_under_them():
+    before = {"prod": snapshot()}
+    after = {"prod": snapshot(tags=(("t", "ssn", "class.email"),))}
+    assert driver._eval_diff_limited_to(driver.DiffLimitedTo("prod", "uc", ("cat.s.t",)), ctx(before, after)) == []
+    assert driver._eval_diff_limited_to(driver.DiffLimitedTo("prod", "uc", ("cat.s.u",)), ctx(before, after)) == [
+        "prod uc changed outside ['cat.s.u']: cat.s.t.ssn"]
+    assert driver._eval_unchanged(driver.Unchanged("prod", "uc", ("cat.s.*",)), ctx(before, after))
+
+
+def test_unchanged_receipts_and_state_paths():
+    before = {"prod": {"state_serials": {"a.tfstate": 1, "b.tfstate": 4}, "receipts": []}}
+    after = {"prod": {"state_serials": {"a.tfstate": 2, "b.tfstate": 4},
+                      "receipts": [{"path": "r1.json", "sha256": "x", "bytes": 1}]}}
+    assert driver._eval_unchanged(driver.Unchanged("prod", "state_serials", ("b.tfstate",)), ctx(before, after)) == []
+    assert driver._eval_unchanged(driver.Unchanged("prod", "state_serials"), ctx(before, after)) == [
+        "prod state_serials changed: a.tfstate"]
+    assert driver._eval_diff_limited_to(driver.DiffLimitedTo("prod", "receipts", ("r*.json",)), ctx(before, after)) == []
+
+
+@pytest.mark.parametrize("after, expected", [
+    ([agent("a.auto", "space-a", {"title": "overwritten"})], []),
+    ([agent("a.auto", "space-new")], ["prod agent 'a' space ID ['space-a'] -> ['space-new']: recreated or lost"]),
+    ([], ["prod agent 'a' space ID ['space-a'] -> []: recreated or lost"]),
+])
+def test_agent_id_unchanged(after, expected):
+    before = {"prod": with_agents(agent("a.auto", "space-a"))}
+    assert driver._eval_agent_id_unchanged(driver.AgentIdUnchanged("prod", "a"),
+                                           ctx(before, {"prod": with_agents(*after)})) == expected
+
+
+def test_agent_id_unknown_at_baseline_is_unproven_not_a_pass():
+    problems = driver._eval_agent_id_unchanged(driver.AgentIdUnchanged("prod", "a"),
+                                               ctx({"prod": with_agents()}, {"prod": with_agents()}))
+    assert "unproven" in problems[0]
+
+
+def test_s4_genie_change_fails_through_its_unchanged_check(tmp_path, live):
+    class AgentDrift(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            return with_agents(agent("a", "space-a", {"v": int(self.n > 2)})) if env == "prod" else snapshot()
+    live()
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=AgentDrift) == 1
+    report = json.loads((tmp_path / "reports/s4.json").read_text())
+    assert "unchanged(env='prod', component='agents'" in report["error"] and "space-a" in report["error"]
