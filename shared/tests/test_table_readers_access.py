@@ -28,6 +28,7 @@ ROOT = SHARED.parent
 sys.path.insert(0, str(SHARED))
 
 import table_readers as tr  # noqa: E402
+from governed_tables_record import committed_agent_tables  # noqa: E402
 from deterministic_governance import validate_config  # noqa: E402
 from scripts import agent_coverage as ac  # noqa: E402
 from scripts import release_helpers  # noqa: E402
@@ -188,6 +189,24 @@ def test_clean_clone_reads_the_record_not_a_stale_local_discovery(tmp_path):
 
     assert tr.agents(env)[0]["tables"] == ["paycat.s.t"]
     assert tr.access_problems(env) == []
+
+
+def test_committed_agent_tables_rejects_an_entry_with_an_invalid_table(tmp_path):
+    env = _id_only(tmp_path, {"s1": ["paycat.s.t"]})
+    (env / "generated" / "governed_tables.json").write_text(json.dumps({
+        "tables": ["paycat.s.t"],
+        "agent_tables": {"s1": ["paycat.s.t", "paycat.s.*"]},
+    }))
+
+    assert committed_agent_tables(env) == {}
+    assert tr.access_problems(env) == [ID_ONLY_REFUSAL]
+
+
+def test_empty_agent_entry_never_falls_back_to_the_record_table_list(tmp_path):
+    env = _id_only(tmp_path, {"s1": []})
+
+    assert committed_agent_tables(env) == {"s1": []}
+    assert tr.access_problems(env) == [ID_ONLY_REFUSAL]
 
 
 @pytest.mark.parametrize("agent_tables", [None, {}, {"other": ["paycat.s.t"]}])
