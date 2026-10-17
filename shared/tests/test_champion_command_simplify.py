@@ -984,6 +984,11 @@ def test_verify_result_file_counts_mask_passes_per_key(monkeypatch, tmp_path, ca
     rc, result = _live_main(monkeypatch, tmp_path, {"column_masks": [MASK], "row_filters": [ROW]},
                             {"column-mask": "PASS", "row-filter": "PASS"})
     assert rc == 0
+    assert [(c["kind"], c["status"], c["principals"]) for c in result.pop("checks")] == [
+        ("column-mask", "PASS", {"ops": {"expected": "raw", "observed": "raw"},
+                                 "viewers": {"expected": "masked", "observed": "masked"}}),
+        ("row-filter", "PASS", {"ops": {"expected": "unrestricted", "observed": "unrestricted"},
+                                "viewers": {"expected": "restricted", "observed": "restricted"}})]
     assert result == {"passed": True, "mask_checks_passed": 1,
                       "masked_tables": ["c.s.t"], "mask_keys_complete": False,
                       "mask_checks_passed_by_key": {"customer_id": 1}, "mask_keys_proven_by_table": {},
