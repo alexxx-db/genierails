@@ -10,6 +10,7 @@ assertions are exercised without credentials.
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from scripts import environment_lock as env_lock  # noqa: E402
 SPACE_ID = "01champion0dev"
 WAREHOUSE = "wh0champion"
 DEV_TABLES = [f"dev_fin.finance.{t}" for t in rit.CHAMPION_TABLES]
+DEV_TABLES_SORTED = sorted(DEV_TABLES, key=str.lower)
 
 
 def _var(args, key):
@@ -101,17 +103,39 @@ class FakeMake:
                 f'genie_space_id_to_name = {{ "{SPACE_ID}" = "{title}" }}\n'
             )
             (env_dir / "generated" / "masking_functions.sql").write_text("-- masks\n")
-        return self._done(args)
+        return self._record(args, env_dir)
+
+    def _record(self, args, env_dir):
+        """What the real generate recipe runs right after generate_abac.py: in a
+        deterministic env with a generated config, the real sticky_governance.py
+        record, which commits each ID-only agent's discovered tables."""
+        config = env_dir / "generated" / "abac.auto.tfvars"
+        cfg = rit._load_tfvars(env_dir / "env.auto.tfvars")
+        if not (config.is_file() and cfg.get("governance_mode") == "deterministic"):
+            return self._done(args)
+        record = subprocess.run(
+            [sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
+             "--env-dir", str(env_dir), "--config", str(config)],
+            capture_output=True, text=True,
+        )
+        return self._done(args, record.returncode, record.stdout + record.stderr)
 
     def _enable_classification(self, args, env_dir):
         return self._guard(args, env_dir)
 
     def _rehearse(self, args, env_dir):
+        # rehearse's access check reads the committed attribution generate wrote.
+        assert self._agent_tables(env_dir) == {SPACE_ID: DEV_TABLES_SORTED}, "rehearse before generate recorded"
         assert _var(args, "VERIFY_KEY_COLUMN") is None  # no key flag: picked per table
         # A passing verify-access saves the keys it proved per table.
         with (env_dir / "env.auto.tfvars").open("a") as f:
             f.write('verify_key_columns = { "dev_fin.finance.customers" = "customer_id" }\n')
         return self._done(args, 0, "  ✓ [PASS] column-mask x\n  RESULT: ALL EFFECTIVE (1 passed / 1)\n")
+
+    @staticmethod
+    def _agent_tables(env_dir):
+        path = env_dir / "generated" / "governed_tables.json"
+        return json.loads(path.read_text()).get("agent_tables") if path.is_file() else None
 
     def _promote(self, args, env_dir):
         src = self.envs / _var(args, "SOURCE_ENV")
@@ -209,6 +233,9 @@ def test_champion_dry_run_follows_the_readme_order(champion):
     # Promote and release neither write nor need the retired exposure flag.
     assert "business_access_enabled" not in prod_cfg
     assert prod_cfg["sql_warehouse_id"] == WAREHOUSE
+    # The agent is given by ID only: generate committed its tables under that ID.
+    assert FakeMake._agent_tables(envs / "dev") == {SPACE_ID: DEV_TABLES_SORTED}
+    assert sorted(prod_cfg["uc_tables"]) == sorted(t.replace("dev_fin.", "prod_fin.") for t in DEV_TABLES)
     assert (envs / "prod" / "generated" / "masking_functions.sql").read_text() == "-- prod masks\n"
 
 
@@ -313,3 +340,106 @@ def test_promote_renames_the_catalog_named_title(champion, monkeypatch, capsys):
                         f"Champion Finance Analytics ({rit.DEV_FIN_CAT}.finance)")
     rit.scenario_champion(envs / "dev" / "auth.auto.tfvars", "", keep_data=False)
     assert "renamed to 'Champion Finance Analytics (prod_fin.finance)'" in capsys.readouterr().out
+
+
+# ── The real generate recipe, with only generate_abac.py stubbed ─────────────
+
+# What generate_abac.py writes for an agent given by ID in a deterministic env
+# (the Genie API reads are the stubbed part): every mode persists the discovery,
+# then write_deterministic_draft writes generated/abac.auto.tfvars with the
+# ID -> canonical name map (MODE=genie too, with no ABAC blocks; see
+# test_genie_mode_draft_writes_the_id_to_name_map); --groups is persisted.
+GENERATE_STUB = f"""import sys, pathlib
+sys.path.insert(0, {str(SHARED)!r})
+from access_tier_groups import persist_access_tier_groups
+args = sys.argv[1:]
+env = pathlib.Path.cwd()
+if "--groups" in args:
+    persist_access_tier_groups(env / "env.auto.tfvars", args[args.index("--groups") + 1].split(","))
+rows = "".join(f'  "{{t}}",\\n' for t in {DEV_TABLES!r})
+owners = "".join(f'  "{{t}}" = ["Champion Finance Analytics"]\\n' for t in {DEV_TABLES!r})
+(env / "data_access" / "discovered_uc_tables.auto.tfvars").write_text(
+    f"discovered_uc_tables = [\\n{{rows}}]\\ndiscovered_table_agents = {{{{\\n{{owners}}}}}}\\n")
+abac = 'genie_space_id_to_name = {{ "{SPACE_ID}" = "Champion Finance Analytics" }}\\n'
+if "genie" not in args:
+    abac = 'groups = {{ full = {{}}, analyst = {{}} }}\\ntag_policies = []\\ntag_assignments = []\\n' + abac
+(env / "generated" / "abac.auto.tfvars").write_text(abac)
+"""
+
+
+def _real_make(cloud, shared_root, *args):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("MAKEFLAGS", "MAKELEVEL", "ENV", "MODE", "GENERATE_ARGS", "SOURCE_ENV", "DEST_ENV")}
+    return subprocess.run(["make", "--no-print-directory", *args, f"CLOUD_ROOT={cloud}",
+                           f"SHARED_ROOT={shared_root}"],
+                          cwd=SHARED.parent / "aws", text=True, capture_output=True, env=env, timeout=300)
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="make not installed")
+def test_real_generate_commits_the_id_only_agents_tables_before_promotion(tmp_path):
+    """README order with the real make recipes: import by ID, generate, then promote from a clean clone."""
+    overlay = tmp_path / "shared"
+    overlay.mkdir()
+    for entry in SHARED.iterdir():
+        if entry.name != "generate_abac.py":
+            (overlay / entry.name).symlink_to(entry)
+    (overlay / "generate_abac.py").write_text(GENERATE_STUB)
+    cloud = tmp_path / "aws"
+    cloud.mkdir()
+    dev = cloud / "envs" / "dev"
+    assert _real_make(cloud, overlay, "setup", "ENV=dev").returncode == 0
+    template = (SHARED / "examples" / "dev_to_prod" / "env.auto.tfvars.example").read_text()
+    # A deterministic agent must name its acl_groups (decision 4); make generate
+    # then proposes table_readers for its tables.
+    (dev / "env.auto.tfvars").write_text(template.replace(
+        '{ genie_space_id = "<your-genie-space-id>" }',
+        f'{{ genie_space_id = "{SPACE_ID}", acl_groups = ["analyst"] }}').replace(
+        '"<your-deployer-principal-id>"', '"d0000000-0000-0000-0000-00000000d001"'))
+    (dev / "auth.auto.tfvars").write_text('databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n')
+    record = dev / "generated" / "governed_tables.json"
+
+    # README step 3: import by ID. The recipe records the agent's tables right
+    # after generate_abac.py, before its access check and table_readers proposal.
+    imported = _real_make(cloud, overlay, "generate", "ENV=dev", "MODE=genie", 'GENERATE_ARGS=--groups full,analyst')
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+    assert json.loads(record.read_text())["agent_tables"] == {SPACE_ID: DEV_TABLES_SORTED}
+    readers = rit._load_tfvars(dev / "env.auto.tfvars").get("table_readers") or {}
+    assert set(readers) == set(DEV_TABLES), readers  # proposed from the committed tables
+    # README step 5: the full generate keeps it.
+    generated = _real_make(cloud, overlay, "generate", "ENV=dev")
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    assert json.loads(record.read_text())["agent_tables"] == {SPACE_ID: DEV_TABLES_SORTED}
+    # A clean clone has no ignored discovery file; promotion reads the committed record.
+    (dev / "data_access" / "discovered_uc_tables.auto.tfvars").unlink()
+    prod = cloud / "envs" / "prod"
+    for sub in ("generated", "data_access"):
+        (prod / sub).mkdir(parents=True, exist_ok=True)
+    remap = subprocess.run([sys.executable, str(SHARED / "scripts" / "remap_env_config.py"), str(dev), str(prod),
+                            "dev_fin=prod_fin"], capture_output=True, text=True)
+    assert remap.returncode == 0, remap.stdout + remap.stderr
+    assert sorted(rit._load_tfvars(prod / "env.auto.tfvars")["uc_tables"]) == sorted(
+        t.replace("dev_fin.", "prod_fin.") for t in DEV_TABLES)
+
+    # Without the committed entry, promotion still refuses (fail closed).
+    record.write_text(json.dumps({"tables": []}))
+    refused = subprocess.run([sys.executable, str(SHARED / "scripts" / "remap_env_config.py"), str(dev), str(prod),
+                              "dev_fin=prod_fin"], capture_output=True, text=True)
+    assert refused.returncode != 0
+    assert f"no tables found for agent {SPACE_ID}" in refused.stdout
+    assert "run `make generate ENV=dev` and commit generated/" in refused.stdout
+
+
+def test_genie_mode_draft_writes_the_id_to_name_map(tmp_path):
+    """The real deterministic MODE=genie draft writes generated/abac.auto.tfvars with
+    genie_space_id_to_name, so generate's record step runs at import (the stub above relies on it)."""
+    import generate_abac
+
+    out = tmp_path / "generated"
+    out.mkdir()
+    tfvars, _sql = generate_abac.write_deterministic_draft(
+        out, {"genie_spaces": [{"genie_space_id": SPACE_ID}]}, mode="genie", group_names=[],
+        catalog_schemas=[], api_genie_configs={"Champion Finance Analytics": {"title": "Champion Finance Analytics"}},
+        genie_space_id_to_name={SPACE_ID: "Champion Finance Analytics"}, bootstrap_spaces=False,
+    )
+    assert tfvars == out / "abac.auto.tfvars" and tfvars.is_file()
+    assert rit._load_tfvars(tfvars)["genie_space_id_to_name"] == {SPACE_ID: "Champion Finance Analytics"}
