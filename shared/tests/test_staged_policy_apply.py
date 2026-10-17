@@ -328,10 +328,9 @@ class Harness:
             record = pg.load_stage_record(self.env_dir)
             self.calls.append(f"verify-access:{record['stage']}")
             self.verify_envs.append(hcl2.loads(Path(env["GENIERAILS_VERIFY_ENV_FILE"]).read_text()))
-            if not self.simulate_access:
-                return SimpleNamespace(returncode=0)
-            problems = simulated_verify_access(self.env_dir, Path(env["GENIERAILS_VERIFY_TFVARS"]),
-                                               Path(env["GENIERAILS_VERIFY_ENV_FILE"]))
+            problems = [] if not self.simulate_access else simulated_verify_access(
+                self.env_dir, Path(env["GENIERAILS_VERIFY_TFVARS"]),
+                Path(env["GENIERAILS_VERIFY_ENV_FILE"]))
             if record["stage"] in self.fail_verify:
                 self.fail_verify.discard(record["stage"])
                 problems.append("injected verification failure")

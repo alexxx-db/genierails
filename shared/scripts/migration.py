@@ -477,7 +477,8 @@ def adopt(env_dir: Path, env: str, *, terraform: Callable[..., int] | None = Non
     result = check(env_dir, env, generation)
     terraform = terraform or _terraform_state(env_dir, env)
     forget = forgotten_tags(dep, _load_hcl(effective(env_dir, "abac.auto.tfvars")))
-    print(f"=== Migration ({env}): adopting the legacy deployment as generation {generation['fingerprint']} ===")
+    print(f"=== Migration ({env}): adopting the legacy deployment as generation {generation['fingerprint']} ===",
+          flush=True)
     # The no-way-back marker lands before the first move, so a crash part-way
     # still leaves the env refusing legacy applies (release_gate.legacy_guard).
     pg.write_json(record_path(env_dir), {

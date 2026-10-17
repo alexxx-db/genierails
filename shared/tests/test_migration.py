@@ -526,8 +526,9 @@ def test_the_cutover_stages_new_policies_first_and_keeps_legacy_until_a_later_re
                    f'module.data_access.databricks_entity_tag_assignment.treatment["columns|{COLUMN}|gr_treatment"]']
     assert cutover.calls == ["create", "inventory:create/restore", "verify-access:create", "switch",
                              "inventory:switch", "verify-access:switch", "grant"]
-    # Before the switch, columns still on the legacy value are checked by the legacy checks.
-    assert cutover.verify_envs[0]["governance_mode"] == "legacy"
+    # Before the switch, columns still on the legacy value use the legacy
+    # generation's tier settings, inside deterministic verification semantics.
+    assert cutover.verify_envs[0]["governance_mode"] == "deterministic"
     assert cutover.verify_envs[1]["governance_mode"] == "deterministic"
     state = live_state(env_dir)
     names = {p["name"] for p in live_policies(state)}
@@ -550,6 +551,23 @@ def test_the_cutover_stages_new_policies_first_and_keeps_legacy_until_a_later_re
     assert cutover.apply() == 0
     assert "retire" in cutover.calls and "drop-functions" in cutover.calls and cutover.dropped == []
     assert LEGACY_POLICY not in {p["name"] for p in live_policies(live_state(env_dir))}
+
+
+def test_rehearse_retry_resumes_at_verify_created_without_create_or_tag_moves(cutover, env_dir):
+    """Offline model of the AWS rehearsal that failed in verify-created."""
+    opt_in(env_dir)
+    cutover.legacy = migration.legacy_generation(migration.deployment(env_dir))
+    cutover.fail_verify = {"create"}
+    assert cutover.apply() == 1
+    assert cutover.calls[-1] == "verify-access:create"
+    moves_before = (env_dir / "state_tool.log").read_text().splitlines()
+    assert len(moves_before) == 1
+
+    cutover.calls.clear()
+    assert cutover.apply() == 0
+    assert cutover.calls[0] == "inventory:create/restore"
+    assert "create" not in cutover.calls
+    assert (env_dir / "state_tool.log").read_text().splitlines() == moves_before
 
 
 def test_a_refused_migration_changes_nothing(cutover, env_dir):
@@ -585,6 +603,9 @@ def test_an_interrupted_adoption_resumes(cutover, env_dir, monkeypatch):
 
 def test_saved_plans_take_one_manifest_per_changing_phase(cutover, env_dir, tmp_path):
     opt_in(env_dir)
+    deployer = "82bb9d6d-da56-489d-aaaf-98f6177132c9"
+    with (env_dir / "env.auto.tfvars").open("a") as handle:
+        handle.write(f'deployer_principal_id = "{deployer}"\n')
     cutover.legacy = migration.legacy_generation(migration.deployment(env_dir))
     controller = cutover.controller()
     adopt = tmp_path / "plan0"
@@ -601,6 +622,12 @@ def test_saved_plans_take_one_manifest_per_changing_phase(cutover, env_dir, tmp_
     assert [s["phase"] for s in phases["steps"]] == ["create", "verify-created"] and not phases["final"]
     assert phases["transition"]["from"] == cutover.legacy["fingerprint"]
     assert controller.apply_saved(first) == spa.MORE_PHASES
+    # The adopted generation retains its historical legacy mode for audit, but
+    # verify-created is a deterministic staged verification.  In the AWS
+    # shape this is what makes deployer_principal_id the admin baseline rather
+    # than an account-group display name.
+    assert cutover.verify_envs[-1]["governance_mode"] == "deterministic"
+    assert cutover.verify_envs[-1]["deployer_principal_id"] == deployer
     second = tmp_path / "plan2"
     assert controller.plan(second) == 0
     assert [s["phase"] for s in json.loads((second / spa.PHASES_FILE).read_text())["steps"]] == \
@@ -741,6 +768,29 @@ def _crash_after_one_move(env_dir: Path, monkeypatch):
     state = live_state(env_dir)
     assert len(_attrs(state, "treatment")) == 1 and len(_attrs(state, "assignments")) == 1
     assert migration.load_record(env_dir)["status"] == "adopting"  # written before the move
+
+
+def test_adopting_marker_is_fsynced_before_the_first_state_move(env_dir, monkeypatch):
+    """The no-way-back record is durable, not merely visible in page cache."""
+    write_legacy_state(env_dir)
+    opt_in(env_dir)
+    fsyncs = []
+    real_fsync = os.fsync
+
+    def tracked_fsync(fd):
+        fsyncs.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(pg.os, "fsync", tracked_fsync)
+
+    def stop_at_first_move(command, *addresses):
+        assert command == "state-mv"
+        assert migration.load_record(env_dir)["status"] == "adopting"
+        assert len(fsyncs) >= 2  # temporary file, then its parent directory
+        raise KeyboardInterrupt("stop before changing fake state")
+
+    with pytest.raises(KeyboardInterrupt):
+        migration.adopt(env_dir, ENV, terraform=stop_at_first_move)
 
 
 def test_an_interrupted_adoption_already_refuses_legacy_applies(cutover, env_dir, monkeypatch):

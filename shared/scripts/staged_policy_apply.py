@@ -372,6 +372,12 @@ class Controller:
                               "protection can't be verified across a tier move")
             settings = {}
         env_cfg.update(settings)
+        # This controller only runs for a deterministic env.  A generation
+        # adopted from legacy governance records governance_mode = "legacy"
+        # in its historical settings; keep its tiers, but do not let that old
+        # mode disable deterministic verify-access semantics (notably the
+        # deployer SP -> admin-baseline alias) during verify-created.
+        env_cfg["governance_mode"] = "deterministic"
         env_file = verify_dir / f"{record['stage']}.env.auto.tfvars"
         env_file.write_text("".join(f"{key} = {_hcl_value(value)}\n" for key, value in env_cfg.items()))
         return tfvars, env_file
