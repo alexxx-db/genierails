@@ -10,6 +10,7 @@ Terraform, and provider 1.111 cannot rename in place.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ from remap_generated_config import (  # noqa: E402
     remap_hcl,
     remap_policy_name,
     remap_policy_names,
+    remote_policy_name,
 )
 from treatment_derivation import derive_treatment_model, load_treatment_config  # noqa: E402
 
@@ -41,6 +43,14 @@ ROOT = SHARED / "roots" / "data_access"
 DEV_1, DEV_2 = "genierails_dev_1", "genierails_dev_2"
 PROD_1, PROD_2 = "genierails_prod_1", "genierails_prod_2"
 MAPS = ["--map", f"{DEV_1}={PROD_1}", "--map", f"{DEV_2}={PROD_2}"]
+
+
+def test_remote_policy_name_is_pinned_to_terraform_expression():
+    source = (SHARED / "modules/data_access/main.tf").read_text()
+    expression = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', source)
+    assert expression and expression.group(1) == "${each.value.catalog}_${each.key}"
+    assert remote_policy_name("prod_catalog", "gr_mask_dev_catalog_value_full") == (
+        "prod_catalog_gr_mask_dev_catalog_value_full")
 
 
 def _dev_generated_config() -> dict:
@@ -496,5 +506,3 @@ def _policy_plan(tmp_path: Path, generated: Path) -> dict[str, tuple[list[str], 
         for rc in json.loads(shown.stdout)["resource_changes"]
         if rc["type"] == "databricks_policy_info"
     }
-
-

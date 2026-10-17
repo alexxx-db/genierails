@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from governance_policies import FAILSAFE_TREATMENT, is_never_raw, parse_treatment_value, resolve_column
 from access_tier_groups import _assignment_spans
 from scripts.scaffold_treatments import write_tag_treatments
-from scripts.remap_generated_config import remote_policy_name
 
 
 DESIGN_SOURCE = "shared/docs/design/deterministic-governance.md"
@@ -351,7 +350,7 @@ def custom_mask_checks(expected: str, *, verify: bool = False) -> tuple[Any, ...
         OutputOrder("=== Custom mask cases (", "=== GenieRails environment lock acquired"),
         OutputContains(f"expected outputs include {expected!r}"),
     )
-    return checks + ((AccessVerified("prod", "{custom_mask_column}"),) if verify else ())
+    return checks + ((AccessVerified("prod", "{custom_mask_column_prod}"),) if verify else ())
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -518,14 +517,15 @@ SCENARIOS: tuple[Scenario, ...] = (
         "The fixture has three ordered tiers, group_map_source is the middle tier, one governed table is the grant target, and effective-access verification rows cover every tier.",
     ), (
         fixture_action("Capture baseline access", "snapshot_checkpoint", "tier-baseline"),
-        fixture_action("Add a new tier group", "tier_add", "tier_group", "tier_table", "prod_agent"),
+        fixture_action("Add a new tier group", "tier_add", "tier_group", "tier_table_dev",
+                       "tier_table_prod", "prod_agent"),
         mk("Regenerate for the added tier", "generate", "dev"), AUTHOR_MERGE,
         mk("Check added tier PR", "check", "dev"),
         mk("Rehearse added tier merge", "rehearse", "dev", assertions=(
-            GrantDelta("dev", added=(("{tier_group}", "SELECT", "{tier_table}"),
+            GrantDelta("dev", added=(("{tier_group}", "SELECT", "{tier_table_dev}"),
                                      ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
-                       may_add=_business_grants("{tier_group}", "{tier_table}")),
-            ProtectionDelta("dev", (("policies", "catalog:{tier_table}",
+                       may_add=_business_grants("{tier_group}", "{tier_table_dev}")),
+            ProtectionDelta("dev", (("policies", "catalog:{tier_table_dev}",
                                      "full: newly exempts {tier_group}"),)),
         )),
         mk("Promote added tier", "promote-to", "prod"), AUTHOR_MERGE,
@@ -538,10 +538,10 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan acknowledged tier addition", "release-plan", "prod"),
         mk("Release acknowledged tier addition", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             AcknowledgedWeakening("prod", "{tier_add_acks}", ((
-                "policies", "catalog:{tier_table}", "full: newly exempts {tier_group}"),)),
-            GrantDelta("prod", added=(("{tier_group}", "SELECT", "{tier_table}"),
+                "policies", "catalog:{tier_table_prod}", "full: newly exempts {tier_group}"),)),
+            GrantDelta("prod", added=(("{tier_group}", "SELECT", "{tier_table_prod}"),
                                       ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
-                       may_add=_business_grants("{tier_group}", "{tier_table}")),
+                       may_add=_business_grants("{tier_group}", "{tier_table_prod}")),
         )),
         mk("Maintain added tier", "maintain", "prod"),
         fixture_action("Verify tier grant and CAN_RUN are the only widenings", "verify_effect",
@@ -549,11 +549,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         action("Remove tier acknowledgements", "remove_ack", "tier_add_acks"), AUTHOR_MERGE,
         mk("Rehearse tier-ack cleanup merge", "rehearse", "dev"),
         fixture_action("Capture access before tier removal", "snapshot_checkpoint", "tier-added"),
-        fixture_action("Remove the tier group", "tier_remove", "tier_group", "tier_table", "prod_agent"),
+        fixture_action("Remove the tier group", "tier_remove", "tier_group", "tier_table_dev",
+                       "tier_table_prod", "prod_agent"),
         mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
         mk("Check removed tier PR", "check", "dev"),
         mk("Rehearse removed tier merge", "rehearse", "dev", assertions=(
-            ProtectionDelta("dev", (("policies", "catalog:{tier_table}",
+            ProtectionDelta("dev", (("policies", "catalog:{tier_table_dev}",
                                      "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Promote removed tier", "promote-to", "prod"), AUTHOR_MERGE,
@@ -561,9 +562,9 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Rehearse removed tier promotion merge", "rehearse", "dev"),
         mk("Plan tier removal", "release-plan", "prod"),
         mk("Release tier removal", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
-            GrantDelta("prod", revoked=(("{tier_group}", "SELECT", "{tier_table}"),
+            GrantDelta("prod", revoked=(("{tier_group}", "SELECT", "{tier_table_prod}"),
                                         ("{tier_group}", "CAN_RUN", "agent:{prod_agent}"))),
-            ProtectionDelta("prod", (("policies", "catalog:{tier_table}",
+            ProtectionDelta("prod", (("policies", "catalog:{tier_table_prod}",
                                       "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Maintain removed tier", "maintain", "prod"),
@@ -583,13 +584,13 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan only the acknowledged group-map effect", "release-plan", "prod"),
         mk("Apply acknowledged group-map manifest", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             AcknowledgedWeakening("prod", "prod:weaken:group_map:{group_map_source}={mapped_group}", (
-                ("policies", "catalog:{tier_table}", "full: newly exempts {mapped_group}"),
-                ("policies", "catalog:{tier_table}", "partial: no longer applies to {group_map_old_target}"),
+                ("policies", "catalog:{tier_table_prod}", "full: newly exempts {mapped_group}"),
+                ("policies", "catalog:{tier_table_prod}", "partial: no longer applies to {group_map_old_target}"),
             )),
-            GrantDelta("prod", added=(("{mapped_group}", "SELECT", "{tier_table}"),
+            GrantDelta("prod", added=(("{mapped_group}", "SELECT", "{tier_table_prod}"),
                                       ("{mapped_group}", "CAN_RUN", "agent:{prod_agent}")),
-                       may_add=_business_grants("{mapped_group}", "{tier_table}"),
-                       revoked=(("{group_map_old_target}", "SELECT", "{tier_table}"),
+                       may_add=_business_grants("{mapped_group}", "{tier_table_prod}"),
+                       revoked=(("{group_map_old_target}", "SELECT", "{tier_table_prod}"),
                                 ("{group_map_old_target}", "CAN_RUN", "agent:{prod_agent}"))),
         )),
         mk("Maintain mapped access", "maintain", "prod"),
@@ -625,12 +626,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Validate prepared custom mask", "check", "dev"),
         mk("Run committed cases read-only before the dev lock", "rehearse", "dev",
            assertions=custom_mask_checks("***CD") + (ProtectionDelta("dev", ((
-               "custom-adoption", "{custom_mask_column}", "unmapped_redact->custom_e2e_suffix"),)),)),
+               "custom-adoption", "{custom_mask_column_dev}", "unmapped_redact->custom_e2e_suffix"),)),)),
         mk("Promote adopted mask byte-for-byte", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check promoted custom mask", "check", "prod"),
         mk("Rehearse custom-mask promotion merge", "rehearse", "dev",
            assertions=custom_mask_checks("***CD") + (
-               ProtectionDelta("dev", (("custom-retire", "{custom_mask_column}",
+               ProtectionDelta("dev", (("custom-retire", "{custom_mask_column_dev}",
                                          FAILSAFE_STRING_VALUE),)),
            )),
         mk("Refuse unacknowledged custom-mask install weakening", "release-plan", "prod", fail=True,
@@ -643,10 +644,10 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Release prepared custom mask", "release", "prod", args=("MANIFEST={manifest}",),
            assertions=custom_mask_checks("***CD", verify=True) + (
                AcknowledgedWeakening("prod", "{custom_install_ack}",
-                                     (("custom-adoption", "{custom_mask_column}",
+                                     (("custom-adoption", "{custom_mask_column_prod}",
                                        "unmapped_redact->custom_e2e_suffix"),)),)),
         mk("Verify partial/full behavior and idempotence", "maintain", "prod", assertions=(
-            ProtectionDelta("prod", (("custom-retire", "{custom_mask_column}",
+            ProtectionDelta("prod", (("custom-retire", "{custom_mask_column_prod}",
                                       FAILSAFE_STRING_VALUE),)),)),
         action("Remove custom-mask install acknowledgement", "remove_ack", "custom_install_ack"), AUTHOR_MERGE,
         mk("Rehearse custom-mask install ack cleanup", "rehearse", "dev",
@@ -670,7 +671,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Release acknowledged custom-mask change", "release", "prod", args=("MANIFEST={manifest}",),
            assertions=custom_mask_checks("**BCD", verify=True) + (
                AcknowledgedWeakening("prod", "{custom_mask_ack}", (
-                   ("custom-generation", "{custom_mask_column}",
+                   ("custom-generation", "{custom_mask_column_prod}",
                     "custom_e2e_suffix->custom_e2e_suffix"),
                )),
            )),
@@ -862,6 +863,7 @@ class LiveSnapshotProvider:
             agents.append({"name": name, "space_id": space_id, "export": exported, "acl": acl})
         return redact({
             "uc": sql,
+            "catalog_map": dict(config.get("catalog_map") or {}),
             "agents": agents,
             "state_serials": _state_serials(self.state_dir / env, env_dir),
             "receipts": _receipt_inventory(self.state_dir / env),
@@ -1179,6 +1181,28 @@ def deterministic_env(cloud_root: Path, env: str | None) -> bool:
     return path.is_file() and _load_hcl(path).get("governance_mode") == "deterministic"
 
 
+def custom_mask_preflight_problems(snapshots: Mapping[str, Any], values: Mapping[str, str]) -> list[str]:
+    """Adoption must retire the catalog's last fail-safe STRING generation."""
+    problems: list[str] = []
+    for env in ("dev", "prod"):
+        column = values.get(f"custom_mask_column_{env}", "")
+        facts = _protection(snapshots.get(env, {}))["columns"]
+        current = facts.get((column, "gr_treatment"))
+        if not (isinstance(current, tuple) and current[:2] == (FAILSAFE_TREATMENT, "string")):
+            problems.append(f"{env}: custom mask column {column!r} is not a fail-safe STRING column")
+            continue
+        catalog = column.split(".", 1)[0]
+        fail_safe = sorted(location for (location, tag), value in facts.items()
+                           if tag == "gr_treatment" and location.startswith(catalog + ".")
+                           and isinstance(value, tuple)
+                           and value[:2] == (FAILSAFE_TREATMENT, "string"))
+        if fail_safe != [column]:
+            problems.append(
+                f"{env}: custom mask adoption requires {column} to be the catalog's last fail-safe "
+                f"STRING column; found {', '.join(fail_safe) or 'none'}")
+    return problems
+
+
 def import_unset_treatment(output: str) -> bool:
     return bool(IMPORT_UNSET_LOG.search(output))
 
@@ -1437,6 +1461,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"columns": {}, "masks": set(), "mask_names": set(),
                               "mask_definitions": {}, "policies": {}, "grants": set()}
     uc = snapshot.get("uc", {})
+    catalog_map = snapshot.get("catalog_map") or {}
     for catalog, evidence in uc.items() if isinstance(uc, Mapping) else []:
         if not isinstance(evidence, Mapping): continue
         for row in evidence.get("governed_tags") or []:
@@ -1462,8 +1487,11 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 normalized_function = prefix + "__".join(normalized) if normalized else function
                 key = ((str(entry.get("table")), str(catalog), *normalized) if normalized
                        else (str(entry.get("table")), str(catalog), str(policy.get("name"))))
+                allowed_catalogs = {str(catalog)} | {
+                    str(src) for src, dest in catalog_map.items() if str(dest) == str(catalog)}
                 fact = {"function": {normalized or (function,)},
                         "policy_names": {str(policy.get("name"))},
+                        "allowed_catalogs": allowed_catalogs,
                         "masks": {normalized_function},
                         "raw_functions": {function},
                         "values": set(policy.get("match_values") or []) or
@@ -1477,6 +1505,7 @@ def _protection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                 if prior:
                     prior["function"].update(fact["function"])
                     prior["policy_names"].update(fact["policy_names"])
+                    prior["allowed_catalogs"].update(fact["allowed_catalogs"])
                     prior["masks"].update(fact["masks"])
                     prior["raw_functions"].update(fact["raw_functions"])
                     prior["values"].update(fact["values"])
@@ -1794,13 +1823,14 @@ def _has_exact_generated_policy_name(policy_key: tuple[Any, ...], fact: Mapping[
     # Terraform prefixes the generated for_each key with the deployed catalog.
     # The key's embedded catalog may remain the promotion source, so validate
     # it around the exact deterministic treatment value rather than replacing it.
+    sources = fact.get("allowed_catalogs") or {catalog}
     key_shape = re.compile(
-        rf"gr_mask_.+_(?:{'|'.join(re.escape(str(v)) for v in values)})_{level}")
+        rf"gr_mask_(?:{'|'.join(re.escape(str(src)) for src in sources)})_"
+        rf"(?:{'|'.join(re.escape(str(v)) for v in values)})_{level}")
     prefix = catalog + "_"
     return bool(values) and bool(names) and all(
         name.startswith(prefix)
-        and key_shape.fullmatch(key := name.removeprefix(prefix)) is not None
-        and remote_policy_name(catalog, key) == name
+        and key_shape.fullmatch(name.removeprefix(prefix)) is not None
         for name in names)
 
 
@@ -2378,8 +2408,8 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
         repo.local_merge(scenario.key)
         return
     if step.action in {"tier_add", "tier_remove"}:
-        group, table, agent = (values[name] for name in step.fixture_args)
-        for env in ("dev", "prod"):
+        group, dev_table, prod_table, agent = (values[name] for name in step.fixture_args)
+        for env, table in (("dev", dev_table), ("prod", prod_table)):
             path = repo.runner.cwd / "envs" / env / "env.auto.tfvars"
             cfg = _load_hcl(path)
             tiers = cfg.get("access_tier_groups")
@@ -2700,6 +2730,10 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     repo.init_remote(); remote_ready = True
                 scenario_verify = verify_signatures(cloud_root)
                 before = capture()
+                if scenario.key == "custom-mask":
+                    preflight = custom_mask_preflight_problems(before, values)
+                    if preflight:
+                        raise RuntimeError("custom-mask preflight refused before mutation: " + "; ".join(preflight))
                 if not run_baseline: run_baseline = before
                 for index, (step, item) in enumerate(zip(scenario.steps, plan), 1):
                     label = f"{scenario.key}-{index}"

@@ -168,31 +168,56 @@ def test_custom_mask_retirement_is_required_on_the_next_staged_run():
         "fixture", ("class.not_in_library",), "STRING").value
 
 
+def test_custom_mask_preflight_requires_last_failsafe_string_column():
+    model = _failsafe_model()
+    snapshots = {
+        **_model_snapshot(model, "dev"),
+        **_model_snapshot(model, "prod", catalog=PROD_CATALOG),
+    }
+    values = {"custom_mask_column_dev": CUSTOM_COLUMN,
+              "custom_mask_column_prod": PROD_CUSTOM_COLUMN}
+    assert driver.custom_mask_preflight_problems(snapshots, values) == []
+    prod = snapshots["prod"]["uc"][PROD_CATALOG]
+    prod["governed_tags"].append({
+        "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "notes",
+        "column_name": "second_secret", "tag_name": "gr_treatment",
+        "tag_value": driver.FAILSAFE_STRING_VALUE,
+    })
+    problems = driver.custom_mask_preflight_problems(snapshots, values)
+    assert len(problems) == 1
+    assert "last fail-safe STRING column" in problems[0]
+    assert "second_secret" in problems[0]
+
+
 def test_new_fixture_actions_execute_with_real_hcl_and_mask_validators(tmp_path):
     cloud = tmp_path / "aws"
     for env in ("dev", "prod"):
         root = cloud / "envs" / env
         (root / "agents").mkdir(parents=True)
         extra = 'group_map = { "dev_ops" = "prod_ops" }\n' if env == "prod" else "tag_treatments = {}\n"
+        table = f'{"devcat" if env == "dev" else "prodcat"}.s.t'
         (root / "env.auto.tfvars").write_text(
             'governance_mode = "deterministic"\naccess_tier_groups = ["ops", "viewers"]\n'
-            'table_readers = { "cat.s.t" = ["ops"] }\n' + extra)
+            f'table_readers = {{ "{table}" = ["ops"] }}\n' + extra)
         (root / "agents/pay.auto.tfvars").write_text(
             'acl_groups = ["ops"]\nuc_tables = ["cat.s.t"]\n')
     agent = cloud / "envs/prod/agents/pay.auto.tfvars"
     repo = SimpleNamespace(runner=SimpleNamespace(cwd=cloud))
     values = {"tier_group": "analysts", "group_map_source": "dev_ops", "mapped_group": "prod_new",
-              "tier_table": "cat.s.t", "prod_agent": "pay", "acl_group": "auditors",
+              "tier_table_dev": "devcat.s.t", "tier_table_prod": "prodcat.s.t",
+              "prod_agent": "pay", "acl_group": "auditors",
               "custom_mask_class": "class.postcode"}
 
-    tier_action = driver.fixture_action("add", "tier_add", "tier_group", "tier_table", "prod_agent")
+    tier_action = driver.fixture_action("add", "tier_add", "tier_group", "tier_table_dev",
+                                        "tier_table_prod", "prod_agent")
     driver._run_action(tier_action, None, repo, values)
     assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["access_tier_groups"] == ["ops", "analysts", "viewers"]
-    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["table_readers"]["cat.s.t"] == ["ops", "analysts"]
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["table_readers"]["devcat.s.t"] == ["ops", "analysts"]
     assert driver._load_hcl(cloud / "envs/dev/agents/pay.auto.tfvars")["acl_groups"] == ["ops", "analysts"]
-    driver._run_action(driver.fixture_action("remove", "tier_remove", "tier_group", "tier_table", "prod_agent"), None, repo, values)
+    driver._run_action(driver.fixture_action("remove", "tier_remove", "tier_group", "tier_table_dev",
+                                             "tier_table_prod", "prod_agent"), None, repo, values)
     assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["access_tier_groups"] == ["ops", "viewers"]
-    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["table_readers"]["cat.s.t"] == ["ops"]
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["table_readers"]["prodcat.s.t"] == ["ops"]
     assert driver._load_hcl(agent)["acl_groups"] == ["ops"]
     driver._run_action(driver.fixture_action("map", "group_map_change", "group_map_source", "mapped_group"), None, repo, values)
     assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["group_map"] == {"dev_ops": "prod_new"}
@@ -255,15 +280,18 @@ def _effect_snapshot(*, grants=(), runs=()):
 
 
 LIVE_CATALOG = "genierails_dev_1"
+PROD_CATALOG = "genierails_prod_1"
 LIVE_SCHEMA = "dev_to_prod_demo"
 LIVE_TABLES = tuple(f"{LIVE_CATALOG}.{LIVE_SCHEMA}.{name}" for name in ("customers", "payments", "notes"))
 TIER_TABLE = LIVE_TABLES[0]
 CUSTOM_COLUMN = f"{TIER_TABLE}.postcode"
+PROD_TABLES = tuple(table.replace(LIVE_CATALOG + ".", PROD_CATALOG + ".", 1) for table in LIVE_TABLES)
+PROD_TIER_TABLE = PROD_TABLES[0]
+PROD_CUSTOM_COLUMN = f"{PROD_TIER_TABLE}.postcode"
 
 
-def _model_snapshot(model, env, *, grants=(), runs=()):
+def _model_snapshot(model, env, *, grants=(), runs=(), catalog=LIVE_CATALOG):
     """Realistic live snapshot: catalog policies inherited by all three demo tables."""
-    catalog = LIVE_CATALOG
     policies = []
     for policy in model.fgac_policies:
         policies.append({
@@ -271,7 +299,7 @@ def _model_snapshot(model, env, *, grants=(), runs=()):
             # post-prefix names observed in the real dev plan and s13 snapshot.
             "name": remote_policy_name(catalog, policy["name"]),
             "column_mask": {"function_name":
-                f"{policy['function_catalog']}.{policy['function_schema']}.{policy['function_name']}"},
+                f"{catalog}.{policy['function_schema']}.{policy['function_name']}"},
             "match_values": re.findall(r"hasTagValue\('gr_treatment', '([^']+)'\)",
                                        policy["match_condition"]),
             "to_principals": policy["to_principals"],
@@ -280,7 +308,7 @@ def _model_snapshot(model, env, *, grants=(), runs=()):
     functions = {policy["column_mask"]["function_name"] for policy in policies}
     evidence = {
         "governed_tags": [{
-            "catalog_name": assignment["entity_name"].split(".")[0],
+            "catalog_name": catalog,
             "schema_name": assignment["entity_name"].split(".")[1],
             "table_name": assignment["entity_name"].split(".")[2],
             "column_name": assignment["entity_name"].split(".")[3],
@@ -290,15 +318,17 @@ def _model_snapshot(model, env, *, grants=(), runs=()):
             "routine_catalog": name.split(".")[0], "routine_schema": name.split(".")[1],
             "routine_name": name.split(".")[2], "definition_hash": name.split(".")[2],
         } for name in sorted(functions)],
-        "abac_policies": [{"table": table, "policies": json.loads(json.dumps(policies))}
+        "abac_policies": [{"table": table.replace(LIVE_CATALOG + ".", catalog + ".", 1),
+                           "policies": json.loads(json.dumps(policies))}
                           for table in LIVE_TABLES],
         "table_grants": [{
             "grantee": principal, "privilege_type": privilege,
-            "table_catalog": TIER_TABLE.split(".")[0], "table_schema": TIER_TABLE.split(".")[1],
+            "table_catalog": catalog, "table_schema": TIER_TABLE.split(".")[1],
             "table_name": TIER_TABLE.split(".")[2],
         } for principal, privilege in grants],
     }
-    return {env: {"uc": {catalog: evidence}, "agents": [{
+    catalog_map = {LIVE_CATALOG: catalog} if catalog != LIVE_CATALOG else {}
+    return {env: {"uc": {catalog: evidence}, "catalog_map": catalog_map, "agents": [{
         "name": "pay", "space_id": "space-pay", "acl": {"access_control_list": [{
             "group_name": principal, "all_permissions": [{"permission_level": "CAN_RUN"}],
         } for principal in runs]},
@@ -362,8 +392,9 @@ def _allowed_diff(scenario, checks, before, after, acks=()):
 def _retained_generation(new, old, env):
     """Staged switch snapshot: old policies/functions remain until the next run."""
     result = json.loads(json.dumps(new))
-    current = result[env]["uc"][LIVE_CATALOG]
-    prior = old[env]["uc"][LIVE_CATALOG]
+    catalog = next(iter(result[env]["uc"]))
+    current = result[env]["uc"][catalog]
+    prior = old[env]["uc"][catalog]
     old_by_table = {entry["table"]: entry["policies"] for entry in prior["abac_policies"]}
     for entry in current["abac_policies"]:
         entry["policies"].extend(json.loads(json.dumps(old_by_table[entry["table"]])))
@@ -395,8 +426,9 @@ def test_real_tier_and_group_map_fixtures_require_exact_allowances():
     added_dev = _model_snapshot(added_model, "dev", grants=(("admins", "SELECT"), ("ops", "SELECT"),
                                                                ("analysts", "SELECT")),
                                 runs=("admins", "ops", "analysts"))
-    values = {"tier_group": "analysts", "tier_table": TIER_TABLE, "prod_agent": "pay",
-              "tier_add_acks": f"prod:reader:{TIER_TABLE}:analysts;;prod:weaken:{CUSTOM_COLUMN}:analysts",
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts",
               "group_map_source": "dev_ops", "mapped_group": "prod_new",
               "group_map_old_target": "prod_ops"}
     scenario, checks = _rendered_step_checks(
@@ -413,7 +445,11 @@ def test_real_tier_and_group_map_fixtures_require_exact_allowances():
     assert f"stranger SELECT {TIER_TABLE}" in _allowed_diff(
         scenario, checks, base_dev, extra_dev)["dev"]["widened_grants"]
 
-    base = {"prod": base_dev["dev"]}; added = {"prod": added_dev["dev"]}
+    base = _model_snapshot(base_model, "prod", grants=(("admins", "SELECT"), ("ops", "SELECT")),
+                           runs=("admins", "ops"), catalog=PROD_CATALOG)
+    added = _model_snapshot(added_model, "prod", grants=(("admins", "SELECT"), ("ops", "SELECT"),
+                                                           ("analysts", "SELECT")),
+                            runs=("admins", "ops", "analysts"), catalog=PROD_CATALOG)
     scenario, add_checks = _rendered_step_checks(
         "tier-groupmap", "Release acknowledged tier addition", values)
     acks = set(driver._ack_entries(values["tier_add_acks"]))
@@ -432,10 +468,10 @@ def test_real_tier_and_group_map_fixtures_require_exact_allowances():
 
     mapped_model = _tier_model(["admins", "prod_new", "viewers"])
     mapped = _model_snapshot(mapped_model, "prod", grants=(("admins", "SELECT"), ("prod_new", "SELECT")),
-                             runs=("admins", "prod_new"))
+                             runs=("admins", "prod_new"), catalog=PROD_CATALOG)
     old_model = _tier_model(["admins", "prod_ops", "viewers"])
     old = _model_snapshot(old_model, "prod", grants=(("admins", "SELECT"), ("prod_ops", "SELECT")),
-                          runs=("admins", "prod_ops"))
+                          runs=("admins", "prod_ops"), catalog=PROD_CATALOG)
     scenario, map_checks = _rendered_step_checks(
         "tier-groupmap", "Apply acknowledged group-map manifest", values)
     map_ack = {"prod:weaken:group_map:dev_ops=prod_new"}
@@ -448,10 +484,10 @@ def test_real_tier_and_group_map_fixtures_require_exact_allowances():
     assert "stranger CAN_RUN genie:space-pay" in _allowed_diff(
         scenario, map_checks, old, extra_mapped, map_ack)["prod"]["widened_grants"]
     grant_widened = json.loads(json.dumps(mapped))
-    grant_widened["prod"]["uc"][LIVE_CATALOG]["table_grants"].append({
+    grant_widened["prod"]["uc"][PROD_CATALOG]["table_grants"].append({
         "grantee": "account users", "privilege_type": "SELECT",
-        "table_catalog": LIVE_CATALOG, "table_schema": LIVE_SCHEMA, "table_name": "customers"})
-    assert f"account users SELECT {TIER_TABLE}" in _allowed_diff(
+        "table_catalog": PROD_CATALOG, "table_schema": LIVE_SCHEMA, "table_name": "customers"})
+    assert f"account users SELECT {PROD_TIER_TABLE}" in _allowed_diff(
         scenario, map_checks, old, grant_widened, map_ack)["prod"]["widened_grants"]
 
     acl_values = {**values, "acl_group": "auditors"}
@@ -472,9 +508,10 @@ def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_
     before_dev = _model_snapshot(failsafe, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
     after_dev = _model_snapshot(custom_v1, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
     retained_dev = _retained_generation(after_dev, before_dev, "dev")
-    values = {"custom_mask_column": CUSTOM_COLUMN,
-              "custom_install_ack": f"prod:weaken:{CUSTOM_COLUMN}:ops",
-              "custom_mask_ack": f"prod:weaken:{CUSTOM_COLUMN}:ops"}
+    values = {"custom_mask_column_dev": CUSTOM_COLUMN,
+              "custom_mask_column_prod": PROD_CUSTOM_COLUMN,
+              "custom_install_ack": f"prod:weaken:{PROD_CUSTOM_COLUMN}:ops",
+              "custom_mask_ack": f"prod:weaken:{PROD_CUSTOM_COLUMN}:ops"}
     scenario, dev_checks = _rendered_step_checks(
         "custom-mask", "Run committed cases read-only before the dev lock", values)
     assert _allowed_diff(scenario, dev_checks, before_dev, retained_dev) == {}
@@ -485,9 +522,11 @@ def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_
     assert _allowed_diff(scenario, retire_dev_checks, retained_dev, after_dev) == {}
     assert set(_allowed_diff(scenario, [], retained_dev, after_dev)["dev"]) == {"masks", "policies"}
 
-    before = {"prod": before_dev["dev"]}
-    retained_prod = {"prod": retained_dev["dev"]}
-    after = {"prod": after_dev["dev"]}
+    before = _model_snapshot(failsafe, "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                             catalog=PROD_CATALOG)
+    after = _model_snapshot(custom_v1, "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                            catalog=PROD_CATALOG)
+    retained_prod = _retained_generation(after, before, "prod")
     scenario, prod_checks = _rendered_step_checks(
         "custom-mask", "Release prepared custom mask", values)
     ack = {values["custom_install_ack"]}
@@ -499,17 +538,18 @@ def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_
     assert driver.failed_checks(driver.evaluate_checks(
         maintain_checks, driver.CheckContext(after, after, ROOT)))
     before_extra, after_extra = json.loads(json.dumps(before)), json.loads(json.dumps(after))
-    before_extra["prod"]["uc"][LIVE_CATALOG]["governed_tags"].append({
-        "catalog_name": LIVE_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "other",
+    before_extra["prod"]["uc"][PROD_CATALOG]["governed_tags"].append({
+        "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "other",
         "column_name": "secret", "tag_name": "gr_treatment",
         "tag_value": "unmapped_redact__string__455f4485",
     })
     remaining = _allowed_diff(scenario, prod_checks, before_extra, after_extra, ack)
-    assert any(f"{LIVE_CATALOG}.{LIVE_SCHEMA}.other.secret" in item
+    assert any(f"{PROD_CATALOG}.{LIVE_SCHEMA}.other.secret" in item
                for item in remaining["prod"]["columns"])
 
     custom_v2 = _custom_model(tmp_path, "v2")
-    v2 = _model_snapshot(custom_v2, "prod", grants=(("ops", "SELECT"),), runs=("ops",))
+    v2 = _model_snapshot(custom_v2, "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                         catalog=PROD_CATALOG)
     _, change_checks = _rendered_step_checks(
         "custom-mask", "Release acknowledged custom-mask change", values)
     ctx = driver.CheckContext(after, v2, ROOT, acknowledged=frozenset())
@@ -521,20 +561,20 @@ def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_
                       if result["check"].startswith("acknowledged-weakening"))
     assert ack_result["problems"] == []
 
-    v2_dev = _model_snapshot(custom_v2, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
-    v2_prod = {"prod": v2_dev["dev"]}
-    assert _allowed_diff(scenario, change_checks, after, v2_prod,
+    assert _allowed_diff(scenario, change_checks, after, v2,
                          {values["custom_mask_ack"]}) == {}
 
 
 def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_widening(tmp_path):
-    values = {"tier_group": "analysts", "tier_table": TIER_TABLE, "prod_agent": "pay",
-              "tier_add_acks": f"prod:reader:{TIER_TABLE}:analysts;;prod:weaken:{CUSTOM_COLUMN}:analysts"}
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts"}
     base = _model_snapshot(_tier_model(["admins", "ops", "viewers"]), "prod",
-                           grants=(("admins", "SELECT"), ("ops", "SELECT")), runs=("admins", "ops"))
+                           grants=(("admins", "SELECT"), ("ops", "SELECT")), runs=("admins", "ops"),
+                           catalog=PROD_CATALOG)
     added = _model_snapshot(_tier_model(["admins", "ops", "analysts", "viewers"]), "prod",
                             grants=(("admins", "SELECT"), ("ops", "SELECT"), ("analysts", "SELECT")),
-                            runs=("admins", "ops", "analysts"))
+                            runs=("admins", "ops", "analysts"), catalog=PROD_CATALOG)
     scenario, checks = _rendered_step_checks(
         "tier-groupmap", "Release acknowledged tier addition", values)
     acks = set(driver._ack_entries(values["tier_add_acks"]))
@@ -542,11 +582,11 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
     handwritten_before, handwritten_after = json.loads(json.dumps(base)), json.loads(json.dumps(added))
     generated_function = next(
         policy["column_mask"]["function_name"]
-        for policy in handwritten_before["prod"]["uc"][LIVE_CATALOG]["abac_policies"][0]["policies"]
+        for policy in handwritten_before["prod"]["uc"][PROD_CATALOG]["abac_policies"][0]["policies"]
         if policy["column_mask"]["function_name"].endswith("_full"))
     handwritten_function = re.sub(r"__[0-9a-f]{8}_full$", "__ffffffff_full", generated_function)
     for snapshot, principals in ((handwritten_before, []), (handwritten_after, ["analysts"])):
-        snapshot["prod"]["uc"][LIVE_CATALOG]["abac_policies"][0]["policies"].append({
+        snapshot["prod"]["uc"][PROD_CATALOG]["abac_policies"][0]["policies"].append({
             "name": "customer_handwritten_full", "column_mask": {"function_name": handwritten_function},
             "match_values": [], "to_principals": ["account users"], "except_principals": principals})
     remaining = _allowed_diff(scenario, checks, handwritten_before, handwritten_after, acks)
@@ -554,15 +594,16 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
 
     cross_before, cross_after = json.loads(json.dumps(base)), json.loads(json.dumps(added))
     cross_before["prod"]["uc"]["other_catalog"] = json.loads(json.dumps(
-        cross_before["prod"]["uc"][LIVE_CATALOG]))
+        cross_before["prod"]["uc"][PROD_CATALOG]))
     cross_after["prod"]["uc"]["other_catalog"] = json.loads(json.dumps(
-        cross_after["prod"]["uc"][LIVE_CATALOG]))
+        cross_after["prod"]["uc"][PROD_CATALOG]))
     for snapshot in (cross_before, cross_after):
+        snapshot["prod"]["catalog_map"] = {LIVE_CATALOG: "other_catalog"}
         evidence = snapshot["prod"]["uc"]["other_catalog"]
         for entry in evidence["abac_policies"]:
-            entry["table"] = entry["table"].replace(LIVE_CATALOG + ".", "other_catalog.", 1)
+            entry["table"] = entry["table"].replace(PROD_CATALOG + ".", "other_catalog.", 1)
             for policy in entry["policies"]:
-                policy["name"] = re.sub(rf"^{LIVE_CATALOG}_", "other_catalog_", policy["name"])
+                policy["name"] = re.sub(rf"^{PROD_CATALOG}_", "other_catalog_", policy["name"])
     remaining = _allowed_diff(scenario, checks, cross_before, cross_after, acks)
     assert any("newly exempts analysts" in item for item in remaining["prod"]["policies"])
 
@@ -571,58 +612,81 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
     assert "policies" in _allowed_diff(dev_scenario, dev_checks, base, added)["prod"]
 
     extra_level = json.loads(json.dumps(added))
-    for entry in extra_level["prod"]["uc"][LIVE_CATALOG]["abac_policies"]:
+    for entry in extra_level["prod"]["uc"][PROD_CATALOG]["abac_policies"]:
         for policy in entry["policies"]:
             if policy["column_mask"]["function_name"].endswith("_partial"):
                 policy["except_principals"].append("analysts")
     remaining = _allowed_diff(scenario, checks, base, extra_level, acks)
     assert any("partial: newly exempts analysts" in item for item in remaining["prod"]["policies"])
 
-    failsafe = _model_snapshot(_failsafe_model(), "prod", grants=(("ops", "SELECT"),), runs=("ops",))
+    failsafe = _model_snapshot(_failsafe_model(), "prod", grants=(("ops", "SELECT"),), runs=("ops",),
+                               catalog=PROD_CATALOG)
     custom = _model_snapshot(_custom_model(tmp_path, "v1"), "prod",
-                             grants=(("ops", "SELECT"),), runs=("ops",))
+                             grants=(("ops", "SELECT"),), runs=("ops",), catalog=PROD_CATALOG)
+    custom_clean = json.loads(json.dumps(custom))
     for snapshot, digest in ((failsafe, "old"), (custom, "new")):
-        evidence = snapshot["prod"]["uc"][LIVE_CATALOG]
+        evidence = snapshot["prod"]["uc"][PROD_CATALOG]
         value = "unmapped_redact__string__ffffffff"
         evidence["governed_tags"].append({
-            "catalog_name": LIVE_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "notes",
+            "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "notes",
             "column_name": "other", "tag_name": "gr_treatment", "tag_value": value})
         evidence["mask_functions"].append({
-            "routine_catalog": LIVE_CATALOG, "routine_schema": LIVE_SCHEMA,
+            "routine_catalog": PROD_CATALOG, "routine_schema": LIVE_SCHEMA,
             "routine_name": f"gr_mask_{value}_full", "definition_hash": digest})
         for entry in evidence["abac_policies"]:
             entry["policies"].append({
-                "name": f"{LIVE_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
+                "name": f"{PROD_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
                 "column_mask": {"function_name":
-                    f"{LIVE_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
+                    f"{PROD_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
                 "match_values": [value], "to_principals": ["account users"], "except_principals": []})
-    custom_values = {"custom_mask_column": CUSTOM_COLUMN,
-                     "custom_install_ack": f"prod:weaken:{CUSTOM_COLUMN}:ops"}
+    custom_values = {"custom_mask_column_dev": CUSTOM_COLUMN,
+                     "custom_mask_column_prod": PROD_CUSTOM_COLUMN,
+                     "custom_install_ack": f"prod:weaken:{PROD_CUSTOM_COLUMN}:ops"}
     custom_scenario, custom_checks = _rendered_step_checks(
         "custom-mask", "Release prepared custom mask", custom_values)
     remaining = _allowed_diff(custom_scenario, custom_checks, failsafe, custom,
                               {custom_values["custom_install_ack"]})
     assert any("definition changed" in item for item in remaining["prod"]["masks"])
 
-    wrong_generation_before = json.loads(json.dumps(custom))
-    wrong_generation_after = json.loads(json.dumps(custom))
+    wrong_generation_before = json.loads(json.dumps(custom_clean))
+    wrong_generation_after = json.loads(json.dumps(custom_clean))
     value = "unmapped_redact__string__ffffffff"
     for snapshot in (wrong_generation_before,):
-        evidence = snapshot["prod"]["uc"][LIVE_CATALOG]
+        evidence = snapshot["prod"]["uc"][PROD_CATALOG]
         evidence["mask_functions"].append({
-            "routine_catalog": LIVE_CATALOG, "routine_schema": LIVE_SCHEMA,
+            "routine_catalog": PROD_CATALOG, "routine_schema": LIVE_SCHEMA,
             "routine_name": f"gr_mask_{value}_full", "definition_hash": "wrong-generation"})
         for entry in evidence["abac_policies"]:
             entry["policies"].append({
-                "name": f"{LIVE_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
+                "name": f"{PROD_CATALOG}_gr_mask_{LIVE_CATALOG}_{value}_full",
                 "column_mask": {"function_name":
-                    f"{LIVE_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
+                    f"{PROD_CATALOG}.{LIVE_SCHEMA}.gr_mask_{value}_full"},
                 "match_values": [value], "to_principals": ["account users"],
                 "except_principals": []})
     _, maintain_checks = _rendered_step_checks(
         "custom-mask", "Verify partial/full behavior and idempotence", custom_values)
+    retire = next(check for check in maintain_checks if isinstance(check, driver.ProtectionDelta))
+    actual = driver.protection_diff(wrong_generation_before["prod"],
+                                    wrong_generation_after["prod"], include_grants=False)
+    assert driver._finding_matches(retire.findings[0], actual,
+                                   wrong_generation_before["prod"],
+                                   wrong_generation_after["prod"]) == set()
     assert _allowed_diff(custom_scenario, maintain_checks,
                          wrong_generation_before, wrong_generation_after)
+
+
+def test_protection_allowance_filter_is_strictly_environment_scoped():
+    base = _model_snapshot(_tier_model(["admins", "ops", "viewers"]), "dev")
+    added = _model_snapshot(_tier_model(["admins", "ops", "analysts", "viewers"]), "dev")
+    before = {"dev": base["dev"], "prod": json.loads(json.dumps(base["dev"]))}
+    after = {"dev": added["dev"], "prod": json.loads(json.dumps(added["dev"]))}
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": TIER_TABLE, "prod_agent": "pay"}
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse added tier merge", values)
+    remaining = _allowed_diff(scenario, checks, before, after)
+    assert "prod" in remaining and "policies" in remaining["prod"]
+    assert "dev" not in remaining
 
 
 def test_exact_policy_name_accepts_terraform_prefix_and_kept_dev_source():
@@ -630,6 +694,7 @@ def test_exact_policy_name_accepts_terraform_prefix_and_kept_dev_source():
     fact = {
         "values": {"email_partial__string__f86256b2"},
         "raw_functions": {raw},
+        "allowed_catalogs": {"genierails_prod_1", "genierails_dev_1"},
         "policy_names": {
             "genierails_prod_1_gr_mask_genierails_dev_1_email_partial__string__f86256b2_full"},
     }
