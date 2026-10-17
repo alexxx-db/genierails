@@ -173,7 +173,9 @@ principal, the expected tier and what the run proved (`raw`, `mismatch`,
 the initial refused tier plan, separated by `;;` (normally one `prod:reader:`
 and one `prod:weaken:` entry for the governed grant target). Catalog-level ABAC policies are
 reported once for every table that inherits them; protection allowances expand only across
-the exact generated policy identities and tables present in that anchored catalog. The driver derives the one exact
+the exact generated policy identities and tables in the committed governed-catalog set.
+An ungoverned catalog remains outside the allowance. Prod preflight also requires every
+kept dev-source policy name to have its exact committed `catalog_map` entry. The driver derives the one exact
 `prod:weaken:group_map:<source>=<mapped_group>` acknowledgement. `custom-mask` needs
 `custom_mask_class` (for example `class.postcode`), `custom_mask_column_dev`,
 `custom_mask_column_prod`,
@@ -185,8 +187,10 @@ fixture proves both tier addition and fail-safe-to-custom-mask adoption are
 weakenings, so neither positive release is attempted before its refusal and
 exact acknowledgement. Tier removal deliberately needs no weakening acknowledgement:
 it revokes access and strengthens protection. Custom-mask adoption retains the staged
-The custom-mask preflight refuses before any mutation unless each named column is the
-only fail-safe STRING column in its catalog. Adoption retains that fail-safe generation
+The named columns must be dedicated `gr_e2e_*` fixture columns in catalogs isolated from
+other fail-safe STRING fixtures. The custom-mask preflight refuses before any mutation
+and names every conflicting column unless each named column is the only fail-safe STRING
+column in its catalog. Adoption retains that fail-safe generation
 until the next successful run; its later policy/function retirement
 has a separate, exact required protection delta on the next dev rehearse and prod maintain.
 Tier addition/removal updates only that exact table's readers and the named agent's

@@ -328,7 +328,8 @@ def _model_snapshot(model, env, *, grants=(), runs=(), catalog=LIVE_CATALOG):
         } for principal, privilege in grants],
     }
     catalog_map = {LIVE_CATALOG: catalog} if catalog != LIVE_CATALOG else {}
-    return {env: {"uc": {catalog: evidence}, "catalog_map": catalog_map, "agents": [{
+    return {env: {"uc": {catalog: evidence}, "catalog_map": catalog_map,
+                  "governed_catalogs": [catalog], "agents": [{
         "name": "pay", "space_id": "space-pay", "acl": {"access_control_list": [{
             "group_name": principal, "all_permissions": [{"permission_level": "CAN_RUN"}],
         } for principal in runs]},
@@ -598,14 +599,20 @@ def test_protection_allowances_reject_cross_catalog_handwritten_and_generation_w
     cross_after["prod"]["uc"]["other_catalog"] = json.loads(json.dumps(
         cross_after["prod"]["uc"][PROD_CATALOG]))
     for snapshot in (cross_before, cross_after):
-        snapshot["prod"]["catalog_map"] = {LIVE_CATALOG: "other_catalog"}
+        snapshot["prod"]["catalog_map"] = {
+            LIVE_CATALOG: PROD_CATALOG,
+            "genierails_dev_2": "other_catalog",
+        }
         evidence = snapshot["prod"]["uc"]["other_catalog"]
         for entry in evidence["abac_policies"]:
             entry["table"] = entry["table"].replace(PROD_CATALOG + ".", "other_catalog.", 1)
             for policy in entry["policies"]:
                 policy["name"] = re.sub(rf"^{PROD_CATALOG}_", "other_catalog_", policy["name"])
+                policy["name"] = policy["name"].replace(LIVE_CATALOG, "genierails_dev_2")
     remaining = _allowed_diff(scenario, checks, cross_before, cross_after, acks)
-    assert any("newly exempts analysts" in item for item in remaining["prod"]["policies"])
+    raw = driver.protection_diff(cross_before["prod"], cross_after["prod"], include_grants=False)
+    expected_other = sorted(item for item in raw["policies"] if item.startswith("other_catalog."))
+    assert remaining == {"prod": {"policies": expected_other}}
 
     dev_scenario, dev_checks = _rendered_step_checks(
         "tier-groupmap", "Rehearse added tier merge", values)
@@ -687,6 +694,59 @@ def test_protection_allowance_filter_is_strictly_environment_scoped():
     remaining = _allowed_diff(scenario, checks, before, after)
     assert "prod" in remaining and "policies" in remaining["prod"]
     assert "dev" not in remaining
+
+
+def test_tier_allowance_covers_exact_changes_in_every_governed_catalog():
+    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts"}
+    base_model = _tier_model(["admins", "ops", "viewers"])
+    added_model = _tier_model(["admins", "ops", "analysts", "viewers"])
+    before = _model_snapshot(base_model, "prod", catalog=PROD_CATALOG)
+    after = _model_snapshot(added_model, "prod", catalog=PROD_CATALOG)
+    second_dev, second_prod = "gr_e2e_s14_20261016", "gr_e2e_s14p_20261016"
+    for target, model in ((before, base_model), (after, added_model)):
+        second = _model_snapshot(model, "prod", catalog=second_prod)["prod"]
+        for entry in second["uc"][second_prod]["abac_policies"]:
+            for policy in entry["policies"]:
+                policy["name"] = policy["name"].replace(LIVE_CATALOG, second_dev)
+        target["prod"]["uc"].update(second["uc"])
+        target["prod"]["catalog_map"].update({second_dev: second_prod})
+        target["prod"]["governed_catalogs"].append(second_prod)
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Release acknowledged tier addition", values)
+    acks = set(driver._ack_entries(values["tier_add_acks"]))
+    assert _allowed_diff(scenario, checks, before, after, acks) == {}
+
+    extra = json.loads(json.dumps(after))
+    policy = next(p for entry in extra["prod"]["uc"][second_prod]["abac_policies"]
+                  for p in entry["policies"]
+                  if p["column_mask"]["function_name"].endswith("_partial"))
+    policy["except_principals"].append("analysts")
+    remaining = _allowed_diff(scenario, checks, before, extra, acks)
+    assert any(item.startswith(second_prod + ".") and "partial: newly exempts analysts" in item
+               for item in remaining["prod"]["policies"])
+
+
+def test_tier_preflight_requires_catalog_map_for_kept_source_names():
+    snapshot = _model_snapshot(_tier_model(["admins", "ops", "viewers"]), "prod",
+                               catalog=PROD_CATALOG)
+    assert driver.tier_groupmap_preflight_problems(snapshot) == []
+    snapshot["prod"]["catalog_map"] = {}
+    problems = driver.tier_groupmap_preflight_problems(snapshot)
+    assert problems and "requires catalog_map" in problems[0]
+    assert LIVE_CATALOG in problems[0] and PROD_CATALOG in problems[0]
+
+
+def test_e2e_policy_name_helper_is_pinned_to_policy_resource_expression():
+    source = (ROOT / "shared/modules/data_access/main.tf").read_text()
+    block = re.search(
+        r'resource\s+"databricks_policy_info"\s+"policies"\s*\{(?P<body>.*?\n\})',
+        source, re.S)
+    assert block
+    expression = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', block["body"])
+    assert expression and expression.group(1) == "${each.value.catalog}_${each.key}"
+    assert remote_policy_name("prod", "key") == "prod_key"
 
 
 def test_exact_policy_name_accepts_terraform_prefix_and_kept_dev_source():

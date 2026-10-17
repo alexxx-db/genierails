@@ -47,7 +47,11 @@ MAPS = ["--map", f"{DEV_1}={PROD_1}", "--map", f"{DEV_2}={PROD_2}"]
 
 def test_remote_policy_name_is_pinned_to_terraform_expression():
     source = (SHARED / "modules/data_access/main.tf").read_text()
-    expression = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', source)
+    block = re.search(
+        r'resource\s+"databricks_policy_info"\s+"policies"\s*\{(?P<body>.*?\n\})',
+        source, re.S)
+    assert block
+    expression = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', block["body"])
     assert expression and expression.group(1) == "${each.value.catalog}_${each.key}"
     assert remote_policy_name("prod_catalog", "gr_mask_dev_catalog_value_full") == (
         "prod_catalog_gr_mask_dev_catalog_value_full")

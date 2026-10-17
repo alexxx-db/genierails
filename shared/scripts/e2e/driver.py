@@ -525,7 +525,7 @@ SCENARIOS: tuple[Scenario, ...] = (
             GrantDelta("dev", added=(("{tier_group}", "SELECT", "{tier_table_dev}"),
                                      ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
                        may_add=_business_grants("{tier_group}", "{tier_table_dev}")),
-            ProtectionDelta("dev", (("policies", "catalog:{tier_table_dev}",
+            ProtectionDelta("dev", (("policies", "governed",
                                      "full: newly exempts {tier_group}"),)),
         )),
         mk("Promote added tier", "promote-to", "prod"), AUTHOR_MERGE,
@@ -538,7 +538,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan acknowledged tier addition", "release-plan", "prod"),
         mk("Release acknowledged tier addition", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             AcknowledgedWeakening("prod", "{tier_add_acks}", ((
-                "policies", "catalog:{tier_table_prod}", "full: newly exempts {tier_group}"),)),
+                "policies", "governed", "full: newly exempts {tier_group}"),)),
             GrantDelta("prod", added=(("{tier_group}", "SELECT", "{tier_table_prod}"),
                                       ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
                        may_add=_business_grants("{tier_group}", "{tier_table_prod}")),
@@ -554,7 +554,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
         mk("Check removed tier PR", "check", "dev"),
         mk("Rehearse removed tier merge", "rehearse", "dev", assertions=(
-            ProtectionDelta("dev", (("policies", "catalog:{tier_table_dev}",
+            ProtectionDelta("dev", (("policies", "governed",
                                      "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Promote removed tier", "promote-to", "prod"), AUTHOR_MERGE,
@@ -564,7 +564,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Release tier removal", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             GrantDelta("prod", revoked=(("{tier_group}", "SELECT", "{tier_table_prod}"),
                                         ("{tier_group}", "CAN_RUN", "agent:{prod_agent}"))),
-            ProtectionDelta("prod", (("policies", "catalog:{tier_table_prod}",
+            ProtectionDelta("prod", (("policies", "governed",
                                       "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Maintain removed tier", "maintain", "prod"),
@@ -584,8 +584,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Plan only the acknowledged group-map effect", "release-plan", "prod"),
         mk("Apply acknowledged group-map manifest", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             AcknowledgedWeakening("prod", "prod:weaken:group_map:{group_map_source}={mapped_group}", (
-                ("policies", "catalog:{tier_table_prod}", "full: newly exempts {mapped_group}"),
-                ("policies", "catalog:{tier_table_prod}", "partial: no longer applies to {group_map_old_target}"),
+                ("policies", "governed", "full: newly exempts {mapped_group}"),
+                ("policies", "governed", "partial: no longer applies to {group_map_old_target}"),
             )),
             GrantDelta("prod", added=(("{mapped_group}", "SELECT", "{tier_table_prod}"),
                                       ("{mapped_group}", "CAN_RUN", "agent:{prod_agent}")),
@@ -617,7 +617,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         "The final PR changes only the named prod agent acl_groups and prod effective access matches it.",
     ), ("Forward-release the pinned baseline, then remove disposable groups and access fixtures.",)),
     _scenario("custom-mask", "Prepared adopted custom mask lifecycle", (
-        "custom_mask_class is a non-secret class on one STRING fixture column with raw, partial and full tier verification rows.",
+        "custom_mask_column_dev/prod name a dedicated gr_e2e_* fixture column whose catalog has no other governed fail-safe STRING column.",
+        "custom_mask_class is a non-secret class on that STRING fixture column with raw, partial and full tier verification rows.",
         "custom_mask_ack is the exact prod:weaken:<column>:<principal> entry for the one prepared SQL change.",
     ), (
         fixture_action("Install prepared adopted custom mask and class mapping", "custom_mask_install",
@@ -864,6 +865,7 @@ class LiveSnapshotProvider:
         return redact({
             "uc": sql,
             "catalog_map": dict(config.get("catalog_map") or {}),
+            "governed_catalogs": catalogs,
             "agents": agents,
             "state_serials": _state_serials(self.state_dir / env, env_dir),
             "receipts": _receipt_inventory(self.state_dir / env),
@@ -1201,6 +1203,26 @@ def custom_mask_preflight_problems(snapshots: Mapping[str, Any], values: Mapping
                 f"{env}: custom mask adoption requires {column} to be the catalog's last fail-safe "
                 f"STRING column; found {', '.join(fail_safe) or 'none'}")
     return problems
+
+
+def tier_groupmap_preflight_problems(snapshots: Mapping[str, Any]) -> list[str]:
+    """Kept dev-source prod policy names require their committed catalog_map."""
+    prod = snapshots.get("prod", {})
+    mapping = prod.get("catalog_map") or {}
+    problems: set[str] = set()
+    for key, fact in _protection(prod)["policies"].items():
+        if len(key) != 5: continue
+        catalog, level = key[1], key[4]
+        for value in fact.get("values") or ():
+            pattern = re.compile(
+                rf"{re.escape(catalog)}_gr_mask_(.+)_{re.escape(str(value))}_{re.escape(level)}")
+            for name in fact.get("policy_names") or ():
+                match = pattern.fullmatch(name)
+                if match and match.group(1) != catalog and mapping.get(match.group(1)) != catalog:
+                    problems.add(
+                        f"prod: kept policy source catalog {match.group(1)!r} for {catalog!r} requires "
+                        f"catalog_map[{match.group(1)!r}] = {catalog!r} in committed env.auto.tfvars")
+    return sorted(problems)
 
 
 def import_unset_treatment(output: str) -> bool:
@@ -1761,21 +1783,25 @@ def _finding_matches(key: ProtectionKey, actual: Mapping[str, list[str]],
     """Concrete findings selected by one narrow semantic protection key."""
     category, resource, change = key
     if category == "policies":
-        anchor = resource.removeprefix("catalog:")
-        catalog = anchor.split(".", 1)[0]
+        if resource == "governed":
+            catalogs = set(before.get("governed_catalogs") or ()) | set(after.get("governed_catalogs") or ())
+        else:
+            anchor = resource.removeprefix("catalog:")
+            catalogs = {anchor.split(".", 1)[0]}
         match = re.fullmatch(r"(partial|full): (newly exempts|no longer applies to) (\S+)", change)
         if not match: return set()
         level, effect, principal = match.groups()
         left, right = _protection(before), _protection(after)
         selected = set()
         facts = right["policies"] if effect == "newly exempts" else left["policies"]
-        for policy_key in set(left["policies"]) | set(right["policies"]):
-            if len(policy_key) != 5 or policy_key[1] != catalog or policy_key[4] != level: continue
-            fact = facts.get(policy_key)
-            if not fact or not _has_exact_generated_policy_name(policy_key, fact): continue
-            label = " ".join((policy_key[0], *policy_key[2:]))
-            finding = f"{label}: {effect} {principal}"
-            if finding in actual.get("policies", ()): selected.add(("policies", finding))
+        for catalog in catalogs:
+            for policy_key in set(left["policies"]) | set(right["policies"]):
+                if len(policy_key) != 5 or policy_key[1] != catalog or policy_key[4] != level: continue
+                fact = facts.get(policy_key)
+                if not fact or not _has_exact_generated_policy_name(policy_key, fact): continue
+                label = " ".join((policy_key[0], *policy_key[2:]))
+                finding = f"{label}: {effect} {principal}"
+                if finding in actual.get("policies", ()): selected.add(("policies", finding))
         return selected
     if category not in {"custom-adoption", "custom-generation", "custom-retire"}: return set()
     if category == "custom-retire":
@@ -2041,7 +2067,8 @@ def _shape_problems(check: Any) -> list[str]:
                 column = rf"{table}\.{identifier}"
                 treatment = r"[a-z][a-z0-9_]*"
                 principal = r"[^\s*?\[\]]+"
-                table_resource = bool(re.fullmatch(rf"catalog:{table}", resource)
+                table_resource = bool(resource == "governed"
+                                      or re.fullmatch(rf"catalog:{table}", resource)
                                       or re.fullmatch(r"catalog:\{[a-z_][a-z0-9_]*\}", resource))
                 column_resource = bool(re.fullmatch(column, resource)
                                        or re.fullmatch(r"\{[a-z_][a-z0-9_]*\}", resource))
@@ -2734,6 +2761,10 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     preflight = custom_mask_preflight_problems(before, values)
                     if preflight:
                         raise RuntimeError("custom-mask preflight refused before mutation: " + "; ".join(preflight))
+                if scenario.key == "tier-groupmap":
+                    preflight = tier_groupmap_preflight_problems(before)
+                    if preflight:
+                        raise RuntimeError("tier-groupmap preflight refused before mutation: " + "; ".join(preflight))
                 if not run_baseline: run_baseline = before
                 for index, (step, item) in enumerate(zip(scenario.steps, plan), 1):
                     label = f"{scenario.key}-{index}"
