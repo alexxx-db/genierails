@@ -8546,7 +8546,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
   - Each space includes all groups that need access
   - Groups that should NOT see this space are excluded
   - Set durable per-agent `acl_groups` only on `genie_spaces[]` in `env.auto.tfvars`
-  - Explicit `acl_groups = []` means nobody; omission derives fresh from policies
+  - Explicit `acl_groups = []` means nobody; omission derives fresh from policies (legacy mode only)
   - ACL fields in the generated draft are ignored
 - **Validate before apply**: Run validation before `terraform apply`.
 
