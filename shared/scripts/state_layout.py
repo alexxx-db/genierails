@@ -6,8 +6,10 @@ Layouts (design section 15, rollout step 12b):
 in-checkout   no GENIERAILS_STATE_DIR, no remote_state.hcl: state, TF data and
               the env lock stay under envs/<env>/ as before.
 state dir     GENIERAILS_STATE_DIR set: <dir>/<cloud>/<env>/ holds
-              layers/<layer>/{terraform.tfstate,.terraform}, locks/, receipts/
-              and manifests/; nothing is written under envs/<env>/.
+              layers/<layer>/{terraform.tfstate,.terraform}, locks/, receipts/,
+              manifests/ and records/ (the policy journal and the other
+              runtime records a fresh checkout must see, record_path); none of
+              them is written under envs/<env>/.
 remote        envs/<env>/remote_state.hcl: the layer's state is in S3 or Azure
               Blob (locked). Runtime files go to the state dir, or to
               <cloud>/.genierails-state/<env>/ when it is unset, never under
@@ -17,9 +19,11 @@ state_json is the only reader of Terraform state (tests enforce it): local
 files are read where terraform_layer.sh writes them, remote state through
 ``terraform state pull``. A state that should exist but can't be read raises.
 
-make migrate-state-dir moves the in-checkout layout into the state dir under
-the env lock, copy-verify-then-remove, and leaves envs/<env>/.state-moved so
-a run without the variable refuses instead of seeing empty state.
+make migrate-state-dir moves the in-checkout layout (state and records) into
+the state dir under the env lock, copy-verify-then-remove, and leaves
+envs/<env>/.state-moved so a run without the variable refuses instead of
+seeing empty state. With the variable set, a record still in the checkout
+refuses too (record_path), so a half-moved env is never read.
 """
 
 from __future__ import annotations
@@ -119,6 +123,62 @@ def refuse_moved(env_dir: Path) -> None:
     if not state_dir_setting() and marker.exists():
         raise StateError(f"state was moved to GENIERAILS_STATE_DIR ({marker}); set it to the "
                          "migration destination before running")
+
+
+# -- runtime records ----------------------------------------------------------
+
+# Records under envs/<env>/ (env-relative) that a later run must find, even
+# from a fresh checkout: the staged policy ledger (journal, generation
+# snapshots, stage.json, the migration record with its "adopting" marker,
+# verify results) and group_map's last applied mapping. With
+# GENIERAILS_STATE_DIR set they live in <dir>/<cloud>/<env>/records/<same path>.
+# Receipts, manifests, imports records and locks were already there; what
+# each run re-derives (generated/.runtime/, the coverage check's files,
+# .*.apply.sha) stays in the checkout.
+CHECKOUT_RECORDS = (Path("data_access") / ".policy_generations", Path(".group_map_applied.json"))
+RECORDS = "records"
+
+
+class RecordError(StateError, ValueError):
+    """A runtime record can't be located safely; nothing may read or write it."""
+
+
+def _holds_files(path: Path) -> bool:
+    return path.is_file() or (path.is_dir() and any(p.is_file() for p in path.rglob("*")))
+
+
+def record_path(env_dir: Path, relpath: str | Path) -> Path:
+    """Where the runtime record ``relpath`` (one of CHECKOUT_RECORDS, or under one) lives.
+
+    Unset GENIERAILS_STATE_DIR: envs/<env>/<relpath>, unchanged (a moved-state
+    marker refuses). Set: <dir>/<cloud>/<env>/records/<relpath>; refuses when
+    the state dir exists but can't be read, and when the record, or any
+    file of a record directory, is still in the checkout (only there, or in
+    both places): run make migrate-state-dir, never silently start from nothing.
+    """
+    env_dir = Path(env_dir)
+    relpath = Path(relpath)
+    top = next((r for r in CHECKOUT_RECORDS if relpath == r or r in relpath.parents), None)
+    if top is None:
+        raise RecordError(f"{relpath} is not a runtime record")
+    root = state_root(env_dir)
+    if root is None:
+        try:
+            refuse_moved(env_dir)
+        except StateError as exc:
+            raise RecordError(str(exc)) from exc
+        return env_dir / relpath
+    base = Path(state_dir_setting()).expanduser()
+    # A state dir not created yet holds no records (as it holds no state); one
+    # that exists but can't be listed or read never reads as empty.
+    for path in (base, root, root / env_dir.name, root / env_dir.name / RECORDS):
+        if path.exists() and not (path.is_dir() and os.access(path, os.R_OK | os.X_OK)):
+            raise RecordError(f"{STATE_DIR_ENV} is set but {path} can't be read; fix it before running")
+    if _holds_files(env_dir / top):
+        raise RecordError(f"{env_dir / top} is still in the checkout while {STATE_DIR_ENV} is set; run "
+                          f"make migrate-state-dir ENV={env_dir.name} to move it into "
+                          f"{root / env_dir.name / RECORDS}")
+    return root / env_dir.name / RECORDS / relpath
 
 
 def refuse_split(env_dir: Path, env: str, layer: str) -> None:
@@ -448,7 +508,22 @@ def _migrations(env_dir: Path, env: str, target: Path) -> list[tuple[Path, Path]
             if rel.parts[0] in ("locks", "roots") or not source.is_file() or source.name.endswith(".migrating"):
                 continue
             moves.append((source, target / rel))
+    for record in CHECKOUT_RECORDS:
+        source = env_dir / record
+        files = sorted(p for p in source.rglob("*") if p.is_file()) if source.is_dir() else [source]
+        moves += [(f, target / RECORDS / f.relative_to(env_dir)) for f in files
+                  if not f.name.endswith(".migrating")]
     return [(source, destination) for source, destination in moves if source.is_file()]
+
+
+def _remove_empty_record_dirs(env_dir: Path) -> None:
+    """After the move: the emptied record dirs go too, so no reader sees one left behind."""
+    for record in CHECKOUT_RECORDS:
+        source = env_dir / record
+        if source.is_dir():
+            for path in sorted((p for p in source.rglob("*") if p.is_dir()), reverse=True) + [source]:
+                if not any(path.iterdir()):
+                    path.rmdir()
 
 
 def migrate(env_dir: Path, env: str) -> int:
@@ -487,6 +562,7 @@ def migrate(env_dir: Path, env: str) -> int:
         _fsync_dir(env_dir)
         for source, destination in operations:
             print(f"{_move_file(source, destination)}: {source} -> {destination}")
+        _remove_empty_record_dirs(env_dir)
         for cache in (env_dir / ".terraform", env_dir / "data_access" / ".terraform"):
             shutil.rmtree(cache, ignore_errors=True)
         print(f"State-dir migration complete: {len(operations)} file(s) moved to {target}; config and "

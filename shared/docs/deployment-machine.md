@@ -34,7 +34,8 @@ make maintain ENV=prod
    ID from the last release receipt, but nothing else comes back.
 2. **State outside the checkout.** Set `GENIERAILS_STATE_DIR` for every
    command (in the operator's shell profile, or a wrapper). Then
-   Terraform state, receipts, manifests and the env locks live under
+   Terraform state, receipts, manifests, the env locks and the runtime
+   records (the staged policy journal, the migration record) live under
    `$GENIERAILS_STATE_DIR/<cloud>/<env>/`, and the account layer under
    `<cloud>/account/` ([below](#state-outside-the-checkout)).
 3. **Credentials.** Fill each env's `auth.auto.tfvars` with its deployer SP;
@@ -109,10 +110,16 @@ With `GENIERAILS_STATE_DIR` unset, state, receipts and the env lock live under
 the checkout (`envs/<env>/` and `<cloud>/.genierails-state/<env>/`, all
 gitignored). That only works for one checkout that is never re-cloned. With it
 set, `$GENIERAILS_STATE_DIR/<cloud>/<env>/` holds `layers/<layer>/` (state and
-`.terraform`), `locks/`, `receipts/` and `manifests/`, and nothing is written
-under `envs/<env>/`. Every reader of Terraform state goes through
-`scripts/state_layout.py`; a state that should exist but can't be read
-refuses.
+`.terraform`), `locks/`, `receipts/`, `manifests/` and `records/`: the staged
+policy journal and generation snapshots (`records/data_access/.policy_generations/`,
+including the migration record) and group_map's last applied mapping, so a
+fresh checkout sees a pending or failed staged change. Genie agent ID files
+and adoption markers still live in the checkout (step 1 above); what each run
+re-derives (`generated/.runtime/`, the coverage check's files) does too. Every
+reader of Terraform state goes through `scripts/state_layout.py`; a state that
+should exist but can't be read refuses. A record reader refuses when the state
+dir exists but can't be read, and when a record is still in the checkout (alone
+or next to the state dir's copy): run `make migrate-state-dir`.
 
 Move existing local state once:
 
@@ -122,7 +129,8 @@ GENIERAILS_STATE_DIR=/protected/genierails-state make migrate-state-dir ENV=prod
 GENIERAILS_STATE_DIR=/protected/genierails-state make migrate-state-dir ENV=account
 ```
 
-It refuses while the env lock is held, never overwrites a different file, and
+It moves Terraform state and the runtime records above. It refuses while the
+env lock is held, never overwrites a different file, and
 copies, fsyncs and verifies each file before removing its source, so a re-run
 after a crash resumes. It writes `envs/<env>/.state-moved` first: from then on
 a run without `GENIERAILS_STATE_DIR` refuses instead of planning to create
