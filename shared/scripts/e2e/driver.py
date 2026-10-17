@@ -70,7 +70,7 @@ HANDLED_ACTIONS = frozenset({
     "checkout_value", "add_ack", "add_acks", "remove_ack", "local_merge",
     "tier_add", "tier_remove", "group_map_change", "add_group_map_ack",
     "remove_group_map_ack", "prod_acl_change", "custom_mask_install",
-    "custom_mask_change", "snapshot_checkpoint", "verify_effect",
+    "custom_mask_change", "snapshot_checkpoint", "verify_effect", "write_agent_file",
 })
 # Scenarios whose purpose is to remove or loosen protection mid-scenario. The
 # post-restore check still applies to them.
