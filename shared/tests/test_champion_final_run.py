@@ -62,6 +62,8 @@ def _resource_block(tf: str, header: str) -> str:
 
 def test_root_passes_the_layer_auth_file_beside_the_default_masking_sql():
     root = ROOT_TF.read_text()
+    variable = _resource_block(root, 'variable "masking_sql_file" {')
+    assert 'default = ""' in variable
     assert ('masking_sql_file                         = var.masking_sql_file != "" ? '
             'var.masking_sql_file : "${var.env_dir}/masking_functions.sql"') in root
     assert 'auth_file                                = "${var.env_dir}/auth.auto.tfvars"' in root

@@ -827,4 +827,5 @@ def test_custom_masks_never_imports_the_model_client():
         if _model_import_names(names)
     }
     assert model_imports == {}, closure
+    assert SHARED / "governed_tables_record.py" in closure
     assert "serving_endpoints" not in (SHARED / "scripts" / "custom_masks.py").read_text()
