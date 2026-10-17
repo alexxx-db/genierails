@@ -838,6 +838,60 @@ def test_simulated_live_s6_merges_ack_on_driver_branch_and_restores(sim):
     assert json.loads((sim.reports / "final-protection.json").read_text())["status"] == "passed"
 
 
+def _remotes(checkout):
+    return _git(checkout, "remote").split()
+
+
+def test_driver_remote_is_removed_after_a_passing_run_and_a_rerun_works(sim, tmp_path):
+    for run in ("first", "second"):
+        (sim.state / "widening").write_text("")
+        args = list(sim.args); args[args.index("--reports") + 1] = str(tmp_path / f"reports-{run}")
+        rc = driver.main([*args, "--scenarios", "s6", "--value", "ack_entry=prod:reader:cat.s.t:g"],
+                         snapshot_factory=FakeSnapshots)
+        report = json.loads((tmp_path / f"reports-{run}" / "s6.json").read_text())
+        assert rc == 0 and report["status"] == "passed", report["error"]
+        assert driver.E2E_REMOTE not in _remotes(sim.checkout)
+        # The bare repo stays with the run's reports for inspection.
+        assert (tmp_path / f"reports-{run}" / "e2e-remote.git" / "HEAD").is_file()
+
+
+def test_driver_remote_is_removed_after_a_failing_run(sim):
+    # No widening: the first release-plan passes instead of refusing, so s6 fails after the remote exists.
+    rc = driver.main([*sim.args, "--scenarios", "s6", "--value", "ack_entry=prod:reader:cat.s.t:g"],
+                     snapshot_factory=FakeSnapshots)
+    report = json.loads((sim.reports / "s6.json").read_text())
+    assert rc == 1 and report["status"] == "ERROR" and "did not satisfy its contract" in report["error"]
+    assert any(e["argv"][0] == "release-plan" and e["remote"] == driver.E2E_REMOTE for e in sim.log())
+    assert driver.E2E_REMOTE not in _remotes(sim.checkout)
+
+
+def test_driver_remote_is_removed_when_final_protection_capture_is_interrupted(sim):
+    class InterruptFinalCapture(FakeSnapshots):
+        def capture(self, env):
+            # The scenario's report is written before the run's final-protection capture.
+            if (sim.reports / "s4.json").exists(): raise KeyboardInterrupt("final protection")
+            return super().capture(env)
+
+    with pytest.raises(KeyboardInterrupt, match="final protection"):
+        driver.main([*sim.args, "--scenarios", "s4"], snapshot_factory=InterruptFinalCapture)
+    assert json.loads((sim.reports / "s4.json").read_text())["status"] == "passed"
+    assert not (sim.reports / "final-protection.json").exists()
+    assert driver.E2E_REMOTE not in _remotes(sim.checkout)
+
+
+def test_foreign_driver_remote_is_refused_and_kept(sim, tmp_path):
+    foreign = tmp_path / "someone-else.git"
+    _git(sim.checkout, "remote", "add", driver.E2E_REMOTE, str(foreign))
+    rc = driver.main([*sim.args, "--scenarios", "s6", "--value", "ack_entry=prod:reader:cat.s.t:g"],
+                     snapshot_factory=FakeSnapshots)
+    report = json.loads((sim.reports / "s6.json").read_text())
+    assert rc == 1 and report["status"] == "ERROR"
+    assert "points elsewhere" in report["error"] and str(foreign) in report["error"]
+    assert f"git remote remove {driver.E2E_REMOTE}" in report["error"]
+    assert sim.log() == []
+    assert _git(sim.checkout, "remote", "get-url", driver.E2E_REMOTE) == str(foreign)
+
+
 def test_simulated_live_champion_commits_generate_then_promotion(sim, monkeypatch):
     monkeypatch.setattr(driver.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "champion")
