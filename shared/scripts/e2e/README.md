@@ -140,7 +140,8 @@ unknown level). Their `{placeholders}` are required values.
 | `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
 | `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
 | `OutputContains(text)` / `OutputOrder(before, after)` | The command emitted exact deterministic evidence, in the required pre-lock order. |
-| `AcknowledgedWeakening(env, entries, findings)` | Only the named protection findings are permitted, and only after every exact acknowledgement key is committed or recorded by release. |
+| `ProtectionDelta(env, findings)` | Only the named environment, resource and exact policy/custom-adoption effect is permitted. |
+| `AcknowledgedWeakening(env, entries, findings)` | The same exact protection keys are permitted only after every exact acknowledgement key is committed or recorded by release. |
 
 A grant is `(principal, privilege, securable)`: a table, schema or catalog, or
 `agent:<key>` for Genie CAN_RUN. `USE_CATALOG`/`USE_SCHEMA` on a table mean its

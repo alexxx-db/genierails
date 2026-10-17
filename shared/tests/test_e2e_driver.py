@@ -15,6 +15,7 @@ import pytest
 
 from scripts.e2e import driver
 from scripts import custom_masks
+from governance_policies import build_model
 from weakening import GovernanceState, Protection, find_weakenings
 
 
@@ -68,6 +69,14 @@ def test_every_executable_step_uses_public_make_target():
 def test_every_scenario_action_has_a_handler():
     used = {step.action for scenario in driver.SCENARIOS for step in scenario.steps if step.action}
     assert used <= driver.HANDLED_ACTIONS
+
+
+def test_new_scenarios_never_require_fresh_verify_receipts_on_rehearse():
+    for scenario in driver.SCENARIOS:
+        if scenario.key not in {"tier-groupmap", "custom-mask"}: continue
+        for step in scenario.steps:
+            if step.target == "rehearse":
+                assert not any(isinstance(check, driver.AccessVerified) for check in step.assertions)
 
 
 def test_secret_fields_are_redacted():
@@ -221,6 +230,85 @@ def _effect_snapshot(*, grants=(), runs=()):
                    for agent, acl in by_agent.items()]}}
 
 
+def _model_snapshot(model, env, *, grants=(), runs=()):
+    """Live-snapshot shape built from the real deterministic policy builder."""
+    catalog = "cat"
+    policies = []
+    for policy in model.fgac_policies:
+        policies.append({
+            "name": policy["name"],
+            "column_mask": {"function_name":
+                f"{policy['function_catalog']}.{policy['function_schema']}.{policy['function_name']}"},
+            "match_values": re.findall(r"hasTagValue\('gr_treatment', '([^']+)'\)",
+                                       policy["match_condition"]),
+            "to_principals": policy["to_principals"],
+            "except_principals": policy["except_principals"],
+        })
+    functions = {policy["column_mask"]["function_name"] for policy in policies}
+    evidence = {
+        "governed_tags": [{
+            "catalog_name": assignment["entity_name"].split(".")[0],
+            "schema_name": assignment["entity_name"].split(".")[1],
+            "table_name": assignment["entity_name"].split(".")[2],
+            "column_name": assignment["entity_name"].split(".")[3],
+            "tag_name": assignment["tag_key"], "tag_value": assignment["tag_value"],
+        } for assignment in model.tag_assignments],
+        "mask_functions": [{
+            "routine_catalog": name.split(".")[0], "routine_schema": name.split(".")[1],
+            "routine_name": name.split(".")[2], "definition_hash": name.split(".")[2],
+        } for name in sorted(functions)],
+        "abac_policies": [{"table": "cat.s.t", "policies": policies}],
+        "table_grants": [{
+            "grantee": principal, "privilege_type": privilege,
+            "table_catalog": "cat", "table_schema": "s", "table_name": "t",
+        } for principal, privilege in grants],
+    }
+    return {env: {"uc": {catalog: evidence}, "agents": [{
+        "name": "pay", "space_id": "space-pay", "acl": {"access_control_list": [{
+            "group_name": principal, "all_permissions": [{"permission_level": "CAN_RUN"}],
+        } for principal in runs]},
+    }]}}
+
+
+def _tier_model(tiers):
+    column = "cat.s.t.postcode"
+    return build_model({column: ["email_address"]}, {column: "STRING"},
+                       {"access_tier_groups": tiers})
+
+
+def _custom_model(tmp_path, version):
+    env = tmp_path / version
+    folder = env / "custom_masks"; folder.mkdir(parents=True)
+    source = ROOT / "shared/scripts/e2e/fixtures" / f"custom_mask_{version}.json"
+    (folder / "custom_e2e_suffix.json").write_bytes(source.read_bytes())
+    library = custom_masks.effective_library(env)
+    column = "cat.s.t.postcode"
+    return build_model({column: ["e2e_custom"]}, {column: "STRING"}, {
+        "access_tier_groups": ["admins", "ops", "viewers"],
+        "tag_treatments": {"class.e2e_custom": "custom_e2e_suffix"},
+    }, library=library)
+
+
+def _failsafe_model():
+    column = "cat.s.t.postcode"
+    return build_model({column: ["not_mapped_e2e"]}, {column: "STRING"},
+                       {"access_tier_groups": ["admins", "ops", "viewers"]})
+
+
+def _rendered_step_checks(scenario_key, step_name, values):
+    scenario = next(item for item in driver.SCENARIOS if item.key == scenario_key)
+    step = next(item for item in scenario.steps if item.name == step_name)
+    return scenario, [driver.render_check(check, values) for check in step.assertions]
+
+
+def _allowed_diff(scenario, checks, before, after, acks=()):
+    return driver.live_protection_diff(
+        scenario, before, after, allowed_adoptions={},
+        allowed_grants=driver.grant_allowances(checks, before, after),
+        allowed_weakening_findings=driver.weakening_finding_allowances(
+            checks, acks, before, after))
+
+
 def test_live_effect_checks_enforce_exact_grant_and_can_run_diffs():
     empty = _effect_snapshot()
     added = _effect_snapshot(grants=(("analysts", "t"),), runs=(("pay", "analysts"),))
@@ -235,6 +323,124 @@ def test_live_effect_checks_enforce_exact_grant_and_can_run_diffs():
         driver.verify_live_effect("tier_added", empty,
             _effect_snapshot(grants=(("analysts", "t"), ("stranger", "t")), runs=(("pay", "analysts"),)),
             ["analysts"])
+
+
+def test_real_tier_and_group_map_fixtures_require_exact_allowances():
+    base_model = _tier_model(["admins", "ops", "viewers"])
+    added_model = _tier_model(["admins", "ops", "analysts", "viewers"])
+    base_dev = _model_snapshot(base_model, "dev", grants=(("admins", "SELECT"), ("ops", "SELECT")),
+                               runs=("admins", "ops"))
+    added_dev = _model_snapshot(added_model, "dev", grants=(("admins", "SELECT"), ("ops", "SELECT"),
+                                                               ("analysts", "SELECT")),
+                                runs=("admins", "ops", "analysts"))
+    values = {"tier_group": "analysts", "tier_table": "cat.s.t", "prod_agent": "pay",
+              "tier_add_acks": "prod:reader:cat.s.t:analysts;;prod:weaken:cat.s.t.postcode:analysts",
+              "group_map_source": "dev_ops", "mapped_group": "prod_new",
+              "group_map_old_target": "prod_ops"}
+    scenario, checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse added tier merge", values)
+    assert _allowed_diff(scenario, checks, base_dev, added_dev) == {}
+    assert "policies" in _allowed_diff(scenario, [c for c in checks if not isinstance(c, driver.ProtectionDelta)],
+                                        base_dev, added_dev)["dev"]
+    assert "widened_grants" in _allowed_diff(
+        scenario, [c for c in checks if not isinstance(c, driver.GrantDelta)], base_dev, added_dev)["dev"]
+    extra_dev = json.loads(json.dumps(added_dev))
+    extra_dev["dev"]["uc"]["cat"]["table_grants"].append({
+        "grantee": "stranger", "privilege_type": "SELECT", "table_catalog": "cat",
+        "table_schema": "s", "table_name": "t"})
+    assert "stranger SELECT cat.s.t" in _allowed_diff(
+        scenario, checks, base_dev, extra_dev)["dev"]["widened_grants"]
+
+    base = {"prod": base_dev["dev"]}; added = {"prod": added_dev["dev"]}
+    scenario, add_checks = _rendered_step_checks(
+        "tier-groupmap", "Release acknowledged tier addition", values)
+    acks = set(driver._ack_entries(values["tier_add_acks"]))
+    assert _allowed_diff(scenario, add_checks, base, added, acks) == {}
+    assert "policies" in _allowed_diff(scenario, add_checks, base, added)["prod"]
+
+    scenario, remove_checks = _rendered_step_checks(
+        "tier-groupmap", "Release tier removal", values)
+    assert _allowed_diff(scenario, remove_checks, added, base) == {}
+    assert "policies" in _allowed_diff(
+        scenario, [c for c in remove_checks if not isinstance(c, driver.ProtectionDelta)],
+        added, base)["prod"]
+    _, dev_remove_checks = _rendered_step_checks(
+        "tier-groupmap", "Rehearse removed tier merge", values)
+    assert _allowed_diff(scenario, dev_remove_checks, added_dev, base_dev) == {}
+
+    mapped_model = _tier_model(["admins", "prod_new", "viewers"])
+    mapped = _model_snapshot(mapped_model, "prod", grants=(("admins", "SELECT"), ("prod_new", "SELECT")),
+                             runs=("admins", "prod_new"))
+    old_model = _tier_model(["admins", "prod_ops", "viewers"])
+    old = _model_snapshot(old_model, "prod", grants=(("admins", "SELECT"), ("prod_ops", "SELECT")),
+                          runs=("admins", "prod_ops"))
+    scenario, map_checks = _rendered_step_checks(
+        "tier-groupmap", "Apply acknowledged group-map manifest", values)
+    map_ack = {"prod:weaken:group_map:dev_ops=prod_new"}
+    assert _allowed_diff(scenario, map_checks, old, mapped, map_ack) == {}
+    missing = _allowed_diff(scenario, map_checks, old, mapped)
+    assert "policies" in missing["prod"]
+    extra_mapped = json.loads(json.dumps(mapped))
+    extra_mapped["prod"]["agents"][0]["acl"]["access_control_list"].append({
+        "group_name": "stranger", "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    assert "stranger CAN_RUN genie:space-pay" in _allowed_diff(
+        scenario, map_checks, old, extra_mapped, map_ack)["prod"]["widened_grants"]
+
+    acl_values = {**values, "acl_group": "auditors"}
+    scenario, acl_checks = _rendered_step_checks(
+        "tier-groupmap", "Apply isolated prod ACL release", acl_values)
+    acl_after = json.loads(json.dumps(mapped))
+    acl_after["prod"]["agents"][0]["acl"]["access_control_list"].append({
+        "group_name": "auditors", "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    assert _allowed_diff(scenario, acl_checks, mapped, acl_after) == {}
+    acl_after["prod"]["agents"][0]["acl"]["access_control_list"].append({
+        "group_name": "stranger", "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    assert "stranger CAN_RUN genie:space-pay" in _allowed_diff(
+        scenario, acl_checks, mapped, acl_after)["prod"]["widened_grants"]
+
+
+def test_real_custom_mask_fixture_adoption_allowance_is_exact_and_ack_gated(tmp_path):
+    failsafe = _failsafe_model(); custom_v1 = _custom_model(tmp_path, "v1")
+    before_dev = _model_snapshot(failsafe, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
+    after_dev = _model_snapshot(custom_v1, "dev", grants=(("ops", "SELECT"),), runs=("ops",))
+    values = {"custom_mask_column": "cat.s.t.postcode",
+              "custom_install_ack": "prod:weaken:cat.s.t.postcode:ops",
+              "custom_mask_ack": "prod:weaken:cat.s.t.postcode:ops"}
+    scenario, dev_checks = _rendered_step_checks(
+        "custom-mask", "Run committed cases read-only before the dev lock", values)
+    assert _allowed_diff(scenario, dev_checks, before_dev, after_dev) == {}
+    without = [check for check in dev_checks if not isinstance(check, driver.ProtectionDelta)]
+    assert set(_allowed_diff(scenario, without, before_dev, after_dev)["dev"]) == {
+        "columns", "masks", "policies"}
+
+    before = {"prod": before_dev["dev"]}; after = {"prod": after_dev["dev"]}
+    scenario, prod_checks = _rendered_step_checks(
+        "custom-mask", "Release prepared custom mask", values)
+    ack = {values["custom_install_ack"]}
+    assert _allowed_diff(scenario, prod_checks, before, after, ack) == {}
+    assert set(_allowed_diff(scenario, prod_checks, before, after)["prod"]) == {
+        "columns", "masks", "policies"}
+    before_extra, after_extra = json.loads(json.dumps(before)), json.loads(json.dumps(after))
+    before_extra["prod"]["uc"]["cat"]["governed_tags"].append({
+        "catalog_name": "cat", "schema_name": "s", "table_name": "other",
+        "column_name": "secret", "tag_name": "gr_treatment",
+        "tag_value": "unmapped_redact__string__455f4485",
+    })
+    remaining = _allowed_diff(scenario, prod_checks, before_extra, after_extra, ack)
+    assert any("cat.s.other.secret" in item for item in remaining["prod"]["columns"])
+
+    custom_v2 = _custom_model(tmp_path, "v2")
+    v2 = _model_snapshot(custom_v2, "prod", grants=(("ops", "SELECT"),), runs=("ops",))
+    _, change_checks = _rendered_step_checks(
+        "custom-mask", "Release acknowledged custom-mask change", values)
+    ctx = driver.CheckContext(after, v2, ROOT, acknowledged=frozenset())
+    missing_ack = next(result for result in driver.evaluate_checks(change_checks, ctx)
+                       if result["check"].startswith("acknowledged-weakening"))
+    assert missing_ack["problems"]
+    ctx = dataclasses.replace(ctx, acknowledged=frozenset({values["custom_mask_ack"]}))
+    ack_result = next(result for result in driver.evaluate_checks(change_checks, ctx)
+                      if result["check"].startswith("acknowledged-weakening"))
+    assert ack_result["problems"] == []
 
 
 def test_custom_mask_log_contract_is_executable():
@@ -1993,7 +2199,7 @@ def test_every_real_scenario_check_has_an_evaluator_and_dry_run_passes(tmp_path,
     assert set(driver.EVALUATORS) == {driver.GrantDelta, driver.AccessLevel, driver.AccessVerified,
                                       driver.DiffLimitedTo, driver.Unchanged, driver.AgentIdUnchanged,
                                       driver.OutputContains, driver.OutputOrder,
-                                      driver.AcknowledgedWeakening}
+                                      driver.AcknowledgedWeakening, driver.ProtectionDelta}
 
 
 def test_dry_run_fails_on_a_free_text_assertion(tmp_path, monkeypatch, capsys):

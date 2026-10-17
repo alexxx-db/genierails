@@ -138,6 +138,7 @@ ACCESS_LEVELS = ("raw", "partial", "full", "redacted", "masked")
 # An access target meaning every column the scenario's migrate-plan adopted.
 ADOPTED_COLUMNS = "@migrate-plan"
 Grant = tuple[str, str, str]  # (principal, privilege, securable)
+ProtectionKey = tuple[str, str, str]  # (category, resource, exact change)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,9 +234,22 @@ class AcknowledgedWeakening:
     """Exact ``;;``-separated acknowledgement keys committed for this effect."""
     env: str
     entries: str
-    # protection_diff category and a required substring of the one allowed finding.
-    findings: tuple[tuple[str, str], ...] = ()
+    findings: tuple[ProtectionKey, ...] = ()
     kind: ClassVar[str] = "acknowledged-weakening"
+    snapshots: ClassVar[bool] = True
+
+
+@dataclasses.dataclass(frozen=True)
+class ProtectionDelta:
+    """Exact non-grant protection findings intentionally produced in ``env``.
+
+    A policy key names its table and exact trailing effect. A custom transition
+    names the one column and exact old/new treatment prefixes; adoption's concrete
+    tag, mask and policy findings are derived from the two real snapshots.
+    """
+    env: str
+    findings: tuple[ProtectionKey, ...]
+    kind: ClassVar[str] = "protection-delta"
     snapshots: ClassVar[bool] = True
 
 
@@ -503,7 +517,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         fixture_action("Capture baseline access", "snapshot_checkpoint", "tier-baseline"),
         fixture_action("Add a new tier group", "tier_add", "tier_group"),
         mk("Regenerate for the added tier", "generate", "dev"), AUTHOR_MERGE,
-        mk("Check added tier PR", "check", "dev"), mk("Rehearse added tier merge", "rehearse", "dev"),
+        mk("Check added tier PR", "check", "dev"),
+        mk("Rehearse added tier merge", "rehearse", "dev", assertions=(
+            GrantDelta("dev", may_add=(("{tier_group}", "SELECT", "{tier_table}"),
+                                       ("{tier_group}", "CAN_RUN", "agent:{prod_agent}"),
+                                       *_business_grants("{tier_group}", "{tier_table}"))),
+            ProtectionDelta("dev", (("policies", "{tier_table}",
+                                     "full: newly exempts {tier_group}"),)),
+        )),
         mk("Promote added tier", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check added tier promotion", "check", "prod"),
         mk("Rehearse added tier promotion merge", "rehearse", "dev"),
@@ -513,7 +534,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Rehearse tier acknowledgement merge", "rehearse", "dev"),
         mk("Plan acknowledged tier addition", "release-plan", "prod"),
         mk("Release acknowledged tier addition", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
-            AcknowledgedWeakening("prod", "{tier_add_acks}"),
+            AcknowledgedWeakening("prod", "{tier_add_acks}", ((
+                "policies", "{tier_table}", "full: newly exempts {tier_group}"),)),
             GrantDelta("prod", added=(("{tier_group}", "SELECT", "{tier_table}"),
                                       ("{tier_group}", "CAN_RUN", "agent:{prod_agent}")),
                        may_add=_business_grants("{tier_group}", "{tier_table}")),
@@ -526,7 +548,11 @@ SCENARIOS: tuple[Scenario, ...] = (
         fixture_action("Capture access before tier removal", "snapshot_checkpoint", "tier-added"),
         fixture_action("Remove the tier group", "tier_remove", "tier_group"),
         mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
-        mk("Check removed tier PR", "check", "dev"), mk("Rehearse removed tier merge", "rehearse", "dev"),
+        mk("Check removed tier PR", "check", "dev"),
+        mk("Rehearse removed tier merge", "rehearse", "dev", assertions=(
+            ProtectionDelta("dev", (("policies", "{tier_table}",
+                                     "partial: no longer applies to {tier_group}"),)),
+        )),
         mk("Promote removed tier", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check removed tier promotion", "check", "prod"),
         mk("Rehearse removed tier promotion merge", "rehearse", "dev"),
@@ -534,6 +560,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Release tier removal", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
             GrantDelta("prod", revoked=(("{tier_group}", "SELECT", "{tier_table}"),
                                         ("{tier_group}", "CAN_RUN", "agent:{prod_agent}"))),
+            ProtectionDelta("prod", (("policies", "{tier_table}",
+                                      "partial: no longer applies to {tier_group}"),)),
         )),
         mk("Maintain removed tier", "maintain", "prod"),
         fixture_action("Verify removed tier lost grants and CAN_RUN with no widening", "verify_effect",
@@ -551,7 +579,15 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Rehearse group-map acknowledgement merge", "rehearse", "dev"),
         mk("Plan only the acknowledged group-map effect", "release-plan", "prod"),
         mk("Apply acknowledged group-map manifest", "release", "prod", args=("MANIFEST={manifest}",), assertions=(
-            AcknowledgedWeakening("prod", "prod:weaken:group_map:{group_map_source}={mapped_group}"),
+            AcknowledgedWeakening("prod", "prod:weaken:group_map:{group_map_source}={mapped_group}", (
+                ("policies", "{tier_table}", "full: newly exempts {mapped_group}"),
+                ("policies", "{tier_table}", "partial: no longer applies to {group_map_old_target}"),
+            )),
+            GrantDelta("prod", added=(("{mapped_group}", "SELECT", "{tier_table}"),
+                                      ("{mapped_group}", "CAN_RUN", "agent:{prod_agent}")),
+                       may_add=_business_grants("{mapped_group}", "{tier_table}"),
+                       revoked=(("{group_map_old_target}", "SELECT", "{tier_table}"),
+                                ("{group_map_old_target}", "CAN_RUN", "agent:{prod_agent}"))),
         )),
         mk("Maintain mapped access", "maintain", "prod"),
         fixture_action("Verify only the named group-map effect", "verify_effect", "group_mapped",
@@ -585,7 +621,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Generate policy for prepared custom mask", "generate", "dev"), AUTHOR_MERGE,
         mk("Validate prepared custom mask", "check", "dev"),
         mk("Run committed cases read-only before the dev lock", "rehearse", "dev",
-           assertions=custom_mask_checks("***CD")),
+           assertions=custom_mask_checks("***CD") + (ProtectionDelta("dev", ((
+               "custom-adoption", "{custom_mask_column}", "unmapped_redact->custom_e2e_suffix"),)),)),
         mk("Promote adopted mask byte-for-byte", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check promoted custom mask", "check", "prod"),
         mk("Rehearse custom-mask promotion merge", "rehearse", "dev",
@@ -600,7 +637,8 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Release prepared custom mask", "release", "prod", args=("MANIFEST={manifest}",),
            assertions=custom_mask_checks("***CD", verify=True) + (
                AcknowledgedWeakening("prod", "{custom_install_ack}",
-                                     (("masks", "gr_mask_custom_e2e_suffix_"),)),)),
+                                     (("custom-adoption", "{custom_mask_column}",
+                                       "unmapped_redact->custom_e2e_suffix"),)),)),
         mk("Verify partial/full behavior and idempotence", "maintain", "prod"),
         action("Remove custom-mask install acknowledgement", "remove_ack", "custom_install_ack"), AUTHOR_MERGE,
         mk("Rehearse custom-mask install ack cleanup", "rehearse", "dev",
@@ -623,8 +661,9 @@ SCENARIOS: tuple[Scenario, ...] = (
            assertions=custom_mask_checks("**BCD")),
         mk("Release acknowledged custom-mask change", "release", "prod", args=("MANIFEST={manifest}",),
            assertions=custom_mask_checks("**BCD", verify=True) + (
-               AcknowledgedWeakening("prod", "{custom_mask_ack}",
-                                     (("masks", "gr_mask_custom_e2e_suffix_"),)),)),
+               AcknowledgedWeakening("prod", "{custom_mask_ack}", ((
+                   "custom-generation", "{custom_mask_column}",
+                   "custom_e2e_suffix->custom_e2e_suffix"),)),)),
         mk("Verify changed partial/full behavior", "maintain", "prod"),
         action("Remove custom-mask change acknowledgement", "remove_ack", "custom_mask_ack"), AUTHOR_MERGE,
         mk("Rehearse custom-mask ack cleanup merge", "rehearse", "dev",
@@ -1103,7 +1142,9 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
         for name in (n for part in step.command for n in PLACEHOLDER.findall(part)):
             if not values.get(name) and name not in produced: missing.append(name)
         for name in (n for check in step.assertions for n in check_placeholders(check)):
-            if not values.get(name): missing.append(name)
+            if not values.get(name) and name not in produced: missing.append(name)
+        if step.action == "snapshot_checkpoint" and step.fixture_args == ("before-group-map",):
+            produced.add("group_map_old_target")
         if step.target == "release-plan" and not step.expect_failure: produced.add("manifest")
     missing += [n for check in scenario.checks for n in check_placeholders(check) if not values.get(n)]
     for step in scenario.steps:
@@ -1654,7 +1695,7 @@ def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any]
 def live_protection_diff(scenario: Scenario, before: Mapping[str, Any], after: Mapping[str, Any], *,
                          allowed_adoptions: Mapping[str, Mapping[str, Adoption]],
                          allowed_grants: Mapping[str, Iterable[Grant]],
-                         allowed_weakening_findings: Iterable[tuple[str, str]] = ()) -> dict[str, Any]:
+                         allowed_weakening_findings: Mapping[str, set[tuple[str, str]]] | None = None) -> dict[str, Any]:
     """The step/phase/scenario-end check: weaker protection or any grant or
     CAN_RUN widening beyond the scenario's declared GrantDelta. A scenario that
     is expected to weaken protection is still held to its grant allowance."""
@@ -1664,15 +1705,49 @@ def live_protection_diff(scenario: Scenario, before: Mapping[str, Any], after: M
         weak = {env: {"widened_grants": found["widened_grants"]}
                 for env, found in weak.items() if "widened_grants" in found}
     else:
-        permitted = tuple(allowed_weakening_findings)
+        permitted = allowed_weakening_findings or {}
         weak = {env: {category: [finding for finding in findings
-                                 if not any(category == allowed_category and marker in finding
-                                            for allowed_category, marker in permitted)]
+                                 if (category, finding) not in permitted.get(env, set())]
                       for category, findings in found.items()}
                 for env, found in weak.items()}
         weak = {env: {category: findings for category, findings in found.items() if findings}
                 for env, found in weak.items() if any(found.values())}
     return weak
+
+
+def _finding_matches(key: ProtectionKey, actual: Mapping[str, list[str]],
+                     before: Mapping[str, Any], after: Mapping[str, Any]) -> set[tuple[str, str]]:
+    """Concrete findings selected by one narrow semantic protection key."""
+    category, resource, change = key
+    if category == "policies":
+        return {(category, finding) for finding in actual.get(category, ())
+                if finding.startswith(resource + " ") and finding.endswith(change)}
+    if category not in {"custom-adoption", "custom-generation"}: return set()
+    old_prefix, separator, new_prefix = change.partition("->")
+    if not separator: return set()
+    left, right = _protection(before), _protection(after)
+    old = left["columns"].get((resource, "gr_treatment"))
+    new = right["columns"].get((resource, "gr_treatment"))
+    old_raw = old[2] if isinstance(old, tuple) else old
+    new_raw = new[2] if isinstance(new, tuple) else new
+    if not (isinstance(old_raw, str) and isinstance(new_raw, str)
+            and old_raw.startswith(old_prefix + "__") and new_raw.startswith(new_prefix + "__")):
+        return set()
+    if category == "custom-generation":
+        return {(category, f"{resource} {old_raw} -> {new_raw}")} if old_raw != new_raw else set()
+    selected: set[tuple[str, str]] = set()
+    exact_column = f"{resource} gr_treatment never-raw {old_raw} -> {new_raw}"
+    if exact_column in actual.get("columns", ()): selected.add(("columns", exact_column))
+    old_normalized = "__".join(old[:2]) if isinstance(old, tuple) else old_raw
+    selected |= {("masks", finding) for finding in actual.get("masks", ()) if old_normalized in finding}
+    table = resource.rsplit(".", 1)[0]
+    for policy_key, fact in left["policies"].items():
+        if policy_key[0] != table or old_raw not in fact["values"]: continue
+        label = f"{policy_key[0]} {policy_key[2]}" if len(policy_key) == 3 else " ".join(
+            (policy_key[0], *policy_key[2:]))
+        finding = f"{label}: removed"
+        if finding in actual.get("policies", ()): selected.add(("policies", finding))
+    return selected
 
 
 def unexpected_changes(scenario: str, before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, list[str]]:
@@ -1844,6 +1919,13 @@ def _shape_problems(check: Any) -> list[str]:
                 problems.append(f"grant {grant!r} must be (principal, privilege, securable)")
             elif any(ch in part for part in grant for ch in "*?[") or grant[2] == "agent:":
                 problems.append(f"grant {grant!r} must name one principal, privilege and securable exactly")
+    if isinstance(check, (ProtectionDelta, AcknowledgedWeakening)):
+        for finding in check.findings:
+            if not (isinstance(finding, tuple) and len(finding) == 3
+                    and all(isinstance(part, str) and part.strip() for part in finding)):
+                problems.append(f"protection finding {finding!r} must be (category, resource, exact change)")
+            elif finding[0] not in {"policies", "custom-adoption", "custom-generation"}:
+                problems.append(f"protection finding category {finding[0]!r} is not supported")
     return problems
 
 
@@ -1998,7 +2080,19 @@ def _eval_output_order(check: OutputOrder, ctx: CheckContext) -> list[str]:
 def _eval_acknowledged_weakening(check: AcknowledgedWeakening, ctx: CheckContext) -> list[str]:
     expected = set(_ack_entries(check.entries))
     missing = expected - set(ctx.acknowledged)
-    return [f"exact acknowledgement key(s) were not committed/recorded: {', '.join(sorted(missing))}"] if missing else []
+    problems = ([f"exact acknowledgement key(s) were not committed/recorded: {', '.join(sorted(missing))}"]
+                if missing else [])
+    return problems + _protection_delta_problems(check.env, check.findings, ctx)
+
+
+def _protection_delta_problems(env: str, keys: Iterable[ProtectionKey], ctx: CheckContext) -> list[str]:
+    actual = protection_diff(ctx.before.get(env, {}), ctx.after.get(env, {}), include_grants=False)
+    return [f"{env}: expected protection finding was not produced: {key!r}" for key in keys
+            if not _finding_matches(key, actual, ctx.before.get(env, {}), ctx.after.get(env, {}))]
+
+
+def _eval_protection_delta(check: ProtectionDelta, ctx: CheckContext) -> list[str]:
+    return _protection_delta_problems(check.env, check.findings, ctx)
 
 
 def file_signature(path: Path) -> tuple[int, str] | None:
@@ -2096,6 +2190,7 @@ EVALUATORS: Mapping[type, Callable[[Any, CheckContext], list[str]]] = {
     OutputContains: _eval_output_contains,
     OutputOrder: _eval_output_order,
     AcknowledgedWeakening: _eval_acknowledged_weakening,
+    ProtectionDelta: _eval_protection_delta,
 }
 
 
@@ -2106,10 +2201,20 @@ def weakening_allowances(checks: Iterable[Any], acknowledged: Iterable[str]) -> 
     return declared & committed
 
 
-def weakening_finding_allowances(checks: Iterable[Any], acknowledged: Iterable[str]) -> set[tuple[str, str]]:
+def weakening_finding_allowances(checks: Iterable[Any], acknowledged: Iterable[str],
+                                 before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, set[tuple[str, str]]]:
     committed = set(acknowledged)
-    return {finding for check in checks if isinstance(check, AcknowledgedWeakening)
-            and set(_ack_entries(check.entries)) <= committed for finding in check.findings}
+    allowed: dict[str, set[tuple[str, str]]] = {}
+    for check in checks:
+        if isinstance(check, AcknowledgedWeakening):
+            if not set(_ack_entries(check.entries)) <= committed: continue
+        elif not isinstance(check, ProtectionDelta):
+            continue
+        actual = protection_diff(before.get(check.env, {}), after.get(check.env, {}), include_grants=False)
+        for key in check.findings:
+            allowed.setdefault(check.env, set()).update(
+                _finding_matches(key, actual, before.get(check.env, {}), after.get(check.env, {})))
+    return allowed
 
 
 def evaluate_checks(checks: Iterable[Any], ctx: CheckContext) -> list[dict[str, Any]]:
@@ -2484,6 +2589,12 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                                 "snapshot": capture(),
                                 "prod_group_map": dict(prod_cfg.get("group_map") or {}),
                             }
+                            if step.fixture_args == ("before-group-map",):
+                                source = values["group_map_source"]
+                                old_target = checkpoints["before-group-map"]["prod_group_map"].get(source)
+                                if not isinstance(old_target, str) or not old_target:
+                                    raise RuntimeError(f"checkpoint prod group_map has no target for {source!r}")
+                                values["group_map_old_target"] = old_target
                         elif step.action == "verify_effect":
                             kind, checkpoint, *names = step.fixture_args
                             if checkpoint not in checkpoints: raise RuntimeError(f"missing snapshot checkpoint {checkpoint}")
@@ -2543,7 +2654,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             scenario, step_before, step_after, allowed_adoptions=allowed_adoptions,
                             allowed_grants=grant_allowances(declared_checks, step_before, step_after),
                             allowed_weakening_findings=weakening_finding_allowances(
-                                declared_checks, _current_acks(cloud_root) | recorded_ack_keys))
+                                declared_checks, _current_acks(cloud_root) | recorded_ack_keys,
+                                step_before, step_after))
                         if weak_step:
                             item["status"] = "ERROR"
                             if "assertion" not in item:
@@ -2585,7 +2697,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                                 scenario, phase_plan_after, phase_after, allowed_adoptions=allowed_adoptions,
                                 allowed_grants=grant_allowances(declared_checks, phase_plan_after, phase_after),
                                 allowed_weakening_findings=weakening_finding_allowances(
-                                    declared_checks, _current_acks(cloud_root) | recorded_ack_keys))
+                                    declared_checks, _current_acks(cloud_root) | recorded_ack_keys,
+                                    phase_plan_after, phase_after))
                             if weak_phase:
                                 raise RuntimeError(f"release phase {phase} weakened protection: {weak_phase}")
                             phase_output = plan_result.stdout + "\n" + phase_release.stdout
@@ -2607,7 +2720,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                 weak = live_protection_diff(scenario, before, after, allowed_adoptions=allowed_adoptions,
                                             allowed_grants=grant_allowances(declared_checks, before, after),
                                             allowed_weakening_findings=weakening_finding_allowances(
-                                                declared_checks, _current_acks(cloud_root) | recorded_ack_keys))
+                                                declared_checks, _current_acks(cloud_root) | recorded_ack_keys,
+                                                before, after))
                 if weak: raise RuntimeError(f"protection became weaker or access widened: {weak}")
                 scenario_check_results = evaluate_checks(scenario_checks, CheckContext(
                     before, after, cloud_root, scenario_verify, allowed_adoptions, "",
