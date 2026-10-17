@@ -336,6 +336,71 @@ tag_assignments = [{ entity_type = "columns", entity_name = "cat.sch.people.api_
     assert "partial" not in set(dict(check.expected_tiers).values())
 
 
+DEPLOYER_APP_ID = "c2309647-459e-4bad-9883-1b932eaf1b17"
+
+
+def _deployer_excepted_tfvars(tmp_path, mode):
+    """Policies as build_policies writes them when deployer_principal_id is set."""
+    tfvars = tmp_path / "abac.auto.tfvars"
+    env = tmp_path / "env.auto.tfvars"
+    tfvars.write_text(f'''fgac_policies = [
+  {{ name = "partial", policy_type = "POLICY_TYPE_COLUMN_MASK", to_principals = ["analyst"],
+    except_principals = ["raw", "{DEPLOYER_APP_ID}"],
+    match_condition = "hasTagValue('gr_treatment', 'email_partial')",
+    function_catalog = "cat", function_schema = "gov", function_name = "partial_email" }},
+  {{ name = "full", policy_type = "POLICY_TYPE_COLUMN_MASK", to_principals = ["account users"],
+    except_principals = ["raw", "analyst", "{DEPLOYER_APP_ID}"],
+    match_condition = "hasTagValue('gr_treatment', 'email_partial')",
+    function_catalog = "cat", function_schema = "gov", function_name = "full_email" }},
+  {{ name = "secret", policy_type = "POLICY_TYPE_COLUMN_MASK", to_principals = ["account users"],
+    except_principals = [], match_condition = "hasTagValue('gr_treatment', 'secret')",
+    function_catalog = "cat", function_schema = "gov", function_name = "redact" }},
+]
+tag_assignments = [
+  {{ entity_type = "columns", entity_name = "cat.sch.people.email", tag_key = "gr_treatment", tag_value = "email_partial" }},
+  {{ entity_type = "columns", entity_name = "cat.sch.people.api_key", tag_key = "gr_treatment", tag_value = "secret" }},
+]
+''')
+    env.write_text(f'''{mode}access_tier_groups = ["raw", "analyst", "viewer"]
+deployer_principal_id = "{DEPLOYER_APP_ID}"
+''')
+    return tfvars, env
+
+
+def test_deterministic_spec_checks_deployer_as_admin_baseline_not_tier_group(tmp_path):
+    tfvars, env = _deployer_excepted_tfvars(tmp_path, 'governance_mode = "deterministic"\n')
+    spec = load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
+    assert DEPLOYER_APP_ID not in spec.principals
+    assert DEPLOYER_APP_ID not in spec.principal_memberships
+    assert spec.principals == {"raw", "analyst", "viewer", "__out_of_tier__", "__dual_tier__"}
+    by_column = {c.column: c for c in spec.column_masks}
+    for check in by_column.values():
+        assert DEPLOYER_APP_ID not in check.masked_principals + check.unmasked_principals
+        assert DEPLOYER_APP_ID not in dict(check.expected_tiers)
+        assert DEFAULT_ADMIN_TIER not in check.masked_principals
+    assert dict(by_column["email"].expected_tiers)[DEFAULT_ADMIN_TIER] == "raw"
+    assert dict(by_column["api_key"].expected_tiers)[DEFAULT_ADMIN_TIER] == "full"
+    # The policy fingerprint inputs are the deployed policies, unchanged.
+    excepts = [p["except_principals"] for p in spec.mask_config["fgac_policies"]]
+    assert sum(DEPLOYER_APP_ID in e for e in excepts) == 2
+
+
+def test_deterministic_spec_refuses_deployer_principal_id_equal_to_a_tier_group(tmp_path):
+    tfvars, env = _deployer_excepted_tfvars(tmp_path, 'governance_mode = "deterministic"\n')
+    tfvars.write_text(tfvars.read_text().replace('to_principals = ["analyst"]',
+                                                 f'to_principals = ["{DEPLOYER_APP_ID}"]'))
+    env.write_text(env.read_text().replace('"analyst"', f'"{DEPLOYER_APP_ID}"'))
+    with pytest.raises(ValueError, match="deployer_principal_id .* is also a configured group"):
+        load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
+
+
+def test_legacy_spec_keeps_deployer_principal_id_unaliased(tmp_path):
+    tfvars, env = _deployer_excepted_tfvars(tmp_path, "")
+    spec = load_spec_from_tfvars(tfvars, env_file=env, key_column="id")
+    assert DEPLOYER_APP_ID in spec.principals
+    assert all(not c.expected_tiers for c in spec.column_masks)
+
+
 def test_deterministic_spec_rejects_raw_exempt_user_email(tmp_path):
     tfvars = tmp_path / "abac.auto.tfvars"
     env = tmp_path / "env.auto.tfvars"
