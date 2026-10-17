@@ -30,9 +30,9 @@ sys.path.insert(0, str(SHARED))  # verify_effective_access: the spec verify-acce
 
 
 def _refuse(env: str, reason: str) -> int:
-    print(f"release: {reason}; nothing was applied.\n"
+    print(f"verification gate: {reason}; nothing was applied.\n"
           f"  Fix the masking policies or the account groups (dev, then rehearse and re-promote),\n"
-          f"  or pass a VERIFY_SPEC=<file> whose column_masks check every masked column.",
+          f"  or pass a VERIFY_SPEC=<file> that preserves every policy-derived proof semantic.",
           file=sys.stderr)
     return 1
 
@@ -49,8 +49,9 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
     match (required_mask_columns), whatever principals a check could use.
     verify-access derives a check per masked column, but drops a mask with no
     concrete masked tier (e.g. "account users" without account groups); an
-    explicit VERIFY_SPEC replaces the derived checks altogether. Each must
-    cover every required column. Row-pairing keys need no setting here:
+    explicit VERIFY_SPEC replaces the derived checks at execution, so a gate
+    first proves that it preserves every derived principal, exact-output
+    function, membership and comparison exception. Row-pairing keys need no setting here:
     verify-access picks one per table (or uses verify_key_columns /
     VERIFY_KEY_COLUMN), and release proves them all as the admin
     (verify-access --check-keys-only) before it applies. Run before the
@@ -66,6 +67,8 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
     if not masks and not spec.strip():
         return 0
     tfvars = tfvars or _promoted_tfvars(env_dir)
+    if spec.strip() and not tfvars.is_file():
+        return _refuse(env, f"VERIFY_SPEC cannot be checked because the derivation config {tfvars} is missing")
     try:
         required = required_mask_columns_from_tfvars(tfvars) if tfvars.is_file() else set()
     except (OSError, ValueError, KeyError, TypeError) as exc:

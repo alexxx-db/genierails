@@ -87,6 +87,73 @@ def test_gate_spec_cannot_drop_or_weaken_a_derived_row_filter_principal():
         "cat.sch.orders: regional expected restricted row access (missing or weakened)"]
 
 
+def _derived_gate_spec():
+    tiers = (("finance", "raw"), ("analyst", "partial"),
+             ("viewer", "full"), ("__admin__", "raw"))
+    return VerificationSpec(
+        column_masks=[ColumnMaskCheck(
+            "c.s.p", "ssn", "id", (), (), expected_tiers=tiers,
+            partial_function="c.s.mask_partial", full_function="c.s.mask_full")],
+        principal_memberships={"finance": ("finance",), "analyst": ("analyst",),
+                               "viewer": ("viewer",), "__admin__": ("__admin__",)},
+    )
+
+
+def test_gate_rejects_tiered_check_replaced_by_untiered_probe_p1():
+    explicit = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", ("analyst", "viewer"), ("finance", "__admin__"))])
+    problems = weaker_explicit_spec_checks(_derived_gate_spec(), explicit)
+    assert any("tiered exact-output check replaced by an untiered check" in p for p in problems)
+
+
+def test_gate_rejects_changed_expected_output_function_probe_p2():
+    check = _derived_gate_spec().column_masks[0]
+    explicit = VerificationSpec(column_masks=[replace(check, full_function=check.partial_function)])
+    assert any("full_function expected c.s.mask_full, got c.s.mask_partial" in p
+               for p in weaker_explicit_spec_checks(_derived_gate_spec(), explicit))
+
+
+def test_gate_rejects_changed_effective_memberships_probe_p3():
+    derived = _derived_gate_spec()
+    explicit = VerificationSpec(
+        column_masks=[replace(derived.column_masks[0], expected_tiers=(
+            ("finance", "raw"), ("analyst", "full"),
+            ("viewer", "full"), ("__admin__", "raw")))],
+        principal_memberships={"analyst": ()},
+    )
+    assert any("analyst memberships expected ['analyst'], got []" in p
+               for p in weaker_explicit_spec_checks(derived, explicit))
+
+
+def test_gate_rejects_added_moving_principal_probe_p4():
+    derived = _derived_gate_spec()
+    explicit = VerificationSpec(column_masks=[replace(
+        derived.column_masks[0], moving_principals=("analyst",))],
+        principal_memberships=derived.principal_memberships)
+    assert any("moving_principals may not add ['analyst']" in p
+               for p in weaker_explicit_spec_checks(derived, explicit))
+
+
+def test_minimum_from_tfvars_cli_refuses_a_weaker_explicit_spec(tmp_path):
+    tfvars = tmp_path / "abac.auto.tfvars"
+    tfvars.write_text('''fgac_policies = [{
+      name = "mask", policy_type = "POLICY_TYPE_COLUMN_MASK", catalog = "cat",
+      to_principals = ["analysts"], match_condition = "hasTagValue('gr_treatment', 'redact')",
+      function_name = "mask_redact", function_catalog = "cat", function_schema = "sch"
+    }]
+    tag_assignments = [{ entity_type = "columns", entity_name = "cat.sch.t.ssn",
+                         tag_key = "gr_treatment", tag_value = "redact" }]
+    ''')
+    env_file = tmp_path / "env.auto.tfvars"
+    env_file.write_text('governance_mode = "legacy"\n')
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text('''{"column_masks": [{"table": "cat.sch.t", "column": "ssn",
+      "unmasked_principals": ["__admin__"]}]}''')
+    with pytest.raises(SystemExit, match="analysts expected full"):
+        main(["--spec", str(spec_file), "--minimum-from-tfvars", str(tfvars),
+              "--minimum-env-file", str(env_file), "--print-spec"])
+
+
 def _tiered_check():
     return ColumnMaskCheck(
         table="cat.sch.people", column="email", key_column="id",

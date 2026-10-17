@@ -118,6 +118,14 @@ def test_a_missing_spec_file_refuses(tmp_path, capsys):
     assert "could not be read" in capsys.readouterr().err
 
 
+def test_a_spec_refuses_when_the_derivation_tfvars_are_missing(tmp_path, capsys):
+    env = _env(tmp_path)
+    missing = env / "data_access" / "abac.auto.tfvars"
+    missing.unlink()
+    assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, FULL_SPEC), tfvars=missing) == 1
+    assert "derivation config" in capsys.readouterr().err
+
+
 def test_a_keyed_spec_covering_every_masked_column_passes(tmp_path):
     env = _env(tmp_path, policies=TAGGED)
     assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, FULL_SPEC)) == 0
@@ -274,6 +282,21 @@ def test_release_verifies_strictly():
     assert "_VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)" in makefile
     verify = makefile[makefile.index("\nverify-access:"):]
     assert "$(_VERIFY_REQUIRE_FLAG)" in verify[:verify.index("\n\n")]
+
+
+def test_every_applying_verify_spec_path_has_a_semantic_minimum_guard():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    rehearse = makefile[makefile.index("override _REHEARSE_STEPS"):makefile.index("\nrehearse:")]
+    maintain = makefile[makefile.index("\nmaintain:"):makefile.index("\nvalidate:")]
+    manifest = makefile[makefile.index("\n_release-manifest:"):makefile.index("\nmaintain:")]
+    apply = makefile[makefile.index("\napply:"):makefile.index("\n# Read-only:")]
+    verify = makefile[makefile.index("\nverify-access:"):]
+    assert "require-mask-proof" in rehearse
+    assert "require-mask-proof" in maintain
+    assert manifest.index("$(_REQUIRE_MASK_PROOF)") < manifest.index("apply-saved")
+    assert apply.count("$(_REQUIRE_MASK_PROOF)") >= 2
+    assert "$(_VERIFY_MINIMUM_FLAG)" in verify[:verify.index("\n\ntest-quickstart:")]
+    assert "VERIFY_GATE=1" in rehearse
 
 
 # ── a mask verify-access derives no check for ───────────────────────────────

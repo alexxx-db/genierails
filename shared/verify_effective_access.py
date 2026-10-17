@@ -2747,7 +2747,7 @@ def load_spec_from_file(path: Path) -> VerificationSpec:
 
 
 def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: VerificationSpec) -> list[str]:
-    """Describe policy-derived principal expectations omitted or weakened by a spec."""
+    """Describe derived proof semantics omitted or weakened by an explicit gate spec."""
     rank = {"raw": 0, "partial": 1, "full": 2}
 
     def expectations(check: ColumnMaskCheck) -> dict[str, str]:
@@ -2756,22 +2756,58 @@ def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: Verificatio
         return ({p: "full" for p in check.masked_principals}
                 | {p: "raw" for p in check.unmasked_principals})
 
-    explicit_by_column: dict[tuple[str, str], dict[str, str]] = {}
-    for check in explicit.column_masks:
-        current = explicit_by_column.setdefault((check.table.lower(), check.column.lower()), {})
-        for principal, tier in expectations(check).items():
-            if tier in rank and (principal not in current or rank[tier] > rank.get(current[principal], -1)):
-                current[principal] = tier
+    def memberships(spec: VerificationSpec, principal: str) -> tuple[str, ...]:
+        return tuple(sorted(spec.principal_memberships.get(principal, (principal,))))
 
-    missing = []
+    explicit_by_column: dict[tuple[str, str], list[ColumnMaskCheck]] = {}
+    for check in explicit.column_masks:
+        explicit_by_column.setdefault((check.table.lower(), check.column.lower()), []).append(check)
+
+    missing: list[str] = []
     for check in derived.column_masks:
-        actual = explicit_by_column.get((check.table.lower(), check.column.lower()), {})
-        for principal, expected in expectations(check).items():
-            supplied = actual.get(principal)
-            if supplied is None:
-                missing.append(f"{check.table}.{check.column}: {principal} expected {expected} (missing)")
-            elif supplied not in rank or rank[supplied] < rank[expected]:
-                missing.append(f"{check.table}.{check.column}: {principal} expected {expected}, got {supplied}")
+        label = f"{check.table}.{check.column}"
+        candidates = explicit_by_column.get((check.table.lower(), check.column.lower()), [])
+        if not candidates:
+            missing.append(f"{label}: derived check missing")
+            continue
+        candidate_problems = []
+        for actual_check in candidates:
+            problems = []
+            expected_tiers, supplied_tiers = expectations(check), expectations(actual_check)
+            if check.expected_tiers and not actual_check.expected_tiers:
+                problems.append("tiered exact-output check replaced by an untiered check")
+            for principal, expected in expected_tiers.items():
+                supplied = supplied_tiers.get(principal)
+                if supplied is None:
+                    problems.append(f"{principal} expected {expected} (missing)")
+                elif supplied not in rank or (expected == "raw" and supplied != "raw") \
+                        or (expected != "raw" and rank[supplied] < rank[expected]):
+                    problems.append(f"{principal} expected {expected}, got {supplied}")
+                if memberships(explicit, principal) != memberships(derived, principal):
+                    problems.append(
+                        f"{principal} memberships expected {list(memberships(derived, principal))}, "
+                        f"got {list(memberships(explicit, principal))}")
+            if check.expected_tiers:
+                for field_name in ("partial_function", "full_function"):
+                    expected_fn = getattr(check, field_name).lower()
+                    supplied_fn = getattr(actual_check, field_name).lower()
+                    if supplied_fn != expected_fn:
+                        problems.append(f"{field_name} expected {expected_fn or '<empty>'}, "
+                                        f"got {supplied_fn or '<empty>'}")
+            if actual_check.mask_function and actual_check.mask_function.lower() != check.mask_function.lower():
+                problems.append(f"mask_function expected {check.mask_function or '<empty>'}, "
+                                f"got {actual_check.mask_function or '<empty>'}")
+            if check.key_column and actual_check.key_column.lower() != check.key_column.lower():
+                problems.append(f"key_column expected {check.key_column or '<live-picked>'}, "
+                                f"got {actual_check.key_column or '<live-picked>'}")
+            unexpected_moving = sorted(set(actual_check.moving_principals) - set(check.moving_principals))
+            if unexpected_moving:
+                problems.append(f"moving_principals may not add {unexpected_moving}")
+            if not problems:
+                break
+            candidate_problems.append(problems)
+        else:
+            missing.extend(f"{label}: {problem}" for problem in min(candidate_problems, key=len))
     explicit_rows: dict[str, dict[str, str]] = {}
     for check in explicit.row_filters:
         current = explicit_rows.setdefault(check.table.lower(), {})
@@ -2783,9 +2819,17 @@ def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: Verificatio
         for principal in check.restricted_principals:
             if actual.get(principal) != "restricted":
                 missing.append(f"{check.table}: {principal} expected restricted row access (missing or weakened)")
+            if memberships(explicit, principal) != memberships(derived, principal):
+                missing.append(f"{check.table}: {principal} row-filter memberships expected "
+                               f"{list(memberships(derived, principal))}, got "
+                               f"{list(memberships(explicit, principal))}")
         for principal in check.unrestricted_principals:
-            if principal not in actual:
-                missing.append(f"{check.table}: {principal} expected unrestricted row baseline (missing)")
+            if actual.get(principal) != "unrestricted":
+                missing.append(f"{check.table}: {principal} expected unrestricted row baseline (missing or changed)")
+            if memberships(explicit, principal) != memberships(derived, principal):
+                missing.append(f"{check.table}: {principal} row-filter memberships expected "
+                               f"{list(memberships(derived, principal))}, got "
+                               f"{list(memberships(explicit, principal))}")
     return sorted(set(missing))
 
 
@@ -3191,7 +3235,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if weaker:
                 raise ValueError("ERROR: explicit verification spec is weaker than the policy-derived "
                                  "gate spec; missing or weakened check(s): " + "; ".join(weaker))
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
     sensitive_keys = sorted(

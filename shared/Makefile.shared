@@ -831,7 +831,7 @@ override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FL
 		key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
 		$(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac"; fi && \
 	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
-	$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+	$(MAKE) verify-access ENV="$(ENV)" VERIFY_GATE=1 $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 	$(_SAVE_VERIFY_KEY) && \
 	$(_GROUP_MAP_RECORD) && \
 	$(_STAGED_CONFIRM_RUN)
@@ -873,7 +873,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
 		GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
-		$(MAKE) verify-access ENV="$(ENV)" $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+		$(MAKE) verify-access ENV="$(ENV)" VERIFY_GATE=1 $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 		$(_SAVE_VERIFY_KEY) && \
 		$(_GROUP_MAP_RECORD) && \
 		$(_STAGED_CONFIRM_RUN)
@@ -1913,6 +1913,7 @@ test-unit: ## Run fast unit tests (no Databricks/LLM/Terraform required) — use
 #   VERIFY_REQUIRE_MASKS=1 fail when a masked table has no provable key (make release sets it)
 VERIFY_KEY_COLUMN ?=
 VERIFY_SPEC ?=
+VERIFY_GATE ?=
 # VERIFY_FROM_TFVARS / VERIFY_ENV_FILE: the staged policy controller verifies
 # one stage's render, with the tier settings of the generation it checks.
 VERIFY_FROM_TFVARS ?=
@@ -1925,7 +1926,7 @@ override _VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_
 # make release sets VERIFY_REQUIRE_MASKS=1: a mask check whose table has no
 # provable row-pairing key fails instead of letting the release report success.
 override _VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)
-override _VERIFY_MINIMUM_FLAG = $(if $(and $(VERIFY_SPEC),$(filter 1,$(VERIFY_REQUIRE_MASKS))),--minimum-from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --minimum-env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)" --minimum-account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars",)
+override _VERIFY_MINIMUM_FLAG = $(if $(and $(VERIFY_SPEC),$(or $(filter 1,$(VERIFY_REQUIRE_MASKS)),$(filter 1,$(VERIFY_GATE)))),--minimum-from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --minimum-env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)" --minimum-account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars",)
 
 verify-access-spec: _guarded-bootstrap _guard-workspace-target ## Print the derived effective-access checks (no workspace/cluster needed)
 	@key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
@@ -1955,7 +1956,7 @@ _verify-access-keys-readonly: _guard-workspace-target
 	$(_VERIFY_KEYS_CHECK)
 
 verify-access: _guarded-bootstrap _guard-workspace-target ## Verify masking/row-filters take effect via per-tier test principals (LIVE workspace)
-	@if [ -n "$(VERIFY_SPEC)" ] && [ "$(VERIFY_REQUIRE_MASKS)" != 1 ]; then \
+	@if [ -n "$(VERIFY_SPEC)" ] && [ "$(VERIFY_REQUIRE_MASKS)" != 1 ] && [ "$(VERIFY_GATE)" != 1 ]; then \
 		echo "NOTE: VERIFY_SPEC is free-form for standalone verify-access; this read-only run is not an apply/release gate."; \
 	fi
 	@rm -f "$(_VERIFY_RESULT)"
