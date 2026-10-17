@@ -22,6 +22,8 @@ import group_map
 from scripts import migration
 from scripts import policy_generations as pg
 from scripts import staged_policy_apply as spa
+from scripts import environment_lock
+from scripts import release_gate as rg
 from scripts import state_layout
 
 SHARED = Path(__file__).resolve().parents[1]
@@ -184,10 +186,10 @@ def test_an_unreadable_state_dir_fails_closed(tmp_path, monkeypatch):
     not_a_dir = tmp_path / "file"
     not_a_dir.write_text("")
     monkeypatch.setenv(state_layout.STATE_DIR_ENV, str(not_a_dir))
-    with pytest.raises(spa.Refused, match="can't be read"):
+    with pytest.raises(spa.Refused, match="is not a directory"):
         spa.load_journal(env_dir)
     result = _status(env_dir)
-    assert result.returncode == 3 and "can't be read" in result.stderr
+    assert result.returncode == 3 and "is not a directory" in result.stderr
 
     if os.geteuid() == 0:
         pytest.skip("root reads any directory")
@@ -200,6 +202,66 @@ def test_an_unreadable_state_dir_fails_closed(tmp_path, monkeypatch):
             spa.load_journal(env_dir)
     finally:
         records.chmod(0o700)
+
+
+def test_a_mistyped_state_dir_refuses_every_reader_and_creates_nothing(tmp_path, monkeypatch):
+    env_dir = tmp_path / "aws" / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    (tmp_path / "state").mkdir()  # the real one; the variable names a typo of it
+    typo = tmp_path / "statee"
+    monkeypatch.setenv(state_layout.STATE_DIR_ENV, str(typo))
+
+    with pytest.raises(state_layout.StateError, match="does not exist"):
+        state_layout.state_json(env_dir, "dev", "workspace")
+    for read in (spa.load_journal, migration.load_record):
+        with pytest.raises((spa.Refused, migration.Refused), match="does not exist"):
+            read(env_dir)
+    with pytest.raises(state_layout.RecordError, match="does not exist"):
+        group_map._applied(env_dir)
+    with pytest.raises(RuntimeError, match="does not exist"):
+        environment_lock.acquire(env_dir, os.getpid(), "rehearse")
+    with pytest.raises(RuntimeError, match="does not exist"):
+        rg.env_state(rg.cloud_dir_of(env_dir), "dev")
+    result = _status(env_dir)
+    assert result.returncode == 3 and "does not exist" in result.stderr, result.stdout + result.stderr
+    assert "no policy journal yet" not in result.stdout
+    for command in ("layer-dir", "records-dir"):
+        cli = subprocess.run([sys.executable, str(SHARED / "scripts" / "state_layout.py"), command,
+                              "--env-dir", str(env_dir), "--env", "dev", *(["--layer", "workspace"]
+                                                                          if command == "layer-dir" else [])],
+                             text=True, capture_output=True)
+        assert cli.returncode == 2 and "does not exist" in cli.stderr, (command, cli.stdout, cli.stderr)
+    environ = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL")}
+    made = subprocess.run(["make", "--no-print-directory", "policy-status", "ENV=dev", f"ENV_DIR={env_dir}"],
+                          cwd=ROOT / "aws", text=True, capture_output=True, env=environ)
+    assert made.returncode != 0 and "does not exist" in made.stderr, made.stdout + made.stderr
+    assert not typo.exists(), "nothing may create a mistyped state dir"
+
+
+def test_an_existing_state_dir_without_records_reads_as_empty(tmp_path, monkeypatch):
+    env_dir = tmp_path / "aws" / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv(state_layout.STATE_DIR_ENV, str(tmp_path / "state"))
+    assert spa.load_journal(env_dir) is None and migration.load_record(env_dir) is None
+    assert group_map._applied(env_dir) is None
+    assert state_layout.state_json(env_dir, "dev", "workspace") is None
+    assert state_layout.records_dir(env_dir) == (tmp_path / "state").resolve() / "aws" / "dev" / "records"
+    result = _status(env_dir)
+    assert result.returncode == 0 and "no policy journal yet" in result.stdout, result.stderr
+    assert not (tmp_path / "state" / "aws").exists(), "reading creates nothing"
+
+
+def test_only_migrate_state_dir_creates_a_missing_state_dir(tmp_path, monkeypatch):
+    env_dir, files = _records_env(tmp_path)
+    monkeypatch.setenv(state_layout.STATE_DIR_ENV, str(tmp_path / "new" / "state"))
+    with pytest.raises(spa.Refused, match="does not exist"):
+        spa.load_journal(env_dir)
+    assert state_layout.migrate(env_dir, "dev") == len(files)
+    assert (tmp_path / "new" / "state").is_dir()
+    assert spa.load_journal(env_dir)["active"] == "g1"
 
 
 def test_without_the_state_dir_records_stay_in_the_checkout(tmp_path, monkeypatch):

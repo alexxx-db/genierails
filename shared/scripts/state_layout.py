@@ -72,10 +72,33 @@ def state_dir_setting() -> str:
     return os.environ.get(STATE_DIR_ENV, "").strip()
 
 
-def state_root(env_dir: Path) -> Path | None:
-    """GENIERAILS_STATE_DIR/<cloud>, or None when the variable is unset."""
+def checked_state_dir(create: bool = False) -> Path | None:
+    """GENIERAILS_STATE_DIR, resolved, or None when unset; it must already exist and be readable.
+
+    A mistyped or unmounted state dir must never read as an empty store (no
+    state, no journal, no agent ID), so every reader and writer refuses until
+    it exists. Only make migrate-state-dir creates it (``create``); a fresh CI
+    runner's throwaway one is created by its pipeline step (docs/pipelines.md).
+    """
     value = state_dir_setting()
-    return Path(value).expanduser().resolve() / cloud_dir(env_dir).name if value else None
+    if not value:
+        return None
+    base = Path(value).expanduser()
+    if create and not base.exists():
+        base.mkdir(mode=0o700, parents=True)
+    if not base.is_dir():
+        raise StateError(f"{STATE_DIR_ENV}={value} does not exist or is not a directory; a mistyped or "
+                         "unmounted state dir would read as empty state, so nothing runs. Fix the path (or "
+                         f"mount it); a new one is created by make migrate-state-dir, or by mkdir -m 700 {value}")
+    if not os.access(base, os.R_OK | os.X_OK):
+        raise StateError(f"{STATE_DIR_ENV}={value} can't be read; fix its permissions before running")
+    return base.resolve()
+
+
+def state_root(env_dir: Path, create: bool = False) -> Path | None:
+    """GENIERAILS_STATE_DIR/<cloud>, or None when the variable is unset (refuses a missing state dir)."""
+    base = checked_state_dir(create)
+    return None if base is None else base / cloud_dir(env_dir).name
 
 
 def config_path(env_dir: Path) -> Path:
@@ -136,6 +159,15 @@ def refuse_moved(env_dir: Path) -> None:
 # each run re-derives (generated/.runtime/, the coverage check's files,
 # .*.apply.sha) stays in the checkout.
 CHECKOUT_RECORDS = (Path("data_access") / ".policy_generations", Path(".group_map_applied.json"))
+# Genie agent records, one file per agent key: the ID file the workspace
+# root's create resource reads and writes, genie_space.sh's title-adoption
+# marker, and genie_adopt_preflight.py's adoption-required marker.
+GENIE_RECORD_PREFIXES = (".genie_space_id_", ".genie_adopted_", ".genie_adopt_required_")
+# State-dir only, written by migrate: each in-checkout ID file path the
+# workspace state recorded -> the file's state-dir path, so Terraform and
+# agent_ownership.py still recognise an agent's create resource (and its
+# create-to-ID handoff) until the next apply records the new path.
+GENIE_ID_MOVES = ".genie_id_moves.json"
 RECORDS = "records"
 
 
@@ -143,42 +175,75 @@ class RecordError(StateError, ValueError):
     """A runtime record can't be located safely; nothing may read or write it."""
 
 
-def _holds_files(path: Path) -> bool:
-    return path.is_file() or (path.is_dir() and any(p.is_file() for p in path.rglob("*")))
+def _is_genie_record(name: str) -> bool:
+    return any(name.startswith(prefix) and len(name) > len(prefix) for prefix in GENIE_RECORD_PREFIXES)
+
+
+def checkout_records(env_dir: Path) -> list[Path]:
+    """Every runtime record file in the checkout's envs/<env>/ (what migrate-state-dir moves)."""
+    env_dir = Path(env_dir)
+    found = []
+    for record in CHECKOUT_RECORDS:
+        path = env_dir / record
+        found += sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path] * path.is_file()
+    if env_dir.is_dir():
+        found += sorted(p for p in env_dir.iterdir() if p.is_file() and _is_genie_record(p.name))
+    return found
+
+
+def records_dir(env_dir: Path) -> Path:
+    """The dir an env's runtime records are relative to: envs/<env>, or <state dir>/<cloud>/<env>/records.
+
+    Unset GENIERAILS_STATE_DIR: envs/<env>, unchanged (a moved-state marker
+    refuses). Set: the state dir must exist and be readable (an env's records/
+    not created yet holds none), and no record may be left in the checkout,
+    alone or next to the state dir's copy: run make migrate-state-dir, never
+    silently start from nothing.
+    """
+    env_dir = Path(env_dir)
+    try:
+        root = state_root(env_dir)
+        if root is None:
+            refuse_moved(env_dir)
+            return env_dir
+    except StateError as exc:
+        raise RecordError(str(exc)) from exc
+    target = root / env_dir.name / RECORDS
+    for path in (root, root / env_dir.name, target):
+        if path.exists() and not (path.is_dir() and os.access(path, os.R_OK | os.X_OK)):
+            raise RecordError(f"{STATE_DIR_ENV} is set but {path} can't be read; fix it before running")
+    left = checkout_records(env_dir)
+    if left:
+        names = ", ".join(str(p.relative_to(env_dir)) for p in left[:5]) + (", ..." if len(left) > 5 else "")
+        raise RecordError(f"runtime records are still in the checkout ({env_dir}: {names}) while "
+                          f"{STATE_DIR_ENV} is set; run make migrate-state-dir ENV={env_dir.name} to move "
+                          f"them into {target}")
+    return target
 
 
 def record_path(env_dir: Path, relpath: str | Path) -> Path:
-    """Where the runtime record ``relpath`` (one of CHECKOUT_RECORDS, or under one) lives.
-
-    Unset GENIERAILS_STATE_DIR: envs/<env>/<relpath>, unchanged (a moved-state
-    marker refuses). Set: <dir>/<cloud>/<env>/records/<relpath>; refuses when
-    the state dir exists but can't be read, and when the record, or any
-    file of a record directory, is still in the checkout (only there, or in
-    both places): run make migrate-state-dir, never silently start from nothing.
-    """
-    env_dir = Path(env_dir)
+    """Where the runtime record ``relpath`` lives (one of CHECKOUT_RECORDS or under one, or a Genie
+    record named by GENIE_RECORD_PREFIXES): records_dir(env_dir) / relpath, refusing as it does."""
     relpath = Path(relpath)
-    top = next((r for r in CHECKOUT_RECORDS if relpath == r or r in relpath.parents), None)
-    if top is None:
+    known = any(relpath == r or r in relpath.parents for r in CHECKOUT_RECORDS) or (
+        len(relpath.parts) == 1 and _is_genie_record(relpath.name))
+    if not known:
         raise RecordError(f"{relpath} is not a runtime record")
-    root = state_root(env_dir)
-    if root is None:
-        try:
-            refuse_moved(env_dir)
-        except StateError as exc:
-            raise RecordError(str(exc)) from exc
-        return env_dir / relpath
-    base = Path(state_dir_setting()).expanduser()
-    # A state dir not created yet holds no records (as it holds no state); one
-    # that exists but can't be listed or read never reads as empty.
-    for path in (base, root, root / env_dir.name, root / env_dir.name / RECORDS):
-        if path.exists() and not (path.is_dir() and os.access(path, os.R_OK | os.X_OK)):
-            raise RecordError(f"{STATE_DIR_ENV} is set but {path} can't be read; fix it before running")
-    if _holds_files(env_dir / top):
-        raise RecordError(f"{env_dir / top} is still in the checkout while {STATE_DIR_ENV} is set; run "
-                          f"make migrate-state-dir ENV={env_dir.name} to move it into "
-                          f"{root / env_dir.name / RECORDS}")
-    return root / env_dir.name / RECORDS / relpath
+    return records_dir(env_dir) / relpath
+
+
+def genie_id_moves(env_dir: Path) -> dict[str, str]:
+    """Old in-checkout ID file path (as the workspace state recorded it) -> its state-dir path."""
+    path = records_dir(env_dir) / GENIE_ID_MOVES
+    if state_root(env_dir) is None or not path.is_file():
+        return {}
+    try:
+        moves = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise RecordError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(moves, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in moves.items()):
+        raise RecordError(f"{path} must map old ID file paths to new ones")
+    return moves
 
 
 def refuse_split(env_dir: Path, env: str, layer: str) -> None:
@@ -378,8 +443,8 @@ def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
     return True
 
 
-# Variables only terraform_layer.sh sets: where the roots read their state.
-RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file")
+# Variables only terraform_layer.sh sets: where the roots read their state and Genie ID files.
+RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir")
 
 
 def _assigned_names(args: list[str], source: str) -> list[tuple[str, str]]:
@@ -508,12 +573,65 @@ def _migrations(env_dir: Path, env: str, target: Path) -> list[tuple[Path, Path]
             if rel.parts[0] in ("locks", "roots") or not source.is_file() or source.name.endswith(".migrating"):
                 continue
             moves.append((source, target / rel))
-    for record in CHECKOUT_RECORDS:
-        source = env_dir / record
-        files = sorted(p for p in source.rglob("*") if p.is_file()) if source.is_dir() else [source]
-        moves += [(f, target / RECORDS / f.relative_to(env_dir)) for f in files
-                  if not f.name.endswith(".migrating")]
+    moves += [(f, target / RECORDS / f.relative_to(env_dir)) for f in checkout_records(env_dir)
+              if not f.name.endswith(".migrating")]
     return [(source, destination) for source, destination in moves if source.is_file()]
+
+
+def _recorded_id_files(value) -> list[str]:
+    """Every ``id_file`` string anywhere in a Terraform state (create inputs, the ID reader's query)."""
+    if isinstance(value, dict):
+        found = [value["id_file"]] if isinstance(value.get("id_file"), str) else []
+        return found + [f for v in value.values() for f in _recorded_id_files(v)]
+    if isinstance(value, list):
+        return [f for v in value for f in _recorded_id_files(v)]
+    return []
+
+
+def _id_file_moves(env_dir: Path, env: str, target: Path, operations) -> dict[str, str]:
+    """The moves record entries for the Genie ID files this migration moves.
+
+    Each moved file is keyed by its own path and by every path the workspace
+    state recorded for it, read where the state is now (before or after its
+    own move, or remote).
+    """
+    moved = [(s, d) for s, d in operations if s.parent == env_dir and s.name.startswith(GENIE_RECORD_PREFIXES[0])]
+    if not moved:
+        return {}
+    candidates = [env_dir / "terraform.tfstate", target / "layers" / "workspace" / "terraform.tfstate"]
+    state_file = next((p for p in candidates if p.is_file()), None)
+    if state_file is not None:
+        state = json.loads(state_file.read_text())
+    elif remote_configured(env_dir):
+        state = _pull(env_dir, env, "workspace") or {}
+    else:
+        state = {}
+    recorded = _recorded_id_files(state)
+    entries = {}
+    for source, destination in moved:
+        for path in [str(source)] + recorded:
+            if Path(path).resolve() == source.resolve():
+                entries[path] = str(destination)
+    return entries
+
+
+def _write_moves(path: Path, entries: dict[str, str]) -> None:
+    """Merge ``entries`` into the moves record, durably; an entry that names another file refuses."""
+    current = json.loads(path.read_text()) if path.is_file() else {}
+    clash = [k for k, v in entries.items() if k in current and current[k] != v]
+    if clash:
+        raise StateError(f"refusing to change {path}: {clash[0]} already moved to {current[clash[0]]}")
+    if not entries or all(k in current for k in entries):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".migrating")
+    with partial.open("w") as handle:
+        json.dump(current | entries, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    partial.rename(path)
+    _fsync_dir(path.parent)
 
 
 def _remove_empty_record_dirs(env_dir: Path) -> None:
@@ -529,9 +647,9 @@ def _remove_empty_record_dirs(env_dir: Path) -> None:
 def migrate(env_dir: Path, env: str) -> int:
     """Move the env's state and records into GENIERAILS_STATE_DIR; returns how many files moved."""
     env_dir = Path(env_dir).resolve()
-    root = state_root(env_dir)
-    if root is None:
+    if not state_dir_setting():
         raise StateError("set GENIERAILS_STATE_DIR before migrating")
+    root = state_root(env_dir, create=True)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import environment_lock
 
@@ -560,6 +678,8 @@ def migrate(env_dir: Path, env: str) -> int:
             handle.flush()
             os.fsync(handle.fileno())
         _fsync_dir(env_dir)
+        # Before any ID file moves: the state still names its old path.
+        _write_moves(target / RECORDS / GENIE_ID_MOVES, _id_file_moves(env_dir, env, target, operations))
         for source, destination in operations:
             print(f"{_move_file(source, destination)}: {source} -> {destination}")
         _remove_empty_record_dirs(env_dir)
@@ -624,7 +744,8 @@ def main() -> int:
     check.add_argument("--tf-command", required=True)
     check.add_argument("--var-file", type=Path, action="append", default=[])
     check.add_argument("args", nargs=argparse.REMAINDER)
-    for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file"):
+    for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file",
+                 "records-dir"):
         command = commands.add_parser(name)
         command.add_argument("--env-dir", type=Path, required=True)
         command.add_argument("--env", required=True)
@@ -657,6 +778,9 @@ def main() -> int:
             print(layer_base(args.env_dir, args.env, args.layer) or "")
         elif args.command == "state-json":
             print(json.dumps(state_json(args.env_dir, args.env, args.layer)))
+        elif args.command == "records-dir":
+            # The workspace root's Genie ID file dir with a state dir; empty means envs/<env>.
+            print(records_dir(args.env_dir) if state_dir_setting() else "")
         elif args.command == "state-file":
             write_state_file(args.env_dir, args.env, args.layer, args.out)
         else:
