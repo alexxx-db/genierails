@@ -289,6 +289,8 @@ def test_every_applying_verify_spec_path_has_a_semantic_minimum_guard():
     rehearse = makefile[makefile.index("override _REHEARSE_STEPS"):makefile.index("\nrehearse:")]
     maintain = makefile[makefile.index("\nmaintain:"):makefile.index("\nvalidate:")]
     manifest = makefile[makefile.index("\n_release-manifest:"):makefile.index("\nmaintain:")]
+    release_plan = makefile[makefile.index("\nrelease-plan:"):makefile.index("\n_release-manifest:")]
+    release = makefile[makefile.index("\nrelease:"):makefile.index("\n# Two-phase release")]
     apply = makefile[makefile.index("\napply:"):makefile.index("\n# Read-only:")]
     verify = makefile[makefile.index("\nverify-access:"):]
     assert "require-mask-proof" in rehearse
@@ -296,7 +298,14 @@ def test_every_applying_verify_spec_path_has_a_semantic_minimum_guard():
     assert manifest.index("$(_REQUIRE_MASK_PROOF)") < manifest.index("apply-saved")
     assert apply.count("$(_REQUIRE_MASK_PROOF)") >= 2
     assert "$(_VERIFY_MINIMUM_FLAG)" in verify[:verify.index("\n\ntest-quickstart:")]
-    assert "VERIFY_GATE=1" in rehearse
+    assert rehearse.count("VERIFY_GATE=1") == 1
+    legacy_rehearse = makefile[makefile.index("\nrehearse:"):makefile.index("\n# A failed $(MAKE)")]
+    assert legacy_rehearse.count("VERIFY_GATE=1") == 1
+    assert "VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in rehearse
+    assert "VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in legacy_rehearse
+    assert release_plan.count("$(_REQUIRE_MASK_PROOF)") == 2
+    assert "VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in release
+    assert "VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in manifest
 
 
 # ── a mask verify-access derives no check for ───────────────────────────────

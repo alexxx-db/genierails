@@ -2716,9 +2716,34 @@ def load_key_map(env_file: Optional[Path]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Spec loading (pure)
 # ---------------------------------------------------------------------------
-def load_spec_from_file(path: Path) -> VerificationSpec:
+def load_spec_from_file(path: Path, *, strict: bool = True) -> VerificationSpec:
     """Load a spec from a JSON file (schema mirrors the dataclasses)."""
     data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError("verification spec must be a JSON object")
+    if strict:
+        def reject_unknown(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
+            unknown = sorted(set(value) - allowed)
+            if unknown:
+                raise ValueError(f"unknown verification spec field {where}.{unknown[0]}")
+
+        reject_unknown(data, {"principal_memberships", "column_masks", "row_filters"}, "root")
+        column_keys = {"table", "column", "key_column", "masked_principals", "unmasked_principals",
+                       "policy_name", "mask_function", "expected_tiers", "partial_function",
+                       "full_function", "moving_principals"}
+        row_keys = {"table", "restricted_principals", "unrestricted_principals", "policy_name"}
+        for index, value in enumerate(data.get("column_masks", []) or []):
+            if not isinstance(value, dict):
+                raise ValueError(f"column_masks[{index}] must be an object")
+            reject_unknown(value, column_keys, f"column_masks[{index}]")
+            for principal, tier in (value.get("expected_tiers", {}) or {}).items():
+                if tier not in {"raw", "partial", "full"}:
+                    raise ValueError(f"unknown tier value column_masks[{index}].expected_tiers"
+                                     f"[{principal!r}]={tier!r}")
+        for index, value in enumerate(data.get("row_filters", []) or []):
+            if not isinstance(value, dict):
+                raise ValueError(f"row_filters[{index}] must be an object")
+            reject_unknown(value, row_keys, f"row_filters[{index}]")
     spec = VerificationSpec(principal_memberships={
         str(principal): tuple(map(str, memberships))
         for principal, memberships in (data.get("principal_memberships", {}) or {}).items()})
@@ -2764,6 +2789,10 @@ def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: Verificatio
         explicit_by_column.setdefault((check.table.lower(), check.column.lower()), []).append(check)
 
     missing: list[str] = []
+    for check in explicit.column_masks:
+        for principal, tier in check.expected_tiers:
+            if tier not in rank:
+                missing.append(f"{check.table}.{check.column}: {principal} has unknown tier {tier!r}")
     for check in derived.column_masks:
         label = f"{check.table}.{check.column}"
         candidates = explicit_by_column.get((check.table.lower(), check.column.lower()), [])
@@ -2776,6 +2805,12 @@ def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: Verificatio
             expected_tiers, supplied_tiers = expectations(check), expectations(actual_check)
             if check.expected_tiers and not actual_check.expected_tiers:
                 problems.append("tiered exact-output check replaced by an untiered check")
+            if not check.expected_tiers and actual_check.expected_tiers:
+                mask_function = check.mask_function.lower()
+                supplied_functions = {actual_check.partial_function.lower(), actual_check.full_function.lower()}
+                if not mask_function or supplied_functions != {mask_function}:
+                    problems.append("untiered check may become tiered only when partial_function and "
+                                    "full_function both equal the derived mask_function")
             for principal, expected in expected_tiers.items():
                 supplied = supplied_tiers.get(principal)
                 if supplied is None:
@@ -3057,7 +3092,7 @@ def _load_spec_from_args(args, key_map: Mapping[str, str]) -> VerificationSpec:
     if args.spec:
         if not args.spec.is_file():
             raise SystemExit(f"ERROR: verification spec not found: {args.spec}")
-        spec = load_spec_from_file(args.spec)
+        spec = load_spec_from_file(args.spec, strict=bool(args.minimum_from_tfvars))
         spec.column_masks = [replace(c, key_column=c.key_column or by_table.get(c.table.lower(), ""))
                              for c in spec.column_masks]
         return spec

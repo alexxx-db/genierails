@@ -99,7 +99,7 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
     path = Path(spec.strip())
     path = path if path.is_absolute() else SHARED / path
     try:
-        explicit = load_spec_from_file(path)
+        explicit = load_spec_from_file(path, strict=True)
         checks = explicit.column_masks
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         return _refuse(env, f"VERIFY_SPEC {path} could not be read ({exc})")

@@ -11,6 +11,8 @@ conclusively proves the policy took effect. Anything it could not verify
 (missing data, failed query, no overlap, all-null values, empty spec) is
 NON-PASSING (FAIL or INCONCLUSIVE) and blocks the gate.
 """
+import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -152,6 +154,51 @@ def test_minimum_from_tfvars_cli_refuses_a_weaker_explicit_spec(tmp_path):
     with pytest.raises(SystemExit, match="analysts expected full"):
         main(["--spec", str(spec_file), "--minimum-from-tfvars", str(tfvars),
               "--minimum-env-file", str(env_file), "--print-spec"])
+
+
+@pytest.mark.parametrize("partial,full", [
+    ("c.s.identity", "c.s.identity"),
+    ("c.s.mask_ssn", "c.s.identity"),
+])
+def test_gate_rejects_legacy_check_tiered_with_non_policy_functions_p8(tmp_path, partial, full):
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", ("analyst",), ("finance",), mask_function="c.s.mask_ssn")])
+    explicit = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", (), (), expected_tiers=(("analyst", "full"), ("finance", "raw")),
+        partial_function=partial, full_function=full)])
+    assert any("untiered check may become tiered" in p
+               for p in weaker_explicit_spec_checks(derived, explicit))
+
+
+def test_gate_allows_legacy_check_tiered_with_the_policy_function_p8b():
+    derived = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", ("analyst",), ("finance",), mask_function="c.s.mask_ssn")])
+    explicit = VerificationSpec(column_masks=[ColumnMaskCheck(
+        "c.s.p", "ssn", "id", (), (), expected_tiers=(("analyst", "full"), ("finance", "raw")),
+        partial_function="C.S.MASK_SSN", full_function="c.s.mask_ssn")])
+    assert weaker_explicit_spec_checks(derived, explicit) == []
+
+
+@pytest.mark.parametrize("payload,field", [
+    ({"bogus_top_level": 1}, "root.bogus_top_level"),
+    ({"column_masks": [{"table": "c.s.p", "column": "ssn", "skip": True}]},
+     "column_masks[0].skip"),
+    ({"column_masks": [{"table": "c.s.p", "column": "ssn", "expected_tier": {}}]},
+     "column_masks[0].expected_tier"),
+])
+def test_gate_spec_strict_loader_rejects_unknown_fields_p9(tmp_path, payload, field):
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=re.escape(field)):
+        load_spec_from_file(path, strict=True)
+
+
+def test_gate_spec_strict_loader_rejects_unknown_tier_on_added_principal_p10(tmp_path):
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps({"column_masks": [{
+        "table": "c.s.p", "column": "ssn", "expected_tiers": {"extra": "bogus"}}]}))
+    with pytest.raises(ValueError, match="unknown tier value.*extra.*bogus"):
+        load_spec_from_file(path, strict=True)
 
 
 def _tiered_check():
