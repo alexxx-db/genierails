@@ -15,6 +15,7 @@ import pytest
 
 from scripts.e2e import driver
 from scripts import custom_masks
+from weakening import GovernanceState, Protection, find_weakenings
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -117,20 +118,147 @@ def test_tier_groupmap_keeps_all_four_day2_changes_and_guards():
     cursor = 0
     for signature in required:
         cursor = signatures.index(signature, cursor) + 1
-    assert len(scenario.steps) == 40  # deleting any declared acceptance step is a regression
-    assert all(step.refusal == driver.REFUSALS["weakening"] for step in scenario.steps if step.expect_failure)
+    assert len(scenario.steps) == 61  # deleting any declared acceptance step is a regression
+    assert {step.refusal for step in scenario.steps if step.expect_failure} == {
+        driver.REFUSALS["weakening"], driver.REFUSALS["group_map"]}
 
 
 def test_custom_mask_scenario_keeps_case_order_and_weakening_ack():
     scenario = next(s for s in driver.SCENARIOS if s.key == "custom-mask")
-    assert len(scenario.steps) == 24  # fails if a case/check/lifecycle step is removed
+    assert len(scenario.steps) == 37  # fails if a case/check/lifecycle step is removed
     lock_targets = {"rehearse", "release-plan"}
     guarded = [step for step in scenario.steps if step.target in lock_targets and not step.expect_failure]
-    assert len(guarded) == 4
-    assert all("custom mask cases precede environment lock" in step.assertions for step in guarded)
+    assert len(guarded) == 10
+    assert all("custom-mask-order" in step.assertions for step in guarded)
+    releases = [step for step in scenario.steps if step.target == "release"]
+    assert len(releases) == 2 and all("custom-mask-order" in step.assertions for step in releases)
     refusal = next(step for step in scenario.steps if step.expect_failure)
     assert refusal.target == "release-plan" and refusal.refusal == driver.REFUSALS["weakening"]
     assert any(step.action == "add_ack" and step.value == "custom_mask_ack" for step in scenario.steps)
+
+
+def test_new_fixture_actions_execute_with_real_hcl_and_mask_validators(tmp_path):
+    cloud = tmp_path / "aws"
+    for env in ("dev", "prod"):
+        root = cloud / "envs" / env
+        (root / "agents").mkdir(parents=True)
+        extra = 'group_map = { "dev_ops" = "prod_ops" }\n' if env == "prod" else "tag_treatments = {}\n"
+        (root / "env.auto.tfvars").write_text(
+            'governance_mode = "deterministic"\naccess_tier_groups = ["ops", "viewers"]\n' + extra)
+    agent = cloud / "envs/prod/agents/pay.auto.tfvars"
+    agent.write_text('acl_groups = ["prod_ops"]\nuc_tables = ["cat.s.t"]\n')
+    repo = SimpleNamespace(runner=SimpleNamespace(cwd=cloud))
+    values = {"tier_group": "analysts", "group_map_source": "dev_ops", "mapped_group": "prod_new",
+              "prod_agent": "pay", "acl_group": "auditors", "custom_mask_class": "class.postcode"}
+
+    driver._run_action(driver.fixture_action("add", "tier_add", "tier_group"), None, repo, values)
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["access_tier_groups"] == ["ops", "analysts", "viewers"]
+    driver._run_action(driver.fixture_action("remove", "tier_remove", "tier_group"), None, repo, values)
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["access_tier_groups"] == ["ops", "viewers"]
+    driver._run_action(driver.fixture_action("map", "group_map_change", "group_map_source", "mapped_group"), None, repo, values)
+    assert driver._load_hcl(cloud / "envs/prod/env.auto.tfvars")["group_map"] == {"dev_ops": "prod_new"}
+    driver._run_action(driver.fixture_action("acl", "prod_acl_change", "prod_agent", "acl_group"), None, repo, values)
+    assert driver._load_hcl(agent)["acl_groups"] == ["prod_ops", "auditors"]
+
+    driver._run_action(driver.fixture_action("install", "custom_mask_install", "custom_mask_class"), None, repo, values)
+    mask_path = cloud / "envs/dev/custom_masks/custom_e2e_suffix.json"
+    v1 = json.loads(mask_path.read_text())
+    assert custom_masks.mask_file_problems(v1, v1["treatment"]) == []
+    assert driver._load_hcl(cloud / "envs/dev/env.auto.tfvars")["tag_treatments"] == {
+        "class.postcode": "custom_e2e_suffix"}
+    driver._run_action(driver.fixture_action("change", "custom_mask_change"), None, repo, values)
+    v2 = json.loads(mask_path.read_text())
+    assert custom_masks.mask_file_problems(v2, v2["treatment"]) == []
+    assert v2["partial"]["STRING"]["sql"] != v1["partial"]["STRING"]["sql"]
+
+
+def test_ack_actions_add_and_remove_exact_entries(tmp_path):
+    cloud = tmp_path / "aws"; (cloud / "envs/prod").mkdir(parents=True)
+    repo = SimpleNamespace(runner=SimpleNamespace(cwd=cloud))
+    values = {"acks": "prod:reader:cat.s.t:g;;prod:weaken:cat.s.t.c:g",
+              "group_map_source": "dev", "mapped_group": "prod"}
+    driver._run_action(driver.action("add", "add_acks", "acks"), None, repo, values)
+    driver._run_action(driver.fixture_action("gm", "add_group_map_ack", "group_map_source", "mapped_group"), None, repo, values)
+    assert len((cloud / "envs/prod/ack.txt").read_text().splitlines()) == 3
+    driver._run_action(driver.action("remove", "remove_ack", "acks"), None, repo, values)
+    driver._run_action(driver.fixture_action("remove gm", "remove_group_map_ack", "group_map_source", "mapped_group"), None, repo, values)
+    assert (cloud / "envs/prod/ack.txt").read_text() == ""
+
+
+def test_tier_add_and_custom_install_fixtures_are_acknowledged_weakenings():
+    column, table, tier = "cat.s.t.postcode", "cat.s.t", "analysts"
+    before = GovernanceState(
+        columns={column: {tier: Protection("redacted", "redacted (failsafe)")}},
+        table_readers={table: set()})
+    tier_after = GovernanceState(
+        columns={column: {tier: Protection("partial", "partial (postcode)")}},
+        table_readers={table: {tier}})
+    issues = find_weakenings(before, tier_after, "prod")
+    assert {issue.ack_key for issue in issues} == {
+        f"prod:weaken:{column}:{tier}", f"prod:reader:{table}:{tier}"}
+    custom_after = GovernanceState(
+        columns={column: {tier: Protection("partial", "partial (custom_e2e_suffix)")}},
+        table_readers={table: set()})
+    (custom_issue,) = find_weakenings(before, custom_after, "prod")
+    assert custom_issue.ack_key == f"prod:weaken:{column}:{tier}"
+
+
+def _effect_snapshot(*, grants=(), runs=()):
+    by_agent = {}
+    for agent, principal in runs:
+        by_agent.setdefault(agent, []).append({"group_name": principal,
+                                                "all_permissions": [{"permission_level": "CAN_RUN"}]})
+    return {"prod": {"uc": {"cat": {"table_grants": [
+        {"grantee": principal, "privilege_type": "SELECT", "table_catalog": "cat",
+         "table_schema": "s", "table_name": table} for principal, table in grants]}},
+        "agents": [{"name": agent, "acl": {"access_control_list": acl}}
+                   for agent, acl in by_agent.items()]}}
+
+
+def test_live_effect_checks_enforce_exact_grant_and_can_run_diffs():
+    empty = _effect_snapshot()
+    added = _effect_snapshot(grants=(("analysts", "t"),), runs=(("pay", "analysts"),))
+    driver.verify_live_effect("tier_added", empty, added, ["analysts"])
+    driver.verify_live_effect("tier_removed", added, empty, ["analysts"])
+    mapped_before = _effect_snapshot(grants=(("dev_ops", "t"),), runs=(("pay", "dev_ops"),))
+    mapped_after = _effect_snapshot(grants=(("prod_ops", "t"),), runs=(("pay", "prod_ops"),))
+    driver.verify_live_effect("group_mapped", mapped_before, mapped_after, ["dev_ops", "prod_ops"])
+    acl = _effect_snapshot(runs=(("pay", "auditors"),))
+    driver.verify_live_effect("acl_only", empty, acl, ["pay", "auditors"])
+    with pytest.raises(RuntimeError, match="exclusively"):
+        driver.verify_live_effect("tier_added", empty,
+            _effect_snapshot(grants=(("analysts", "t"), ("stranger", "t")), runs=(("pay", "analysts"),)),
+            ["analysts"])
+
+
+def test_custom_mask_log_contract_is_executable():
+    step = driver.mk("x", "rehearse", "dev", assertions=(
+        "custom-mask-order", "verify-exact", "fixture-output=***CD"))
+    output = ("=== Custom mask cases (dev): 1 adopted mask(s), read-only on the SQL warehouse ===\n"
+              "PASS custom_e2e_suffix (STRING): 3 exact-output cases; expected outputs include '***CD'\n"
+              "=== GenieRails environment lock acquired (dev, rehearse) ===\n"
+              "all deterministic tiers matched their exact expected output across 3 row(s)\n")
+    driver.check_step_output(step, output)
+    with pytest.raises(RuntimeError, match="precede"):
+        driver.check_step_output(step, output.replace("=== Custom mask cases", "=== cases"))
+
+
+@pytest.mark.parametrize("scenario_key", ["tier-groupmap", "custom-mask"])
+def test_every_new_merge_is_rehearsed_before_a_later_release_plan(scenario_key):
+    scenario = next(item for item in driver.SCENARIOS if item.key == scenario_key)
+    for index, step in enumerate(scenario.steps):
+        if step.action != "local_merge": continue
+        later_plan = next((i for i in range(index + 1, len(scenario.steps))
+                           if scenario.steps[i].target == "release-plan"), None)
+        if later_plan is None: continue
+        assert any(candidate.target == "rehearse" and not candidate.expect_failure
+                   for candidate in scenario.steps[index + 1:later_plan]), step.name
+
+
+def test_group_map_refusal_is_anchored_to_product_path():
+    message = "ERROR: make release-plan refused: group_map changed since the last apply, which is a weakening."
+    assert re.search(driver.REFUSALS["group_map"], message)
+    assert driver.REFUSAL_SOURCE_ANCHORS[driver.REFUSALS["group_map"]][0] == "shared/group_map.py"
 
 
 def test_prepared_custom_mask_fixtures_use_real_loader_and_validator():

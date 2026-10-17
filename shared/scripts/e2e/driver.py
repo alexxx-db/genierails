@@ -66,7 +66,7 @@ APPLYING = frozenset({"rehearse", "release-plan", "release", "maintain", "detach
 AUTHORING = frozenset({"setup", "generate", "promote-to", "capture", "ungovern", "scaffold-treatments"})
 # Scenarios whose purpose is to remove or loosen protection mid-scenario. The
 # post-restore check still applies to them.
-WEAKENING_EXPECTED = frozenset({"s8", "s9"})
+WEAKENING_EXPECTED = frozenset({"s8", "s9", "tier-groupmap", "custom-mask"})
 # The upstream .gitignore ignores envs/, so a local merge can only commit
 # authored changes in a checkout whose <cloud>/.gitignore has the block
 # `make setup GITIGNORE=customer` writes (scripts/customer_gitignore.py BEGIN).
@@ -142,6 +142,7 @@ REFUSALS = {
     "maintain_provenance": r"make maintain refused",
     "ci": r"applying targets cannot run in CI",
     "weakening": r"(refused by the reader or weakening check|unacknowledged (weakening|reader) )",
+    "group_map": r"make release-plan refused: group_map changed since the last apply, which is a weakening\.",
     "detach": r"ERROR: detach: .*?(?:not found: detach-agent works on an agent file|is not detached)",
     "tamper": r"(make release refused: \S+ no longer matches|is not a release manifest|is a manifest for \S+, not)",
     "stale": r"committed files differ from what the commit regenerates",
@@ -153,6 +154,7 @@ REFUSAL_SOURCE_ANCHORS: Mapping[str, tuple[str, str]] = {
     REFUSALS["maintain_provenance"]: ("shared/scripts/release_gate.py", "make maintain refused"),
     REFUSALS["ci"]: ("shared/Makefile.shared", "applying targets cannot run in CI"),
     REFUSALS["weakening"]: ("shared/Makefile.shared", "refused by the reader or weakening check"),
+    REFUSALS["group_map"]: ("shared/group_map.py", "group_map changed since the last apply, which is a"),
     REFUSALS["detach"]: ("shared/scripts/agent_ownership.py", "not found: detach-agent works on an agent file"),
     REFUSALS["tamper"]: ("shared/scripts/release_gate.py", "no longer matches:"),
     REFUSALS["stale"]: ("shared/scripts/check_env.py", "committed files differ from what the commit regenerates"),
@@ -315,28 +317,65 @@ SCENARIOS: tuple[Scenario, ...] = (
         "Disposable dev/prod groups named by tier_group and mapped_group exist; prod_agent names a committed agent fixture.",
         "The fixture has three ordered tiers, one governed table, and effective-access verification rows for every tier.",
     ), (
+        fixture_action("Capture baseline access", "snapshot_checkpoint", "tier-baseline"),
         fixture_action("Add a new tier group", "tier_add", "tier_group"),
         mk("Regenerate for the added tier", "generate", "dev"), AUTHOR_MERGE,
-    ) + DAY2 + (
+        mk("Check added tier PR", "check", "dev"), mk("Rehearse added tier merge", "rehearse", "dev"),
+        mk("Promote added tier", "promote-to", "prod"), AUTHOR_MERGE,
+        mk("Check added tier promotion", "check", "prod"),
+        mk("Rehearse added tier promotion merge", "rehearse", "dev"),
+        mk("Refuse unacknowledged tier widening", "release-plan", "prod", fail=True,
+           refusal=REFUSALS["weakening"], refusal_in_ci=False),
+        action("Write exact tier widening acknowledgements", "add_acks", "tier_add_acks"), AUTHOR_MERGE,
+        mk("Rehearse tier acknowledgement merge", "rehearse", "dev"),
+        mk("Plan acknowledged tier addition", "release-plan", "prod"),
+        mk("Release acknowledged tier addition", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Maintain added tier", "maintain", "prod"),
+        fixture_action("Verify tier grant and CAN_RUN are the only widenings", "verify_effect",
+                       "tier_added", "tier-baseline", "tier_group"),
+        action("Remove tier acknowledgements", "remove_acks", "tier_add_acks"), AUTHOR_MERGE,
+        mk("Rehearse tier-ack cleanup merge", "rehearse", "dev"),
+        fixture_action("Capture access before tier removal", "snapshot_checkpoint", "tier-added"),
         fixture_action("Remove the tier group", "tier_remove", "tier_group"),
         mk("Regenerate after tier removal", "generate", "dev"), AUTHOR_MERGE,
-    ) + DAY2 + (
+        mk("Check removed tier PR", "check", "dev"), mk("Rehearse removed tier merge", "rehearse", "dev"),
+        mk("Promote removed tier", "promote-to", "prod"), AUTHOR_MERGE,
+        mk("Check removed tier promotion", "check", "prod"),
+        mk("Rehearse removed tier promotion merge", "rehearse", "dev"),
+        mk("Plan tier removal", "release-plan", "prod"),
+        mk("Release tier removal", "release", "prod", args=("MANIFEST={manifest}",)),
+        mk("Maintain removed tier", "maintain", "prod"),
+        fixture_action("Verify removed tier lost grants and CAN_RUN with no widening", "verify_effect",
+                       "tier_removed", "tier-added", "tier_group"),
+        fixture_action("Capture access before group remap", "snapshot_checkpoint", "before-group-map"),
         fixture_action("Map the tier to a different real group", "group_map_change",
-                       "group_map_source", "mapped_group"), AUTHOR_MERGE,
-        mk("Refuse unacknowledged group-map weakening", "release-plan", "prod", fail=True,
-           refusal=REFUSALS["weakening"], refusal_in_ci=False),
-        fixture_action("Write exact env-scoped group-map acknowledgement", "add_group_map_ack",
                        "group_map_source", "mapped_group"),
-        action("Commit and merge the exact acknowledgement", "local_merge"),
+        mk("Re-promote principals through changed group_map", "promote-to", "prod"), AUTHOR_MERGE,
+        mk("Check remapped promotion", "check", "prod"),
+        mk("Rehearse remapped promotion merge", "rehearse", "dev"),
+        mk("Refuse unacknowledged group-map weakening", "release-plan", "prod", fail=True,
+           refusal=REFUSALS["group_map"], refusal_in_ci=False),
+        fixture_action("Write exact env-scoped group-map acknowledgement", "add_group_map_ack",
+                       "group_map_source", "mapped_group"), AUTHOR_MERGE,
+        mk("Rehearse group-map acknowledgement merge", "rehearse", "dev"),
         mk("Plan only the acknowledged group-map effect", "release-plan", "prod"),
         mk("Apply acknowledged group-map manifest", "release", "prod", args=("MANIFEST={manifest}",)),
         mk("Maintain mapped access", "maintain", "prod"),
+        fixture_action("Verify only the named group-map effect", "verify_effect", "group_mapped",
+                       "before-group-map", "group_map_source", "mapped_group"),
+        fixture_action("Remove recorded group-map acknowledgement", "remove_group_map_ack",
+                       "group_map_source", "mapped_group"), AUTHOR_MERGE,
+        mk("Rehearse group-map ack cleanup merge", "rehearse", "dev"),
+        fixture_action("Capture access before prod ACL PR", "snapshot_checkpoint", "before-acl"),
         fixture_action("Prepare isolated prod-only acl_groups PR", "prod_acl_change", "prod_agent", "acl_group"),
         action("Commit and merge prod-only ACL change", "local_merge"),
         mk("Check isolated prod ACL PR", "check", "prod"),
+        mk("Rehearse isolated prod ACL merge", "rehearse", "dev"),
         mk("Plan isolated prod ACL release", "release-plan", "prod"),
         mk("Apply isolated prod ACL release", "release", "prod", args=("MANIFEST={manifest}",)),
         mk("Maintain prod ACL", "maintain", "prod"),
+        fixture_action("Verify prod_agent CAN_RUN is the only widening", "verify_effect", "acl_only",
+                       "before-acl", "prod_agent", "acl_group"),
     ), (
         "The added tier has its configured partial/full/raw effective access; removal revokes its SELECT/CAN_RUN and widens nothing else.",
         "The unacknowledged group_map plan mutates nothing; the exact prod ack permits only its named effect.",
@@ -351,28 +390,46 @@ SCENARIOS: tuple[Scenario, ...] = (
         mk("Generate policy for prepared custom mask", "generate", "dev"), AUTHOR_MERGE,
         mk("Validate prepared custom mask", "check", "dev"),
         mk("Run committed cases read-only before the dev lock", "rehearse", "dev",
-           assertions=("custom mask cases precede environment lock",)),
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=***CD")),
         mk("Promote adopted mask byte-for-byte", "promote-to", "prod"), AUTHOR_MERGE,
         mk("Check promoted custom mask", "check", "prod"),
+        mk("Rehearse custom-mask promotion merge", "rehearse", "dev",
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=***CD")),
+        mk("Refuse unacknowledged custom-mask install weakening", "release-plan", "prod", fail=True,
+           refusal=REFUSALS["weakening"], refusal_in_ci=False),
+        action("Write exact custom-mask install acknowledgement", "add_ack", "custom_install_ack"), AUTHOR_MERGE,
+        mk("Rehearse custom-mask install acknowledgement", "rehearse", "dev",
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=***CD")),
         mk("Run committed cases read-only before the prod plan lock", "release-plan", "prod",
-           assertions=("custom mask cases precede environment lock",)),
-        mk("Release prepared custom mask", "release", "prod", args=("MANIFEST={manifest}",)),
+           assertions=("custom-mask-order", "fixture-output=***CD")),
+        mk("Release prepared custom mask", "release", "prod", args=("MANIFEST={manifest}",),
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=***CD")),
         mk("Verify partial/full behavior and idempotence", "maintain", "prod"),
+        action("Remove custom-mask install acknowledgement", "remove_ack", "custom_install_ack"), AUTHOR_MERGE,
+        mk("Rehearse custom-mask install ack cleanup", "rehearse", "dev",
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=***CD")),
         fixture_action("Replace with separately tested custom SQL fixture", "custom_mask_change"),
         mk("Generate changed custom-mask policy", "generate", "dev"),
         action("Commit and merge tested SQL change", "local_merge"),
         mk("Check changed custom mask", "check", "dev"),
         mk("Rehearse changed committed cases", "rehearse", "dev",
-           assertions=("custom mask cases precede environment lock",)),
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=**BCD")),
         mk("Promote changed mask", "promote-to", "prod"), AUTHOR_MERGE,
+        mk("Rehearse changed-mask promotion merge", "rehearse", "dev",
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=**BCD")),
         mk("Refuse unacknowledged custom-mask weakening", "release-plan", "prod", fail=True,
            refusal=REFUSALS["weakening"], refusal_in_ci=False),
-        action("Write exact env-scoped custom-mask acknowledgement", "add_ack", "custom_mask_ack"),
-        action("Commit and merge custom-mask acknowledgement", "local_merge"),
+        action("Write exact env-scoped custom-mask acknowledgement", "add_ack", "custom_mask_ack"), AUTHOR_MERGE,
+        mk("Rehearse custom-mask acknowledgement merge", "rehearse", "dev",
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=**BCD")),
         mk("Plan acknowledged custom-mask change", "release-plan", "prod",
-           assertions=("custom mask cases precede environment lock",)),
-        mk("Release acknowledged custom-mask change", "release", "prod", args=("MANIFEST={manifest}",)),
+           assertions=("custom-mask-order", "fixture-output=**BCD")),
+        mk("Release acknowledged custom-mask change", "release", "prod", args=("MANIFEST={manifest}",),
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=**BCD")),
         mk("Verify changed partial/full behavior", "maintain", "prod"),
+        action("Remove custom-mask change acknowledgement", "remove_ack", "custom_mask_ack"), AUTHOR_MERGE,
+        mk("Rehearse custom-mask ack cleanup merge", "rehearse", "dev",
+           assertions=("custom-mask-order", "verify-exact", "fixture-output=**BCD")),
     ), (
         "Every committed case runs read-only before rehearsal/release locks on both clouds.",
         "Prod raw/partial/full rows show raw, the fixture's exact partial output, and library redacted respectively.",
@@ -837,7 +894,7 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
     produced: set[str] = set()
     missing: list[str] = []
     for step in scenario.steps:
-        if step.action in ("checkout_value", "add_ack") and not values.get(step.value or ""):
+        if step.action in ("checkout_value", "add_ack", "add_acks", "remove_ack") and not values.get(step.value or ""):
             missing.append(step.value or "")
         if step.action in {"tier_add", "tier_remove", "group_map_change", "prod_acl_change",
                            "custom_mask_install"}:
@@ -1369,6 +1426,93 @@ def unexpected_changes(scenario: str, before: Mapping[str, Any], after: Mapping[
     return result
 
 
+def _select_grants(snapshot_value: Mapping[str, Any]) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for catalog in (snapshot_value.get("uc") or {}).values():
+        if not isinstance(catalog, Mapping): continue
+        for grant in catalog.get("table_grants") or []:
+            if str(grant.get("privilege_type") or "").upper() != "SELECT": continue
+            principal = str(grant.get("grantee") or "")
+            table = ".".join(str(grant.get(key) or "") for key in ("table_catalog", "table_schema", "table_name"))
+            if principal and table.count(".") == 2: found.add((principal, table))
+    return found
+
+
+def _can_run(snapshot_value: Mapping[str, Any]) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    principal_keys = ("group_name", "user_name", "service_principal_name", "principal")
+    for agent in snapshot_value.get("agents") or []:
+        name = str(agent.get("name") or agent.get("space_id") or "")
+        def visit(value: Any) -> None:
+            if isinstance(value, Mapping):
+                blob = json.dumps(value, sort_keys=True, default=str).upper()
+                if "CAN_RUN" in blob:
+                    for key in principal_keys:
+                        principal = value.get(key)
+                        if isinstance(principal, str) and principal: found.add((name, principal))
+                for child in value.values(): visit(child)
+            elif isinstance(value, list):
+                for child in value: visit(child)
+        visit(agent.get("acl") or {})
+    return found
+
+
+def _rename_principal(value: Any, old: str, new: str) -> Any:
+    if isinstance(value, Mapping): return {key: _rename_principal(child, old, new) for key, child in value.items()}
+    if isinstance(value, list): return [_rename_principal(child, old, new) for child in value]
+    return new if value == old else value
+
+
+def verify_live_effect(kind: str, before: Mapping[str, Any], after: Mapping[str, Any], args: Sequence[str]) -> None:
+    left, right = before["prod"], after["prod"]
+    old_grants, new_grants = _select_grants(left), _select_grants(right)
+    old_run, new_run = _can_run(left), _can_run(right)
+    grant_add, grant_remove = new_grants - old_grants, old_grants - new_grants
+    run_add, run_remove = new_run - old_run, old_run - new_run
+    if kind == "tier_added":
+        group = args[0]
+        if not grant_add or not run_add or {p for p, _ in grant_add} != {group} or {p for _, p in run_add} != {group}:
+            raise RuntimeError(f"tier addition did not exclusively add {group!r} SELECT and CAN_RUN: grants={grant_add}, can_run={run_add}")
+        if grant_remove or run_remove: raise RuntimeError("tier addition unexpectedly revoked access")
+    elif kind == "tier_removed":
+        group = args[0]
+        if not grant_remove or not run_remove or any(p == group for p, _ in new_grants) or any(p == group for _, p in new_run):
+            raise RuntimeError(f"tier removal did not revoke every {group!r} SELECT and CAN_RUN")
+        if grant_add or run_add: raise RuntimeError(f"tier removal widened access: grants={grant_add}, can_run={run_add}")
+    elif kind == "group_mapped":
+        source, target = args
+        additions = {p for p, _ in grant_add} | {p for _, p in run_add}
+        removals = {p for p, _ in grant_remove} | {p for _, p in run_remove}
+        if additions != {target} or source not in removals:
+            raise RuntimeError(f"group_map live effect was not exactly {source!r}->{target!r}: add={additions}, remove={removals}")
+        renamed = _rename_principal({"uc": right.get("uc"), "agents": right.get("agents")}, target, source)
+        original = {"uc": left.get("uc"), "agents": left.get("agents")}
+        if canonical(renamed) != canonical(original):
+            raise RuntimeError("group_map release changed live UC/agent state beyond the acknowledged principal rename")
+    elif kind == "acl_only":
+        agent, group = args
+        if grant_add or grant_remove or run_remove or run_add != {(agent, group)}:
+            raise RuntimeError(f"ACL PR changed more than {agent!r} CAN_RUN for {group!r}: grants=({grant_add},{grant_remove}) can_run=({run_add},{run_remove})")
+    else:
+        raise RuntimeError(f"unknown live effect check {kind!r}")
+
+
+def check_step_output(step: Step, output: str) -> None:
+    for assertion in step.assertions:
+        if assertion == "custom-mask-order":
+            case = output.find("=== Custom mask cases (")
+            lock = output.find("=== GenieRails environment lock acquired")
+            if case < 0 or lock < 0 or case >= lock:
+                raise RuntimeError("custom-mask case line did not precede the environment-lock line")
+        elif assertion == "verify-exact":
+            if "all deterministic tiers matched their exact expected output" not in output:
+                raise RuntimeError("verify-access did not report exact expected output for every deterministic tier")
+        elif assertion.startswith("fixture-output="):
+            expected = assertion.split("=", 1)[1]
+            if f"expected outputs include {expected!r}" not in output:
+                raise RuntimeError(f"custom-mask live cases did not report exact partial output {expected!r}")
+
+
 def release_plan_workspace_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, Any]:
     """Release planning may write immutable manifests, but never live/state facts."""
     return {env: {key: value for key, value in snapshot_diff(before.get(env, {}), after.get(env, {})).items()
@@ -1386,6 +1530,22 @@ def _write_ack(cloud_root: Path, entry: str) -> None:
         path.write_text(prior.rstrip("\n") + ("\n" if prior.strip() else "") + entry + "\n", encoding="utf-8")
 
 
+def _ack_entries(value: str) -> tuple[str, ...]:
+    entries = tuple(item.strip() for item in value.split(";;") if item.strip())
+    if not entries: raise RuntimeError("acknowledgement list is empty")
+    return entries
+
+
+def _remove_acks(cloud_root: Path, entries: Iterable[str]) -> None:
+    path = cloud_root / "envs" / "prod" / "ack.txt"
+    wanted = set(entries)
+    prior = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    missing = wanted - set(prior)
+    if missing: raise RuntimeError(f"cannot remove absent acknowledgement(s): {', '.join(sorted(missing))}")
+    kept = [line for line in prior if line not in wanted]
+    path.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+
+
 def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[str, str]) -> None:
     if step.action == "checkout_value":
         repo.require_clean(f"{scenario.key}-before-checkout")
@@ -1394,6 +1554,12 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
     if step.action == "add_ack":
         entry = values[step.value or ""]
         _write_ack(repo.runner.cwd, entry)
+        return
+    if step.action == "add_acks":
+        for entry in _ack_entries(values[step.value or ""]): _write_ack(repo.runner.cwd, entry)
+        return
+    if step.action == "remove_ack":
+        _remove_acks(repo.runner.cwd, _ack_entries(values[step.value or ""]))
         return
     if step.action == "local_merge":
         repo.local_merge(scenario.key)
@@ -1430,6 +1596,10 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
     if step.action == "add_group_map_ack":
         source, target = (values[name] for name in step.assertions)
         _write_ack(repo.runner.cwd, f"prod:weaken:group_map:{source}={target}")
+        return
+    if step.action == "remove_group_map_ack":
+        source, target = (values[name] for name in step.assertions)
+        _remove_acks(repo.runner.cwd, (f"prod:weaken:group_map:{source}={target}",))
         return
     if step.action == "prod_acl_change":
         agent, group = (values[name] for name in step.assertions)
@@ -1472,6 +1642,18 @@ def _restore_baseline(runner: CommandRunner, repo: Checkout, targets: set[str], 
     if missing: raise RuntimeError(f"restore targets unavailable: {', '.join(sorted(missing))}")
     repo.reset()
     repo.forward_fix()
+    # group_map records the last applied mapping outside Git. Returning to the
+    # baseline mapping is itself an exact, reviewable weakening. Derive only
+    # those reverse keys from the product checker, commit them for the restore,
+    # then remove them after the baseline release is recorded.
+    reverse_acks: tuple[str, ...] = ()
+    if deterministic_env(runner.cwd, "prod"):
+        from agent_files import merged_config
+        from group_map import required_acks
+        reverse_acks = tuple(required_acks(runner.cwd / "envs" / "prod", "prod",
+                                           merged_config(runner.cwd / "envs" / "prod")))
+    for entry in reverse_acks: _write_ack(runner.cwd, entry)
+    if reverse_acks: repo.local_merge(f"{label}-restore-group-map-ack")
     result = runner.run(("make", "rehearse", "ENV=dev"), f"{label}-restore-rehearse")
     if result.returncode: raise RuntimeError("baseline restore rehearse failed")
     if deterministic_env(runner.cwd, "dev") and import_unset_treatment(result.stdout):
@@ -1496,6 +1678,11 @@ def _restore_baseline(runner: CommandRunner, repo: Checkout, targets: set[str], 
     if result.returncode: raise RuntimeError("baseline restore maintain failed")
     if deterministic_env(runner.cwd, "prod") and import_unset_treatment(result.stdout):
         raise RuntimeError("baseline restore maintain attempted to clear gr_treatment")
+    if reverse_acks:
+        _remove_acks(runner.cwd, reverse_acks)
+        repo.local_merge(f"{label}-restore-ack-cleanup")
+        result = runner.run(("make", "rehearse", "ENV=dev"), f"{label}-restore-cleanup-rehearse")
+        if result.returncode: raise RuntimeError("baseline restore acknowledgement cleanup rehearse failed")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1653,6 +1840,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             stop = False
             confirmations: list[dict[str, str]] = []
             allowed_adoptions: dict[str, dict[str, Adoption]] = {}
+            checkpoints: dict[str, dict[str, Any]] = {}
             try:
                 # Pin: every scenario starts at exactly the requested commit.
                 repo.switch(repo.baseline, f"{scenario.key}-pin")
@@ -1668,7 +1856,14 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         confirmations.append(_human_gate(scenario, step))
                         item["status"] = "passed"; continue
                     if step.action:
-                        _run_action(step, scenario, repo, values)
+                        if step.action == "snapshot_checkpoint":
+                            checkpoints[step.assertions[0]] = capture()
+                        elif step.action == "verify_effect":
+                            kind, checkpoint, *names = step.assertions
+                            if checkpoint not in checkpoints: raise RuntimeError(f"missing snapshot checkpoint {checkpoint}")
+                            verify_live_effect(kind, checkpoints[checkpoint], capture(), [values.get(name, name) for name in names])
+                        else:
+                            _run_action(step, scenario, repo, values)
                         item["status"] = "passed"; continue
                     argv2 = [render(part, {**values, "manifest": manifest}) for part in step.command]
                     applying = step.target in APPLYING
@@ -1693,6 +1888,10 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         ok = result.returncode != 0 and bool(step.refusal and re.search(step.refusal, result.stdout))
                         if not ok: item["assertion"] = "nonzero exit and the expected refusal message are both required"
                     else: ok = result.returncode == 0
+                    if ok and not step.expect_failure and step.assertions:
+                        try: check_step_output(step, result.stdout)
+                        except RuntimeError as exc:
+                            ok = False; item["assertion"] = str(exc)
                     if applying and deterministic_env(cloud_root, step.env) and import_unset_treatment(result.stdout):
                         ok = False
                         item["assertion"] = "deterministic apply attempted to clear gr_treatment"
@@ -1707,7 +1906,9 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         successful_step_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
                         if step.target == "release-plan" and release_plan_workspace_diff(step_before, step_after):
                             item["status"] = "ERROR"; item["assertion"] = "successful release-plan changed the snapshot"; ok = False
-                        weak_step = protection_diff_envs(step_before, step_after, allowed_adoptions=allowed_adoptions)
+                        weak_step = protection_diff_envs(
+                            step_before, step_after, allowed_adoptions=allowed_adoptions,
+                            include_grants=scenario.key in {"tier-groupmap", "custom-mask"})
                         if weak_step and scenario.key not in WEAKENING_EXPECTED:
                             item["status"] = "ERROR"
                             if "assertion" not in item:
@@ -1809,6 +2010,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             error_message = "; ".join(filter(None, (error_message, f"protection not restored: {weak_restore}")))
                 except BaseException as exc:
                     scenario_status = "RESTORE FAILED"; failed = True; stop = True
+                    manual_restore_commands = list(MANUAL_RESTORE_COMMANDS)
                     error_message = "; ".join(filter(None, (error_message, f"restore: {type(exc).__name__}: {exc}")))
                 if scenario.known_failure and scenario_status == "passed":
                     scenario_status = f"UNEXPECTED PASS — remove known_failure {scenario.known_failure}"

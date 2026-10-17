@@ -231,7 +231,7 @@ class EffectiveAccessReport:
         for r in self.results:
             marker = {PASS: "✓", FAIL: "✗", INCONCLUSIVE: "✗"}.get(r.status, "?")
             lines.append(f"  {marker} [{r.status}] {r.target}")
-            if r.status != PASS:
+            if r.status != PASS or "all deterministic tiers matched their exact expected output" in r.detail:
                 lines.append(f"        {r.detail}")
         for r in self.not_verified:
             lines.append(f"  ! [NOT VERIFIED] {r.target}")

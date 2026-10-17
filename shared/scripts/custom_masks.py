@@ -690,7 +690,9 @@ def live_check(env_dir: Path, env: str, warehouse=None) -> int:
             if misses:
                 failed += 1
             else:
-                print(f"  PASS {name} ({entry['tested_type']}): {len(entry['cases'])} exact-output cases")
+                expected = [case["expected"] for case in entry["cases"]]
+                print(f"  PASS {name} ({entry['tested_type']}): {len(entry['cases'])} exact-output cases; "
+                      f"expected outputs include {expected[1]!r}")
     if failed:
         print(f"custom mask cases FAILED on envs/{env}'s warehouse (above); nothing was applied. A custom mask "
               "must give exactly its tested output in every env it governs.", file=sys.stderr)

@@ -918,7 +918,8 @@ override _NO_SIGNALS = trap "" HUP INT TERM
 override _ENV_LOCK = trap '$(_NO_SIGNALS); $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	trap '$(_NO_SIGNALS); exit 129' HUP; trap '$(_NO_SIGNALS); exit 130' INT; trap '$(_NO_SIGNALS); exit 143' TERM; \
 	_genierails_lock_nonce="$$($(_ENV_LOCK_HELPER) lock "$(ENV_DIR)" --pid $$$$ --owner $(1) --env "$(ENV)")" || exit 1; \
-	export "GENIERAILS_LOCK_NONCE_$$(printf '%s' "$(notdir $(patsubst %/,%,$(ENV_DIR)))" | tr 'a-z-' 'A-Z_')=$$_genierails_lock_nonce"
+	export "GENIERAILS_LOCK_NONCE_$$(printf '%s' "$(notdir $(patsubst %/,%,$(ENV_DIR)))" | tr 'a-z-' 'A-Z_')=$$_genierails_lock_nonce"; \
+	echo "=== GenieRails environment lock acquired ($(ENV), $(1)) ==="
 
 # Removed, not aliased: certify used to stop before granting access, so a
 # pipeline running certify -> approval -> release must not grant at certify.
