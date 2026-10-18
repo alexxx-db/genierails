@@ -217,10 +217,15 @@ def test_pr_check_samples_re_run_after_main_moves():
         merge_step = next(s for s in check["steps"]
                           if s.get("name") == "Test PR head merged with current main")
         assert merge_step["env"] == {"HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
-                                     "PR_NUMBER": "${{ github.event.pull_request.number }}"}
-        assert "git fetch --no-tags origin main" in merge_step["run"]
+                                     "PR_NUMBER": "${{ github.event.pull_request.number }}",
+                                     "GIT_COMMITTER_NAME": "genierails-ci",
+                                     "GIT_COMMITTER_EMAIL": "genierails-ci@users.noreply.github.com",
+                                     "GIT_AUTHOR_NAME": "genierails-ci",
+                                     "GIT_AUTHOR_EMAIL": "genierails-ci@users.noreply.github.com"}
+        assert "git fetch --no-tags origin main:refs/remotes/origin/main" in merge_step["run"]
         assert 'git checkout --force --detach "$HEAD_SHA"' in merge_step["run"]
         assert "git merge --no-edit --no-ff origin/main" in merge_step["run"]
+        assert "git diff --name-only --diff-filter=U" in merge_step["run"]
         assert "does not merge cleanly with current origin/main" in merge_step["run"]
 
         pipeline = yaml.safe_load((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text())
@@ -229,6 +234,69 @@ def test_pr_check_samples_re_run_after_main_moves():
         ado_text = " ".join((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text().replace("#", "").split())
         assert "Build expiration to" in ado_text and "Immediately when main is updated" in ado_text
         assert "GitHub-hosted repositories connected to Azure Pipelines" in ado_text
+
+
+def _github_pr_merge_script(cloud="aws"):
+    workflow = yaml.safe_load((ROOT / cloud / ".github/workflows/pr-check.yml").read_text())
+    return next(s for s in workflow["jobs"]["check"]["steps"]
+                if s.get("name") == "Test PR head merged with current main")
+
+
+def _repo_for_pr_merge_test(tmp_path: Path, *, conflict: bool) -> tuple[Path, str]:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    (origin / "shared.txt").write_text("base\n")
+    _git(origin, "add", ".")
+    _git(origin, "commit", "-qm", "base")
+    _git(origin, "checkout", "-qb", "pr")
+    if conflict:
+        (origin / "shared.txt").write_text("pr\n")
+    else:
+        (origin / "pr.txt").write_text("pr\n")
+    _git(origin, "add", ".")
+    _git(origin, "commit", "-qm", "pr")
+    head = _git(origin, "rev-parse", "HEAD")
+    _git(origin, "update-ref", "refs/pull/1/head", head)
+    _git(origin, "checkout", "-q", "main")
+    if conflict:
+        (origin / "shared.txt").write_text("main\n")
+    else:
+        (origin / "main.txt").write_text("main\n")
+    _git(origin, "add", ".")
+    _git(origin, "commit", "-qm", "main")
+
+    work = tmp_path / "work"
+    _git(tmp_path, "clone", "-q", f"file://{origin}", str(work))
+    return work, head
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_github_pr_check_merge_step_runs_without_global_identity(tmp_path, conflict):
+    step = _github_pr_merge_script("aws")
+    work, head = _repo_for_pr_merge_test(tmp_path, conflict=conflict)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")}
+    env.update(step["env"])
+    env.update({
+        "HEAD_SHA": head,
+        "PR_NUMBER": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "user.useConfigOnly",
+        "GIT_CONFIG_VALUE_0": "true",
+    })
+    result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, text=True,
+                            capture_output=True, env=env)
+    output = result.stdout + result.stderr
+    if conflict:
+        assert result.returncode != 0, output
+        assert "does not merge cleanly with current origin/main" in output
+    else:
+        assert result.returncode == 0, output
+        assert "Committer identity unknown" not in output
 
 
 def _github_pr_scope(cloud):

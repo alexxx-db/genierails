@@ -101,12 +101,20 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          GIT_COMMITTER_NAME: genierails-ci
+          GIT_COMMITTER_EMAIL: genierails-ci@users.noreply.github.com
+          GIT_AUTHOR_NAME: genierails-ci
+          GIT_AUTHOR_EMAIL: genierails-ci@users.noreply.github.com
         run: |
-          git fetch --no-tags origin main
+          git fetch --no-tags origin main:refs/remotes/origin/main
           git fetch --no-tags origin "$HEAD_SHA" || git fetch --no-tags origin "pull/${PR_NUMBER}/head"
           git checkout --force --detach "$HEAD_SHA"
           if ! git merge --no-edit --no-ff origin/main; then
-            echo "::error::PR head $HEAD_SHA does not merge cleanly with current origin/main; rebase or merge main and re-run checks."
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              echo "::error::PR head $HEAD_SHA does not merge cleanly with current origin/main; rebase or merge main and re-run checks."
+            else
+              echo "::error::git merge failed while testing PR head $HEAD_SHA against current origin/main; see git output above."
+            fi
             exit 1
           fi
 

@@ -374,6 +374,7 @@ def test_the_sample_codeowners_splits_data_citizens_from_governance_engineers():
                  "aws/envs/prod/abac.auto.tfvars", "shared/mask_library.json"):
         assert owners(path) == [GOVERNANCE], path
     for path in ("aws/.github/workflows/pr-check.yml", "azure/.github/workflows/pr-check.yml",
+                 ".github/workflows/ci.yml", ".github/CODEOWNERS",
                  "aws/azure-pipelines/pr-check.yml", "azure/azure-pipelines/pr-check.yml"):
         assert owners(path) == [PLATFORM], path
 
@@ -396,7 +397,8 @@ def test_every_sample_codeowners_rule_is_anchored_to_a_supported_cloud_tree():
     assert examples, "the sample's optional per-agent example is gone"
     for pattern in active + examples:
         assert pattern.startswith("/") and "**" not in pattern, pattern
-        assert pattern.split("/")[1] in ("shared", *CLOUDS), pattern
+        assert pattern.split("/")[1] in ("shared", ".github", *CLOUDS), pattern
+    assert "/.github/" in active
     for cloud in CLOUDS:
         for pattern in (f"/{cloud}/envs/", f"/{cloud}/envs/*/agents/", f"/{cloud}/envs/*/ack.txt",
                         f"/{cloud}/.github/", f"/{cloud}/azure-pipelines/"):

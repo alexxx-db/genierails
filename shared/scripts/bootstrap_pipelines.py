@@ -577,10 +577,13 @@ def _codeowners(cfg: Config) -> list[str]:
         ("# Data citizen (18.1): agent files; lifecycle revival also needs governance review", None),
         (f"/{c}/envs/*/agents/", agents),
         ("# Pipelines and this file", None),
-        (pipelines, gov),
     ]
     if cfg.ci == "github":
+        rows.append(("/.github/", gov))
+        rows.append((pipelines, gov))
         rows.append(("/CODEOWNERS", gov))
+    else:
+        rows.append((pipelines, gov))
     return [row if owner is None else f"{row:<36} {owner}" for row, owner in rows]
 
 

@@ -319,7 +319,7 @@ def test_codeowners_follow_the_persona_split():
     owners = {line.split()[0]: line.split()[1] for line in lines if not line.startswith("#")}
     assert owners["/aws/envs/*/agents/"] == "@acme/agents"
     for path in ("/shared/", "/aws/envs/", "/aws/envs/*/env.auto.tfvars",
-                 "/aws/envs/*/generated/", "/aws/envs/*/ack.txt", "/aws/.github/"):
+                 "/aws/envs/*/generated/", "/aws/envs/*/ack.txt", "/.github/", "/aws/.github/"):
         assert owners[path] == "@acme/gov"
     # Last match wins: the agents rule must come after the envs catch-all.
     paths = [line.split()[0] for line in lines if not line.startswith("#")]
