@@ -40,7 +40,9 @@ checkout finds it: ``policy_generations.ledger_dir``) records the active generat
 for retirement and the transition in progress. A failed tighten or switch
 phase restores the previous protection at once. Any unfinished transition
 makes the next run resume it, or refuse when the generated config has moved
-on; ``abandon`` drops one that never switched. Legacy envs are never staged:
+on; ``abandon`` drops one that never switched, or one whose switch was rolled
+back (the journal's ``restored`` marker) when a fresh live check shows every
+column and principal back on the previous generation. Legacy envs are never staged:
 the controller exits 0 and touches nothing.
 
 Exit codes: 0 done, 1 a phase failed (the journal says what is live), 2 a
@@ -322,7 +324,7 @@ class Controller:
             "retire": eligible["fingerprint"] if eligible else "", "tier_move": tier_move,
             "phases": phases, "completed": [], "current": "", "status": "running",
             "failed_phase": "", "error": "", "switch_attempted": False, "restoring": False,
-            "restore_failed": False, "started_at": _now(), "updated_at": _now(),
+            "restore_failed": False, "restored": None, "started_at": _now(), "updated_at": _now(),
         }
 
     # -- running hooks ---------------------------------------------------------
@@ -407,7 +409,7 @@ class Controller:
     # -- the protocol ------------------------------------------------------------
     def _restore(self, journal: dict, t: dict) -> bool:
         """Put the previous protection back: (tighten, when principals may be moved,) then restore."""
-        t["restoring"] = True
+        t.update(restoring=True, restored=None)
         self._save(journal)
         steps = (["tighten"] if t["switch_attempted"] and t["tier_move"] else []) + ["restore"]
         for step in steps:
@@ -416,7 +418,13 @@ class Controller:
                 break
         else:
             if not self._inventory(t, ("restore",)):
-                t.update(restoring=False, restore_failed=False, completed=["create"])
+                record = pg.load_stage_record(self.env_dir) or {}
+                rendered = record.get("rendered") or {}
+                # What the live check proved, so abandon can tell a rolled-back switch from one in flight.
+                restored = {"at": _now(), "after": t["failed_phase"], "generation": t["from"],
+                            "tags": dict(rendered.get("tags") or {}),
+                            "policies": sorted(p["name"] for p in rendered.get("fgac_policies") or [])}
+                t.update(restoring=False, restore_failed=False, completed=["create"], restored=restored)
                 self._save(journal)
                 print("  The previous protection is back in place and verified live.")
                 return True
@@ -472,7 +480,7 @@ class Controller:
                     continue
                 t.update(current=phase, status="running")
                 if phase in ("switch", "verify-switched"):
-                    t["switch_attempted"] = True
+                    t.update(switch_attempted=True, restored=None)
                 self._save(journal)
                 print(f"=== Policy phase {index + 1}/{len(t['phases'])}: {phase} ({self.env_name}) ===", flush=True)
                 rc = self._phase(t, phase)
@@ -587,7 +595,7 @@ class Controller:
                 phase = step["phase"]
                 t.update(current=phase, status="running")
                 if phase in ("switch", "verify-switched"):
-                    t["switch_attempted"] = True
+                    t.update(switch_attempted=True, restored=None)
                 self._save(journal)
                 print(f"=== Policy phase {phase} ({self.env_name}) ===", flush=True)
                 if step["kind"] == "apply":
@@ -672,8 +680,48 @@ class Controller:
               f"run make release-plan ENV={self.env_name} again for the create phase.")
         return MORE_PHASES
 
+    def _restore_unproven(self, t: dict) -> str:
+        """Why a switched transition can't be abandoned ('' when it can).
+
+        Only a switch that was rolled back qualifies: the journal records a
+        verified restore, the last applied stage is that restore (or a partly
+        done abandon) of this transition, it puts every column on exactly the
+        previous generation's value and every retained policy on its previous
+        principals, and a fresh live check shows Unity Catalog still matches it.
+        Then abandon ends where it would for a change that never switched.
+        """
+        if not t.get("restored") or t["restoring"] or t["restore_failed"]:
+            return "no verified restore of the previous protection is recorded"
+        record = pg.load_stage_record(self.env_dir)
+        if not record or record.get("stage") not in ("restore", "abandon") \
+                or record.get("desired") != t["to"] or record.get("old") != t["from"]:
+            return (f"the last applied stage is {(record or {}).get('stage') or 'none'}, not the restore "
+                    "of this change")
+        old = self._snapshot(t["from"]) if t["from"] else None
+        retain = self._snapshot(t["retain"]) if t["retain"] else None
+        if (t["from"] and old is None) or (t["retain"] and retain is None):
+            return "the previous generation's snapshot is missing, so what it protects can't be checked"
+        rendered = record["rendered"]
+        old_tags = dict((old or {}).get("tags") or {})
+        if dict(rendered["tags"]) != old_tags:
+            moved = sorted(c for c in rendered["tags"].keys() | old_tags.keys()
+                           if rendered["tags"].get(c) != old_tags.get(c))
+            return f"{len(moved)} column(s) keep the new generation's treatment ({', '.join(moved[:5])})"
+        previous = _expected_live([g for g in (old, retain) if g])
+        for policy in rendered["fgac_policies"]:
+            want = previous.get(policy["name"])
+            have = {"to": sorted(policy.get("to_principals") or []),
+                    "except": sorted(policy.get("except_principals") or [])}
+            if want is not None and have != want:
+                return f"policy {policy['name']} has principals {have}, the previous generation {want}"
+        rc = self._inventory(t, (record["stage"],))
+        if rc:
+            return ("the live check found Unity Catalog differs from the restored protection" if rc == 1
+                    else f"the live check couldn't run (exit {rc}), so the restore can't be confirmed")
+        return ""
+
     def abandon(self) -> int:
-        """Drop an unfinished transition that never switched, back to the active generation."""
+        """Drop an unfinished transition that never switched, or whose switch was rolled back and still is."""
         if governance_mode(self.env_dir) != "deterministic":
             print("Staged policy apply: legacy governance mode; nothing to abandon.")
             return 0
@@ -684,8 +732,12 @@ class Controller:
                 print("Staged policy apply: no unfinished policy change; nothing to abandon.")
                 return 0
             if t["switch_attempted"]:
-                raise Refused("this change already retagged columns or moved principals; it can't be "
-                              "abandoned. Re-run the command that started it to resume it.")
+                reason = self._restore_unproven(t)
+                if reason:
+                    raise Refused("this change already retagged columns or moved principals; it can't be "
+                                  f"abandoned ({reason}). Re-run the command that started it to resume it.")
+                print(f"  The switch of run {t['run_id']} was rolled back after {t['restored']['after']} and "
+                      f"the live check confirms the previous protection ({t['from'] or 'none'}).")
             print(f"=== Policy staged apply: abandoning run {t['run_id']} (generation {t['to']}) ===")
             if self._hook(t, "abandon") or self._inventory(t, ("abandon",)):
                 t.update(status="failed", error="abandon failed")
@@ -788,6 +840,9 @@ class Controller:
         options = [f"re-run the same command at commit {t['commit'] or '?'} (generation {t['to']}) to resume it"]
         if not t["switch_attempted"]:
             options.append(f"or drop it with make policy-abandon ENV={self.env_name}")
+        elif t.get("restored") and not t["restore_failed"]:
+            options.append(f"or drop it with make policy-abandon ENV={self.env_name} (the switch was rolled "
+                           "back; abandon re-checks live protection first)")
         return (self.describe_transition(t) + f"\nThe generated config is now generation {desired['fingerprint']}. "
                 "A new policy change can't start until this one is finished: " + "; ".join(options) + ".")
 

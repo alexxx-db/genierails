@@ -355,7 +355,8 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   Not gated: `apply-account` (its own account lock and approval),
   `enable-classification` (classification config only), `import`,
   `migrate-state`, `rebuild-governed-tables` (state or a local record), and
-  `policy-abandon` (drops only a staged change that never switched). Each
+  `policy-abandon` (drops only a staged change that never switched, or whose
+  switch was rolled back and still is, live). Each
   moves a state serial or a committed file, so a manifest planned before it is
   refused.
 

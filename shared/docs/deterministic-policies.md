@@ -121,8 +121,21 @@ any unfinished transition with its completed phases. Writes are atomic.
   stale journal) is refused. With no journal, a state that exactly matches
   the generated config is adopted; any other is refused.
 - `make policy-status ENV=<env>` prints the journal. `make policy-abandon
-  ENV=<env>` drops an unfinished change that never retagged a column or moved
-  a principal, so a corrected config can start a new one.
+  ENV=<env>` drops an unfinished change (removing the policies it created),
+  so a corrected config can start a new one. It abandons a change that never
+  retagged a column or moved a principal, or one whose switch was **rolled
+  back**: the automatic restore after a
+  failed `switch` or `verify-switched` completed and was verified live (the
+  journal's `restored` marker), the last applied stage is still that restore,
+  it puts every column on exactly the previous generation's value (a newly
+  governed column keeping its new mask doesn't qualify) and every retained
+  policy on its previous principals, and a fresh live check (the
+  `verify-created`/`verify-switched` check: policies, `TO`/`EXCEPT`
+  principals, functions and treatment tags) still finds exactly that. It
+  refuses otherwise, including when the live check can't run. This is the way
+  out when the config must change after a rolled-back switch (for example a
+  recreated deployer or tier groups), which the unfinished change would
+  otherwise refuse.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
 

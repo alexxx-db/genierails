@@ -682,8 +682,123 @@ def test_abandon_drops_a_change_that_never_switched(harness):
 def test_abandon_is_refused_once_a_switch_was_attempted(harness):
     released(harness)
     write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
-    assert harness.apply(FAKE_TF_FAIL_APPLY="switch") == 1
+    # The switch fails halfway and so does the restore: columns may be on either generation.
+    assert harness.apply(FAKE_TF_FAIL_APPLY="switch", FAKE_TF_FAIL_PLAN="restore") == 1
+    t = harness.journal()["transition"]
+    assert t["switch_attempted"] and t["restore_failed"] and not t["restored"]
+    harness.calls.clear()
     with pytest.raises(spa.Refused, match="can't be abandoned"):
+        harness.controller().abandon()
+    assert harness.calls == [] and harness.journal()["transition"] == t
+
+
+def _rolled_back_switch(harness):
+    """The live AWS shape: verify-switched failed and the previous protection was restored and verified."""
+    old = released(harness)
+    failed = write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    harness.fail_verify = {"switch"}
+    assert harness.apply() == 1
+    t = harness.journal()["transition"]
+    assert (t["completed"], t["failed_phase"], t["switch_attempted"]) == (["create"], "verify-switched", True)
+    assert t["restored"]["after"] == "verify-switched" and t["restored"]["generation"] == old["fingerprint"]
+    assert t["restored"]["tags"] == old["tags"]
+    assert live_tags(live_state(harness.env_dir)) == old["tags"]
+    harness.calls.clear()
+    return old, failed
+
+
+def test_abandon_drops_a_rolled_back_switch_after_a_live_check(harness):
+    old, failed = _rolled_back_switch(harness)
+    # The deployer and the tier groups were recreated: the config changed, so the change can't resume.
+    fixed = write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}},
+                      tiers=["raw_v2", "regional_v2", "masked_v2"], exempt=("new-deployer-sp",))
+    assert fixed["fingerprint"] != failed["fingerprint"]
+    with pytest.raises(spa.Refused, match="make policy-abandon ENV=dev"):
+        harness.apply()
+    harness.calls.clear()
+    assert harness.controller().abandon() == 0
+    # The fresh live check runs before anything is dropped.
+    assert harness.calls == ["inventory:restore", "abandon", "inventory:abandon"]
+    state = live_state(harness.env_dir)
+    assert {p["name"] for p in live_policies(state)} == {p["name"] for p in old["fgac_policies"]}
+    assert live_tags(state) == old["tags"]
+    journal = harness.journal()
+    assert journal["transition"] is None and journal["active"] == old["fingerprint"]
+    assert journal["history"][-1]["abandoned"] == failed["fingerprint"]
+    assert harness.apply() == 0
+    assert live_tags(live_state(harness.env_dir)) == fixed["tags"]
+    assert harness.journal()["active"] == fixed["fingerprint"]
+
+
+def test_abandon_of_a_rolled_back_switch_refuses_when_a_column_is_live_on_the_new_value(harness):
+    old, failed = _rolled_back_switch(harness)
+    (column, value), = ((c, v) for c, v in failed["tags"].items() if v != old["tags"].get(c))
+    path = harness.env_dir / "data_access" / "terraform.tfstate"
+    state = live_state(harness.env_dir)
+    for resource in state["resources"]:
+        for instance in resource["instances"]:
+            if instance["attributes"].get("entity_name") == column:
+                instance["attributes"]["tag_value"] = value  # retagged outside GenieRails since the restore
+    path.write_text(json.dumps(state))
+    harness.live_check = "real"
+    before = harness.journal()
+    with pytest.raises(spa.Refused, match=r"can't be abandoned \(the live check found"):
+        harness.controller().abandon()
+    assert harness.calls == ["inventory:restore"]
+    assert any(f"live treatment {value}" in p for p in harness.inventory_problems[-1])
+    assert harness.journal() == before and live_policies(live_state(harness.env_dir)) == live_policies(state)
+
+
+def test_abandon_of_a_rolled_back_switch_refuses_when_the_live_check_cannot_run(harness):
+    old, _ = _rolled_back_switch(harness)
+    real_run = harness.run
+
+    def unreadable(argv, env=None, check=False):
+        if argv[0] == "inventory":
+            harness.calls.append("inventory:unreadable")
+            return SimpleNamespace(returncode=2)
+        return real_run(argv, env=env, check=check)
+
+    harness.run = unreadable
+    before = harness.journal()
+    with pytest.raises(spa.Refused, match="live check couldn't run"):
+        harness.controller().abandon()
+    assert harness.calls == ["inventory:unreadable"] and harness.journal() == before
+    assert live_tags(live_state(harness.env_dir)) == old["tags"]
+
+
+def test_abandon_of_a_switch_is_refused_without_the_restored_marker(harness):
+    _rolled_back_switch(harness)
+    journal = harness.journal()
+    journal["transition"].pop("restored")  # a journal written before the marker existed
+    spa.save_journal(harness.env_dir, journal)
+    with pytest.raises(spa.Refused, match="no verified restore"):
+        harness.controller().abandon()
+    assert harness.calls == []
+
+
+def test_abandon_of_a_rolled_back_switch_refuses_when_a_new_column_keeps_its_new_mask(harness):
+    old = released(harness)
+    failed = write_env(harness.env_dir, columns=("email", "contact"))
+    assert failed["tags"].keys() - old["tags"].keys()
+    harness.fail_verify = {"switch"}
+    assert harness.apply() == 1
+    t = harness.journal()["transition"]
+    assert t["restored"] and t["restored"]["tags"] != old["tags"]
+    harness.calls.clear()
+    with pytest.raises(spa.Refused, match="keep the new generation's treatment"):
+        harness.controller().abandon()
+    assert harness.calls == []
+
+
+def test_a_resumed_switch_clears_the_restored_marker(harness):
+    _, failed = _rolled_back_switch(harness)
+    harness.crash_after = "switch"
+    with pytest.raises(KeyboardInterrupt):
+        harness.apply()
+    t = harness.journal()["transition"]
+    assert t["switch_attempted"] and t["restored"] is None
+    with pytest.raises(spa.Refused, match="no verified restore"):
         harness.controller().abandon()
 
 
