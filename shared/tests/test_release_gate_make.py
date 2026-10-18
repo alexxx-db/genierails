@@ -365,6 +365,23 @@ def test_apply_account_refuses_a_stale_or_tampered_manifest_and_applies_nothing(
     assert not rg.account_receipts(repo.cloud, "account")
 
 
+def test_apply_account_refuses_when_the_real_auth_endpoint_changes_after_plan(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    auth = repo.cloud / "envs" / "account" / "auth.auto.tfvars"
+    auth.write_text('databricks_account_host = "https://accounts.cloud.databricks.com"\n'
+                    'databricks_account_id = "acc-123"\n'
+                    'databricks_workspace_host = "https://workspace.one.example"\n'
+                    'databricks_client_id = "client"\n'
+                    'databricks_client_secret = "secret-not-hashed"\n')
+    manifest = _account_planned(make)
+    auth.write_text(auth.read_text().replace("workspace.one.example", "workspace.two.example"))
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "account input file hashes changed" in result.stderr
+    assert not [c for c in make.calls() if c[:4] == ["runner", "account", "account", "apply-plan"]]
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
 def test_apply_account_refuses_several_default_manifests_and_lists_ids(make, repo):
     first = _account_planned(make)
     second = _account_planned(make)

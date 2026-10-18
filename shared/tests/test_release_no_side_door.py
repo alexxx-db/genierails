@@ -142,6 +142,18 @@ def test_account_layer_refuses_a_direct_destroy_when_any_env_is_deterministic(tm
     assert not [c for c in calls if c[0] == "runner"]
 
 
+@pytest.mark.parametrize("target", ["_apply-layer", "_destroy-layer"])
+def test_account_layer_guard_uses_the_real_layer_dir_not_an_account_dir_override(tmp_path, envs, target):
+    cloud, _ = envs
+    decoy = tmp_path / "decoy" / "envs" / "account"
+    decoy.mkdir(parents=True)
+    result, calls = run(tmp_path, envs, target, "account", "LAYER=account", "TARGET_ENV=account",
+                        f"LAYER_ENV_DIR={cloud / 'envs' / 'account'}", f"ACCOUNT_ENV_DIR={decoy}")
+    assert result.returncode != 0
+    assert "direct account-layer" in result.stderr
+    assert not [c for c in calls if c[0] == "runner"]
+
+
 @pytest.mark.parametrize("owner", ["release", "release-plan", "rehearse", "ungovern", "apply-account"])
 def test_no_other_lock_owner_opens_a_promoted_env(tmp_path, envs, lock, owner):
     lock("prod", owner)

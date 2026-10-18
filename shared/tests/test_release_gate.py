@@ -474,13 +474,37 @@ def test_account_input_hashes_pin_auth_endpoint_but_not_auth_secrets(tmp_path):
     env_dir = tmp_path / "envs" / "account"
     env_dir.mkdir(parents=True)
     auth = env_dir / "auth.auto.tfvars"
-    auth.write_text('host = "https://one.example"\naccount_id = "123"\nclient_secret = "first"\n')
+    auth.write_text('databricks_account_host = "https://accounts.one.example"\n'
+                    'databricks_account_id = "123"\n'
+                    'databricks_workspace_host = "https://workspace.one.example"\n'
+                    'databricks_client_id = "client-one"\n'
+                    'databricks_client_secret = "first"\n')
     first = rg.account_input_hashes(env_dir)
-    assert [item["path"] for item in first] == ["auth.auto.tfvars#host,account_id"]
-    auth.write_text('host = "https://one.example"\naccount_id = "123"\nclient_secret = "second"\n')
+    assert [item["path"] for item in first] == [
+        "auth.auto.tfvars#databricks_account_host,databricks_account_id,databricks_workspace_host"]
+    auth.write_text('databricks_account_host = "https://accounts.one.example"\n'
+                    'databricks_account_id = "123"\n'
+                    'databricks_workspace_host = "https://workspace.one.example"\n'
+                    'databricks_client_id = "client-two"\n'
+                    'databricks_client_secret = "second"\n')
     assert rg.account_input_hashes(env_dir) == first
-    auth.write_text('host = "https://two.example"\naccount_id = "123"\nclient_secret = "second"\n')
+    auth.write_text('databricks_account_host = "https://accounts.one.example"\n'
+                    'databricks_account_id = "123"\n'
+                    'databricks_workspace_host = "https://workspace.two.example"\n'
+                    'databricks_client_id = "client-two"\n'
+                    'databricks_client_secret = "second"\n')
     assert rg.account_input_hashes(env_dir) != first
+
+
+@pytest.mark.parametrize("missing", ["databricks_account_id", "databricks_workspace_host"])
+def test_account_input_hashes_fail_closed_without_a_required_endpoint_key(tmp_path, missing):
+    env_dir = tmp_path / "envs" / "account"
+    env_dir.mkdir(parents=True)
+    values = {"databricks_account_id": "123", "databricks_workspace_host": "https://workspace.example"}
+    values.pop(missing)
+    (env_dir / "auth.auto.tfvars").write_text("".join(f'{key} = "{value}"\n' for key, value in values.items()))
+    with pytest.raises(rg.Refused, match=missing):
+        rg.account_input_hashes(env_dir)
 
 
 def test_account_manifest_refuses_tag_sync_diff_drift(repo, account_manifest, monkeypatch):

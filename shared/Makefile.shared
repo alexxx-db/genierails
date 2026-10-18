@@ -868,6 +868,7 @@ _apply-account-locked:
 	$(call _ENV_LOCK,apply-account); \
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
 	apply_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-plan.XXXXXX")" || exit 1; chmod 700 "$$apply_dir"; \
+	trap '$(_NO_SIGNALS); rm -rf "$$apply_dir"; $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	cp "$$plans/account.tfplan" "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; chmod 400 "$$apply_dir/account.tfplan"; \
 	expected="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plan.sha256)" || { rm -rf "$$apply_dir"; exit 1; }; \
 	actual="$$(shasum -a 256 "$$apply_dir/account.tfplan" | awk '{print $$1}')"; \
@@ -1580,7 +1581,8 @@ wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to 
 _apply-layer: _guard-not-ci-apply
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
-	if [ "$$layer" = account ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+	layer_det=0; if [ "$$layer" = account ]; then layer_det="$$(python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$$(dirname "$$env_dir")" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)")"; fi; \
+	if [ "$$layer" = account ] && { [ "$$layer_det" = 1 ] || [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; }; then \
 		echo "ERROR: direct account-layer apply refused while a deterministic env exists; run 'make account-plan', get its manifest approved, then run 'make apply-account'." >&2; exit 1; \
 	fi; \
 	if [ "$$layer" = data_access ]; then $(call _APPLY_GUARD,$$(dirname "$$env_dir"),$$target_env,_apply-layer:data_access); \
@@ -1874,7 +1876,8 @@ migrate-state: _guard-not-ci-apply _bootstrap ## Migrate legacy state into accou
 
 _destroy-layer: _guard-not-ci-apply
 	@layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
-	if [ "$$layer" = account ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+	layer_det=0; if [ "$$layer" = account ]; then layer_det="$$(python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$$(dirname "$(LAYER_ENV_DIR)")" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)")"; fi; \
+	if [ "$$layer" = account ] && { [ "$$layer_det" = 1 ] || [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; }; then \
 		echo "ERROR: direct account-layer destroy refused while a deterministic env exists; account changes require 'make account-plan' and 'make apply-account'." >&2; exit 1; \
 	fi; \
 	if [ "$$layer" = data_access ]; then guard_dir="$$(dirname "$(LAYER_ENV_DIR)")"; elif [ "$$layer" = workspace ]; then guard_dir="$(LAYER_ENV_DIR)"; else guard_dir=; fi; \

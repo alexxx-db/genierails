@@ -998,6 +998,10 @@ def account_state_serial(env_dir: Path) -> dict | None:
 
 
 ACCOUNT_RUNTIME_INPUTS = ("abac.auto.tfvars", "classification.auto.tfvars", "discovered_uc_tables.auto.tfvars")
+ACCOUNT_AUTH_ENDPOINT_KEYS = (
+    "databricks_account_host", "databricks_account_id", "databricks_workspace_host",
+)
+DEFAULT_DATABRICKS_ACCOUNT_HOST = "https://accounts.cloud.databricks.com"
 
 
 def _account_auth_endpoint_hash(env_dir: Path) -> dict | None:
@@ -1006,16 +1010,26 @@ def _account_auth_endpoint_hash(env_dir: Path) -> dict | None:
     if not auth.is_file() or auth.is_symlink():
         return None
     values = _load_hcl(auth)
-    endpoint = {name: values[name] for name in ("host", "account_id") if name in values}
-    return {"path": "auth.auto.tfvars#host,account_id", "sha256": _json_digest(endpoint)}
+    endpoint = {name: values.get(name) for name in ACCOUNT_AUTH_ENDPOINT_KEYS}
+    endpoint["databricks_account_host"] = (
+        endpoint["databricks_account_host"] or DEFAULT_DATABRICKS_ACCOUNT_HOST
+    )
+    missing = [name for name in ("databricks_account_id", "databricks_workspace_host")
+               if not endpoint.get(name)]
+    if missing:
+        raise Refused("account auth endpoint is not pinned: auth.auto.tfvars is missing non-empty "
+                      + ", ".join(missing))
+    return {"path": "auth.auto.tfvars#databricks_account_host,databricks_account_id,databricks_workspace_host",
+            "sha256": _json_digest(endpoint)}
 
 
 def account_input_hashes(env_dir: Path) -> list[dict]:
     """Account-layer inputs that are not protected by git cleanliness.
 
-    Only ``host`` and ``account_id`` are represented from ``auth.auto.tfvars``;
-    their canonical digest pins the REST destination without hashing or
-    persisting any secret field.
+    Only the effective ``databricks_account_host``, ``databricks_account_id``
+    and ``databricks_workspace_host`` are represented from
+    ``auth.auto.tfvars``; their canonical digest pins both Terraform and REST
+    destinations without hashing or persisting any credential field.
     """
     env_dir = Path(env_dir)
     files = {p.resolve() for p in env_input_files(env_dir)}

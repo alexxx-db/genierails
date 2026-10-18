@@ -99,7 +99,9 @@ class Repo:
         (self.cloud / ".gitignore").write_text(".genierails-state/\nenvs/*/auth.auto.tfvars\nenvs/*/abac.auto.tfvars\nenvs/*/generated/.*\n")
         (self.account / "env.auto.tfvars").write_text("manage_groups = false\n")
         (self.account / "abac.auto.tfvars").write_text(DESIRED)
-        (self.account / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://unused.invalid"\n')
+        (self.account / "auth.auto.tfvars").write_text(
+            'databricks_account_id = "test-account"\n'
+            'databricks_workspace_host = "https://unused.invalid"\n')
         (self.dev / "env.auto.tfvars").write_text(
             f'governance_mode = "{mode}"\n' if mode == "deterministic" else 'uc_tables = ["c.s.t"]\n')
         self.state_dir = tmp_path / "state-dir"
