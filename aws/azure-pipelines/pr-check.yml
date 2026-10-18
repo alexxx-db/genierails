@@ -3,8 +3,11 @@
 # Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull
 # request. Create a pipeline from this file. For Azure Repos, add it to the
 # main branch policy as a required build validation (the pr: block below only
-# applies to GitHub and Bitbucket repos), and set the policy to re-run when
-# main changes, so every open PR re-checks against the latest main.
+# applies to GitHub and Bitbucket repos). In Azure Repos, set that build
+# validation policy's Build expiration to "Immediately when main is updated";
+# that is the mechanism that re-queues every open PR validation after main
+# moves. The main trigger below leaves a visible main-push run in this sample,
+# but Databricks checks run only for PR validation runs.
 #
 #   make check ENV=dev                 always
 #   make check ENV=prod                also, when the PR touches envs/prod/** or
@@ -27,7 +30,9 @@
 # system.information_schema and CAN_VIEW on the agents. The Databricks
 # Terraform provider and SDK must support the azure-devops-oidc auth type.
 
-trigger: none
+trigger:
+  branches:
+    include: [main]
 
 pr:
   branches:
@@ -44,8 +49,14 @@ pool:
 steps:
   - checkout: self
     fetchDepth: 0
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+
+  - script: echo "Branch policy build expiration re-queues open PR validations when main changes."
+    displayName: Main push PR re-run marker
+    condition: ne(variables['Build.Reason'], 'PullRequest')
 
   - task: UsePythonVersion@0
+    condition: eq(variables['Build.Reason'], 'PullRequest')
     inputs:
       versionSpec: '3.11'
 
@@ -54,6 +65,7 @@ steps:
       curl -fsSL -o /tmp/terraform.zip "https://releases.hashicorp.com/terraform/$(TERRAFORM_VERSION)/terraform_$(TERRAFORM_VERSION)_linux_amd64.zip"
       sudo unzip -o -q /tmp/terraform.zip -d /usr/local/bin
     displayName: Install dependencies and Terraform
+    condition: eq(variables['Build.Reason'], 'PullRequest')
 
   - script: |
       if git diff --name-only "origin/${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}...HEAD" -- envs/prod ../shared | grep -q .; then
@@ -61,6 +73,7 @@ steps:
       fi
     displayName: Does this PR touch envs/prod or shared?
     workingDirectory: aws
+    condition: eq(variables['Build.Reason'], 'PullRequest')
 
   # Runtime files only (gitignored). make check copies them into its scratch
   # dir for the plan step and never writes back to envs/.
@@ -78,6 +91,7 @@ steps:
       write_auth prod "$PROD_CLIENT_ID" "$PROD_WORKSPACE_ID" "$PROD_HOST"
     displayName: Write OIDC auth files (IDs only, no secrets)
     workingDirectory: aws
+    condition: eq(variables['Build.Reason'], 'PullRequest')
     env:
       ACCOUNT_ID: $(DATABRICKS_ACCOUNT_ID)
       DEV_CLIENT_ID: $(DEV_READONLY_CLIENT_ID)
@@ -90,13 +104,14 @@ steps:
   - script: make check ENV=dev
     displayName: make check ENV=dev
     workingDirectory: aws
+    condition: eq(variables['Build.Reason'], 'PullRequest')
     env:
       DATABRICKS_AUTH_TYPE: azure-devops-oidc
       SYSTEM_ACCESSTOKEN: $(System.AccessToken)
 
   - script: make check ENV=prod
     displayName: make check ENV=prod
-    condition: and(succeeded(), eq(variables['CHECK_PROD'], 'true'))
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['CHECK_PROD'], 'true'))
     workingDirectory: aws
     env:
       DATABRICKS_AUTH_TYPE: azure-devops-oidc

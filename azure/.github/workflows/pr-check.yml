@@ -3,7 +3,9 @@ name: GenieRails PR check (azure)
 # Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull request.
 # Copy this file to .github/workflows/ at the repository root. On main, make
 # this job a required status check and require branches to be up to date
-# before merging, so every open PR re-runs against the latest main.
+# before merging. The push job below uses the repository GITHUB_TOKEN to
+# re-run this workflow for every open PR head whenever main moves, so a stale
+# green check cannot be merged.
 #
 #   make check ENV=dev                 always
 #   make check ENV=prod                also, when the PR touches envs/prod/** or
@@ -30,19 +32,58 @@ name: GenieRails PR check (azure)
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
 
 permissions:
   contents: read
-  id-token: write
 
 defaults:
   run:
     working-directory: azure
 
 jobs:
+  rerun-open-pr-checks:
+    name: Re-run open PR checks after main moves
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Re-run this workflow for open PR heads
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prs="$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&per_page=100" \
+            --paginate --jq '.[] | [.number, .head.sha] | @tsv')" || exit $?
+          if [ -z "$prs" ]; then
+            echo "No open PRs targeting main."
+            exit 0
+          fi
+          while IFS=$'\t' read -r number sha; do
+            [ -n "$number" ] || continue
+            run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pr-check.yml/runs?event=pull_request&head_sha=${sha}&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')" || exit $?
+            if [ -z "$run_id" ]; then
+              echo "::notice::PR #${number} has no prior pr-check run to re-run."
+              continue
+            fi
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/rerun" >/dev/null
+            echo "Re-ran pr-check for PR #${number} (${sha})."
+          done <<EOF
+          $prs
+          EOF
+
   check:
     name: make check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
 

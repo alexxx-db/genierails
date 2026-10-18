@@ -128,12 +128,23 @@ def test_shipped_workflows_scope_the_only_applying_command_to_dev_rehearse():
             executed_targets.update(targets)
             opted_out = bool(re.search(r"GENIERAILS_ALLOW_CI_APPLY:\s*['\"]?1['\"]?", step))
             guarded = set(targets) & set(APPLYING_TARGETS)
-            assert not guarded or guarded == {"rehearse"} and "dev-rehearse" in path.name, path
+            allowed = set()
+            if "dev-rehearse" in path.name:
+                allowed = {"rehearse"}
+            elif "prod-maintain" in path.name:
+                allowed = {"maintain"}
+            assert not guarded or guarded <= allowed, path
         # Customer samples never use the integration-test bypass. Only stage 3
-        # may apply, and the make guard independently proves dev locked state.
+        # may rehearse; prod maintain is present only in the remote-state sample
+        # and the make guard independently proves the released commit.
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         assert "GENIERAILS_ALLOW_CI_APPLY" not in code, path
-        assert (executed_targets & set(APPLYING_TARGETS)) <= ({"rehearse"} if "dev-rehearse" in path.name else set())
+        allowed = set()
+        if "dev-rehearse" in path.name:
+            allowed = {"rehearse"}
+        elif "prod-maintain" in path.name:
+            allowed = {"maintain"}
+        assert (executed_targets & set(APPLYING_TARGETS)) <= allowed
 
 
 @pytest.mark.parametrize("stage", ["prod-release", "prod-maintain"])
@@ -143,7 +154,7 @@ def test_applying_stage_samples_are_marked_as_needing_remote_state(stage):
             text = (ROOT / cloud / sample_dir / ("workflows" if sample_dir == ".github" else "") / f"{stage}.yml").read_text()
             assert "REQUIRES DEV REMOTE STATE" in text or "REQUIRES PROD REMOTE STATE" in text
             assert "deployment machine" in text
-            assert "make check" in text or "make audit-schema" in text
+            assert "make check" in text or "make maintain" in text
 
 
 def test_dev_samples_queue_every_commit_and_never_cancel():
@@ -192,7 +203,7 @@ def test_samples_use_oidc_not_secrets():
     for _, path in _sample_workflows():
         text = path.read_text()
         assert "${{ secrets." not in text and "$(secrets" not in text and "CLIENT_SECRET:" not in text, path
-        if "make check" in text or "make audit-schema" in text:
+        if "make check" in text or "make maintain" in text:
             assert "github-oidc" in text or "azure-devops-oidc" in text, path
 
 

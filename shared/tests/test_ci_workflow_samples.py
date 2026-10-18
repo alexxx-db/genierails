@@ -198,6 +198,28 @@ def test_dev_rehearsal_keeps_runtime_files_in_the_runner_temp_dir(cloud):
 
 # -- PR check: when prod is checked ------------------------------------------
 
+def test_pr_check_samples_re_run_after_main_moves():
+    for cloud in CLOUDS:
+        workflow = yaml.safe_load((ROOT / cloud / ".github/workflows/pr-check.yml").read_text())
+        assert workflow[True]["pull_request"]["branches"] == ["main"]
+        assert workflow[True]["push"]["branches"] == ["main"]
+        assert workflow["permissions"] == {"contents": "read"}
+        rerun = workflow["jobs"]["rerun-open-pr-checks"]
+        assert rerun["if"] == "github.event_name == 'push'"
+        assert rerun["permissions"] == {"actions": "write", "contents": "read",
+                                        "pull-requests": "read"}
+        assert "actions/workflows/pr-check.yml/runs?event=pull_request" in rerun["steps"][0]["run"]
+        check = workflow["jobs"]["check"]
+        assert check["if"] == "github.event_name == 'pull_request'"
+        assert check["permissions"] == {"contents": "read", "id-token": "write"}
+
+        pipeline = yaml.safe_load((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text())
+        assert pipeline["trigger"]["branches"]["include"] == ["main"]
+        assert pipeline["pr"]["branches"]["include"] == ["main"]
+        assert "Build expiration to \"Immediately when main is updated\"" in (
+            ROOT / cloud / "azure-pipelines/pr-check.yml").read_text()
+
+
 def _github_pr_scope(cloud):
     workflow = yaml.safe_load((ROOT / cloud / ".github/workflows/pr-check.yml").read_text())
     steps = workflow["jobs"]["check"]["steps"]
@@ -210,7 +232,9 @@ def _github_pr_scope(cloud):
 def _devops_pr_scope(cloud):
     pipeline = yaml.safe_load((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text())
     prod = next(s for s in pipeline["steps"] if s.get("script") == "make check ENV=prod")
-    assert prod["condition"] == "and(succeeded(), eq(variables['CHECK_PROD'], 'true'))"
+    assert prod["condition"] == (
+        "and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), "
+        "eq(variables['CHECK_PROD'], 'true'))")
     step = next(s for s in pipeline["steps"] if "CHECK_PROD" in s.get("script", ""))
     assert step["workingDirectory"] == cloud
     return step["script"]

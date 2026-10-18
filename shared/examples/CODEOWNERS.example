@@ -49,3 +49,4 @@
 
 # Pipelines and repo settings.
 /.github/                       @your-org/platform
+/azure-pipelines/               @your-org/platform
