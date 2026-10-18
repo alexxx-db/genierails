@@ -507,6 +507,17 @@ def test_account_input_hashes_fail_closed_without_a_required_endpoint_key(tmp_pa
         rg.account_input_hashes(env_dir)
 
 
+def test_account_input_hashes_refuse_an_auth_symlink_outside_envs(tmp_path):
+    env_dir = tmp_path / "cloud" / "envs" / "account"
+    env_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.auto.tfvars"
+    outside.write_text('databricks_account_id = "123"\n'
+                       'databricks_workspace_host = "https://workspace.example"\n')
+    (env_dir / "auth.auto.tfvars").symlink_to(outside)
+    with pytest.raises(rg.Refused, match="resolves outside"):
+        rg.account_input_hashes(env_dir)
+
+
 def test_account_manifest_refuses_tag_sync_diff_drift(repo, account_manifest, monkeypatch):
     monkeypatch.setattr(rg, "account_tag_sync_diff", lambda _env_dir: [
         {"key": "gr_treatment", "added": ["other"], "removed": []},

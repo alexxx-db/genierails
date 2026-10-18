@@ -382,6 +382,27 @@ def test_apply_account_refuses_when_the_real_auth_endpoint_changes_after_plan(tm
     assert not rg.account_receipts(repo.cloud, "account")
 
 
+def test_apply_account_pins_the_setup_layout_symlinked_auth_endpoint(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    account_auth = repo.cloud / "envs" / "account" / "auth.auto.tfvars"
+    workspace_auth = repo.cloud / "envs" / "dev" / "auth.auto.tfvars"
+    workspace_auth.write_text('databricks_account_id = "acc-123"\n'
+                              'databricks_workspace_host = "https://workspace.one.example"\n'
+                              'databricks_client_id = "client"\n'
+                              'databricks_client_secret = "secret-not-hashed"\n')
+    account_auth.unlink(missing_ok=True)
+    account_auth.symlink_to("../dev/auth.auto.tfvars")
+    manifest = _account_planned(make)
+    inputs = json.loads(manifest.read_text())["inputs"]
+    assert any(item["path"].startswith("auth.auto.tfvars#databricks_") for item in inputs)
+    workspace_auth.write_text(workspace_auth.read_text().replace("workspace.one.example", "workspace.two.example"))
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "account input file hashes changed" in result.stderr
+    assert not [c for c in make.calls() if c[:4] == ["runner", "account", "account", "apply-plan"]]
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
 def test_apply_account_refuses_several_default_manifests_and_lists_ids(make, repo):
     first = _account_planned(make)
     second = _account_planned(make)

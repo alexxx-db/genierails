@@ -712,7 +712,7 @@ override _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)
 # 1 when any workspace env of this checkout ($(CLOUD_ROOT)/envs/*, not account
 # or data_access) is deterministic. The account layer is shared, so its
 # tag-policy values may only be removed under the account lock then.
-override _ANY_DETERMINISTIC_ENV = python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$(abspath $(ACCOUNT_ENV_DIR)/..)" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)"
+override _ANY_DETERMINISTIC_ENV = $(_RELEASE_GATE) any-deterministic-env --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)"
 
 # 1 when the env is deterministic and configures no agent: governance only.
 # A genie_space_title alone also creates an agent (the legacy single-space path).
@@ -819,8 +819,9 @@ _guard-account-plan-empty:
 	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
 
 _apply-account-for-workspace:
-	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
-	if [ "$$mode" = deterministic ] || [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || { echo "ERROR: cannot determine governance mode from $(ENV_DIR)/env.auto.tfvars" >&2; exit 1; }; \
+	any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; \
+	if [ "$$mode" = deterministic ] || [ "$$any_det" = 1 ]; then \
 		$(MAKE) --no-print-directory _guard-account-plan-empty ENV="$(ENV)" && $(MAKE) --no-print-directory _sync-tags-add-only-locked ENV="$(ACCOUNT_ENV)" ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	else \
 		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace; \
@@ -1558,13 +1559,13 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG_SYNC_MODE=add-only|replace)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
-	@mode="$(TAG_SYNC_MODE)"; \
+	@mode="$(TAG_SYNC_MODE)"; any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; \
 	if [ -z "$$mode" ]; then \
 		mode=replace; \
-		if [ -f "$(ENV_DIR)/env.auto.tfvars" ] && [ "$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" = deterministic ]; then mode=add-only; fi; \
-		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then mode=add-only; fi; \
+		if [ -f "$(ENV_DIR)/env.auto.tfvars" ]; then env_mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || { echo "ERROR: cannot determine governance mode from $(ENV_DIR)/env.auto.tfvars" >&2; exit 1; }; [ "$$env_mode" != deterministic ] || mode=add-only; fi; \
+		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$any_det" = 1 ]; then mode=add-only; fi; \
 	fi; \
-	if [ "$$mode" = replace ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+	if [ "$$mode" = replace ] && [ "$$any_det" = 1 ]; then \
 		$(_RELEASE_GATE) account-lock-check --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" || exit 1; \
 	fi; \
 	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
@@ -1581,8 +1582,8 @@ wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to 
 _apply-layer: _guard-not-ci-apply
 	@set -e; $(_DRY_RUN_GUARD); layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
 	env_dir="$(LAYER_ENV_DIR)"; \
-	layer_det=0; if [ "$$layer" = account ]; then layer_det="$$(python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$$(dirname "$$env_dir")" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)")"; fi; \
-	if [ "$$layer" = account ] && { [ "$$layer_det" = 1 ] || [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; }; then \
+	layer_det=0; any_det=0; if [ "$$layer" = account ]; then layer_det="$$($(_RELEASE_GATE) any-deterministic-env --env-dir "$$env_dir" --env "$(ACCOUNT_ENV)")" || exit 1; any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; fi; \
+	if [ "$$layer" = account ] && { [ "$$layer_det" = 1 ] || [ "$$any_det" = 1 ]; }; then \
 		echo "ERROR: direct account-layer apply refused while a deterministic env exists; run 'make account-plan', get its manifest approved, then run 'make apply-account'." >&2; exit 1; \
 	fi; \
 	if [ "$$layer" = data_access ]; then $(call _APPLY_GUARD,$$(dirname "$$env_dir"),$$target_env,_apply-layer:data_access); \
@@ -1685,7 +1686,7 @@ _apply-layer: _guard-not-ci-apply
 apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or account -> data_access -> workspace for ENV=<workspace>
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
-		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+		any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; if [ "$$any_det" = 1 ]; then \
 			echo "=== A deterministic env uses this account layer: applying it through make apply-account (account lock) ==="; \
 			$(MAKE) --no-print-directory apply-account; \
 		else \
@@ -1876,8 +1877,8 @@ migrate-state: _guard-not-ci-apply _bootstrap ## Migrate legacy state into accou
 
 _destroy-layer: _guard-not-ci-apply
 	@layer="$(LAYER)"; target_env="$(TARGET_ENV)"; \
-	layer_det=0; if [ "$$layer" = account ]; then layer_det="$$(python3 -c 'import glob,hcl2,os,sys; print(int(any(hcl2.load(open(p)).get("governance_mode","legacy")=="deterministic" for p in glob.glob(os.path.join(sys.argv[1],"*","env.auto.tfvars")) if os.path.basename(os.path.dirname(p)) not in sys.argv[2:])))' "$$(dirname "$(LAYER_ENV_DIR)")" "$(ACCOUNT_ENV)" "$(DATA_ACCESS_SUBDIR)")"; fi; \
-	if [ "$$layer" = account ] && { [ "$$layer_det" = 1 ] || [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; }; then \
+	layer_det=0; any_det=0; if [ "$$layer" = account ]; then layer_det="$$($(_RELEASE_GATE) any-deterministic-env --env-dir "$(LAYER_ENV_DIR)" --env "$(ACCOUNT_ENV)")" || exit 1; any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; fi; \
+	if [ "$$layer" = account ] && { [ "$$layer_det" = 1 ] || [ "$$any_det" = 1 ]; }; then \
 		echo "ERROR: direct account-layer destroy refused while a deterministic env exists; account changes require 'make account-plan' and 'make apply-account'." >&2; exit 1; \
 	fi; \
 	if [ "$$layer" = data_access ]; then guard_dir="$$(dirname "$(LAYER_ENV_DIR)")"; elif [ "$$layer" = workspace ]; then guard_dir="$(LAYER_ENV_DIR)"; else guard_dir=; fi; \
@@ -1887,7 +1888,7 @@ _destroy-layer: _guard-not-ci-apply
 
 destroy: _guard-not-ci-apply _bootstrap ## Destroy the selected layer or workspace environment
 	@$(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
-		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then echo "ERROR: make destroy ENV=$(ACCOUNT_ENV) refused: a deterministic env uses the shared account layer; account destroys are outside the manifest flow." >&2; exit 1; fi; \
+		any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; if [ "$$any_det" = 1 ]; then echo "ERROR: make destroy ENV=$(ACCOUNT_ENV) refused: a deterministic env uses the shared account layer; account destroys are outside the manifest flow." >&2; exit 1; fi; \
 		$(MAKE) --no-print-directory _destroy-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	else \
 		$(MAKE) --no-print-directory _destroy-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \

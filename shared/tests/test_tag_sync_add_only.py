@@ -376,6 +376,24 @@ def test_destroy_env_account_refuses_when_any_env_is_deterministic(tmp_path):
     assert repo.applies() == []
 
 
+@pytest.mark.parametrize("target", ["destroy", "_destroy-layer", "sync-tags"])
+def test_account_mutation_guards_fail_closed_on_malformed_workspace_config(tmp_path, target):
+    live = {"gr_treatment": ["email_partial__string__0a1b2c3d", "retired_by_hand"]}
+    repo = Repo(tmp_path, live)
+    (repo.dev / "env.auto.tfvars").write_text('governance_mode = "deterministic" ]]\n')
+    if target == "destroy":
+        result = repo.make("destroy", "account")
+    elif target == "_destroy-layer":
+        result = repo.make("_destroy-layer", "account", "LAYER=account", "TARGET_ENV=account",
+                           f"LAYER_ENV_DIR={repo.account}")
+    else:
+        result = repo.make("sync-tags", "account", "TAG_SYNC_MODE=replace")
+    assert result.returncode != 0
+    assert "cannot determine whether deterministic governance is in use" in result.stderr
+    assert repo.applies() == [] and repo.wrote() == []
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+
+
 # make -n runs recipe lines that call $(MAKE); the lock must not be one of them.
 @pytest.mark.parametrize("args", [("apply-account", "dev"), ("apply", "account")])
 def test_dry_run_takes_no_lock_and_writes_nothing(tmp_path, args):

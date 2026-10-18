@@ -134,6 +134,21 @@ def deterministic(env_dir: Path) -> bool:
     return _load_hcl(Path(env_dir) / "env.auto.tfvars").get("governance_mode", "legacy") == "deterministic"
 
 
+def any_deterministic_env(account_env_dir: Path) -> bool:
+    """Fail-closed scan of workspace envs sharing an account layer."""
+    envs_dir = Path(account_env_dir).resolve().parent
+    for path in sorted(envs_dir.glob("*/env.auto.tfvars")):
+        if path.parent.name in {ACCOUNT_ENV, "data_access"}:
+            continue
+        try:
+            config = _load_hcl(path)
+        except Exception as exc:
+            raise Refused(f"cannot determine whether deterministic governance is in use: {path} is invalid: {exc}") from exc
+        if config.get("governance_mode", "legacy") == "deterministic":
+            return True
+    return False
+
+
 # -- where things live --------------------------------------------------------
 
 def cloud_dir_of(env_dir: Path) -> Path:
@@ -1007,9 +1022,20 @@ DEFAULT_DATABRICKS_ACCOUNT_HOST = "https://accounts.cloud.databricks.com"
 def _account_auth_endpoint_hash(env_dir: Path) -> dict | None:
     """Hash only the non-secret auth fields that select the account REST endpoint."""
     auth = Path(env_dir) / "auth.auto.tfvars"
-    if not auth.is_file() or auth.is_symlink():
+    if not auth.exists() and not auth.is_symlink():
         return None
-    values = _load_hcl(auth)
+    try:
+        resolved = auth.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise Refused(f"account auth endpoint is not pinned: {auth} is not a readable file: {exc}") from exc
+    envs_dir = Path(env_dir).resolve().parent
+    try:
+        resolved.relative_to(envs_dir)
+    except ValueError as exc:
+        raise Refused(f"account auth endpoint is not pinned: {auth} resolves outside {envs_dir}") from exc
+    if not resolved.is_file():
+        raise Refused(f"account auth endpoint is not pinned: {auth} does not resolve to a file")
+    values = _load_hcl(resolved)
     endpoint = {name: values.get(name) for name in ACCOUNT_AUTH_ENDPOINT_KEYS}
     endpoint["databricks_account_host"] = (
         endpoint["databricks_account_host"] or DEFAULT_DATABRICKS_ACCOUNT_HOST
@@ -1046,6 +1072,9 @@ def account_input_hashes(env_dir: Path) -> list[dict]:
 
 
 def account_tag_sync_diff(env_dir: Path) -> list[dict]:
+    # Validate and pin the auth endpoint before invoking the REST-oriented tag
+    # diff, so a missing routing key is reported by name rather than as JSON.
+    account_input_hashes(env_dir)
     script = SHARED / "scripts" / "sync_tag_policies.py"
     result = subprocess.run(
         [sys.executable, str(script), "--mode", "replace", "--dry-run", "--json",
@@ -1602,6 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
         command(name).add_argument("--manifest", type=Path, required=True)
     command("account-receipt").add_argument("--manifest", type=Path, required=True)
     command("account-lock-check")
+    command("any-deterministic-env")
     command("maintain-check")
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
@@ -1703,6 +1733,8 @@ def main(argv: list[str] | None = None) -> int:
             destroy_guard(args.env_dir, args.env, args.confirm)
         elif args.command == "account-lock-check":
             require_account_lock(args.env_dir)
+        elif args.command == "any-deterministic-env":
+            print(int(any_deterministic_env(args.env_dir)))
         elif args.command == "legacy-guard":
             legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":
