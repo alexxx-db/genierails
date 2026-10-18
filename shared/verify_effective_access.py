@@ -1755,10 +1755,13 @@ class EffectiveAccessVerifier:
         self, tier: str, memberships: Optional[Sequence[str]] = None,
         *, resolved_groups: Optional[Sequence[Any]] = None,
     ) -> TestPrincipal:
-        """Create (or reuse) a service principal and add it to the tier group."""
-        self._guard()
-        from databricks.sdk.service import iam
+        """Create (or reuse) a service principal and add it to the tier group.
 
+        A principal created here is deleted again if any later setup step
+        fails. A reused principal must not belong to groups outside
+        ``resolved_groups``; verification refuses it instead of reusing it.
+        """
+        self._guard()
         display_name = f"{self.name_prefix}-{tier}"
         a = self.account
         if resolved_groups is None:
@@ -1773,11 +1776,50 @@ class EffectiveAccessVerifier:
             raise RuntimeError(
                 f"Verification service principal {display_name!r} resolved to "
                 f"{len(exact)} exact matches; expected at most one.")
-        if not exact:
-            sp = a.service_principals.create(display_name=display_name, active=True)
-        else:
+        if exact:
+            # Reuse only adds memberships, so a leftover principal in a group
+            # outside the desired set would silently widen what it can see.
             sp = exact[0]
+            desired = {str(group.id) for group in resolved_groups}
+            current = a.service_principals.get(sp.id).groups or []
+            stale = sorted(
+                getattr(group, "display", None) or str(group.value)
+                for group in current
+                if getattr(group, "type", None) != "indirect"
+                and str(group.value) not in desired
+            )
+            if stale:
+                raise RuntimeError(
+                    f"Verification service principal {display_name!r} already exists "
+                    f"and is a member of account group(s) outside its tier: "
+                    f"{', '.join(stale)}. Delete the service principal (or remove those "
+                    "memberships) before retrying verification."
+                )
+            return self._finish_principal(tier, display_name, sp, resolved_groups)
 
+        sp = a.service_principals.create(display_name=display_name, active=True)
+        try:
+            return self._finish_principal(tier, display_name, sp, resolved_groups)
+        except BaseException:
+            # The caller only records principals that were returned, so a
+            # principal created here must be removed here when setup fails.
+            try:
+                a.service_principals.delete(sp.id)
+            except Exception as cleanup_exc:
+                print(
+                    f"  WARN: could not delete partially provisioned {display_name} "
+                    f"({sp.application_id}); delete it manually: {cleanup_exc}",
+                    file=sys.stderr,
+                )
+            raise
+
+    def _finish_principal(
+        self, tier: str, display_name: str, sp: Any, resolved_groups: Sequence[Any],
+    ) -> TestPrincipal:
+        """Mint a secret, join groups and assign/await the workspace for ``sp``."""
+        from databricks.sdk.service import iam
+
+        a = self.account
         # Mint an OAuth secret so the principal can authenticate on its own.
         secret = a.service_principal_secrets.create(service_principal_id=int(sp.id))
 
@@ -1860,7 +1902,7 @@ class EffectiveAccessVerifier:
     def grant_query_entitlement(self, principal: TestPrincipal) -> None:
         """Give a temporary principal the consumer entitlement needed for SQL.
 
-        The configured access-tier groups receive ``workspace_consume`` from
+        The configured access-tier groups receive ``workspace-consume`` from
         Terraform, but synthetic principals such as the out-of-tier and
         dual-tier probes may deliberately have no (or different) tier group
         membership. Grant the entitlement directly so every probe can reach
@@ -1895,6 +1937,7 @@ class EffectiveAccessVerifier:
                     "or workspace-consume entitlements",
                     "does not have permission to use warehouse",
                     "does not have can use permission",
+                    "does not have can_use permission",
                 ))
                 if not transient or time.monotonic() >= deadline:
                     raise RuntimeError(
