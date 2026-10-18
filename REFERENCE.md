@@ -117,6 +117,7 @@ A deterministic env is one with `governance_mode = "deterministic"`; a legacy en
 
 | Command | Parameters | Purpose | Stage |
 |---|---|---|---|
+| `make account-plan` | `RELEASE_REMOTE` (default `origin`), `RELEASE_BRANCH` (default `main`) | From a clean checkout whose HEAD is exactly freshly fetched `<RELEASE_REMOTE>/<RELEASE_BRANCH>`, save a plan of the shared account layer and its tag-policy sync, and write one immutable account manifest to approve before `make apply-account`. Changes nothing in Databricks. | operations |
 | `make apply-account` | none (always the account layer) | Apply the shared account layer (groups, tag policies) under the account lock. While any env is deterministic, `make apply ENV=account` routes here, and `rehearse` and `release` only add allowed treatment-tag values (they refuse a non-empty account plan). Refuses in CI. | operations |
 | `make sync-tags` | `ENV`, `TAG_SYNC_MODE=add-only\|replace` | Sync tag-policy values in the account layer. Default `add-only` when `ENV` is deterministic, or `ENV=account` while any env is; otherwise `replace`. `add-only` never removes a value (it refuses and points to `apply-account`). | operations |
 | `make wait-tag-policies` | `REQUIRED_VALUES_TFVARS=<abac.auto.tfvars>` | Wait until the account tag policies (and the values that file needs) are visible to the FGAC APIs. `apply` and `release` run it. | operations |
