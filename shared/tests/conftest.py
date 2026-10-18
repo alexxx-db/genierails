@@ -19,7 +19,6 @@ try:
 except ImportError:  # pragma: no cover - the verify tests require the SDK.
     _databricks_sdk = None
     _REAL_WORKSPACE_CLIENT = None
-    _REAL_ACCOUNT_CLIENT = None
 else:
     _REAL_WORKSPACE_CLIENT = _databricks_sdk.WorkspaceClient
 
@@ -90,6 +89,7 @@ def _verify_tests_cannot_use_network(request, monkeypatch):
         raise NoNetworkIOError("real network I/O is blocked in verify unit tests")
 
     monkeypatch.setattr(socket, "create_connection", blocked_network)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked_network)
     monkeypatch.setattr(socket.socket, "connect", blocked_network)
     monkeypatch.setattr(socket.socket, "connect_ex", blocked_network)
     try:
