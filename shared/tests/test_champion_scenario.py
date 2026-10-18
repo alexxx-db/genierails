@@ -67,6 +67,12 @@ class FakeMake:
             'databricks_workspace_host = ""\n'
             'databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n'
         )
+        if env_dir.name == "prod":  # what make setup ENV=prod writes for a promoted env
+            (env_dir / "env.auto.tfvars").write_text(
+                'genie_spaces = []\nsql_warehouse_id = ""\ngovernance_mode = "deterministic"\n'
+                'deployer_principal_id = "<your-deployer-principal-id>"\n'
+                'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n'
+                'promote_from = "dev"\ncatalog_map = { "<dev_catalog>" = "<prod_catalog>" }\n')
         (self.envs / "account").mkdir(exist_ok=True)
         return self._done(args)
 
@@ -103,6 +109,10 @@ class FakeMake:
                 f'genie_space_id_to_name = {{ "{SPACE_ID}" = "{title}" }}\n'
             )
             (env_dir / "generated" / "masking_functions.sql").write_text("-- masks\n")
+        # import-new: the first dev generate captures each agent file's agent.
+        capture = env_dir / "agents" / f"{rit.CHAMPION_AGENT}.space.json"
+        if (env_dir / "agents" / f"{rit.CHAMPION_AGENT}.auto.tfvars").is_file() and not capture.exists():
+            capture.write_text(json.dumps({"data_sources": {"tables": [{"identifier": t} for t in DEV_TABLES]}}))
         return self._record(args, env_dir)
 
     def _record(self, args, env_dir):
@@ -125,7 +135,8 @@ class FakeMake:
 
     def _rehearse(self, args, env_dir):
         # rehearse's access check reads the committed attribution generate wrote.
-        assert self._agent_tables(env_dir) == {SPACE_ID: DEV_TABLES_SORTED}, "rehearse before generate recorded"
+        assert self._agent_tables(env_dir) == {rit.CHAMPION_AGENT: DEV_TABLES_SORTED}, \
+            "rehearse before generate recorded"
         assert _var(args, "VERIFY_KEY_COLUMN") is None  # no key flag: picked per table
         # A passing verify-access saves the keys it proved per table.
         with (env_dir / "env.auto.tfvars").open("a") as f:
@@ -137,17 +148,23 @@ class FakeMake:
         path = env_dir / "generated" / "governed_tables.json"
         return json.loads(path.read_text()).get("agent_tables") if path.is_file() else None
 
-    def _promote(self, args, env_dir):
-        src = self.envs / _var(args, "SOURCE_ENV")
-        dest = self.envs / _var(args, "DEST_ENV")
+    def _promote_to(self, args, env_dir):
+        guard = subprocess.run([sys.executable, str(SHARED / "genie_space_placeholder.py"),
+                                str(self.envs / "dev" / "env.auto.tfvars"), str(env_dir / "env.auto.tfvars")],
+                               capture_output=True, text=True)
+        assert guard.returncode == 0, guard.stdout + guard.stderr
+        src, dest = self.envs / "dev", env_dir
+        catalog_map = ",".join(f"{k}={v}" for k, v in rit._load_tfvars(dest / "env.auto.tfvars")["catalog_map"].items())
         for sub in ("generated", "data_access"):
             (dest / sub).mkdir(parents=True, exist_ok=True)
-        remap = subprocess.run(
-            [sys.executable, str(SHARED / "scripts" / "remap_env_config.py"),
-             str(src), str(dest), _var(args, "DEST_CATALOG_MAP")],
-            capture_output=True, text=True,
-        )
-        assert remap.returncode == 0, remap.stdout + remap.stderr
+        # promote-to's agent step, then promote's env remap (the real scripts).
+        for command in (["agent_promote.py", "--source-dir", str(src), "--dest-dir", str(dest),
+                         "--catalog-map", catalog_map],
+                        ["remap_env_config.py", str(src), str(dest), catalog_map]):
+            result = subprocess.run([sys.executable, str(SHARED / "scripts" / command[0]), *command[1:]],
+                                    capture_output=True, text=True)
+            assert result.returncode == 0, result.stdout + result.stderr
+            print(result.stdout, end="")
         (dest / "generated" / "masking_functions.sql").write_text("-- prod masks\n")
         return self._done(args)
 
@@ -186,6 +203,9 @@ def champion(tmp_path, monkeypatch):
     monkeypatch.setattr(rit, "_force_account_reapply", lambda *_: None)
     monkeypatch.setattr(rit, "_get_genie_space_via_api",
                         lambda _a, sid: {"space_id": sid, "title": rit.CHAMPION_SPACE_TITLE})
+    # A release grants CAN_RUN on the prod agent to exactly its agent file's acl_groups.
+    monkeypatch.setattr(rit, "_get_genie_space_acl_groups", lambda _a, _sid: {"admins", *rit._load_tfvars(
+        envs / "prod" / "agents" / f"{rit.CHAMPION_AGENT}.auto.tfvars")["acl_groups"]})
     for name in ("_try_destroy", "_try_destroy_account", "_delete_genie_space_via_api",
                  "_delete_account_groups", "_teardown_data"):
         monkeypatch.setattr(rit, name, lambda *a, _n=name, **k: teardown.append(_n))
@@ -213,7 +233,8 @@ def test_champion_dry_run_follows_the_readme_order(champion):
         ["enable-classification", "ENV=dev"],
         ["generate", "ENV=dev"],
         ["rehearse", "ENV=dev"],
-        ["promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=dev_fin=prod_fin"],
+        ["setup", "ENV=prod"],
+        ["promote-to", "ENV=prod"],
         ["enable-classification", "ENV=prod"],
         ["enable-classification", "ENV=prod"],
         ["release", "ENV=prod"],
@@ -223,7 +244,13 @@ def test_champion_dry_run_follows_the_readme_order(champion):
     assert teardown[:3] == ["_try_destroy", "_try_destroy", "_try_destroy_account"]
 
     dev_cfg = rit._load_tfvars(envs / "dev" / "env.auto.tfvars")
-    assert dev_cfg["genie_spaces"] == [{"genie_space_id": SPACE_ID}]
+    # The agent is in its own file, with who may run it (decision 4).
+    assert dev_cfg["genie_spaces"] == []
+    groups = ["champion_full_abc123", "champion_analyst_abc123"]
+    dev_agent = rit._load_tfvars(envs / "dev" / "agents" / "Champion Finance Analytics.auto.tfvars")
+    assert dev_agent == {"genie_space_id": SPACE_ID, "acl_groups": groups, "name": rit.CHAMPION_SPACE_TITLE}
+    prod_agent = rit._load_tfvars(envs / "prod" / "agents" / "Champion Finance Analytics.auto.tfvars")
+    assert prod_agent["acl_groups"] == groups and prod_agent["genie_space_id"] == ""
     assert "uc_tables" not in dev_cfg
     assert dev_cfg["enable_auto_tagging"] is True
     assert dev_cfg["verify_key_columns"] == {"dev_fin.finance.customers": "customer_id"}
@@ -233,9 +260,12 @@ def test_champion_dry_run_follows_the_readme_order(champion):
     # Promote and release neither write nor need the retired exposure flag.
     assert "business_access_enabled" not in prod_cfg
     assert prod_cfg["sql_warehouse_id"] == WAREHOUSE
-    # The agent is given by ID only: generate committed its tables under that ID.
-    assert FakeMake._agent_tables(envs / "dev") == {SPACE_ID: DEV_TABLES_SORTED}
-    assert sorted(prod_cfg["uc_tables"]) == sorted(t.replace("dev_fin.", "prod_fin.") for t in DEV_TABLES)
+    # The agent has its own file: generate committed its captured tables under its name.
+    assert FakeMake._agent_tables(envs / "dev") == {rit.CHAMPION_AGENT: DEV_TABLES_SORTED}
+    # promote-to carries the capture with its tables remapped, not env uc_tables.
+    prod_capture = json.loads((envs / "prod" / "agents" / f"{rit.CHAMPION_AGENT}.space.json").read_text())
+    assert sorted(t["identifier"] for t in prod_capture["data_sources"]["tables"]) == sorted(
+        t.replace("dev_fin.", "prod_fin.") for t in DEV_TABLES)
     assert (envs / "prod" / "generated" / "masking_functions.sql").read_text() == "-- prod masks\n"
 
 
@@ -389,11 +419,12 @@ def test_real_generate_commits_the_id_only_agents_tables_before_promotion(tmp_pa
     dev = cloud / "envs" / "dev"
     assert _real_make(cloud, overlay, "setup", "ENV=dev").returncode == 0
     template = (SHARED / "examples" / "dev_to_prod" / "env.auto.tfvars.example").read_text()
-    # A deterministic agent must name its acl_groups (decision 4); make generate
-    # then proposes table_readers for its tables.
+    # An inline agent given by ID (no agent file). A deterministic agent must name
+    # its acl_groups (decision 4); make generate then proposes table_readers for its tables.
+    assert template.count("\ngenie_spaces = []\n") == 1
     (dev / "env.auto.tfvars").write_text(template.replace(
-        '{ genie_space_id = "<your-genie-space-id>" }',
-        f'{{ genie_space_id = "{SPACE_ID}", acl_groups = ["analyst"] }}').replace(
+        "\ngenie_spaces = []\n",
+        f'\ngenie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = ["analyst"] }}]\n').replace(
         '"<your-deployer-principal-id>"', '"d0000000-0000-0000-0000-00000000d001"'))
     (dev / "auth.auto.tfvars").write_text('databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n')
     record = dev / "generated" / "governed_tables.json"

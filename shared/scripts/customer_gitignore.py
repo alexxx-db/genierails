@@ -10,10 +10,21 @@ markers, live snapshots and, for deterministic envs, the layer files that
 applying commands re-derive.
 
 The rule (``--mode``, make setup's GITIGNORE):
-  customer  write the block, or refresh it if present (first time: opt in)
-  auto      the default: refresh the block only if <cloud>/.gitignore already
-            has it, otherwise only print how to opt in. The upstream repo never
-            has the block, so make setup never changes it there.
+  customer  write the block, or refresh it if present
+  auto      the default. If <cloud>/.gitignore already has the block, refresh
+            it. Otherwise detect the repo from its ``origin`` remote:
+              - origin at github.com/databricks-solutions/genierails (https or
+                ssh, any case, with or without a trailing .git) is GenieRails'
+                own repo, which must never commit envs/: write nothing, print
+                the opt-in hint;
+              - not a git checkout: write nothing, print the hint;
+              - any other checkout (a fork, an internal mirror, no origin) is a
+                customer repo: write or refresh the block and print the diff,
+                like customer. That holds even if another remote (say
+                ``upstream``) points at GenieRails, as it does when a customer
+                keeps GenieRails around for upgrades. A contributor working on
+                a fork passes GITIGNORE=off; whenever the block is written in a
+                repo with a GenieRails remote, a one-line note names it.
   off       do nothing
 Only the lines between the markers are ever rewritten; every other line is
 kept byte for byte. Re-running is a no-op; every change is printed as a diff.
@@ -25,8 +36,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BEGIN = "# >>> GenieRails customer repo (make setup GITIGNORE=customer; edit outside this block) >>>"
 END = "# <<< GenieRails customer repo <<<"
@@ -54,6 +67,68 @@ __pycache__/
 /envs/*/data_access/env.auto.tfvars
 /.genierails-state/
 """
+
+
+_UPSTREAM_HOST = "github.com"
+_UPSTREAM_PATH = "databricks-solutions/genierails"
+
+
+def _remotes(cloud_dir: Path) -> dict[str, str] | None:
+    """Each configured git remote's fetch URL by name, or None if not a checkout."""
+    try:
+        proc = subprocess.run(["git", "-C", str(cloud_dir), "remote", "-v"],
+                              capture_output=True, text=True)
+    except OSError:
+        return None  # git is not installed
+    if proc.returncode != 0:
+        return None  # not a git checkout
+    remotes: dict[str, str] = {}
+    for parts in (line.split() for line in proc.stdout.splitlines()):
+        if len(parts) >= 2:
+            remotes.setdefault(parts[0], parts[1])
+    return remotes
+
+
+def _is_upstream(url: str | None) -> bool:
+    """True iff url is the GenieRails repo on GitHub.
+
+    Accepts https/http and ssh:// URLs and scp-style ``[user@]github.com:path``.
+    The host must be exactly github.com and the path exactly
+    databricks-solutions/genierails, with an optional .git and trailing slash,
+    both case-insensitive. Anything else (another host, a host that merely
+    contains github.com, userinfo tricks, a longer path) is not upstream.
+    """
+    if not url:
+        return False
+    if "://" in url:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:
+            return False
+        if parts.scheme.lower() not in ("https", "http", "ssh") or parts.query or parts.fragment:
+            return False
+        path = parts.path
+    else:
+        # scp-like syntax: a colon before any slash, e.g. git@github.com:owner/repo.git
+        head, colon, path = url.partition(":")
+        if not colon or "/" in head:
+            return False
+        host = head.rpartition("@")[2]
+    if (host or "").lower() != _UPSTREAM_HOST:
+        return False
+    path = path.lower().removeprefix("/").removesuffix("/").removesuffix(".git")
+    return path == _UPSTREAM_PATH
+
+
+def _is_customer_repo(remotes: dict[str, str] | None) -> bool:
+    """True iff a plain (auto) make setup should write the block here.
+
+    Only an origin at GenieRails marks GenieRails' own repo, which must never
+    commit envs/. Any other checkout is a customer repo, even with a GenieRails
+    ``upstream`` remote; outside a git checkout there is nothing to commit.
+    """
+    return remotes is not None and not _is_upstream(remotes.get("origin"))
 
 
 def _governance_mode(env_file: Path) -> str:
@@ -139,9 +214,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"ERROR: not changing {path}: {exc}. Fix or remove the block, then re-run.", file=sys.stderr)
         return 1
-    if mode == "auto" and not has_block:
-        print(f"Version control: in your own repo, make setup ENV={args.env} GITIGNORE=customer "
-              f"writes {rel} so envs/ is committed and runtime files are ignored.")
+    remotes = _remotes(args.cloud_dir)
+    if mode == "auto" and not has_block and not _is_customer_repo(remotes):
+        print(f"Version control: GenieRails ignores envs/ in its own repo. In your own repo (an origin "
+              f"that isn't github.com/databricks-solutions/genierails), make setup ENV={args.env} "
+              f"writes {rel} so envs/ is committed and runtime files are ignored; then "
+              f"git add .gitignore envs/. Force it anywhere with GITIGNORE=customer.")
         return 0
     new = merged(text, block(args.cloud_dir, args.account_env))
     if new == text:
@@ -151,6 +229,9 @@ def main(argv: list[str] | None = None) -> int:
         text.splitlines(keepends=True), new.splitlines(keepends=True), f"a/{rel}", f"b/{rel}"))
     path.write_text(new)
     print(f"{rel}: {'updated' if has_block else 'wrote'} the GenieRails block above (lines outside it are unchanged).")
+    if any(_is_upstream(url) for url in (remotes or {}).values()):
+        print(f"{rel}: this repo also has a GenieRails remote; in a GenieRails contributor fork, "
+              f"revert {rel} and pass GITIGNORE=off.")
     return 0
 
 
