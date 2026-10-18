@@ -36,10 +36,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BEGIN = "# >>> GenieRails customer repo (make setup GITIGNORE=customer; edit outside this block) >>>"
 END = "# <<< GenieRails customer repo <<<"
@@ -69,10 +69,8 @@ __pycache__/
 """
 
 
-# A remote URL at the GenieRails repo: https or ssh, any case, with or without
-# a trailing .git or slash.
-_UPSTREAM_REMOTE = re.compile(
-    r"github\.com[:/]databricks-solutions/genierails(?:\.git)?/?$", re.IGNORECASE)
+_UPSTREAM_HOST = "github.com"
+_UPSTREAM_PATH = "databricks-solutions/genierails"
 
 
 def _remotes(cloud_dir: Path) -> dict[str, str] | None:
@@ -92,7 +90,35 @@ def _remotes(cloud_dir: Path) -> dict[str, str] | None:
 
 
 def _is_upstream(url: str | None) -> bool:
-    return bool(url and _UPSTREAM_REMOTE.search(url))
+    """True iff url is the GenieRails repo on GitHub.
+
+    Accepts https/http and ssh:// URLs and scp-style ``[user@]github.com:path``.
+    The host must be exactly github.com and the path exactly
+    databricks-solutions/genierails, with an optional .git and trailing slash,
+    both case-insensitive. Anything else (another host, a host that merely
+    contains github.com, userinfo tricks, a longer path) is not upstream.
+    """
+    if not url:
+        return False
+    if "://" in url:
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:
+            return False
+        if parts.scheme.lower() not in ("https", "http", "ssh") or parts.query or parts.fragment:
+            return False
+        path = parts.path
+    else:
+        # scp-like syntax: a colon before any slash, e.g. git@github.com:owner/repo.git
+        head, colon, path = url.partition(":")
+        if not colon or "/" in head:
+            return False
+        host = head.rpartition("@")[2]
+    if (host or "").lower() != _UPSTREAM_HOST:
+        return False
+    path = path.lower().removeprefix("/").removesuffix("/").removesuffix(".git")
+    return path == _UPSTREAM_PATH
 
 
 def _is_customer_repo(remotes: dict[str, str] | None) -> bool:

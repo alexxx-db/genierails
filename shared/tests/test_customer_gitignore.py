@@ -187,6 +187,53 @@ def test_auto_writes_in_a_customer_repo_that_keeps_a_genierails_remote(remotes, 
     assert "up to date" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("url", [
+    UPSTREAM_HTTPS, UPSTREAM_SSH, UPSTREAM_HTTPS_BARE, UPSTREAM_SSH_URL, UPSTREAM_MIXED_CASE,
+    "https://github.com/databricks-solutions/genierails/",
+    "https://github.com/databricks-solutions/genierails.git/",
+    "http://github.com/databricks-solutions/genierails.git",
+    "https://user:token@github.com/databricks-solutions/genierails.git",
+    "ssh://git@github.com:22/databricks-solutions/genierails.git",
+])
+def test_upstream_url_forms(url):
+    assert cg._is_upstream(url)
+
+
+EVIL_GITHUB_HOST = "https://evilgithub.com/databricks-solutions/genierails.git"
+EVIL_PATH_EMBEDDED = "https://evil.com/github.com/databricks-solutions/genierails.git"
+
+
+@pytest.mark.parametrize("url", [
+    EVIL_GITHUB_HOST, EVIL_PATH_EMBEDDED,
+    "https://github.com/databricks-solutions/genierails-fork.git",
+    "https://github.com.evil.com/databricks-solutions/genierails.git",
+    "https://github.com@evil.com/databricks-solutions/genierails.git",
+    "ssh://git@github.com@evil.com/databricks-solutions/genierails.git",
+    "git@evilgithub.com:databricks-solutions/genierails.git",
+    "github.com@evil.com:databricks-solutions/genierails.git",
+    "git@github.com.evil.com:databricks-solutions/genierails.git",
+    "https://evil.com/databricks-solutions/genierails",
+    "https://github.com/acme/databricks-solutions/genierails.git",
+    "https://github.com/databricks-solutions/genierails.git?x=1",
+    "file:///srv/github.com/databricks-solutions/genierails.git",
+    "/srv/github.com/databricks-solutions/genierails.git",
+    "",
+])
+def test_lookalike_urls_are_not_upstream(url):
+    assert not cg._is_upstream(url)
+
+
+@pytest.mark.parametrize("url", [EVIL_GITHUB_HOST, EVIL_PATH_EMBEDDED])
+def test_auto_writes_when_origin_only_looks_like_genierails(url, tmp_path, monkeypatch, capsys):
+    cloud = tmp_path / "aws"
+    _git_init(cloud, ("origin", url))
+    _isolate_git(monkeypatch, tmp_path)
+    assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
+    out = capsys.readouterr().out
+    _assert_written(cloud, out)
+    assert FORK_NOTE not in out
+
+
 @pytest.mark.parametrize("remotes", [(("origin", CUSTOMER_FORK),), (("origin", CUSTOMER_MIRROR),), ()],
                          ids=["fork", "mirror", "no-remote"])
 def test_auto_writes_in_a_customer_repo(remotes, tmp_path, monkeypatch, capsys):
