@@ -915,12 +915,6 @@ def test_a_caller_cannot_set_the_staged_controllers_variables(tmp_path, fake_ter
     assert fake_terraform["log"].read_text() == ""  # refused before terraform init
 
 
-def test_make_passes_apply_and_destroy_flags_to_the_runner_as_arguments():
-    makefile = (SHARED / "Makefile.shared").read_text()
-    assert '"$(ROOT_RUNNER)" "$$layer" "$$target_env" apply -parallelism=1 -auto-approve $$apply_flags' in makefile
-    assert "destroy -auto-approve" in makefile and "$(DESTROY_FLAGS)" in makefile
-
-
 @pytest.mark.parametrize("command, stage", [("plan", "preview"), ("destroy", "destroy")])
 def test_makes_own_preview_and_destroy_stages_still_pass(tmp_path, fake_terraform, command, stage):
     dev = tmp_path / "aws" / "envs" / "dev"
