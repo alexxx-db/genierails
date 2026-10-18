@@ -1172,7 +1172,6 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
 
     env_dir, manifest_path = Path(env_dir), Path(manifest_path)
     manifest = load_manifest(manifest_path, env)
-    check_releasable(env_dir, env, manifest_path, manifest)
     plan_dir = manifest_path.parent
     status = checkout_status(env_dir)
     drift = []
@@ -1224,6 +1223,8 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
     if drift:
         raise Refused(f"make release refused: {manifest_path} no longer matches:\n  - " + "\n  - ".join(drift)
                       + f"\nNothing was applied. Run make release-plan ENV={env} again and approve the new manifest.")
+    # After the drift checks, so a changed manifest is always reported as changed.
+    check_releasable(env_dir, env, manifest_path, manifest)
     return manifest
 
 
