@@ -45,8 +45,12 @@ back (the journal's ``restored`` marker) when a fresh live check shows every
 column and principal back on the previous generation. Abandon saves a
 refreshed plan that may only delete the change's policies, checks live after
 it, applies exactly that plan (hash checked) and checks live again, all under
-the env lock. Legacy envs are never staged:
-the controller exits 0 and touches nothing.
+the env lock. ``rebind`` (make policy-rebind) is the step before abandon when
+principals of a rolled-back change were deleted and recreated: it re-applies
+the restore render with the generated config's principals, protection first
+(policies and functions, checked live), then the grants the deleted
+principals lost (checked live and with verify-access), each from a saved plan.
+Legacy envs are never staged: the controller exits 0 and touches nothing.
 
 Exit codes: 0 done, 1 a phase failed (the journal says what is live), 2 a
 usage or internal error, 3 refused before applying anything, 10 (apply-saved)
@@ -77,6 +81,7 @@ JOURNAL_VERSION = 1
 JOURNAL_NAME = "journal.json"
 HOOK_DIR = SHARED / "scripts" / "policy_hooks"
 INVENTORY = SHARED / "scripts" / "staged_policy_verify.py"
+AGENT_COVERAGE = SHARED / "scripts" / "agent_coverage.py"
 APPLY_PHASES = {"create": "create", "tighten": "tighten", "switch": "switch", "retire": "retire",
                 "drop-functions": "drop-functions", "grant": "grant"}
 # verify phase -> (stages the last applied hook may be, run verify-access too)
@@ -85,11 +90,13 @@ VERIFY_PHASES = {
     "verify-tightened": (("tighten",), False),
     "verify-switched": (("switch",), True),
     "verify-retired": (("retire",), False),
+    "verify-rebound": (("rebind",), True),
 }
 # A failure here may leave columns on the new value or principals moved, so
 # the previous protection is restored before the run stops.
 RESTORE_ON_FAILURE = {"tighten", "verify-tightened", "switch", "verify-switched"}
 HISTORY_LIMIT = 20
+CI_MARKERS = ("TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI")
 
 
 class Refused(RuntimeError):
@@ -238,12 +245,14 @@ def _hcl_value(value) -> str:
 class Controller:
     def __init__(self, env_dir: Path, env_name: str = "", *, hook_dir: Path = HOOK_DIR,
                  verify_access_cmd: str = "", inventory_cmd: list[str] | None = None,
+                 agent_coverage_cmd: list[str] | None = None,
                  commit: str = "", environ: dict | None = None, run=subprocess.run):
         self.env_dir = env_dir.resolve()
         self.env_name = env_name or self.env_dir.name
         self.hook_dir = hook_dir
         self.verify_access_cmd = verify_access_cmd
         self.inventory_cmd = inventory_cmd or [sys.executable, str(INVENTORY)]
+        self.agent_coverage_cmd = agent_coverage_cmd or [sys.executable, str(AGENT_COVERAGE), "check-masks"]
         self.commit = commit
         self.environ = dict(os.environ if environ is None else environ)
         self.run_cmd = run
@@ -360,7 +369,7 @@ class Controller:
             raise Refused(f"expected a {'/'.join(stages)} stage to be applied, found "
                           f"{(record or {}).get('stage') or 'none'}")
         rendered = record["rendered"]
-        before_switch = record["stage"] in ("create", "restore")
+        before_switch = record["stage"] in ("create", "restore", "rebind")
         basis = self._snapshot(t["from"]) if before_switch and t["from"] else self._snapshot(t["to"])
         tags = dict(rendered["tags"])
         if before_switch:
@@ -683,14 +692,15 @@ class Controller:
               f"run make release-plan ENV={self.env_name} again for the create phase.")
         return MORE_PHASES
 
-    def _restore_unproven(self, t: dict) -> str:
+    def _restore_unproven(self, t: dict, stages: tuple[str, ...] = ("restore", "rebind", "abandon")) -> str:
         """Why a switched transition can't be abandoned ('' when, short of the live check, it can).
 
         Only a switch that was rolled back qualifies: the journal records a
         verified restore, the last applied stage is that restore (or a partly
         done abandon) of this transition, and it puts every column on exactly
         the previous generation's value and every retained policy on its
-        previous principals. abandon then checks Unity Catalog still matches it
+        previous principals. A rebind of that restore (make policy-rebind) is
+        still that restore. abandon then checks Unity Catalog still matches it
         once the abandon plan is saved, so it ends where it would for a change
         that never switched.
 
@@ -707,7 +717,7 @@ class Controller:
             print("  The journal predates the restore marker; treating the recorded failed switch as restored "
                   "after a fresh live check.")
         record = pg.load_stage_record(self.env_dir)
-        if not record or record.get("stage") not in ("restore", "abandon") \
+        if not record or record.get("stage") not in stages \
                 or record.get("desired") != t["to"] or record.get("old") != t["from"]:
             return (f"the last applied stage is {(record or {}).get('stage') or 'none'}, not the restore "
                     "of this change")
@@ -753,6 +763,9 @@ class Controller:
             if not t:
                 print("Staged policy apply: no unfinished policy change; nothing to abandon.")
                 return 0
+            if t.get("rebind_incomplete"):
+                raise Refused(f"make policy-rebind of run {t['run_id']} didn't finish "
+                              f"({t['rebind_incomplete']['reason']}). {t['rebind_incomplete']['next']}")
             switched = t["switch_attempted"]
             if switched:
                 reason = self._restore_unproven(t)
@@ -814,6 +827,157 @@ class Controller:
             self._save(journal)
             print(f"Abandoned generation {t['to']}; {t['from'] or 'nothing'} stays live.")
             return 0
+
+    # -- re-pointing a rolled-back change (make policy-rebind) ----------------------
+    def rebind(self) -> int:
+        """Re-point a rolled-back change at recreated principals: protection first, then the lost grants.
+
+        Deleting a principal leaves the policies naming it as ``unknown`` and
+        drops its grants, and abandon only deletes the change's policies, so
+        it refuses. Rebind re-applies the restore render with the generated
+        config's principals (which may differ from the change only there,
+        policy_generations.rebind_problems), in two saved plans, under the env
+        lock:
+
+        1. ``rebind-protect``: the policies' principals and the function
+           redeploy; every grant the plan would create is held back. Then the
+           live check (the restore's policies and treatment values, with the
+           new principals) and the live agent coverage check (every
+           classified column of each agent's tables has a GenieRails mask).
+        2. ``rebind-access``: the grants, after the coverage gate on the same
+           render. Then the live check again and verify-access with the
+           previous generation's tier settings.
+
+        Each plan's sha256 is recorded when it is made and re-checked before
+        its apply. A failure after the first apply leaves the change marked
+        ``rebind_incomplete`` with the next step; abandon refuses until a
+        rebind finishes.
+        """
+        if governance_mode(self.env_dir) != "deterministic":
+            print("Staged policy apply: legacy governance mode; nothing to rebind.")
+            return 0
+        from scripts.release_gate import PROMOTED, env_role
+
+        if _in_ci(self.environ):
+            raise Refused("policy-rebind applies to the data_access layer; it can't run in CI. "
+                          "Run it on the deployment machine.")
+        if env_role(self.env_dir) == PROMOTED:
+            raise Refused(f"ENV={self.env_name} is promoted: its applies come only from a make release-plan "
+                          "manifest, and policy-rebind doesn't make one yet. It runs on the rehearse env "
+                          "(dev) only; nothing was applied.")
+        with env_lock(self.env_dir, "policy-rebind"):
+            journal = load_journal(self.env_dir)
+            t = (journal or {}).get("transition")
+            if not t:
+                print("Staged policy apply: no unfinished policy change; nothing to rebind.")
+                return 0
+            if t.get("abandon_incomplete"):
+                raise Refused("an abandon of this change was applied but its live check failed; finish it with "
+                              f"make policy-abandon ENV={self.env_name}")
+            if not t["switch_attempted"]:
+                raise Refused("policy-rebind re-points a change whose switch was rolled back; this one never "
+                              f"switched. Resume it, or drop it with make policy-abandon ENV={self.env_name}.")
+            reason = self._restore_unproven(t, ("restore", "rebind"))
+            if reason:
+                raise Refused(f"this change can't be re-pointed ({reason}); nothing was applied.")
+            desired = pg.desired_generation(self.env_dir)
+            if desired["fingerprint"] == t["to"]:
+                raise Refused(f"the generated config is the unfinished change's own generation {t['to']}; "
+                              "there is nothing to re-point. Re-run the command that started it to resume it.")
+            env = self._hook_env(t) | {"GENIERAILS_REBIND_FINGERPRINT": desired["fingerprint"],
+                                       "GENIERAILS_REBIND_TABLE_GRANTS": json.dumps(t.get("rebind_table_grants") or [])}
+            print(f"=== Policy rebind ({self.env_name}): run {t['run_id']} (generation {t['to']}) with the "
+                  f"principals of {desired['fingerprint']} ===", flush=True)
+            plan_dir = pg.ledger_dir(self.env_dir) / "rebind"
+            plan_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Protection: policies' principals and functions; no grant.
+            plan_file, planned = self._rebind_plan(t, env, "rebind-protect", plan_dir)
+            if plan_file is None:
+                raise Refused("the rebind-protect plan was refused or couldn't be made (see above); "
+                              "nothing was applied")
+            rerun = f"re-run make policy-rebind ENV={self.env_name}"
+            # Table SELECT the protect phase holds back: once it is applied, Terraform's state no longer
+            # records it, so the journal keeps it for the access phase (and a re-run).
+            held = pg.load_sidecar(plan_file).get("held") or []
+            t["rebind_table_grants"] = sorted(set(t.get("rebind_table_grants") or [])
+                                              | {h.split("|", 1)[1] for h in held if h.startswith("table_access|")})
+            env["GENIERAILS_REBIND_TABLE_GRANTS"] = json.dumps(t["rebind_table_grants"])
+            t["rebind_incomplete"] = {"phase": "rebind-protect", "generation": desired["fingerprint"],
+                                      "at": _now(), "reason": "it was interrupted",
+                                      "next": f"Re-run make policy-rebind ENV={self.env_name}."}
+            self._save(journal)
+            if not self._rebind_apply(env, "rebind-protect", plan_file, planned):
+                return self._rebind_failed(journal, t, "rebind-protect", "applying the protect plan failed",
+                                           f"No grant was applied. Check the error above, then {rerun}.")
+            rc = self._inventory(t, ("rebind",))
+            if rc:
+                return self._rebind_failed(
+                    journal, t, "rebind-protect", "the live check after the protect phase failed" if rc == 1
+                    else f"the live check after the protect phase couldn't run (exit {rc})",
+                    f"No grant was applied. Fix what the live check lists, then {rerun}.")
+            rc = self.run_cmd(self.agent_coverage_cmd + ["--env-dir", str(self.env_dir), "--env-name", self.env_name],
+                              env=env, check=False).returncode
+            if rc:
+                return self._rebind_failed(
+                    journal, t, "rebind-protect", "the live agent coverage check found an agent table column "
+                    "without a GenieRails mask" if rc == 1 else f"the live agent coverage check couldn't run (exit {rc})",
+                    f"No grant was applied. Fix what the check lists, then {rerun}.")
+            print("  The protection is re-pointed and checked live; planning the grants.", flush=True)
+
+            # 2. Access: the grants the deleted principals lost (after the coverage gate on this render).
+            t["rebind_incomplete"].update(phase="rebind-access", at=_now())
+            self._save(journal)
+            plan_file, planned = self._rebind_plan(t, env, "rebind-access", plan_dir)
+            if plan_file is None:
+                return self._rebind_failed(journal, t, "rebind-access", "the access plan was refused or couldn't "
+                                           "be made", f"The protection is re-pointed and verified. Fix what the "
+                                           f"plan check lists, then {rerun}.")
+            if not self._rebind_apply(env, "rebind-access", plan_file, planned):
+                return self._rebind_failed(journal, t, "rebind-access", "applying the access plan failed",
+                                           f"The protection is re-pointed and verified. {rerun[0].upper()}{rerun[1:]}.")
+            rc = self._verify(t, "verify-rebound")
+            if rc:
+                return self._rebind_failed(journal, t, "rebind-access", "the live check or verify-access after "
+                                           "the access phase failed", f"Fix what the check lists, then {rerun}.")
+            t.pop("rebind_incomplete", None)
+            t.pop("rebind_table_grants", None)
+            t["rebound"] = {"at": _now(), "generation": desired["fingerprint"]}
+            self._save(journal)
+            print(f"Policy rebind: run {t['run_id']} is on the previous protection ({t['from'] or 'none'}) with "
+                  f"the current principals, verified live. Next: make policy-abandon ENV={self.env_name}.")
+            return 0
+
+    def _rebind_plan(self, t: dict, env: dict, stage: str, plan_dir: Path) -> tuple[Path | None, str]:
+        """A saved plan of one rebind phase and its sha256 (None when the hook refused it)."""
+        plan_file = plan_dir / f"{t['run_id']}-{stage}.tfplan"
+        for stale in (plan_file, pg.sidecar_path(plan_file)):
+            stale.unlink(missing_ok=True)
+        if self.run_cmd([str(self.hook_dir / stage)], env=env | {pg.PLAN_OUT_ENV: str(plan_file)},
+                        check=False).returncode:
+            return None, ""
+        planned = _sha256(plan_file)
+        side = pg.load_sidecar(plan_file)
+        if (side.get("stage"), side.get("desired"), side.get("old"), side.get("rebind")) != (
+                stage, t["to"], t["from"], env["GENIERAILS_REBIND_FINGERPRINT"]):
+            raise Refused(f"the saved {stage} plan {plan_file} isn't of this rebind")
+        return plan_file, planned
+
+    def _rebind_apply(self, env: dict, stage: str, plan_file: Path, planned: str) -> bool:
+        """Apply exactly the saved plan whose hash was recorded when it was made."""
+        if _sha256(plan_file) != planned:
+            print(f"ERROR: the saved {stage} plan {plan_file} changed after it was made; not applied.",
+                  file=sys.stderr)
+            return False
+        return not self.run_cmd([str(self.hook_dir / stage)], env=env | {pg.SAVED_PLAN_ENV: str(plan_file)},
+                                check=False).returncode
+
+    def _rebind_failed(self, journal: dict, t: dict, phase: str, reason: str, step: str) -> int:
+        t["rebind_incomplete"].update(phase=phase, at=_now(), reason=reason, next=step)
+        t["error"] = f"policy-rebind {phase}: {reason}"
+        self._save(journal)
+        print(f"ERROR: REBIND INCOMPLETE at {phase}: {reason}. {step}", file=sys.stderr)
+        return 1
 
     def confirm(self) -> int:
         """After a successful release: generations it superseded may retire on a later one."""
@@ -892,7 +1056,10 @@ class Controller:
                  f"  phases:    {' -> '.join(t['phases'])}",
                  f"  completed: {', '.join(t['completed']) or 'none'}",
                  f"  status:    {t['status']}" + (f" at {t['failed_phase']} ({t['error']})" if t['failed_phase'] else "")]
-        if t.get("abandon_incomplete"):
+        if t.get("rebind_incomplete"):
+            lines.append(f"  live:      a policy-rebind stopped at {t['rebind_incomplete']['phase']} "
+                         f"({t['rebind_incomplete']['reason']}); {t['rebind_incomplete']['next']}")
+        elif t.get("abandon_incomplete"):
             lines.append("  live:      an abandon was applied but its live check failed; it is not abandoned")
         elif t["restore_failed"]:
             lines.append("  live:      a restore of the previous protection failed; the next run finishes it first")
@@ -908,9 +1075,17 @@ class Controller:
             options.append(f"or drop it with make policy-abandon ENV={self.env_name}")
         elif (t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t):
             options.append(f"or drop it with make policy-abandon ENV={self.env_name} (the switch was rolled "
-                           "back; abandon re-checks live protection first)")
+                           "back; abandon re-checks live protection first). If principals it names were deleted "
+                           f"and recreated, run make policy-rebind ENV={self.env_name} first")
         return (self.describe_transition(t) + f"\nThe generated config is now generation {desired['fingerprint']}. "
                 "A new policy change can't start until this one is finished: " + "; ".join(options) + ".")
+
+
+def _in_ci(environ: dict) -> bool:
+    """CI, as make's _guard-not-ci-apply sees it (GENIERAILS_ALLOW_CI_APPLY=1 opts out)."""
+    if environ.get("GENIERAILS_ALLOW_CI_APPLY") == "1":
+        return False
+    return str(environ.get("CI") or "").lower() in ("true", "1", "yes") or any(environ.get(m) for m in CI_MARKERS)
 
 
 def _unabandonable(reason: str) -> str:
@@ -955,7 +1130,7 @@ def _git_head() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("run", "confirm", "abandon", "status", "describe", "plan",
+    parser.add_argument("command", choices=("run", "confirm", "abandon", "rebind", "status", "describe", "plan",
                                             "apply-saved"))
     parser.add_argument("--env-dir", type=Path, required=True)
     parser.add_argument("--env-name", default="")

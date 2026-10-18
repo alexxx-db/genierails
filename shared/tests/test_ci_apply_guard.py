@@ -14,7 +14,7 @@ APPLYING_TARGETS = (
     "apply-governance", "apply-genie", "_apply-layer", "integration-test",
     "test-champion", "test-all", "test-ci", "test-ci-parallel",
     "destroy", "destroy-governance", "destroy-genie", "_destroy-layer",
-    "import", "migrate-state", "migrate-state-dir", "ungovern", "apply-account", "policy-abandon",
+    "import", "migrate-state", "migrate-state-dir", "ungovern", "apply-account", "policy-abandon", "policy-rebind",
 )
 CI_MARKERS = ("CI", "TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI")
 

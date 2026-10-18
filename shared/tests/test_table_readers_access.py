@@ -1285,3 +1285,49 @@ def test_legacy_roots_applied_by_main_plan_no_changes(root_name, body, tmp_path,
         assert replan.count("Changes to Outputs:") == 1, replan
     else:
         assert "No changes. Your infrastructure matches the configuration." in replan, replan
+
+
+# -- check-masks (make policy-rebind, before it creates grants again) -------------------------
+LEGACY_MASK = {"name": "cat_gr_mask_cat_email", "function_name": "cat.sch.mask_email", "policy_type": "COLUMN_MASK",
+               "conditions": ["hasTagValue('gr_treatment', 'email')"]}
+
+
+def _legacy_snapshot(**overrides):
+    """A column still on a migrated legacy generation's mask, and no grants yet (they come after)."""
+    return _snapshot(column_tags={"cat.sch.t": {"email": {("class.email_address", ""), ("gr_treatment", "email")}}},
+                     policies={"cat.sch.t": [LEGACY_MASK]}, grants={}, **overrides)
+
+
+def _stage_record(env, names):
+    from scripts import policy_generations as pg
+
+    pg.write_json(pg.stage_record_path(env), {"stage": "rebind", "rendered": {
+        "fgac_policies": [{"catalog": "cat", "name": name} for name in names], "tags": {}, "functions_sql": ""}})
+
+
+def test_check_masks_counts_the_applied_stage_render_and_ignores_grants(tmp_path):
+    env = _env(tmp_path, AGENT_ENV)
+    _stage_record(env, ["gr_mask_cat_email"])
+    factory = lambda _d: _FakeLive(_legacy_snapshot())  # noqa: E731
+    assert ac.check_masks(env, "dev", _console_runner(tmp_path, INPUTS), snapshot_factory=factory) == 0
+    # It records nothing: CAN_RUN never rests on it.
+    assert not (env / ac.RESULT_FILENAME).exists()
+
+
+def test_check_masks_refuses_a_column_no_rendered_or_own_mask_covers(tmp_path, capsys):
+    env = _env(tmp_path, AGENT_ENV)
+    _stage_record(env, ["gr_mask_cat_other"])
+    factory = lambda _d: _FakeLive(_legacy_snapshot())  # noqa: E731
+    assert ac.check_masks(env, "dev", _console_runner(tmp_path, INPUTS), snapshot_factory=factory) == 1
+    assert "cat.sch.t.email is classified" in capsys.readouterr().err
+
+
+def test_check_masks_fails_closed_when_it_cannot_run(tmp_path):
+    env = _env(tmp_path, AGENT_ENV)
+
+    def broken(_d):
+        raise RuntimeError("warehouse unreachable")
+
+    assert ac.check_masks(env, "dev", _console_runner(tmp_path, INPUTS), snapshot_factory=broken) == 2
+    assert ac.check_masks(env, "dev", _console_runner(tmp_path, INPUTS, exit_code=1),
+                          snapshot_factory=lambda _d: _FakeLive(_legacy_snapshot())) == 2

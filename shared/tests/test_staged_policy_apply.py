@@ -35,7 +35,7 @@ TIERS = ["raw", "regional", "masked"]
 
 FAKE_RUNNER = r'''#!/usr/bin/env python3
 """A data_access terraform_layer.sh: plan/show/apply-plan against a JSON state."""
-import json, os, re, sys
+import hashlib, json, os, re, sys
 import hcl2
 
 layer, env_name, command, *args = sys.argv[1:]
@@ -47,6 +47,17 @@ with open(os.path.join(layer_dir, "..", "runner.log"), "a") as log:
     log.write(" ".join([command] + args) + "\n")
 MASK = ("databricks_policy_info", "policies")
 TAG = ("databricks_entity_tag_assignment", "treatment")
+FUNCTIONS = ("terraform_data", "masking_functions")
+DROP = ("terraform_data", "masking_functions_drop")
+WAIT = ("time_sleep", "wait_for_policy_enforcement")
+# Replaced, never updated in place (triggers_replace / triggers).
+REPLACED = {FUNCTIONS, WAIT}
+# Stages whose plans withhold new table SELECT (roots/data_access withhold_new_table_grants).
+WITHHOLD = {"create", "tighten", "switch", "restore", "retire", "abandon", "rebind"}
+# Optional: grants, the function redeploy and the enforcement wait. "gone" lists
+# "<resource>|<key>" grants the state records but Unity Catalog no longer has
+# (a deleted principal): Terraform's refresh drops them before planning.
+ACCESS = os.path.join(layer_dir, "fake_access.json")
 
 
 def load_state():
@@ -93,12 +104,56 @@ def flag(name):
     return next((a.split("=", 1)[1] for a in args if a.startswith(name + "=")), "")
 
 
+def var(name):
+    return next((a.split("=", 2)[2] for a in args if a.startswith(f"-var={name}=")), "")
+
+
+def sha(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def refreshed(state):
+    """The state after Terraform's refresh: grants Unity Catalog lost are gone."""
+    if not os.path.exists(ACCESS):
+        return state
+    gone = set(json.load(open(ACCESS)).get("gone") or [])
+    for resource in state["resources"]:
+        if resource["type"] == "databricks_grant":
+            resource["instances"] = [i for i in resource["instances"]
+                                     if f"{resource['name']}|{i['index_key']}" not in gone]
+    return state
+
+
+def access_wanted(state, stage, masks):
+    """What the config plans for grants, the functions and the wait (with fake_access.json)."""
+    if not os.path.exists(ACCESS):
+        return {}
+    access = json.load(open(ACCESS))
+    held = set(json.loads(var("held_access_grants") or "[]")) if stage == "rebind" else set()
+    kept = set(json.loads(var("rebind_table_grants") or "[]")) if stage == "rebind" else set()
+    applied = set(instances(state, ("databricks_grant", "table_access"))) | kept  # pre-refresh, like the root
+    want = {}
+    for entry in access["grants"]:
+        name, key = entry.split("|", 1)
+        if entry in held or (name == "table_access" and stage in WITHHOLD and key not in applied):
+            continue
+        want.setdefault(("databricks_grant", name), {})[key] = {"principal": key.rsplit("|", 1)[-1]}
+    sql = open(os.path.join(config_dir, "masking_functions.sql")).read()
+    functions = {"triggers_replace": {"sql_hash": sha(sql), "client_id": access["client_id"]}}
+    want[FUNCTIONS] = {"": functions}
+    want[DROP] = {"": {"input": {"client_id": access["client_id"]}}}
+    want[WAIT] = {"": {"triggers": {"policy_hash": sha(masks), "masking_functions_id": sha(functions)}}}
+    return want
+
+
 if command == "plan":
-    stage = flag("-var").split("=", 1)[1] if flag("-var") else ""
+    stage = var("policy_stage")
     if os.environ.get("FAKE_TF_FAIL_PLAN") == stage:
         sys.exit(1)
-    state = load_state()
+    prior = load_state()
     want, functions = desired()
+    want |= access_wanted(prior, stage, want[MASK])
+    state = refreshed(prior)
     changes = []
     for kind, wanted in want.items():
         have = instances(state, kind)
@@ -108,11 +163,12 @@ if command == "plan":
             elif key not in have:
                 actions = ["create"]
             elif have[key] != wanted[key]:
-                actions = ["update"]
+                actions = ["delete", "create"] if kind in REPLACED else ["update"]
             else:
                 continue
-            changes.append({"address": f'module.data_access.{kind[0]}.{kind[1]}["{key}"]', "type": kind[0],
-                            "name": kind[1], "index": key, "change": {"actions": actions},
+            address = f"module.data_access.{kind[0]}.{kind[1]}" + (f'["{key}"]' if key else "")
+            changes.append({"address": address, "type": kind[0], "name": kind[1], "index": key or None,
+                            "change": {"actions": actions, "before": have.get(key), "after": wanted.get(key)},
                             "after": wanted.get(key)})
     json.dump({"stage": stage, "resource_changes": changes, "functions": functions}, open(flag("-out"), "w"))
 elif command == "show":
@@ -120,7 +176,10 @@ elif command == "show":
     print(json.dumps(json.load(open(args[-1]))))
 elif command == "apply-plan":
     plan = json.load(open(args[-1]))
-    state = load_state()
+    state = refreshed(load_state())
+    if os.path.exists(ACCESS):  # the refresh is saved with the apply
+        access = json.load(open(ACCESS))
+        json.dump(access | {"gone": []}, open(ACCESS, "w"))
     changes = plan["resource_changes"]
     fail = os.environ.get("FAKE_TF_FAIL_APPLY") == plan["stage"]
     if fail:
@@ -133,9 +192,10 @@ elif command == "apply-plan":
             resource = {"module": "module.data_access", "mode": "managed", "type": kind[0], "name": kind[1],
                         "instances": []}
             state["resources"].append(resource)
-        resource["instances"] = [i for i in resource["instances"] if i["index_key"] != change["index"]]
+        key = change["index"] or ""
+        resource["instances"] = [i for i in resource["instances"] if i["index_key"] != key]
         if change["change"]["actions"] != ["delete"]:
-            resource["instances"].append({"index_key": change["index"], "attributes": change["after"]})
+            resource["instances"].append({"index_key": key, "attributes": change["after"]})
     json.dump(state, open(state_path, "w"), indent=1, sort_keys=True)
     sys.exit(1 if fail else 0)
 else:
@@ -286,21 +346,23 @@ class Harness:
         # controller gets the real check's result (a test of the check itself).
         self.live_check = "strict"
         self.simulate_access = True
+        self.agent_coverage_rc = 0
         monkeypatch.delenv("FAKE_TF_FAIL_APPLY", raising=False)
         monkeypatch.delenv("FAKE_TF_FAIL_PLAN", raising=False)
 
     def controller(self) -> spa.Controller:
         return spa.Controller(self.env_dir, "dev", hook_dir=Path("/hooks"), verify_access_cmd="simulated",
-                              inventory_cmd=["inventory"], commit="abc123", run=self.run)
+                              inventory_cmd=["inventory"], agent_coverage_cmd=["agent-coverage"],
+                              commit="abc123", run=self.run)
 
     def run(self, argv, env=None, check=False):
         env = dict(env or {})
         if argv[0].startswith("/hooks/"):
             stage = argv[0].rsplit("/", 1)[1]
-            # abandon runs twice: a saved plan, then exactly that plan.
+            # abandon and the rebind phases run twice: a saved plan, then exactly that plan.
             self.calls.append(stage + ({"plan": ":plan", "saved": ":saved"}.get(
                 "plan" if env.get(pg.PLAN_OUT_ENV) else "saved" if env.get(pg.SAVED_PLAN_ENV) else "", "")
-                if stage == "abandon" else ""))
+                if stage in ("abandon",) + pg.REBIND_STAGES else ""))
             before = live_state(self.env_dir)
             if stage == "drop-functions":
                 rc = pg.drop_functions(self.env_dir, env | {"GENIERAILS_WAREHOUSE_ID": "wh"},
@@ -332,6 +394,9 @@ class Harness:
             if self.live_check == "strict":
                 assert not problems, problems
             return SimpleNamespace(returncode=1 if problems else 0)
+        if argv[0] == "agent-coverage":
+            self.calls.append("agent-coverage")
+            return SimpleNamespace(returncode=self.agent_coverage_rc)
         if argv[:2] == ["/bin/sh", "-c"]:
             record = pg.load_stage_record(self.env_dir)
             self.calls.append(f"verify-access:{record['stage']}")
@@ -348,7 +413,7 @@ class Harness:
             if record["stage"] in self.fail_verify:
                 self.fail_verify.discard(record["stage"])
                 problems.append("injected verification failure")
-            assert not problems or record["stage"] in ("switch", "create", "restore") and \
+            assert not problems or record["stage"] in ("switch", "create", "restore", "rebind") and \
                 "injected verification failure" in problems, problems
             return SimpleNamespace(returncode=1 if problems else 0)
         raise AssertionError(f"unexpected command {argv}")
@@ -366,13 +431,17 @@ class Harness:
         old = pg.load_snapshot(self.env_dir, env.get("GENIERAILS_OLD_POLICY_FINGERPRINT", ""))
         desired = pg.load_snapshot(self.env_dir, env.get("GENIERAILS_POLICY_FINGERPRINT", ""))
 
+        # The deployer is excepted from every mask by design (build_model's deployer_principal).
+        deployer = [p for p in [pg._load(self.env_dir / "env.auto.tfvars").get("deployer_principal_id")] if p]
+
         def access(generation, who, value):
             settings = (generation or {}).get("settings") or {}
             return expected_access(who, value, settings.get("access_tier_groups") or [],
-                                   settings.get("raw_exempt_principals") or [])
+                                   list(settings.get("raw_exempt_principals") or []) + deployer)
 
         targets = {"create": [old], "restore": [old], "abandon": [old], "tighten": [old, desired],
-                   "switch": [desired], "retire": [desired]}.get(stage, [])
+                   "switch": [desired], "retire": [desired], "rebind-protect": [old],
+                   "rebind-access": [old]}.get(stage, [])
         universe = pg._universe(old, desired) | {pg.OUTSIDER}
         for column, value in live_tags(state).items():
             masks = [p for p in live_policies(state) if _value_of(p) == value]

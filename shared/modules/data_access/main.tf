@@ -379,7 +379,9 @@ resource "databricks_grant" "terraform_sp_manage_catalog" {
   # User/CLI-profile authentication has no service-principal client ID and the
   # active user already carries their own privileges. Avoid an invalid grant to
   # the empty-string principal in that supported path.
-  for_each = var.databricks_client_id != "" ? toset(local.all_catalogs) : toset([])
+  for_each = var.databricks_client_id != "" ? toset([
+    for catalog in local.all_catalogs : catalog if !contains(var.held_access_grants, "terraform_sp_manage_catalog|${catalog}")
+  ]) : toset([])
 
   # SELECT lets verify-access prove row-pairing keys as this SP. This grant is
   # authoritative for the SP, so leaving SELECT out would revoke bootstrap's.
@@ -390,12 +392,14 @@ resource "databricks_grant" "terraform_sp_manage_catalog" {
 }
 
 resource "databricks_grant" "catalog_access" {
-  for_each = var.governance_mode == "deterministic" ? tomap({
-    for pair in local.reader_catalog_pairs : "${pair.catalog}|${pair.group}" => pair
-    }) : tomap({
-    for pair in setproduct(local.all_catalogs, local.access_principals) :
-    "${pair[0]}|${pair[1]}" => { catalog = pair[0], group = pair[1] }
-  })
+  for_each = {
+    for key, pair in(var.governance_mode == "deterministic" ? tomap({
+      for pair in local.reader_catalog_pairs : "${pair.catalog}|${pair.group}" => pair
+      }) : tomap({
+      for pair in setproduct(local.all_catalogs, local.access_principals) :
+      "${pair[0]}|${pair[1]}" => { catalog = pair[0], group = pair[1] }
+    })) : key => pair if !contains(var.held_access_grants, "catalog_access|${key}")
+  }
 
   provider   = databricks.workspace
   catalog    = each.value.catalog
@@ -408,12 +412,14 @@ resource "databricks_grant" "catalog_access" {
 }
 
 resource "databricks_grant" "schema_access" {
-  for_each = var.governance_mode == "deterministic" ? tomap({
-    for pair in local.reader_schema_pairs : "${pair.schema}|${pair.group}" => pair
-    }) : tomap({
-    for pair in setproduct(local.uc_schemas, local.access_principals) :
-    "${pair[0]}|${pair[1]}" => { schema = pair[0], group = pair[1] }
-  })
+  for_each = {
+    for key, pair in(var.governance_mode == "deterministic" ? tomap({
+      for pair in local.reader_schema_pairs : "${pair.schema}|${pair.group}" => pair
+      }) : tomap({
+      for pair in setproduct(local.uc_schemas, local.access_principals) :
+      "${pair[0]}|${pair[1]}" => { schema = pair[0], group = pair[1] }
+    })) : key => pair if !contains(var.held_access_grants, "schema_access|${key}")
+  }
 
   provider   = databricks.workspace
   schema     = each.value.schema
@@ -428,7 +434,9 @@ resource "databricks_grant" "table_access" {
   for_each = {
     for pair in local.table_access_pairs :
     "${pair.table}|${pair.principal}" => { table = pair.table, group = pair.principal }
-    if(local.coverage_gate_status == "pass" && !var.withhold_new_table_grants) || contains(var.applied_table_grants, "${pair.table}|${pair.principal}")
+    if((
+      (local.coverage_gate_status == "pass" && !var.withhold_new_table_grants) || contains(var.applied_table_grants, "${pair.table}|${pair.principal}")
+    ) && !contains(var.held_access_grants, "table_access|${pair.table}|${pair.principal}"))
   }
 
   provider   = databricks.workspace

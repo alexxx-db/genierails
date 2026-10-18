@@ -163,6 +163,47 @@ any unfinished transition with its completed phases. Writes are atomic.
   Unity Catalog has no transaction across tags and policies, so a retag
   between step 2 and the apply can't be prevented. Step 4 catches it, and
   the change stays recorded until a check passes.
+- `make policy-rebind ENV=<env>` is the step before abandon when principals
+  of a rolled-back change were deleted and recreated (a sandbox SCIM cleanup,
+  say). Unity Catalog then shows each deleted principal as `unknown` in the
+  policies' `TO`/`EXCEPT` and drops its grants, so abandon's plan would
+  re-point policies and recreate grants, which it refuses. Rebind takes the
+  same eligibility as abandon of a rolled-back switch (the `restored` marker
+  or the pre-marker shape; the last applied stage is still the restore), and
+  the generated config may differ from the unfinished change only in its
+  policies' principals: the same policies, conditions, functions and
+  treatment values, and no retained generation's policy naming a principal
+  the config replaced (rebind can re-point those only at principals
+  recreated under the same name). It re-applies the restore render with the
+  config's principals, under the env lock, in two phases:
+
+  1. **Protection.** Every policy depends on the grants in Terraform, so
+     `-target` can't leave them out. Instead rebind plans the whole render,
+     then saves a plan that holds back every grant it would create
+     (`held_access_grants`). That plan may only update policies' `TO` and
+     `EXCEPT`, redeploy the masking functions (the same SQL hash, with no
+     destroy-time drop: the drop lives in `masking_functions_drop`, which
+     may only be updated in place) and restart the enforcement wait. A
+     treatment tag change, a policy create or delete, or a change to a
+     policy's condition or function refuses before anything is applied.
+     Then the live check (every column on the previous generation's value,
+     the policies with their new principals) and the live agent coverage
+     check (every classified column of the agents' tables masked).
+  2. **Access**, only after both pass: a second saved plan, after the
+     coverage check on the same render, that may only create the grants
+     the deleted principals lost (table `SELECT` only where it was applied
+     before; the journal keeps those keys, since Terraform's refresh drops
+     them from state). Then the live check again and verify-access with the
+     previous generation's tier settings.
+
+  Each plan's sha256 is recorded when it is made and re-checked before its
+  apply. A failure after the first apply marks the change
+  `rebind_incomplete` with the next step (`make policy-status` shows it), and
+  abandon refuses until a rebind finishes; re-running rebind re-plans from
+  what is live. Afterwards `make policy-abandon` plans only the change's
+  policy deletes and the restarted wait. Rebind refuses in CI and, in this
+  version, on a promoted env (prod): a prod apply comes only from a
+  release-plan manifest, and rebind doesn't make one.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
 

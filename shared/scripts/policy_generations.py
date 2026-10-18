@@ -42,6 +42,12 @@ scripts/terraform_layer.sh). They read:
 * ``GENIERAILS_POLICY_SAVED_PLAN=<file>`` (make release MANIFEST=...): apply
   exactly that saved plan, after checking the stage still renders what was
   planned; a plan that changes nothing is not applied. Nothing is re-planned.
+* ``GENIERAILS_REBIND_FINGERPRINT``: the rebind hooks only; must equal the
+  generated config's ``fingerprint``.
+* ``GENIERAILS_REBIND_TABLE_GRANTS``: the rebind hooks only; a JSON list of
+  the ``table_access`` keys an earlier protect phase held back. Terraform's
+  refresh drops a grant whose principal was deleted from state, so these are
+  passed back as already applied (``rebind_table_grants``) and granted again.
 
 Stages (every one keeps all retained generations' functions):
 
@@ -74,6 +80,17 @@ Stages (every one keeps all retained generations' functions):
   ``policy_stage`` values that withhold new grants (grants already applied
   stay), so access never opens before its protection is verified. Its plan
   may change no policy or treatment tag.
+* ``rebind-protect`` and ``rebind-access`` (make policy-rebind): after a
+  rolled-back switch, when principals the policies name were deleted and
+  recreated (Unity Catalog then shows them as ``unknown``), re-apply the
+  restore render with the generated config's principals. The generated config
+  may differ from the unfinished change only in its policies' principals
+  (``rebind_problems``). ``rebind-protect`` holds back every grant its plan
+  would create (``held_access_grants``), so it re-points policies and
+  redeploys the functions only; ``rebind-access``, once that is checked live,
+  creates those grants (table SELECT only where it was applied before:
+  ``GENIERAILS_REBIND_TABLE_GRANTS``). ``rebind_violations`` refuses anything
+  else.
 
 Snapshots of every generation a hook applies are kept next to the layer's
 state, in ``<env>/data_access/.policy_generations/<fingerprint>.json`` (with
@@ -104,7 +121,8 @@ from governance_policies import (  # noqa: E402
 )
 
 APPLY_STAGES = ("create", "tighten", "switch", "restore", "retire", "abandon")
-STAGES = APPLY_STAGES + ("drop-functions", "grant")
+REBIND_STAGES = ("rebind-protect", "rebind-access")
+STAGES = APPLY_STAGES + ("drop-functions", "grant") + REBIND_STAGES
 RUNNER = SHARED / "scripts" / "terraform_layer.sh"
 COVERAGE_GATE = SHARED / "scripts" / "coverage_gate.py"
 DEPLOY_FUNCTIONS = SHARED / "deploy_masking_functions.py"
@@ -127,6 +145,14 @@ PROTECTED_TYPES = {
 ENFORCEMENT_WAIT = "time_sleep.wait_for_policy_enforcement"
 # Business access is only ever created once the new protection is switched in.
 BUSINESS_GRANTS = {"catalog_access", "schema_access", "table_access"}
+# The grants a rebind's protect phase holds back (the root's held_access_grants).
+ACCESS_GRANTS = BUSINESS_GRANTS | {"terraform_sp_manage_catalog"}
+MASKING_FUNCTIONS = "terraform_data.masking_functions"
+FUNCTION_DROP = "terraform_data.masking_functions_drop"
+# What a rebind may change on a mask policy; everything else must be planned unchanged.
+REBIND_POLICY_FIELDS = ("to_principals", "except_principals")
+POLICY_BINDING = ("name", "on_securable_type", "on_securable_fullname", "policy_type", "for_securable_type",
+                  "column_mask", "row_filter", "match_columns", "when_condition")
 SETTINGS_KEYS = ("access_tier_groups", "raw_exempt_principals", "treatment_versions",
                  "column_overrides", "tier_access_overrides")
 _VALUE_IN_CONDITION = re.compile(r"hasTagValue\(\s*'" + TAG_KEY + r"'\s*,\s*'([^']+)'\s*\)")
@@ -571,8 +597,8 @@ def planned_policy_deletes(plan: dict) -> list[str]:
                   and "delete" in ((c.get("change") or {}).get("actions") or []))
 
 
-def _plan_json(env_name: str, layer_dir: Path, stage: str, plan_file: Path) -> dict:
-    _runner(env_name, layer_dir, "plan", "-input=false", f"-var=policy_stage={stage}", f"-out={plan_file}")
+def _plan_json(env_name: str, layer_dir: Path, stage: str, plan_file: Path, *extra: str) -> dict:
+    _runner(env_name, layer_dir, "plan", "-input=false", f"-var=policy_stage={stage}", *extra, f"-out={plan_file}")
     shown = _runner(env_name, layer_dir, "show", "-json", str(plan_file), capture=True)
     return json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
 
@@ -611,6 +637,8 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
         return drop_functions(env_dir, environ)
     if stage == "grant":
         return grant(env_dir, environ)
+    if stage in REBIND_STAGES:
+        return rebind(env_dir, environ, stage)
     env_name = environ.get("GENIERAILS_ENV_NAME") or env_dir.name
     layer_dir = env_dir / "data_access"
     expected = environ.get("GENIERAILS_POLICY_FINGERPRINT", "")
@@ -717,6 +745,259 @@ def grant(env_dir: Path, environ: dict) -> int:
             return 0
         _runner(env_name, layer_dir, "apply-plan", str(plan_file))
     print(f"Policy stage grant: access applied on generation {expected}")
+    return 0
+
+
+# -- rebind (make policy-rebind) ----------------------------------------------------
+def _binding(policy: dict) -> dict:
+    return {k: v for k, v in policy.items() if k not in REBIND_POLICY_FIELDS}
+
+
+def rebind_problems(desired: dict, changed: dict, retained: list[dict]) -> list[str]:
+    """Why the generated config isn't the unfinished change with only its principals moved.
+
+    ``changed`` is the unfinished change's generation (its snapshot). Its
+    policies, conditions, functions and treatment values must be exactly the
+    generated config's. A principal the generated config replaced (a
+    recreated deployer under a new ID) may not be named by a retained
+    generation's policy: the rebind keeps those policies as their generation
+    recorded them, so it can re-point them only at principals recreated under
+    the same name.
+    """
+    problems = []
+    want = {p["name"]: p for p in desired["fgac_policies"]}
+    have = {p["name"]: p for p in changed["fgac_policies"]}
+    for name in sorted(want.keys() ^ have.keys()):
+        problems.append(f"policy {name} is {'added' if name in want else 'removed'} by the generated config")
+    for name in sorted(want.keys() & have.keys()):
+        a, b = _binding(want[name]), _binding(have[name])
+        moved = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+        if moved:
+            problems.append(f"policy {name} changes its {', '.join(moved)}")
+    retagged = sorted(c for c in desired["tags"].keys() | changed["tags"].keys()
+                      if desired["tags"].get(c) != changed["tags"].get(c))
+    if retagged:
+        problems.append(f"{len(retagged)} column(s) change their treatment ({', '.join(retagged[:5])})")
+    if desired["functions_sql"] != changed["functions_sql"]:
+        problems.append("the masking functions change")
+    replaced = set()
+    for name in want.keys() & have.keys():
+        for field in REBIND_POLICY_FIELDS:
+            replaced |= set(have[name].get(field) or []) - set(want[name].get(field) or [])
+    for generation in retained:
+        for policy in generation["fgac_policies"]:
+            for who in sorted(replaced & {*(policy.get("to_principals") or []), *(policy.get("except_principals") or [])}):
+                problems.append(f"policy {policy['name']} of generation {generation['fingerprint']} names {who}, "
+                                "which the generated config replaced")
+    return problems
+
+
+def restore_record_problems(record: dict | None, rendered: dict, changed_fp: str, old_fp: str) -> list[str]:
+    """How a rebind render differs from the restore it re-applies, beyond principals."""
+    if not record or record.get("stage") not in ("restore", "rebind") \
+            or record.get("desired") != changed_fp or record.get("old") != old_fp:
+        return [f"the last applied stage is {(record or {}).get('stage') or 'none'}, not the restore of this change"]
+    problems = []
+    before = {p["name"]: _binding(p) for p in record["rendered"]["fgac_policies"]}
+    after = {p["name"]: _binding(p) for p in rendered["fgac_policies"]}
+    for name in sorted(before.keys() ^ after.keys()):
+        problems.append(f"policy {name} is {'added to' if name in after else 'removed from'} the restore render")
+    problems += [f"policy {name} binds differently from the restore render"
+                 for name in sorted(before.keys() & after.keys()) if before[name] != after[name]]
+    if dict(record["rendered"]["tags"]) != dict(rendered["tags"]):
+        problems.append("treatment values differ from the restore render")
+    if record["rendered"]["functions_sql"] != rendered["functions_sql"]:
+        problems.append("masking functions differ from the restore render")
+    return problems
+
+
+def _trigger(values: dict | None, field: str):
+    value = (values or {}).get("triggers_replace")
+    value = value.get("value", value) if isinstance(value, dict) and "type" in value else value
+    return (value or {}).get(field) if isinstance(value, dict) else None
+
+
+def redeploy_drops_functions(module_main: Path = SHARED / "modules" / "data_access" / "main.tf") -> bool:
+    """Whether replacing terraform_data.masking_functions runs a drop (a destroy-time provisioner).
+
+    Terraform takes destroy provisioners from the current config, so this
+    reads the module the plan was made with (unreadable counts as a drop).
+    Since the drop moved to masking_functions_drop, a replace only re-runs
+    CREATE OR REPLACE.
+    """
+    try:
+        text = Path(module_main).read_text()
+    except OSError:
+        return True
+    match = re.search(r'resource\s+"terraform_data"\s+"masking_functions"\s*\{', text)
+    if not match:
+        return True
+    depth, end = 0, match.end() - 1
+    for end in range(match.end() - 1, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[end], 0)
+        if depth == 0:
+            break
+    block = re.sub(r"#[^\n]*", "", text[match.end():end])
+    return bool(re.search(r"\bwhen\s*=\s*destroy\b", block)) or depth != 0
+
+
+def _policy_binding_changes(change: dict) -> list[str]:
+    before, after = (change.get("change") or {}).get("before") or {}, (change.get("change") or {}).get("after") or {}
+    return sorted(f for f in POLICY_BINDING if f in before or f in after if before.get(f) != after.get(f))
+
+
+def held_grants(plan: dict) -> tuple[list[str], list[str]]:
+    """The grants a plan would create, as held_access_grants entries, and any other grant change."""
+    held, problems = [], []
+    for change in plan.get("resource_changes") or []:
+        actions = (change.get("change") or {}).get("actions") or []
+        if change.get("type") != "databricks_grant" or not set(actions) - {"no-op", "read"}:
+            continue
+        if actions == ["create"] and change.get("name") in ACCESS_GRANTS:
+            held.append(f"{change['name']}|{change.get('index') or ''}")
+        else:
+            problems.append(f"{change.get('address')}: {'/'.join(actions)} (a rebind only creates grants again)")
+    return sorted(held), problems
+
+
+def rebind_violations(plan: dict, stage: str, table_grants=frozenset(), *, drops=None) -> list[str]:
+    """Changes a rebind phase's plan may not make.
+
+    ``rebind-protect`` may only update a mask policy's ``TO``/``EXCEPT``
+    principals, redeploy the masking functions and restart the enforcement
+    wait. The redeploy (``masking_functions`` replaced) may not change a
+    function's SQL (``sql_hash``) or run a drop: ``masking_functions_drop``
+    is only updated in place, and ``masking_functions`` has no destroy-time
+    provisioner (``redeploy_drops_functions``), so it re-runs CREATE OR
+    REPLACE of the same definitions and no function a live policy uses is
+    dropped. ``rebind-access`` may only create the access grants, table
+    SELECT only for ``table_grants`` (the grants applied before their
+    principals were deleted). Anything else refuses: a treatment tag change, a
+    policy create or delete, a policy's condition or function, another
+    resource.
+    """
+    problems = []
+    for change in plan.get("resource_changes") or []:
+        actions = (change.get("change") or {}).get("actions") or []
+        address = str(change.get("address") or "")
+        rtype = str(change.get("type") or "")
+        if not set(actions) - {"no-op", "read"}:
+            continue
+        label = f"{address}: {'/'.join(actions)}"
+        if stage == "rebind-access":
+            if rtype == "databricks_grant" and change.get("name") in ACCESS_GRANTS and actions == ["create"] \
+                    and (change.get("name") != "table_access" or str(change.get("index") or "") in table_grants):
+                continue
+            problems.append(f"{label} (the access phase only creates the grants the deleted principals lost)")
+            continue
+        if rtype == "databricks_policy_info" and actions == ["update"]:
+            moved = _policy_binding_changes(change)
+            if moved:
+                problems.append(f"{label} changes its {', '.join(moved)} (a rebind only re-points principals)")
+            continue
+        if address.endswith(MASKING_FUNCTIONS) and sorted(actions) in (["update"], ["create", "delete"]):
+            body = (change.get("change") or {})
+            before, after = _trigger(body.get("before"), "sql_hash"), _trigger(body.get("after"), "sql_hash")
+            if not before or before != after:
+                problems.append(f"{label} changes the function SQL (sql_hash {before or 'unknown'} -> "
+                                f"{after or 'unknown'}); a rebind only redeploys the same functions")
+            elif "delete" in actions and (drops or redeploy_drops_functions)():
+                problems.append(f"{label}: replacing it runs a destroy-time drop of the masking functions "
+                                "that live policies use")
+            continue
+        if address.endswith(FUNCTION_DROP) and actions == ["update"]:
+            continue
+        if address.endswith(ENFORCEMENT_WAIT) and actions != ["delete"]:
+            continue
+        problems.append(f"{label} (the protect phase only re-points policies, redeploys the functions and "
+                        "restarts the enforcement wait)")
+    return problems
+
+
+def planned_summary(plan: dict) -> list[str]:
+    """``<actions> <address>`` for every resource a plan changes."""
+    return sorted(f"{'/'.join((c.get('change') or {}).get('actions') or [])} {c.get('address')}"
+                  for c in plan.get("resource_changes") or []
+                  if set((c.get("change") or {}).get("actions") or []) - {"no-op", "read"})
+
+
+def rebind(env_dir: Path, environ: dict, stage: str) -> int:
+    """Plan (PLAN_OUT) or apply exactly (SAVED_PLAN) one phase of make policy-rebind."""
+    env_name = environ.get("GENIERAILS_ENV_NAME") or env_dir.name
+    layer_dir = env_dir / "data_access"
+    changed_fp = environ.get("GENIERAILS_POLICY_FINGERPRINT", "")
+    old_fp = environ.get("GENIERAILS_OLD_POLICY_FINGERPRINT", "")
+    retire_fp = environ.get("GENIERAILS_RETIRE_FINGERPRINT", "")
+    if not changed_fp:
+        raise StageError(f"{stage} needs GENIERAILS_POLICY_FINGERPRINT (the unfinished change)")
+    desired = desired_generation(env_dir)
+    if environ.get("GENIERAILS_REBIND_FINGERPRINT") != desired["fingerprint"]:
+        raise StageError(f"generated config is generation {desired['fingerprint']}, but policy-rebind is "
+                         f"re-pointing to {environ.get('GENIERAILS_REBIND_FINGERPRINT') or '<unset>'}")
+    changed, old = load_snapshot(env_dir, changed_fp), load_snapshot(env_dir, old_fp)
+    retire = load_snapshot(env_dir, retire_fp) if retire_fp not in {"", changed_fp, old_fp} else None
+    keep_new_tags = environ.get("GENIERAILS_POLICY_KEEP_NEW_TAGS") == "1"
+    # The restore render, with the generated config's principals for the change's own policies.
+    staged = plan_stage("restore", desired, old, retire, keep_new_tags=keep_new_tags)
+    rendered = staged["rendered"]
+    problems = rebind_problems(desired, changed, [g for g in (old, retire) if g]) + staged["problems"]
+    off = sorted(c for c in rendered["tags"].keys() | ((old or {}).get("tags") or {}).keys()
+                 if rendered["tags"].get(c) != ((old or {}).get("tags") or {}).get(c))
+    if off:
+        problems.append(f"{len(off)} column(s) would not be on the previous generation ({', '.join(off[:5])})")
+    problems += restore_record_problems(load_stage_record(env_dir), rendered, changed_fp, old_fp)
+    if problems:
+        print(f"ERROR: {stage}: the generated config isn't the unfinished change with only its principals moved; "
+              "nothing was applied:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 1
+    expect = {"desired": changed_fp, "old": old_fp, "retire": retire["fingerprint"] if retire else "",
+              "rebind": desired["fingerprint"]}
+    if environ.get(SAVED_PLAN_ENV):
+        _apply_saved(env_name, layer_dir, stage, Path(environ[SAVED_PLAN_ENV]), rendered, expect)
+        write_json(stage_record_path(env_dir), expect | {
+            "stage": "rebind", "phase": stage, "keep_new_tags": keep_new_tags, "rendered": rendered,
+            "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        print(f"Policy stage {stage}: applied the saved plan (generation {changed_fp}, principals of "
+              f"{desired['fingerprint']})")
+        return 0
+    plan_out = environ.get(PLAN_OUT_ENV)
+    if not plan_out:
+        raise StageError(f"{stage} only plans (GENIERAILS_POLICY_PLAN_OUT) or applies a saved plan "
+                         "(GENIERAILS_POLICY_SAVED_PLAN)")
+    write_stage(layer_dir, rendered)
+    if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
+        _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"], "restore", old_fp,
+                             keep_new_tags)
+    plan_file = Path(plan_out)
+    table_grants = sorted(json.loads(environ.get("GENIERAILS_REBIND_TABLE_GRANTS") or "[]"))
+    kept = f"-var=rebind_table_grants={json.dumps(table_grants)}"
+    held: list[str] = []
+    problems = []
+    if stage == "rebind-protect":
+        # Terraform's -target pulls in dependencies (every policy depends on the grants), so the
+        # protect phase holds back exactly the grants a plan of the whole render would create.
+        with tempfile.TemporaryDirectory() as tmp:
+            held, problems = held_grants(_plan_json(env_name, layer_dir, "rebind", Path(tmp) / "probe.tfplan", kept))
+    if not problems:
+        plan = _plan_json(env_name, layer_dir, "rebind", plan_file, kept,
+                          f"-var=held_access_grants={json.dumps(held)}")
+        problems = rebind_violations(plan, stage, set(table_grants))
+    if problems:
+        print(f"ERROR: the {stage} plan makes changes a rebind may not; nothing was applied:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 1
+    summary = planned_summary(plan)
+    write_json(sidecar_path(plan_file), expect | {
+        "stage": stage, "keep_new_tags": keep_new_tags, "rendered": rendered, "held": held,
+        "table_grants": table_grants, "changes": plan_changes(plan), "summary": summary})
+    print(f"Policy stage {stage}: planned into {plan_file}" + ("" if summary else " (no changes)"))
+    for line in summary:
+        print(f"  {line}")
+    if held:
+        print(f"  held back until the access phase: {len(held)} grant(s)")
     return 0
 
 
