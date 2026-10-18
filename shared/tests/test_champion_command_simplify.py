@@ -927,8 +927,10 @@ def test_release_needs_no_key_and_proves_keys_before_applying(tmp_path, env_text
     assert result.returncode == 0, result.stdout + result.stderr
     keys = calls.index("verify-access-keys ENV=prod")
     assert keys < calls.index("apply ENV=prod APPLY_FLAGS= _STAGED_CONFIRM=0")
+    # Release verifies as a gate (main 9c2ad7b): the spec cannot narrow the
+    # minimum, and the staged-verify inputs are cleared so none can redirect it.
     gate = [c for c in calls if c.startswith("verify-access ENV=prod ")]
-    assert len(gate) == 1 and {"VERIFY_GATE=1", "VERIFY_REQUIRE_MASKS=1"} <= set(gate[0].split()), gate
+    assert gate == ["verify-access ENV=prod VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE="], gate
 
 
 def _proof(tmp_path, payload=MASK_PASS):
