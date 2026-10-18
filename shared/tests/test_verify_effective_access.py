@@ -1587,6 +1587,21 @@ class TestTemporaryWarehouseAccess:
         assert "could not delete partially provisioned genierails-verify-viewers" in err
         assert "app-new" in err and "delete denied" in err
 
+    def test_provision_failure_surfaces_original_error_when_cleanup_interrupted(
+        self, monkeypatch, capsys,
+    ):
+        verifier = self._provisioning_account(monkeypatch, fail="group-patch")
+        verifier._account.service_principals.delete.side_effect = KeyboardInterrupt(
+            "delete interrupted")
+        group = SimpleNamespace(id="789", display_name="viewers", members=[])
+
+        with pytest.raises(RuntimeError, match="^group-patch failed$"):
+            verifier.provision_principal("viewers", resolved_groups=[group])
+
+        err = capsys.readouterr().err
+        assert "could not delete partially provisioned genierails-verify-viewers" in err
+        assert "delete interrupted" in err
+
     def test_provision_does_not_delete_a_principal_it_did_not_create(self, monkeypatch):
         existing = SimpleNamespace(
             id="321", application_id="app-old", display_name="genierails-verify-viewers",

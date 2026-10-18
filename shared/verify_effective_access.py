@@ -1805,7 +1805,7 @@ class EffectiveAccessVerifier:
             # principal created here must be removed here when setup fails.
             try:
                 a.service_principals.delete(sp.id)
-            except Exception as cleanup_exc:
+            except BaseException as cleanup_exc:
                 print(
                     f"  WARN: could not delete partially provisioned {display_name} "
                     f"({sp.application_id}); delete it manually: {cleanup_exc}",
