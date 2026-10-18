@@ -15,7 +15,7 @@ make rehearse ENV=dev       # applies in dev and proves the masks work
 make promote-to ENV=prod    # copies the reviewed rules (set catalog_map first)
 #   Catalog Explorer: same classification review on the prod catalog
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
-make release ENV=prod MANIFEST=<manifest>   # applies exactly the approved plan, proves the masks
+make release ENV=prod      # applies exactly the approved plan, proves the masks
 make maintain ENV=prod      # run on a schedule
 
 # commit
@@ -92,12 +92,13 @@ Using the sample environment? Load its tables into prod first (`--skip-agent`, s
 **3. Release.** Plan, review the manifest, then apply exactly what was approved:
 ```bash
 make release-plan ENV=prod
-make release ENV=prod MANIFEST=<manifest printed by release-plan>
+make release ENV=prod
 ```
+`make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
 **Pass looks like:** `ALL EFFECTIVE` and "Release complete". Business users can now open the agent and get masked answers.
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
-- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make release-plan ENV=prod` and `make release ENV=prod MANIFEST=<manifest>`.
+- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make release-plan ENV=prod` and `make release ENV=prod`.
 - **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Applying a custom mask in governance (`make adopt-custom-mask`) is not on `main` yet. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
 
 Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-gap-found-in-prod).

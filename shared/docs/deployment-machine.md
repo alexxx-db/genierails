@@ -19,7 +19,7 @@ git fetch && git checkout --force --detach <sha>
 git status --porcelain                         # pass looks like: prints nothing
 make release-plan ENV=prod                     # prints the manifest path; changes nothing
 #   get the manifest approved
-make release ENV=prod MANIFEST=<manifest>      # applies exactly that manifest
+make release ENV=prod                          # applies exactly that manifest
 
 # on a schedule, at the last released commit
 make maintain ENV=prod
@@ -57,10 +57,13 @@ make maintain ENV=prod
    **Pass looks like:** `git status --porcelain` prints nothing.
 3. **Plan.** `make release-plan ENV=prod`. **Pass looks like:**
    `=== Release plan (prod) ===` and `Manifest (immutable): <path>`, then the
-   exact `make release` command to run.
+   `make release` command to run. That manifest is now prod's current one; a
+   later `release-plan` supersedes it.
 4. **Approve.** A governance code owner reviews the manifest's reports
    (readers, weakening, field-level agent overwrite) and saved plans.
-5. **Release.** `make release ENV=prod MANIFEST=<manifest>`. **Pass looks
+5. **Release.** `make release ENV=prod`. It prints the current manifest's
+   path, commit and changes before applying; check they are what was
+   approved (a pipeline passes `MANIFEST=<path>` instead). **Pass looks
    like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
 6. **More phases?** If it says to run `release-plan` again (a staged policy
    change, tier move or recorded imports), repeat steps 3 to 5 until

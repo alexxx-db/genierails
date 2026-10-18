@@ -65,7 +65,7 @@ make setup ENV=prod                        # set governance_mode, deployer_princ
 make promote-to ENV=prod                   # commit envs/prod/, PR, merge
 #   Catalog Explorer: the same classification review on the prod catalog
 make release-plan ENV=prod                 # on the deployment machine; approve the manifest
-make release ENV=prod MANIFEST=<manifest>
+make release ENV=prod                     # releases the approved manifest
 make maintain ENV=prod                     # on a schedule
 ```
 

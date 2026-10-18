@@ -108,7 +108,7 @@ def test_a_promoted_env_refuses_direct_applies(tmp_path, envs, target, env):
     result, calls = run(tmp_path, envs, target, env)
     assert result.returncode != 0
     assert f"make {target} refused" in result.stderr
-    assert f"make release-plan ENV={env}" in result.stderr and "MANIFEST=" in result.stderr
+    assert f"make release-plan ENV={env}, then make release ENV={env}" in result.stderr
     assert applied(calls) == []
 
 

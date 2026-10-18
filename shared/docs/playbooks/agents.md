@@ -80,7 +80,7 @@ keeps its last captured version.
    `envs/prod/`. It can carry the dev change too, in one PR.
 3. **Merge.** After the dev rehearsal passes on the merge commit, the operator
    runs `make release-plan ENV=prod`, gets the manifest approved, and runs
-   `make release ENV=prod MANIFEST=<manifest>` ([deployment machine](../deployment-machine.md#release-prod)).
+   `make release ENV=prod` ([deployment machine](../deployment-machine.md#release-prod)).
    **Pass looks like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
 
 Every release replaces the prod agent's config with the capture in git and

@@ -36,7 +36,7 @@ them or don't need them; the replacement is on the right.
 | `make generate MODE=governance`, `make apply-governance` / `MODE=genie`, `make apply-genie` (central governance, self-service Genie) | one repo, per-agent files and a [CODEOWNERS split](pipelines.md#who-owns-which-file) ([agents](playbooks/agents.md), [governance](playbooks/governance.md)) |
 | `make generate COUNTRY=... INDUSTRY=...` ([country](country-overlays.md), [industry](industry-overlays.md) overlays tune the model's draft) | the fixed [mask library](../REFERENCE.md), `tag_treatments` for customer classes |
 | `make generate-delta` | `make maintain ENV=prod` |
-| `make release ENV=prod` (one step) | `make release-plan ENV=prod`, then `make release ENV=prod MANIFEST=<manifest>` |
+| `make release ENV=prod` (one step) | `make release-plan ENV=prod`, then `make release ENV=prod` (releases the approved manifest) |
 | `make promote SOURCE_ENV=... DEST_ENV=... DEST_CATALOG_MAP=...` | `make promote-to ENV=prod` |
 | `make apply ENV=prod` | refused in a promoted deterministic env |
 | `make scaffold-treatments` stubs in `shared/treatment_config.json` | `tag_treatments` in the env ([map a new class](playbooks/governance.md#map-a-new-class)) |
@@ -49,7 +49,7 @@ A legacy env's split layer files are plain `.tfvars`, so Terraform can run them
 directly, account layer first, then data_access, then workspace. You lose the
 Makefile's layer waits, tag-policy visibility check, auto-import and
 fingerprint skip. Deterministic envs refuse this side door: a promoted env
-changes only through `release MANIFEST=` and `maintain`
+changes only through `release` (a manifest's saved plans) and `maintain`
 ([release gating](pipelines.md#release-gating-deterministic-envs)).
 
 ```bash

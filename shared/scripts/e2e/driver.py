@@ -43,7 +43,7 @@ MAX_RELEASE_PHASES = 8
 MANUAL_RESTORE_COMMANDS = (
     "make rehearse ENV=dev",
     "make release-plan ENV=prod",
-    "make release ENV=prod MANIFEST=<path-from-release-plan>",
+    "make release ENV=prod",
     "make maintain ENV=prod",
 )
 ANOTHER_RELEASE_PHASE = re.compile(r"(?:Release phase applied|needs? another release-plan)", re.I)
