@@ -842,11 +842,6 @@ def _run_make(tmp_path, target, env_name, *extra, result=None, fail=None, cloud=
     return proc, env_file, calls
 
 
-def _called(calls, target, *required):
-    return any(call and call[0] == target and all(token in call for token in required)
-               for call in calls)
-
-
 PROVEN = {"passed": True, "mask_checks_passed": 3, "mask_checks_passed_by_key": {"customer_id": 1},
           "masked_tables": ["dev_cat.sch.customers", "dev_cat.sch.notes"], "mask_keys_complete": True,
           "mask_keys_proven_by_table": {"dev_cat.sch.customers": "customer_id", "dev_cat.sch.notes": "note_id"},
@@ -857,7 +852,8 @@ PROVEN = {"passed": True, "mask_checks_passed": 3, "mask_checks_passed_by_key": 
 def test_rehearse_with_no_key_saves_the_proven_map(tmp_path, cloud):
     proc, env_file, calls = _run_make(tmp_path, "rehearse", "dev", result=PROVEN, cloud=cloud)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert _called(calls, "verify-access", "ENV=dev")                 # no key flag anywhere
+    assert ["verify-access", "ENV=dev", "VERIFY_GATE=1", "VERIFY_FROM_TFVARS=",
+            "VERIFY_ENV_FILE="] in calls                              # no key flag anywhere
     assert not any("VERIFY_KEY_COLUMN" in w for call in calls for w in call)
     assert hcl2.loads(env_file.read_text())["verify_key_columns"] == PROVEN["mask_keys_proven_by_table"]
     assert "verify_key_column " not in env_file.read_text()
@@ -909,7 +905,8 @@ def test_release_with_no_key_reaches_apply_after_the_key_check(tmp_path, cloud):
     names = [c[1] if c[0] == "--no-print-directory" else c[0] for c in calls]
     assert names.index("verify-access-keys") < names.index("apply") < names.index("verify-access")
     assert ["verify-access-keys", "ENV=prod"] in calls
-    assert _called(calls, "verify-access", "ENV=prod", "VERIFY_REQUIRE_MASKS=1")
+    assert ["verify-access", "ENV=prod", "VERIFY_GATE=1", "VERIFY_REQUIRE_MASKS=1",
+            "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="] in calls
 
 
 def _make_n(target, *extra, cloud="aws", env_dir=None):
