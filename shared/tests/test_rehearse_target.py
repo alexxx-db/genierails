@@ -106,7 +106,8 @@ def test_rehearse_with_key_derives_validates_gates_applies_and_verifies(tmp_path
         ["validate-generated", "ENV=dev"],
         ["coverage-gate", "ENV=dev"],
         ["apply", "ENV=dev", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", "<exposure-token>"],
-        ["verify-access", "ENV=dev", "VERIFY_KEY_COLUMN=customer_id"],
+        ["verify-access", "ENV=dev", "VERIFY_GATE=1", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=",
+         "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate toggle: nothing passes or writes the retired flag.
     assert "business_access_enabled" not in log.read_text() + output
@@ -133,6 +134,6 @@ def test_rehearse_without_key_runs_key_independent_live_verification(tmp_path):
         ["validate-generated", "ENV=dev"],
         ["coverage-gate", "ENV=dev"],
         ["apply", "ENV=dev", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", "<exposure-token>"],
-        ["verify-access", "ENV=dev"],
+        ["verify-access", "ENV=dev", "VERIFY_GATE=1", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="],
     ]
     assert "skipped verify-access" not in output
