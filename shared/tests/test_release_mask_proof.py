@@ -113,6 +113,21 @@ def test_a_spec_that_cannot_prove_every_mask_refuses(tmp_path, capsys, spec, mes
     assert message in err and "nothing was applied" in err
 
 
+# Covering specs that would pass the mask-coverage check if unknown fields were
+# silently dropped (strict=False). require_mask_proof must refuse them first.
+@pytest.mark.parametrize("spec, field", [
+    ({**FULL_SPEC, "bogus_top_level": 1}, "root.bogus_top_level"),
+    ({"column_masks": [{**_mask("cat.sch.customers", "ssn"), "skip": True},
+                       _mask("cat.sch.notes", "free_text")],
+      "row_filters": []}, "column_masks[0].skip"),
+])
+def test_a_spec_with_unknown_fields_refuses_before_apply(tmp_path, capsys, spec, field):
+    env = _env(tmp_path, policies=TAGGED)
+    assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, spec)) == 1
+    err = capsys.readouterr().err
+    assert "could not be read" in err and field in err and "nothing was applied" in err
+
+
 def test_a_missing_spec_file_refuses(tmp_path, capsys):
     assert rh.require_mask_proof(_env(tmp_path), "prod", "", str(tmp_path / "absent.json")) == 1
     assert "could not be read" in capsys.readouterr().err

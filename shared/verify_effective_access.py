@@ -66,6 +66,12 @@ LIVE_ENV_FLAG = "GENIERAILS_LIVE_VERIFY"
 SAMPLE_ROWS = 25
 SAMPLE_SALT_ENV = "GENIERAILS_VERIFY_SAMPLE_SALT"
 
+# Workspace assignment, entitlements and warehouse ACLs are eventually
+# consistent. The pre-flight retries only errors known to represent those
+# grants not being visible yet, and remains bounded/fail-closed.
+QUERY_PREFLIGHT_TIMEOUT_SECONDS = 120.0
+QUERY_PREFLIGHT_BACKOFF_SECONDS = 2.0
+
 # A per-mask "unmasked" comparison principal that is a workspace/metastore
 # admin sees raw values for everything; use it as the ground-truth tier when a
 # policy masks a column for a *specific* business group (the admin is not a
@@ -1648,6 +1654,7 @@ class TestPrincipal:
     application_id: str
     client_secret: str
     sp_id: str = ""
+    workspace_sp_id: str = ""
 
 
 class EffectiveAccessVerifier:
@@ -1748,10 +1755,13 @@ class EffectiveAccessVerifier:
         self, tier: str, memberships: Optional[Sequence[str]] = None,
         *, resolved_groups: Optional[Sequence[Any]] = None,
     ) -> TestPrincipal:
-        """Create (or reuse) a service principal and add it to the tier group."""
-        self._guard()
-        from databricks.sdk.service import iam
+        """Create (or reuse) a service principal and add it to the tier group.
 
+        A principal created here is deleted again if any later setup step
+        fails. A reused principal must not belong to groups outside
+        ``resolved_groups``; verification refuses it instead of reusing it.
+        """
+        self._guard()
         display_name = f"{self.name_prefix}-{tier}"
         a = self.account
         if resolved_groups is None:
@@ -1766,11 +1776,50 @@ class EffectiveAccessVerifier:
             raise RuntimeError(
                 f"Verification service principal {display_name!r} resolved to "
                 f"{len(exact)} exact matches; expected at most one.")
-        if not exact:
-            sp = a.service_principals.create(display_name=display_name, active=True)
-        else:
+        if exact:
+            # Reuse only adds memberships, so a leftover principal in a group
+            # outside the desired set would silently widen what it can see.
             sp = exact[0]
+            desired = {str(group.id) for group in resolved_groups}
+            current = a.service_principals.get(sp.id).groups or []
+            stale = sorted(
+                getattr(group, "display", None) or str(group.value)
+                for group in current
+                if getattr(group, "type", None) != "indirect"
+                and str(group.value) not in desired
+            )
+            if stale:
+                raise RuntimeError(
+                    f"Verification service principal {display_name!r} already exists "
+                    f"and is a member of account group(s) outside its tier: "
+                    f"{', '.join(stale)}. Delete the service principal (or remove those "
+                    "memberships) before retrying verification."
+                )
+            return self._finish_principal(tier, display_name, sp, resolved_groups)
 
+        sp = a.service_principals.create(display_name=display_name, active=True)
+        try:
+            return self._finish_principal(tier, display_name, sp, resolved_groups)
+        except BaseException:
+            # The caller only records principals that were returned, so a
+            # principal created here must be removed here when setup fails.
+            try:
+                a.service_principals.delete(sp.id)
+            except BaseException as cleanup_exc:
+                print(
+                    f"  WARN: could not delete partially provisioned {display_name} "
+                    f"({sp.application_id}); delete it manually: {cleanup_exc}",
+                    file=sys.stderr,
+                )
+            raise
+
+    def _finish_principal(
+        self, tier: str, display_name: str, sp: Any, resolved_groups: Sequence[Any],
+    ) -> TestPrincipal:
+        """Mint a secret, join groups and assign/await the workspace for ``sp``."""
+        from databricks.sdk.service import iam
+
+        a = self.account
         # Mint an OAuth secret so the principal can authenticate on its own.
         secret = a.service_principal_secrets.create(service_principal_id=int(sp.id))
 
@@ -1822,6 +1871,7 @@ class EffectiveAccessVerifier:
             application_id=sp.application_id or "",
             client_secret=secret.secret or "",
             sp_id=sp.id or "",
+            workspace_sp_id=visible.id or "",
         )
 
     def deprovision_principal(self, principal: TestPrincipal) -> None:
@@ -1848,6 +1898,52 @@ class EffectiveAccessVerifier:
                 )
             ],
         )
+
+    def grant_query_entitlement(self, principal: TestPrincipal) -> None:
+        """Give a temporary principal the consumer entitlement needed for SQL.
+
+        The configured access-tier groups receive ``workspace-consume`` from
+        Terraform, but synthetic principals such as the out-of-tier and
+        dual-tier probes may deliberately have no (or different) tier group
+        membership. Grant the entitlement directly so every probe can reach
+        the SQL Statement Execution API without changing its data access.
+        """
+        self._guard()
+        from databricks.sdk.service import iam
+
+        self.admin_ws.service_principals.patch(
+            principal.workspace_sp_id or principal.sp_id,
+            operations=[iam.Patch(
+                op=iam.PatchOp.ADD,
+                path="entitlements",
+                value=[{"value": "workspace-consume"}],
+            )],
+            schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+        )
+
+    def assert_query_capable(self, principal: TestPrincipal) -> None:
+        """Fail setup clearly unless a provisioned principal can execute SQL."""
+        self._guard()
+        deadline = time.monotonic() + QUERY_PREFLIGHT_TIMEOUT_SECONDS
+        while True:
+            try:
+                self.run_query(self._ws_for(principal), "SELECT 1")
+                return
+            except Exception as exc:
+                reason = str(exc)
+                normalized = reason.lower()
+                transient = any(marker in normalized for marker in (
+                    "this api is disabled for users without the databricks-sql-access "
+                    "or workspace-consume entitlements",
+                    "does not have permission to use warehouse",
+                    "does not have can use permission",
+                    "does not have can_use permission",
+                ))
+                if not transient or time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"test principal not query-capable: {reason}") from exc
+                time.sleep(min(QUERY_PREFLIGHT_BACKOFF_SECONDS,
+                               max(0.0, deadline - time.monotonic())))
 
     def grant_outsider_table_access(
         self, principal: TestPrincipal, tables: Sequence[str], *, revoke: bool = False,
@@ -2339,6 +2435,8 @@ def verify_effective_access_live(
                 resolved_groups=resolved_groups[tier],
             )
             principals[tier] = principal
+            print(f"  Granting workspace consumer entitlement to test principal: {tier}")
+            verifier.grant_query_entitlement(principal)
             print(f"  Granting warehouse CAN_USE to test principal: {tier}")
             verifier.grant_warehouse_use(principal)
 
@@ -2350,6 +2448,9 @@ def verify_effective_access_live(
 
         # Newly-added group membership can take a short while to propagate.
         time.sleep(int(os.environ.get("GENIERAILS_VERIFY_PROPAGATION_SLEEP", "10")))
+        for tier in sorted(spec.principals):
+            print(f"  Checking test principal can run SQL: {tier}")
+            verifier.assert_query_capable(principals[tier])
         if spec.column_masks:
             print(f"  Mask-check row sample salt: {salt} ({SAMPLE_SALT_ENV}={salt} repeats it)")
 
