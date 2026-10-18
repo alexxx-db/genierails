@@ -11,7 +11,7 @@ Put Genie onboarding on rails — with built-in guardrails. Take a Genie agent f
 | You want to | Start with |
 |---|---|
 | **Govern and promote agents** (the champion flow): ship a Genie agent from dev to prod with its sensitive columns masked | the [Dev-to-Prod Walkthrough](shared/examples/dev_to_prod/) (~30 min), then the [agents](shared/docs/playbooks/agents.md) playbook |
-| **Govern tables only**: mask classified columns and control who reads each table, with no Genie agent | [Govern tables only](shared/docs/playbooks/governance.md#govern-tables-only), then the [governance](shared/docs/playbooks/governance.md) playbook |
+| **Govern tables only**: for a central data governance team that defines the table rules (masks on classified columns, row filters, who reads each table), reviews them as code and promotes them from dev to prod, for every consumer of those tables, Genie agents included. Also for platform teams securing catalogs before Genie rolls out | [Govern tables only](shared/docs/playbooks/governance.md#govern-tables-only), then the [governance](shared/docs/playbooks/governance.md) playbook |
 
 After the first deployment: [one team doing both](shared/docs/playbooks/one-team.md), [pipelines](shared/docs/pipelines.md) and the [deployment machine](shared/docs/deployment-machine.md).
 

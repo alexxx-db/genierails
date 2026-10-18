@@ -14,7 +14,7 @@ The playbook is now one page per persona:
 <a id="schema-drift-detection"></a>
 - **Schema drift:** [governance](playbooks/governance.md#keep-it-safe-between-changes)
 <a id="abac-governance-only-no-genie-agent"></a>
-- **Governance only (no Genie agent):** [governance](playbooks/governance.md#govern-tables-only)
+- **Governance only (a central team owns the table rules):** [governance](playbooks/governance.md#govern-tables-only)
 <a id="independent-bu-environment"></a>
 - **Independent BU environment:** [advanced](advanced.md#independent-environments)
 <a id="destroy-and-reset"></a>
