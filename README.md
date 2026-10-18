@@ -25,3 +25,5 @@ After the first deployment: [one team doing both](shared/docs/playbooks/one-team
 ## Documentation
 
 **[Browse all docs →](shared/docs/)** — the full index: walkthrough, playbooks, pipelines, architecture, effective-access verification, and troubleshooting.
+
+**[Command and settings reference →](REFERENCE.md)** — every `make` target and every `env.auto.tfvars` / `auth.auto.tfvars` setting.
