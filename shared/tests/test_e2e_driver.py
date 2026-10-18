@@ -382,12 +382,12 @@ def _rendered_step_checks(scenario_key, step_name, values):
     return scenario, [driver.render_check(check, values) for check in step.assertions]
 
 
-def _allowed_diff(scenario, checks, before, after, acks=()):
+def _allowed_diff(scenario, checks, before, after, acks=(), pinned=None):
     return driver.live_protection_diff(
         scenario, before, after, allowed_adoptions={},
         allowed_grants=driver.grant_allowances(checks, before, after),
         allowed_weakening_findings=driver.weakening_finding_allowances(
-            checks, acks, before, after))
+            checks, acks, before, after, pinned))
 
 
 def _retained_generation(new, old, env):
@@ -696,27 +696,42 @@ def test_protection_allowance_filter_is_strictly_environment_scoped():
     assert "dev" not in remaining
 
 
-def test_tier_allowance_covers_exact_changes_in_every_governed_catalog():
-    values = {"tier_group": "analysts", "tier_table_dev": TIER_TABLE,
-              "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
-              "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts"}
+TWO_CATALOG_TIER_VALUES = {
+    "tier_group": "analysts", "tier_table_dev": TIER_TABLE,
+    "tier_table_prod": PROD_TIER_TABLE, "prod_agent": "pay",
+    "tier_add_acks": f"prod:reader:{PROD_TIER_TABLE}:analysts;;prod:weaken:{PROD_CUSTOM_COLUMN}:analysts"}
+SECOND_DEV_CATALOG, SECOND_PROD_CATALOG = "gr_e2e_s14_20261016", "gr_e2e_s14p_20261016"
+
+
+def _two_catalog_tier_window(*, govern_second_before=True, govern_second_after=True):
+    """R1 prod window: the tier addition lands in both prod catalogs."""
     base_model = _tier_model(["admins", "ops", "viewers"])
     added_model = _tier_model(["admins", "ops", "analysts", "viewers"])
     before = _model_snapshot(base_model, "prod", catalog=PROD_CATALOG)
     after = _model_snapshot(added_model, "prod", catalog=PROD_CATALOG)
-    second_dev, second_prod = "gr_e2e_s14_20261016", "gr_e2e_s14p_20261016"
-    for target, model in ((before, base_model), (after, added_model)):
-        second = _model_snapshot(model, "prod", catalog=second_prod)["prod"]
-        for entry in second["uc"][second_prod]["abac_policies"]:
+    for target, model, governed in ((before, base_model, govern_second_before),
+                                    (after, added_model, govern_second_after)):
+        second = _model_snapshot(model, "prod", catalog=SECOND_PROD_CATALOG)["prod"]
+        for entry in second["uc"][SECOND_PROD_CATALOG]["abac_policies"]:
             for policy in entry["policies"]:
-                policy["name"] = policy["name"].replace(LIVE_CATALOG, second_dev)
+                policy["name"] = policy["name"].replace(LIVE_CATALOG, SECOND_DEV_CATALOG)
         target["prod"]["uc"].update(second["uc"])
-        target["prod"]["catalog_map"].update({second_dev: second_prod})
-        target["prod"]["governed_catalogs"].append(second_prod)
+        target["prod"]["catalog_map"].update({SECOND_DEV_CATALOG: SECOND_PROD_CATALOG})
+        if governed: target["prod"]["governed_catalogs"].append(SECOND_PROD_CATALOG)
     scenario, checks = _rendered_step_checks(
-        "tier-groupmap", "Release acknowledged tier addition", values)
-    acks = set(driver._ack_entries(values["tier_add_acks"]))
+        "tier-groupmap", "Release acknowledged tier addition", TWO_CATALOG_TIER_VALUES)
+    acks = set(driver._ack_entries(TWO_CATALOG_TIER_VALUES["tier_add_acks"]))
+    return scenario, checks, acks, before, after
+
+
+def test_tier_allowance_covers_exact_changes_in_every_governed_catalog():
+    scenario, checks, acks, before, after = _two_catalog_tier_window()
+    second_prod = SECOND_PROD_CATALOG
     assert _allowed_diff(scenario, checks, before, after, acks) == {}
+    pinned = driver._pinned_governed_catalogs(before)
+    assert pinned["prod"] == {PROD_CATALOG, second_prod}
+    assert driver.governed_catalog_pin_problems(pinned, after) == []
+    assert _allowed_diff(scenario, checks, before, after, acks, pinned) == {}
 
     extra = json.loads(json.dumps(after))
     policy = next(p for entry in extra["prod"]["uc"][second_prod]["abac_policies"]
@@ -726,6 +741,23 @@ def test_tier_allowance_covers_exact_changes_in_every_governed_catalog():
     remaining = _allowed_diff(scenario, checks, before, extra, acks)
     assert any(item.startswith(second_prod + ".") and "partial: newly exempts analysts" in item
                for item in remaining["prod"]["policies"])
+
+
+def test_after_snapshot_cannot_widen_its_own_governed_catalog_allowance():
+    scenario, checks, acks, before, after = _two_catalog_tier_window(govern_second_before=False)
+    pinned = driver._pinned_governed_catalogs(before)
+    assert pinned["prod"] == {PROD_CATALOG}
+    problems = driver.governed_catalog_pin_problems(pinned, after)
+    assert len(problems) == 1
+    assert problems[0].startswith("prod: governed catalog set changed from the scenario baseline")
+    assert f"added {SECOND_PROD_CATALOG}" in problems[0] and "will not widen" in problems[0]
+    remaining = _allowed_diff(scenario, checks, before, after, acks, pinned)
+    assert remaining["prod"]["policies"]
+    assert all(item.startswith(SECOND_PROD_CATALOG + ".") for item in remaining["prod"]["policies"])
+    # The after snapshot alone never decides: without a pin the baseline set still applies.
+    assert _allowed_diff(scenario, checks, before, after, acks) == remaining
+    narrowed = driver.governed_catalog_pin_problems(driver._pinned_governed_catalogs(after), before)
+    assert narrowed and f"removed {SECOND_PROD_CATALOG}" in narrowed[0]
 
 
 def test_tier_preflight_requires_catalog_map_for_kept_source_names():
@@ -1288,6 +1320,78 @@ def test_weaker_protection_fails_scenario_and_final_check(tmp_path, live):
     assert json.loads((tmp_path / "reports" / "s4.json").read_text())["status"] == "RESTORE FAILED"
     final = json.loads((tmp_path / "reports" / "final-protection.json").read_text())
     assert final["status"] == "ERROR" and final["weaker_than_baseline"]["prod"]["masks"] == ["cat.s.mask_ssn"]
+
+
+TIER_GROUPMAP_VALUES = (
+    "--value", "acl_group=analysts", "--value", "group_map_source=dev_ops",
+    "--value", "mapped_group=prod_ops", "--value", "prod_agent=pay",
+    "--value", f"tier_add_acks=prod:reader:{PROD_TIER_TABLE}:analysts",
+    "--value", "tier_group=analysts", "--value", f"tier_table_dev={TIER_TABLE}",
+    "--value", f"tier_table_prod={PROD_TIER_TABLE}")
+CUSTOM_MASK_VALUES = (
+    "--value", f"custom_install_ack=prod:weaken:{PROD_CUSTOM_COLUMN}:ops",
+    "--value", f"custom_mask_ack=prod:weaken:{PROD_CUSTOM_COLUMN}:ops",
+    "--value", "custom_mask_class=e2e_custom",
+    "--value", f"custom_mask_column_dev={CUSTOM_COLUMN}",
+    "--value", f"custom_mask_column_prod={PROD_CUSTOM_COLUMN}")
+
+
+def _refused_preflight_snapshots(scenario):
+    if scenario == "tier-groupmap":
+        snaps = {**_model_snapshot(_tier_model(["admins", "ops", "viewers"]), "dev"),
+                 **_model_snapshot(_tier_model(["admins", "ops", "viewers"]), "prod",
+                                   catalog=PROD_CATALOG)}
+        snaps["prod"]["catalog_map"] = {}  # R2: kept dev-source policy names need catalog_map
+        return snaps
+    snaps = {**_model_snapshot(_failsafe_model(), "dev"),
+             **_model_snapshot(_failsafe_model(), "prod", catalog=PROD_CATALOG)}
+    snaps["prod"]["uc"][PROD_CATALOG]["governed_tags"].append({  # R3: a second fail-safe column
+        "catalog_name": PROD_CATALOG, "schema_name": LIVE_SCHEMA, "table_name": "notes",
+        "column_name": "second_secret", "tag_name": "gr_treatment",
+        "tag_value": driver.FAILSAFE_STRING_VALUE})
+    return snaps
+
+
+@pytest.mark.parametrize("scenario,values,message", [
+    ("tier-groupmap", TIER_GROUPMAP_VALUES, "requires catalog_map"),
+    ("custom-mask", CUSTOM_MASK_VALUES, "last fail-safe STRING column"),
+])
+def test_r2_r3_preflights_refuse_in_main_before_any_mutating_step(tmp_path, live, scenario, values, message):
+    snaps = _refused_preflight_snapshots(scenario)
+    if scenario == "tier-groupmap":
+        assert driver.tier_groupmap_preflight_problems(snaps)
+    else:
+        assert driver.custom_mask_preflight_problems(snaps, {
+            "custom_mask_column_dev": CUSTOM_COLUMN, "custom_mask_column_prod": PROD_CUSTOM_COLUMN})
+
+    class Refused(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            return json.loads(json.dumps(snaps[env]))
+    calls = live()
+    assert driver.main(live_args(tmp_path, scenario, *values), snapshot_factory=Refused) == 1
+    report = json.loads((tmp_path / "reports" / f"{scenario}.json").read_text())
+    assert report["status"] == "ERROR"
+    assert f"{scenario} preflight refused before mutation" in report["error"] and message in report["error"]
+    assert report["restored_lifecycle"] is False
+    assert all(item["status"] == "planned" for item in report["steps"])
+    assert not makes(calls)
+
+
+def test_live_run_fails_the_step_when_a_later_snapshot_widens_the_governed_set(tmp_path, live):
+    class Widens(FakeSnapshots):
+        def capture(self, env):
+            self.n += 1
+            snap = snapshot()
+            snap["governed_catalogs"] = ["cat", "stranger_cat"] if self.n > 2 else ["cat"]
+            return snap
+    live()
+    assert driver.main(live_args(tmp_path, "s4"), snapshot_factory=Widens) == 1
+    report = json.loads((tmp_path / "reports" / "s4.json").read_text())
+    assert "governed catalog set changed mid-scenario" in report["error"]
+    assert "added stranger_cat" in report["error"]
+    failed = [item for item in report["steps"] if item["status"] == "ERROR"]
+    assert len(failed) == 1 and "added stranger_cat" in failed[0]["assertion"]
 
 
 def test_protection_diff_is_per_column_and_principal():
@@ -2801,6 +2905,40 @@ def test_s17_failed_change_that_switches_a_column_is_an_error(tmp_path, policy_l
         driver.subprocess.run = base
     assert "failed staged change moved live protection" in _step_error(
         tmp_path, "Staged change fails at verify-created")["assertion"]
+
+
+# S17's own captures are pinned to the baseline governed set: the drift fails
+# the first step that captures after it, not a later one.
+@pytest.mark.parametrize("trigger, step", [
+    (lambda argv: argv[:2] == ["make", "generate"], "Record dev/prod protection before the staged change"),
+    (lambda argv: argv[:2] == ["make", "rehearse"] and any(a.startswith("VERIFY_SPEC=") for a in argv),
+     "Staged change fails at verify-created"),
+])
+def test_s17_governed_set_drift_fails_the_step_that_captures_it(tmp_path, policy_live, trigger, step):
+    calls, journal = policy_live()
+    state = {"drifted": False}
+    base = driver.subprocess.run
+
+    def run(argv, **kwargs):
+        result = base(argv, **kwargs)
+        if trigger(list(argv)): state["drifted"] = True
+        return result
+    driver.subprocess.run = run
+
+    class Drifting(FakeSnapshots):
+        def capture(self, env):
+            snap = snapshot()
+            snap["governed_catalogs"] = ["cat", "stranger_cat"] if state["drifted"] else ["cat"]
+            return snap
+    try:
+        assert driver.main(_s17_args(tmp_path), snapshot_factory=Drifting) == 1
+    finally:
+        driver.subprocess.run = base
+    report = _s17_report(tmp_path)
+    assert "governed catalog set changed mid-scenario" in report["error"]
+    failed = [item for item in report["steps"] if item["status"] == "ERROR"]
+    assert [item["name"] for item in failed] == [step]
+    assert "added stranger_cat" in failed[0]["assertion"]
 
 
 S17_POLICIES = """fgac_policies = [
