@@ -395,10 +395,12 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@echo ""
 	@$(_CUSTOMER_GITIGNORE)
 
-# A customer repo commits envs/; GenieRails' own .gitignore ignores it. Only an
-# explicit GITIGNORE=customer writes the block into $(CLOUD_ROOT)/.gitignore;
-# after that every setup refreshes it (GITIGNORE=off skips). The upstream repo
-# never has the block, so a plain setup there only prints the opt-in line.
+# A customer repo commits envs/; GenieRails' own .gitignore ignores it. In any
+# git checkout whose origin isn't databricks-solutions/genierails (a fork, a
+# mirror, no origin; an upstream remote doesn't matter) a plain setup
+# writes/refreshes the block in $(CLOUD_ROOT)/.gitignore; with origin at
+# GenieRails, or outside git, it only prints the opt-in line. GITIGNORE=customer
+# forces the write; GITIGNORE=off skips (contributor forks).
 override _CUSTOMER_GITIGNORE = python3 "$(SHARED_ROOT)/scripts/customer_gitignore.py" --cloud-dir "$(CLOUD_ROOT)" \
 	--mode "$(GITIGNORE)" --account-env "$(ACCOUNT_ENV)" --env "$(ENV)"
 

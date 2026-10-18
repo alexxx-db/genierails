@@ -18,8 +18,8 @@ make release-plan ENV=prod  # plans prod and writes the manifest to approve
 make release ENV=prod MANIFEST=<manifest>   # applies exactly the approved plan, proves the masks
 make maintain ENV=prod      # run on a schedule
 
-# commit
-make setup ENV=prod GITIGNORE=customer   # then git add .gitignore envs/ and open the first PR
+# commit (from your own repo)
+make setup ENV=prod          # writes .gitignore in your repo; then git add .gitignore envs/ and open the first PR
 ```
 
 <a id="prerequisites--gather-required-values"></a>
@@ -114,9 +114,9 @@ It masks newly tagged columns, never grants access past a passing coverage check
 
 Put it in your own repo (create an empty one first) and open the first PR. From `aws/` (or `azure/`):
 ```bash
-make setup ENV=prod GITIGNORE=customer   # once: commits envs/, ignores credentials, state and runtime files
 git remote rename origin genierails      # keep GenieRails for upgrades
 git remote add origin <your-repo-url>
+make setup ENV=prod                      # origin is your repo: writes .gitignore (commits envs/, ignores credentials, state and runtime files)
 git push -u origin main
 git switch -c first-agent
 git add .gitignore envs/                 # plus any ../shared/ file a coverage fix changed

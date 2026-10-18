@@ -37,7 +37,7 @@ So "expose last" isn't a policy you hope holds — there is simply no new or wid
 
 | Command | Step (0 setup, 1 dev, 2 promote, 3 prod classify, 4 release, 5 maintain) | What it does |
 |---|---|---|
-| `make setup` / `make init-env ENV=<e>` | 0 | Create local env dirs + default config files (no Databricks calls); `GITIGNORE=customer` (setup, in your own repo) writes the `.gitignore` block that commits `envs/` |
+| `make setup` / `make init-env ENV=<e>` | 0 | Create local env dirs + default config files (no Databricks calls); in your own repo (an `origin` that isn't `databricks-solutions/genierails`, even with a GenieRails `upstream`) `setup` writes the `.gitignore` block that commits `envs/`, then `git add .gitignore envs/` (`GITIGNORE=customer` forces it, `GITIGNORE=off` skips) |
 | `make enable-classification ENV=<e>` | 1/3 | Optional scripted way to turn on UC Data Classification for the footprint; review detections, exclude false positives, and enable auto-tagging in the UI |
 | `make generate ENV=<e>` | 1 | (dev) One run: import the agent's config, find its tables, draft masks + access rules from the model, and derive one `gr_treatment`/column from native `class.*` (fail-closed: without `class.*` tags it stops before any model call); groups come from `access_tier_groups` in `env.auto.tfvars` (or `GENERATE_ARGS='--groups "..."'`, saved there on first use). Re-runs keep reviewed rules and add rules only for uncovered columns; `GENERATE_ARGS='--allow-rule-changes'` accepts the model's changes |
 | `make derive-assignments ENV=<e>` | 4/5 | Re-derive **only** `tag_assignments` from live `class.*`, reusing the promoted rules unchanged — no model call (fail-closed). `release` and `maintain` run it for you |
