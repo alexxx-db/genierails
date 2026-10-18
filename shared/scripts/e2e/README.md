@@ -271,8 +271,10 @@ column and group of the added check.
 
 A dev env where no tier group reads a masked column raw can't host S17; the
 driver stops before the failing step. A spec that omits a real tier is refused
-before apply (`shared/tests/test_release_mask_proof.py`), and the driver then
-reports `ERROR`, because it needs the verify-created failure.
+before apply (`shared/tests/test_release_mask_proof.py`; for S17's own spec,
+`test_s17_spec_omitting_a_real_tier_is_refused_before_apply` in
+`shared/tests/test_e2e_driver.py`), and the driver then reports `ERROR`,
+because it needs the verify-created failure.
 
 Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
 (`databricks_workspace_host`, `databricks_client_id`,
