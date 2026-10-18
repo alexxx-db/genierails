@@ -1693,7 +1693,7 @@ policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target #
 # (policies then name "unknown" and their grants are gone): re-apply the
 # restore render with the generated config's principals, protection first,
 # then the lost grants, so policy-abandon can drop the change. Dev only (v1).
-policy-rebind: _guard-not-ci-rebind _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Re-point a rolled-back policy change at recreated principals, then restore its lost grants (deterministic dev; then policy-abandon)
+policy-rebind: _guard-not-ci-apply _guard-not-ci-rebind _guarded-bootstrap _guard-workspace-target ## Re-point a rolled-back policy change at recreated principals, then restore its lost grants (deterministic dev; then policy-abandon)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); \
 	$(_DEPLOYER_CHECK) "make policy-rebind" || exit 1; \
 	$(_GROUP_CHECK) "make policy-rebind" || exit 1; \
