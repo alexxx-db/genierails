@@ -18,19 +18,100 @@ REFERENCE = ROOT / "REFERENCE.md"
 STAGES = ("setup/local", "PR check", "dev rehearse", "promotion PR",
           "prod release-plan/release", "maintain", "operations", "none")
 
-# A rule line: a lowercase target name at column 0 followed by ':' (not ':=').
-_RULE = re.compile(r"^([a-z_][a-z0-9_-]*)\s*:(?![:=])(.*)$")
 _CODE = re.compile(r"`([^`\n]+)`")
 _LINK = re.compile(r"\]\(([^)\s]+)\)")
 
+# Make directives that never define a target, and the ones that read files.
+_DIRECTIVES = {"ifeq", "ifneq", "ifdef", "ifndef", "else", "endif", "export",
+               "unexport", "override", "undefine", "vpath", "private"}
+_INCLUDES = {"include": True, "-include": False, "sinclude": False}
+# A variable assignment: NAME =, :=, ::=, :::=, ?=, += or != (after any override/export).
+_ASSIGNMENT = re.compile(r"^(?:(?:override|export|private)\s+)*[^\s:#=]+\s*(?:::?=|:::=|[?+!]?=)")
+# A rule: targets, then ':' or '::' (not part of an assignment), then the rest.
+_RULE = re.compile(r"^([^:#=]+?)\s*(::?)(?!=)(.*)$")
+_VAR_REF = re.compile(r"\$[({]([A-Za-z0-9_]+)[)}]")
+
+
+class MakefileParseError(Exception):
+    pass
+
+
+def parse_makefile(path, variables=None, _seen=None):
+    """Explicit targets of a makefile and its includes: name -> has a ## description.
+
+    Handles multi-target and :: rules and follows include directives
+    ($(VAR) expanded from variables, or a failure). Skips recipes, define
+    blocks, conditionals, assignments, target-specific variables, pattern
+    rules and special targets (.PHONY, .SUFFIXES, ...). A target name make
+    computes ($(...)) fails loudly, since it can't be checked.
+    """
+    path = Path(path)
+    variables = dict(variables or {})
+    seen = _seen if _seen is not None else set()
+    if path.resolve() in seen:
+        return {}
+    seen.add(path.resolve())
+    rules = {}
+    in_define = False
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        where = f"{path}:{number}"
+        if line.startswith("\t"):
+            continue  # a recipe line
+        stripped = line.strip()
+        words = stripped.split()
+        if not words or stripped.startswith("#"):
+            continue
+        if in_define:
+            in_define = words[0] != "endef"
+            continue
+        if words[0] == "define" or words[:2] in (["override", "define"], ["export", "define"]):
+            in_define = True
+            continue
+        if words[0] in _INCLUDES:
+            for name in words[1:]:
+                if name.startswith("#"):
+                    break
+                rules.update(_include(name, path, variables, seen, _INCLUDES[words[0]], where))
+            continue
+        if _ASSIGNMENT.match(stripped):
+            continue
+        if words[0] in _DIRECTIVES:
+            continue
+        match = _RULE.match(stripped)
+        if not match:
+            continue
+        rest = match.group(3)
+        if _ASSIGNMENT.match(rest.strip()):
+            continue  # a target-specific variable, not a new rule
+        for target in match.group(1).split():
+            if "$" in target:
+                raise MakefileParseError(f"{where}: can't check computed target {target!r}")
+            if target.startswith(".") or "%" in target:
+                continue  # special target or pattern rule
+            rules[target] = rules.get(target, False) or "## " in rest
+    return rules
+
+
+def _include(name, including, variables, seen, required, where):
+    def expand(ref):
+        if ref.group(1) not in variables:
+            raise MakefileParseError(f"{where}: can't resolve include {name!r}: ${ref.group(1)} is unknown")
+        return str(variables[ref.group(1)])
+    resolved = _VAR_REF.sub(expand, name)
+    if "$" in resolved:
+        raise MakefileParseError(f"{where}: can't resolve include {name!r}")
+    target = Path(resolved)
+    if not target.is_absolute():
+        target = including.parent / target
+    if not target.is_file():
+        if required:
+            raise MakefileParseError(f"{where}: included makefile {resolved!r} does not exist")
+        return {}
+    return parse_makefile(target, variables, seen)
+
 
 def _rules():
-    rules = {}
-    for line in (SHARED / "Makefile.shared").read_text().splitlines():
-        match = _RULE.match(line)
-        if match:
-            rules[match.group(1)] = "## " in match.group(2)
-    return rules
+    return parse_makefile(SHARED / "Makefile.shared", {"SHARED_ROOT": SHARED, "CLOUD_ROOT": ROOT / "aws"})
 
 
 def _cells(line):
@@ -127,3 +208,67 @@ def test_reference_links_resolve_and_readme_links_to_it():
 ])
 def test_named_targets_reads_make_code_spans(text, named):
     assert _named_targets(text) == named
+
+
+def _parse(tmp_path, text, name="Makefile", **variables):
+    path = tmp_path / name
+    path.write_text(text)
+    return parse_makefile(path, variables)
+
+
+def test_parser_reads_single_multi_target_and_double_colon_rules(tmp_path):
+    rules = _parse(tmp_path, (
+        "plain: dep ## Documented\n"
+        "\t@echo plain\n"
+        "one two three: ## Shared description\n"
+        "four  five :\n"
+        "again:: ## First double-colon rule\n"
+        "again::\n"
+        "indented-rule: x\n"
+    ).replace("indented-rule", "  indented-rule"))
+    assert rules == {"plain": True, "one": True, "two": True, "three": True,
+                     "four": False, "five": False, "again": True, "indented-rule": False}
+
+
+def test_parser_ignores_assignments_patterns_special_targets_and_recipes(tmp_path):
+    rules = _parse(tmp_path, (
+        "A := 1\nB ::= 2\nC ?= 3\nD += 4\nE != echo 5\nF = a:b\n"
+        "override G := 6\nexport H := 7\nexport I\n"
+        ".PHONY: real\n.DEFAULT_GOAL := real\n.SUFFIXES:\n"
+        "%.o: %.c\nbuild/%: src/%\n"
+        "real: ## Real\n"
+        "real: VERBOSE = 1\n"
+        "\tnot-a-rule: inside a recipe\n"
+        "# commented: rule\n"
+        "define BLOCK\nfake: rule\nendef\n"
+        "ifneq ($(X),y)\nelse\nendif\n"
+    ))
+    assert rules == {"real": True}
+
+
+def test_parser_follows_includes_and_expands_known_variables(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "extra.mk").write_text("from-include: ## Included\n")
+    (tmp_path / "other.mk").write_text("relative: \n")
+    rules = _parse(tmp_path, (
+        "include $(SUB)/extra.mk other.mk\n"
+        "-include missing-optional.mk\n"
+        "sinclude also-missing.mk\n"
+        "top:\n"
+    ), SUB=tmp_path / "sub")
+    assert rules == {"from-include": True, "relative": False, "top": False}
+
+
+@pytest.mark.parametrize("text, message", [
+    ("include missing.mk\n", "does not exist"),
+    ("include $(NOPE)/x.mk\n", "$NOPE is unknown"),
+    ("$(NAME)-target:\n", "computed target"),
+])
+def test_parser_fails_loudly_on_what_it_cannot_check(tmp_path, text, message):
+    with pytest.raises(MakefileParseError, match=re.escape(message)):
+        _parse(tmp_path, text)
+
+
+def test_parser_survives_an_include_cycle(tmp_path):
+    (tmp_path / "b.mk").write_text("include Makefile\nb-target:\n")
+    assert _parse(tmp_path, "include b.mk\na-target:\n") == {"a-target": False, "b-target": False}
