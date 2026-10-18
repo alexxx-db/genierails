@@ -25,9 +25,9 @@ def _clean_env(**updates):
     return env
 
 
-def _run_guarded_make(cloud, target, *, env, timeout=10):
+def _run_guarded_make(cloud, target, *extra_args, env, timeout=10):
     proc = subprocess.Popen(
-        ["make", "-f", str(ROOT / cloud / "Makefile"), target, "ENV=dev"],
+        ["make", "-f", str(ROOT / cloud / "Makefile"), target, "ENV=dev", *extra_args],
         cwd=ROOT,
         env=env,
         text=True,
@@ -51,6 +51,19 @@ def test_every_applying_target_refuses_in_ci(cloud, target):
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0
     assert "applying targets cannot run in CI" in output
+
+
+def test_ci_guard_fires_before_integration_test_dest_env_guard():
+    proc = _run_guarded_make(
+        "aws",
+        "integration-test",
+        "DEST_ENV=prod",
+        env=_clean_env(CI="true"),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "applying targets cannot run in CI" in output
+    assert "integration-test reads ITEST_DEST_ENV" not in output
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
@@ -128,12 +141,25 @@ def test_shipped_workflows_scope_the_only_applying_command_to_dev_rehearse():
             executed_targets.update(targets)
             opted_out = bool(re.search(r"GENIERAILS_ALLOW_CI_APPLY:\s*['\"]?1['\"]?", step))
             guarded = set(targets) & set(APPLYING_TARGETS)
-            assert not guarded or guarded == {"rehearse"} and "dev-rehearse" in path.name, path
+            allowed = {"rehearse"} if "dev-rehearse" in path.name else set()
+            assert not guarded or guarded <= allowed, path
         # Customer samples never use the integration-test bypass. Only stage 3
         # may apply, and the make guard independently proves dev locked state.
         code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         assert "GENIERAILS_ALLOW_CI_APPLY" not in code, path
-        assert (executed_targets & set(APPLYING_TARGETS)) <= ({"rehearse"} if "dev-rehearse" in path.name else set())
+        allowed = {"rehearse"} if "dev-rehearse" in path.name else set()
+        assert (executed_targets & set(APPLYING_TARGETS)) <= allowed
+
+
+def test_prod_maintain_samples_run_no_applying_target():
+    for cloud in ("aws", "azure"):
+        for sample_dir in SAMPLE_DIRS:
+            path = ROOT / cloud / sample_dir / ("workflows" if sample_dir == ".github" else "") / "prod-maintain.yml"
+            text = path.read_text()
+            code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+            executed = set(re.findall(r"\bmake\s+(?:--no-print-directory\s+)?([A-Za-z_][\w-]*)", code))
+            assert executed & set(APPLYING_TARGETS) == set(), path
+            assert "make audit-schema ENV=prod" in code, path
 
 
 @pytest.mark.parametrize("stage", ["prod-release", "prod-maintain"])

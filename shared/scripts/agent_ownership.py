@@ -5,7 +5,13 @@
                    only envs/dev/agents/<agent>.space.json. No governance
                    drafting, no model call, no Terraform state.
     import-new     after make generate ENV=dev: captures the agents that have a
-                   settings file but no capture yet. Never re-captures one.
+                   settings file but no capture yet. Never re-captures one: an
+                   agent whose capture was ever committed (at its path, or
+                   at an earlier name with the same genie_space_id) is
+                   refused (make capture replaces it on purpose). In a
+                   shallow clone or outside git, history cannot tell, so it
+                   refuses every uncaptured agent. --check, run before
+                   generate writes anything, refuses the same way.
     restore-ids    release-plan (and legacy release), before planning: an agent
                    whose ID file is gone gets it back from the last release
                    receipt, only if the receipt's key, lifecycle and pushed
@@ -227,15 +233,119 @@ def capture(env_dir: Path, env: str, name: str, get: Getter | None = None) -> bo
     return changed
 
 
-def import_new(env_dir: Path, env: str, get: Getter | None = None) -> list[str]:
-    """Capture every agent with a settings file and an ID but no capture yet."""
+def _run_git(folder: Path, *args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["git", "-C", str(folder), *args], capture_output=True, text=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
+
+
+def _git_error(result: subprocess.CompletedProcess) -> str:
+    lines = (result.stderr or result.stdout).strip().splitlines()
+    return lines[0] if lines else f"git exited {result.returncode}"
+
+
+def untrusted_history(env_dir: Path) -> tuple[str, str]:
+    """Why git history cannot say which agents were captured before, and the way out ('' if it can).
+
+    import-new fails closed on these: a shallow clone (CI's fetch-depth: 1)
+    hides the commit that deleted a capture, and outside a git checkout there
+    is no history at all, so a reviewed capture would look never captured.
+    """
+    folder = agent_files.agents_dir(env_dir)
+    inside = _run_git(folder, "rev-parse", "--is-inside-work-tree")
+    if inside.returncode != 0 and "not a git repository" in inside.stderr:
+        return "this is not a git checkout", "run make generate in a git checkout of this repo"
+    if inside.returncode != 0:
+        return f"git failed ({_git_error(inside)})", "fix git and retry"
+    if inside.stdout.strip() != "true":
+        return "this is not a git work tree", "run make generate in a git checkout of this repo"
+    shallow = _run_git(folder, "rev-parse", "--is-shallow-repository")
+    if shallow.returncode != 0:
+        return f"git failed ({_git_error(shallow)})", "fix git and retry"
+    if shallow.stdout.strip() == "true":
+        return ("this is a shallow clone",
+                "fetch full history (git fetch --unshallow; in CI, checkout with fetch-depth: 0) and retry")
+    return "", ""
+
+
+def capture_committed(env_dir: Path, name: str, space_id: str = "") -> str:
+    """The agents/ path an earlier capture of this agent was committed at, or ''.
+
+    That is what "new" means for import-new (design section 5: generate only
+    imports agents not yet in git). Nothing else can tell: agent_tables in
+    generated/governed_tables.json also lists an agent whose tables come from
+    uc_tables, and release receipts are prod's. Any branch counts (--all).
+
+    A capture holds the agent's config but not its ID, so a renamed agent is
+    found through its settings file: every agents/*.auto.tfvars that ever held
+    space_id names a capture path to look for. An agent renamed together with
+    a new genie_space_id keeps no identity to match, and counts as new.
+    Callers check untrusted_history first: in a shallow clone or outside git
+    this answers '' for a capture that was committed.
+    """
+    folder = agent_files.agents_dir(env_dir)
+
+    def log(*args: str) -> str:
+        result = _run_git(folder, "log", "--all", *args)
+        if result.returncode != 0:
+            raise AgentError(f"git log failed ({_git_error(result)}), so it cannot tell whether {name!r} was "
+                             "captured before. Nothing was written.")
+        return result.stdout
+
+    names = [name]
+    if space_id:
+        suffix = agent_files.SETTINGS_SUFFIX
+        held = log("--no-renames", "--relative", "--format=", "--name-only", "-S", json.dumps(space_id),
+                   "--", f":(glob)*{suffix}")
+        names += sorted({line[: -len(suffix)] for line in held.splitlines() if line.endswith(suffix)} - {name})
+    for candidate in names:
+        path = f"{candidate}{agent_files.CAPTURE_SUFFIX}"
+        if log("-1", "--format=%H", "--", f":(literal){path}").strip():
+            return f"{agent_files.AGENTS_DIR}/{path}"
+    return ""
+
+
+def import_new(env_dir: Path, env: str, get: Getter | None = None, *, check: bool = False) -> list[str]:
+    """Capture every agent with a settings file and an ID that was never captured.
+
+    An agent whose committed capture is gone is refused before anything is
+    read or written: a plain generate must not replace a reviewed capture with
+    whatever the dev UI holds now. When git history cannot tell
+    (untrusted_history), every uncaptured agent is refused: it fails closed.
+    ``check`` refuses the same way and captures nothing.
+    """
     if env != DEV_ENV:
         return []
-    missing = [a["name"] for a in agent_files.load_all(env_dir)
+    missing = [a for a in agent_files.load_all(env_dir)
                if a["genie_space_id"] and not agent_files.capture_path(env_dir, a["name"]).is_file()]
-    for name in missing:
+    if not missing:
+        return []
+    reason, way_out = untrusted_history(env_dir)
+    if reason:
+        raise AgentError(
+            f"make generate imports only agents never captured before, and {reason}, so git history cannot "
+            "tell whether these agents were:\n" + "".join(
+                f"  {agent_files.AGENTS_DIR}/{agent_files.capture_path(env_dir, a['name']).name}: {way_out}, "
+                f'or capture it on purpose: make capture ENV={env} SPACE="{a["name"]}"\n'
+                for a in missing) + "  Nothing was written.")
+    lost = {a["name"]: capture_committed(env_dir, a["name"], a["genie_space_id"]) for a in missing}
+    lost = {name: earlier for name, earlier in lost.items() if earlier}
+    if lost:
+        lines = []
+        for name, earlier in lost.items():
+            path = f"{agent_files.AGENTS_DIR}/{agent_files.capture_path(env_dir, name).name}"
+            renamed = "" if earlier == path else f"captured before as {earlier} (same genie_space_id); "
+            lines.append(f"  {path}: {renamed}restore it from git, "
+                         f'or replace it with the live dev agent: make capture ENV={env} SPACE="{name}"\n')
+        raise AgentError("make generate imports only agents never captured before, and these agents' "
+                         "committed captures are gone:\n" + "".join(lines) + "  Nothing was written.")
+    names = [a["name"] for a in missing]
+    if check:
+        return names
+    for name in names:
         capture(env_dir, env, name, get)
-    return missing
+    return names
 
 
 # ── Release ──────────────────────────────────────────────────────────────────
@@ -1047,6 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--plan-dir", type=Path, help="plan: release-plan's plan dir")
     parser.add_argument("--manifest", type=Path, help="sync: the approved release manifest")
+    parser.add_argument("--check", action="store_true", help="import-new: refuse as it would, capture nothing")
     args = parser.parse_args(argv)
     env_dir = args.env_dir
     try:
@@ -1055,7 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise AgentError('SPACE="<agent>" is required')
             capture(env_dir, args.env, args.space)
         elif args.command == "import-new":
-            import_new(env_dir, args.env)
+            import_new(env_dir, args.env, check=args.check)
         elif args.command == "restore-ids":
             restore_ids(env_dir, args.env)
         elif args.command == "check-deletes":

@@ -48,6 +48,7 @@ BASE_COMMIT = "16c9797a5030e80a8fe0c79eb60c29ad12218407"  # origin/main before s
 CODEOWNERS = SHARED / "examples" / "CODEOWNERS.example"
 CLOUDS = ("aws", "azure")
 DATA_CITIZENS, GOVERNANCE = "@your-org/data-citizens", "@your-org/governance-engineers"
+PLATFORM = "@your-org/platform"
 
 DEV_ENV = f'''governance_mode = "deterministic"
 deployer_principal_id = "{base.DEPLOYER}"
@@ -372,6 +373,10 @@ def test_the_sample_codeowners_splits_data_citizens_from_governance_engineers():
                  "aws/envs/prod/ack.txt", "azure/envs/dev/generated/governed_tables.json",
                  "aws/envs/prod/abac.auto.tfvars", "shared/mask_library.json"):
         assert owners(path) == [GOVERNANCE], path
+    for path in ("aws/.github/workflows/pr-check.yml", "azure/.github/workflows/pr-check.yml",
+                 ".github/workflows/ci.yml", ".github/CODEOWNERS",
+                 "aws/azure-pipelines/pr-check.yml", "azure/azure-pipelines/pr-check.yml"):
+        assert owners(path) == [PLATFORM], path
 
 
 def _codeowners_patterns() -> tuple[list[str], list[str]]:
@@ -393,8 +398,10 @@ def test_every_sample_codeowners_rule_is_anchored_to_a_supported_cloud_tree():
     for pattern in active + examples:
         assert pattern.startswith("/") and "**" not in pattern, pattern
         assert pattern.split("/")[1] in ("shared", ".github", *CLOUDS), pattern
+    assert "/.github/" in active
     for cloud in CLOUDS:
-        for pattern in (f"/{cloud}/envs/", f"/{cloud}/envs/*/agents/", f"/{cloud}/envs/*/ack.txt"):
+        for pattern in (f"/{cloud}/envs/", f"/{cloud}/envs/*/agents/", f"/{cloud}/envs/*/ack.txt",
+                        f"/{cloud}/.github/", f"/{cloud}/azure-pipelines/"):
             assert pattern in active, pattern
         assert f"/{cloud}/envs/*/agents/Sales.*" in examples, cloud
     # A directory that only happens to be called envs/ is not an env.
@@ -976,8 +983,13 @@ def _legacy_promotion(tmp_path: Path, shared: Path, makefile: Path) -> dict[str,
     result = base._make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     envs = base._envs(repo)
-    return {str(p.relative_to(envs)): p.read_bytes() for p in sorted(envs.rglob("*"))
-            if p.is_file() and ".runtime" not in p.parts}
+    files = {str(p.relative_to(envs)): p.read_bytes() for p in sorted(envs.rglob("*"))
+             if p.is_file() and ".runtime" not in p.parts}
+    # make bootstraps the account env with a copy of shared/env.auto.tfvars.example,
+    # whose comments are documentation that may change; its settings may not.
+    seed = "account/env.auto.tfvars"
+    files[seed] = b"".join(line for line in files[seed].splitlines(keepends=True) if not line.startswith(b"#"))
+    return files
 
 
 def test_a_legacy_layout_env_promotes_and_plans_exactly_as_before(tmp_path):
