@@ -10,10 +10,20 @@ markers, live snapshots and, for deterministic envs, the layer files that
 applying commands re-derive.
 
 The rule (``--mode``, make setup's GITIGNORE):
-  customer  write the block, or refresh it if present (first time: opt in)
-  auto      the default: refresh the block only if <cloud>/.gitignore already
-            has it, otherwise only print how to opt in. The upstream repo never
-            has the block, so make setup never changes it there.
+  customer  write the block, or refresh it if present
+  auto      the default. If <cloud>/.gitignore already has the block, refresh
+            it. Otherwise detect the repo from its git remotes:
+              - any remote at github.com/databricks-solutions/genierails (https
+                or ssh, with or without a trailing .git) is the upstream repo or
+                a contributor clone, which must never commit envs/: write
+                nothing, print the opt-in hint;
+              - not a git checkout, or a checkout with no remote at all: write
+                nothing, print the hint (it hasn't declared itself a customer
+                repo yet);
+              - otherwise it's a customer repo (a remote that isn't upstream):
+                write or refresh the block and print the diff, like customer.
+            Detection is the only way make setup can tell the upstream repo
+            apart from a customer repo without being told.
   off       do nothing
 Only the lines between the markers are ever rewritten; every other line is
 kept byte for byte. Re-running is a no-op; every change is printed as a diff.
@@ -25,6 +35,8 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -54,6 +66,40 @@ __pycache__/
 /envs/*/data_access/env.auto.tfvars
 /.genierails-state/
 """
+
+
+# A remote URL at the GenieRails upstream repo: https or ssh, with or without a
+# trailing .git or slash. Any such remote means the upstream repo or a
+# contributor clone, which must never commit envs/, so auto writes nothing there.
+_UPSTREAM_REMOTE = re.compile(
+    r"github\.com[:/]databricks-solutions/genierails(?:\.git)?/?$", re.IGNORECASE)
+
+
+def _remote_urls(cloud_dir: Path) -> list[str] | None:
+    """Every configured git remote URL, or None if cloud_dir is not a checkout."""
+    try:
+        proc = subprocess.run(["git", "-C", str(cloud_dir), "remote", "-v"],
+                              capture_output=True, text=True)
+    except OSError:
+        return None  # git is not installed
+    if proc.returncode != 0:
+        return None  # not a git checkout
+    return [parts[1] for parts in (line.split() for line in proc.stdout.splitlines())
+            if len(parts) >= 2]
+
+
+def _is_customer_repo(cloud_dir: Path) -> bool:
+    """True iff a plain (auto) make setup should write the block here.
+
+    A customer repo is a git checkout with at least one remote, none of them the
+    GenieRails upstream. Not a checkout, no remote, or any upstream remote means
+    False: the upstream repo and contributor clones must never commit envs/, and
+    a remote-less checkout hasn't declared itself a customer repo yet.
+    """
+    urls = _remote_urls(cloud_dir)
+    if not urls:
+        return False
+    return not any(_UPSTREAM_REMOTE.search(url) for url in urls)
 
 
 def _governance_mode(env_file: Path) -> str:
@@ -139,9 +185,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"ERROR: not changing {path}: {exc}. Fix or remove the block, then re-run.", file=sys.stderr)
         return 1
-    if mode == "auto" and not has_block:
-        print(f"Version control: in your own repo, make setup ENV={args.env} GITIGNORE=customer "
-              f"writes {rel} so envs/ is committed and runtime files are ignored.")
+    if mode == "auto" and not has_block and not _is_customer_repo(args.cloud_dir):
+        print(f"Version control: GenieRails ignores envs/ in its own repo. In your own customer repo "
+              f"(a git remote that isn't github.com/databricks-solutions/genierails), make setup "
+              f"ENV={args.env} writes {rel} so envs/ is committed and runtime files are ignored; then "
+              f"git add .gitignore envs/. Force it anywhere with GITIGNORE=customer.")
         return 0
     new = merged(text, block(args.cloud_dir, args.account_env))
     if new == text:

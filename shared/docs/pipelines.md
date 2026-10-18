@@ -10,7 +10,7 @@ pipelines run the rest. Design: [section 17](design/deterministic-governance.md#
 # from aws/ (or azure/), as an account admin, once per env
 make bootstrap-sp ACCOUNT_PROFILE=<profile> ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws> TARGET_CATALOG=<dev-catalog> YES=1
 #   commit its application ID as deployer_principal_id in envs/dev/env.auto.tfvars
-make setup ENV=dev GITIGNORE=customer          # .gitignore that commits envs/ and ignores runtime files
+make setup ENV=dev                             # in your repo: writes the .gitignore that commits envs/ and ignores runtime files
 make bootstrap-pipelines ENV=dev  CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws>  REPO=<owner>/<name> PLAN=1
 make bootstrap-pipelines ENV=dev  CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws>  REPO=<owner>/<name>
 make bootstrap-pipelines ENV=prod CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<prod-ws> REPO=<owner>/<name> WAREHOUSE_ID=<id>
@@ -61,11 +61,11 @@ Which commands each person runs: [agents](playbooks/agents.md),
 
 ## What to commit
 
-GenieRails' own `.gitignore` ignores `envs/`. In your repo, opt in once from the
-cloud dir:
+GenieRails' own `.gitignore` ignores `envs/`. In your own repo, `make setup`
+writes a `.gitignore` that commits `envs/`:
 
 ```bash
-make setup ENV=dev GITIGNORE=customer
+make setup ENV=dev
 git status          # pass looks like: no auth.auto.tfvars, *.tfstate or .genie_* files
 ```
 
@@ -76,9 +76,9 @@ checks. Never commit `auth.auto.tfvars`, state, locks, receipts or any dot-file
 under `envs/`.
 
 <a id="setting-up-git-tracking"></a>
-**How the `.gitignore` block works.** `make setup ... GITIGNORE=customer`
-writes a GenieRails block into `<cloud>/.gitignore` (and prints it as a diff).
-It re-includes `envs/` and ignores every runtime file: credentials, Terraform
+**How the `.gitignore` block works.** In your own repo `make setup` writes a
+GenieRails block into `<cloud>/.gitignore` (and prints it as a diff). It
+re-includes `envs/` and ignores every runtime file: credentials, Terraform
 state and plans, `.terraform/`, locks, receipts, Genie ID and adoption markers
 (`.genie_*`), every dot-file under `envs/` (such as `generated/.runtime/` and
 `data_access/.policy_generations/`), `classification.auto.tfvars`,
@@ -86,11 +86,15 @@ state and plans, `.terraform/`, locks, receipts, Genie ID and adoption markers
 and, for each deterministic env, its layer files (applying commands re-derive
 those).
 
-- **`GITIGNORE=customer`** writes the block, or refreshes it.
-- **No `GITIGNORE`** (the default): `make setup` refreshes the block if the
-  file already has it, and otherwise only prints how to opt in. The GenieRails
-  repo never has the block, so `make setup` never changes it there.
-- **`GITIGNORE=off`** leaves the file alone.
+`make setup` writes the block only in a customer repo, which it detects from the
+git remotes: a checkout whose remotes don't include
+`github.com/databricks-solutions/genierails` (https or ssh). In the GenieRails
+repo itself, a contributor clone (any remote is that URL), or a checkout with no
+remote it writes nothing and only prints how to opt in — the upstream repo must
+never commit `envs/`. So run it before you add a GenieRails remote for
+upgrades; after that an existing block is always refreshed. The overrides:
+`GITIGNORE=customer` forces the write anywhere, `GITIGNORE=off` leaves the file
+alone.
 
 Only the lines between the block's markers are rewritten. The block names each
 deterministic env, so re-run `make setup ENV=<env>` after adding an env or

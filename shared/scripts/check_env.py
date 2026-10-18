@@ -149,8 +149,8 @@ def _tracked_env_files(envs: Path) -> list[Path]:
     files = [Path(os.fsdecode(raw)) for raw in listed.split(b"\0") if raw]
     if not files and any(envs.iterdir()):
         raise CheckFailed(f"git tracks no file under {envs} (is envs/ git-ignored?); make check reads only "
-                          "committed env files. Commit envs/ (make setup ENV=<env> GITIGNORE=customer "
-                          "writes a .gitignore that keeps runtime files out).")
+                          "committed env files. Commit envs/ (in your own repo make setup ENV=<env> "
+                          "writes a .gitignore that keeps runtime files out, then git add .gitignore envs/).")
     return files
 
 
