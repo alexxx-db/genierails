@@ -2039,6 +2039,9 @@ test-abac-only: _bootstrap _guard-workspace-target ## Scenario: ABAC governance 
 test-multi-space-import: _bootstrap _guard-workspace-target ## Scenario: import two UI-configured Genie agents in one make generate call
 	cd "$(CLOUD_ROOT)" && $(_ITEST_RUNNER) \
 		--scenario multi-space-import \
+		--auth-file "$(_ITEST_AUTH)" \
+		$(_ITEST_WH_FLAG) $(_ITEST_KD_FLAG)
+
 test-schema-drift: _bootstrap _guard-workspace-target ## Scenario: column tag drift detection after ALTER TABLE ADD/DROP/RENAME COLUMN
 	cd "$(CLOUD_ROOT)" && $(_ITEST_RUNNER) \
 		--scenario schema-drift \
@@ -2196,7 +2199,7 @@ integration-test: _guard-not-ci-apply ## Run the full end-to-end integration tes
 	@# freshly provisioned throwaway integration environments.
 	@# Options:
 	@#   ENV=dev              workspace env for dev  (default: dev)
-	@#   DEST_ENV=prod        workspace env for prod (default: prod)
+	@#   ITEST_DEST_ENV=prod  workspace env for prod (default: prod)
 	@#   KEEP_DATA=1          skip teardown so you can inspect results after the run
 	@#   WAREHOUSE_ID=<id>    pin a specific SQL warehouse
 	$(eval ITEST_DEST_ENV        ?= prod)

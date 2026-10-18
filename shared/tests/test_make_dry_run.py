@@ -44,6 +44,36 @@ def _clean_env():
     }
 
 
+@pytest.mark.parametrize(
+    ("target", "scenario", "other_scenario"),
+    [
+        ("test-multi-space-import", "multi-space-import", "schema-drift"),
+        ("test-schema-drift", "schema-drift", "multi-space-import"),
+    ],
+)
+def test_integration_scenario_targets_dry_run_their_own_recipe(tmp_path, target, scenario, other_scenario):
+    result = subprocess.run(
+        [
+            "make",
+            "-n",
+            target,
+            f"ENV_DIR={tmp_path / 'dev'}",
+            f"ACCOUNT_ENV_DIR={tmp_path / 'account'}",
+        ],
+        cwd=CLOUD_ROOT,
+        text=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Nothing to be done" not in output
+    assert f"--scenario {scenario}" in output
+    assert f"--scenario {other_scenario}" not in output
+    assert f'--auth-file "{tmp_path / "dev" / "auth.auto.tfvars"}"' in output
+
+
 def test_apply_layer_dry_run_prints_but_does_not_execute_side_effects(tmp_path):
     env_dir = tmp_path / "env"
     env_dir.mkdir()
