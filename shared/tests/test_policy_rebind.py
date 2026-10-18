@@ -148,7 +148,7 @@ def test_rebind_reprotects_first_grants_after_and_abandon_then_only_deletes(harn
     assert live_tags(state) == old["tags"]
     t = harness.journal()["transition"]
     assert t["rebound"]["generation"] == fixed["fingerprint"]
-    assert "rebind_incomplete" not in t and "rebind_table_grants" not in t
+    assert "rebind_incomplete" not in t and "rebind_held" not in t
     assert pg.load_stage_record(harness.env_dir)["stage"] == "rebind"
     # Strict abandon now plans only the change's policy deletes and the restarted wait.
     harness.calls.clear()
@@ -398,7 +398,8 @@ def test_the_module_redeploy_runs_no_drop():
       "name": "wait_for_policy_enforcement", "change": {"actions": ["delete"]}}, "wait_for_policy_enforcement"),
 ], ids=["drop-replaced", "drop-deleted", "tag", "function-binding", "condition", "grant-in-protect", "wait-deleted"])
 def test_protect_checker_refuses(change, problem):
-    problems = pg.rebind_violations({"resource_changes": [change]}, "rebind-protect", drops=lambda: False)
+    problems = pg.rebind_violations({"resource_changes": [change]}, "rebind-protect", drops=lambda: False,
+                                    coverage={"recorded": [], "mapping": {}, "principals": set()})
     assert problems and problem in problems[0]
 
 
@@ -411,7 +412,7 @@ def test_protect_checker_refuses(change, problem):
 ], ids=["unrecorded-select", "grant-delete", "grant-update", "policy", "functions"])
 def test_access_checker_refuses(change):
     change = {"address": f"module.data_access.{change['type']}.{change['name']}"} | change
-    assert pg.rebind_violations({"resource_changes": [change]}, "rebind-access", {"c.s.t|raw"})
+    assert pg.rebind_violations({"resource_changes": [change]}, "rebind-access", {"table_access|c.s.t|raw"})
 
 
 def test_access_checker_allows_only_the_lost_grants():
@@ -422,7 +423,7 @@ def test_access_checker_allows_only_the_lost_grants():
          "change": {"actions": ["create"]}},
         {"address": "c", "type": "databricks_policy_info", "name": "policies", "change": {"actions": ["no-op"]}},
     ]}
-    assert pg.rebind_violations(plan, "rebind-access", {"c.s.t|raw"}) == []
+    assert pg.rebind_violations(plan, "rebind-access", {"table_access|c.s.t|raw", "schema_access|c.s|raw"}) == []
 
 
 # -- failures after the first apply ---------------------------------------------------------
@@ -454,8 +455,13 @@ def test_a_failed_live_check_after_protect_applies_no_grant(harness, capsys):
     assert t["rebind_incomplete"]["phase"] == "rebind-protect"
     assert t["rebind_incomplete"]["next"].endswith("re-run make policy-rebind ENV=dev.")
     assert "policy-rebind stopped at rebind-protect" in harness.controller().describe_transition(t)
-    # The table SELECT the protect phase held back is kept for the next run (the state no longer has it).
-    assert t["rebind_table_grants"] == ["cat.sch.t|masked", "cat.sch.t|raw", "cat.sch.t|regional"]
+    # The grants the protect phase held back are kept for the next run (the state no longer has the lost
+    # table SELECT), bound to a copy of the protect plan that held them back.
+    (record,) = t["rebind_held"]
+    assert {g for g in record["grants"] if g.startswith("table_access|")} == {
+        "table_access|cat.sch.t|masked", "table_access|cat.sch.t|raw", "table_access|cat.sch.t|regional"}
+    assert record["digest"] == spa._held_digest(t, record)
+    assert (pg.ledger_dir(harness.env_dir) / "rebind" / record["plan"]).is_file()
     with pytest.raises(spa.Refused, match="make policy-rebind of run .* didn't finish"):
         harness.controller().abandon()
     # The printed next step: re-run the rebind. It re-plans from what is live and restores every grant.
@@ -537,3 +543,129 @@ def test_policy_rebind_is_a_make_target_with_the_ci_guard():
 
 def test_fake_runner_models_the_rebind_variables():
     assert "held_access_grants" in FAKE_RUNNER and "rebind_table_grants" in FAKE_RUNNER
+
+
+
+# -- review fixes ---------------------------------------------------------------------------
+def _edit_config(h, old, new):
+    """Edit the generated config and its split (the same policy text in both)."""
+    for path in (h.env_dir / "generated" / "abac.auto.tfvars", h.env_dir / "data_access" / "abac.auto.tfvars"):
+        text = path.read_text()
+        assert text.count(old) == 1, (path, old)
+        path.write_text(text.replace(old, new))
+
+
+@pytest.mark.parametrize("old, new, message", [
+    # Codex's case: a principal added to EXCEPT on the account-users mask (it would see raw).
+    ('except_principals = ["raw", "regional", "new-sp"]', 'except_principals = ["masked", "raw", "regional", "new-sp"]',
+     "changes its except_principals beyond replacing one recreated principal"),
+    # A TO principal dropped (swapped for another tier still named elsewhere).
+    ('to_principals    = ["regional"]', 'to_principals    = ["masked"]', "replaces regional with masked"),
+], ids=["added-except", "removed-to"])
+def test_rebind_refuses_a_config_that_loosens_a_mask(harness, capsys, old, new, message):
+    deleted_principals(harness)
+    _edit_config(harness, old, new)
+    before, state = harness.journal(), live_state(harness.env_dir)
+    capsys.readouterr()
+    with pytest.raises(spa.Refused, match="rebind-protect plan was refused"):
+        harness.controller().rebind()
+    assert message in capsys.readouterr().err
+    _unchanged(harness, before, state)
+
+
+def test_the_deployer_replacement_is_the_only_principal_change(harness):
+    _, failed, fixed = deleted_principals(harness)
+    problems, mapping = pg.principal_replacements(fixed, failed, {"raw", "regional", "masked", "new-sp"})
+    assert (problems, mapping) == ([], {"old-sp": "new-sp"})
+    # A replacement the env doesn't approve (not a tier group, exempt principal or its deployer) refuses.
+    problems, _ = pg.principal_replacements(fixed, failed, {"raw", "regional", "masked"})
+    assert problems and "isn't a recreated" in problems[0]
+
+
+def _aws_like_plan(after_except):
+    """One updated account-users mask, live after the deletion (deleted principals read back as unknown)."""
+    cond = [{"condition": "hasTagValue('gr_treatment', 'v')"}]
+    return {"resource_changes": [{
+        "address": 'module.data_access.databricks_policy_info.policies["full"]', "type": "databricks_policy_info",
+        "name": "policies", "index": "full", "change": {
+            "actions": ["update"],
+            "before": {"to_principals": ["account users"], "except_principals": ["unknown", "unknown"],
+                       "match_columns": cond},
+            "after": {"to_principals": ["account users"], "except_principals": after_except, "match_columns": cond}}}]}
+
+
+RECORDED = [{"name": "full", "to_principals": ["account users"], "except_principals": ["raw", "old-sp"],
+             "match_condition": "hasTagValue('gr_treatment', 'v')"}]
+COVERAGE = {"recorded": RECORDED, "mapping": {"old-sp": "new-sp"}, "principals": {"raw", "masked", "new-sp"}}
+
+
+def test_the_coverage_check_allows_the_recreated_principals_back():
+    assert pg.coverage_loss_problems(_aws_like_plan(["raw", "new-sp"]), **COVERAGE) == []
+
+
+def test_the_coverage_check_refuses_an_added_except():
+    problems = pg.coverage_loss_problems(_aws_like_plan(["raw", "new-sp", "masked"]), **COVERAGE)
+    assert any("adds" in p and "masked" in p for p in problems)
+    assert any("would unmask v for masked" in p for p in problems)
+
+
+def test_the_coverage_check_refuses_a_removed_to():
+    plan = _aws_like_plan(["raw", "new-sp"])
+    change = plan["resource_changes"][0]["change"]
+    change["before"]["to_principals"] = ["account users", "masked"]
+    change["after"]["to_principals"] = ["masked"]
+    recorded = [RECORDED[0] | {"to_principals": ["account users", "masked"]}]
+    problems = pg.coverage_loss_problems(plan, recorded, COVERAGE["mapping"], COVERAGE["principals"])
+    assert any("drops ['account users'] from TO" in p for p in problems)
+
+
+def test_an_access_plan_creating_an_unheld_grant_is_refused(harness, capsys):
+    deleted_principals(harness)
+
+    def new_reader(env):  # the config now names a reader the protect phase never held back
+        access = json.loads(access_file(harness).read_text())
+        access["grants"].append("schema_access|cat.sch|intruder")
+        access_file(harness).write_text(json.dumps(access))
+
+    _after_call(harness, "rebind-protect:saved", new_reader)
+    capsys.readouterr()
+    assert harness.controller().rebind() == 1
+    assert 'schema_access["cat.sch|intruder"]: create' in capsys.readouterr().err
+    assert "schema_access|cat.sch|intruder" not in grant_keys(live_state(harness.env_dir))
+    assert harness.journal()["transition"]["rebind_incomplete"]["phase"] == "rebind-access"
+
+
+@pytest.mark.parametrize("redigest", [False, True], ids=["edited", "edited-with-digest"])
+def test_a_forged_table_key_in_the_journal_is_refused(harness, redigest):
+    deleted_principals(harness)
+    harness.agent_coverage_rc = 1  # stop after the protect phase, with the held grants journaled
+    assert harness.controller().rebind() == 1
+    access = json.loads(access_file(harness).read_text())
+    access["grants"].append("table_access|cat.sch.t|intruder")
+    access_file(harness).write_text(json.dumps(access))
+    journal = harness.journal()
+    t = journal["transition"]
+    t.setdefault("rebind_table_grants", []).append("cat.sch.t|intruder")  # the key 8c090b5 trusted
+    for record in t.get("rebind_held") or []:
+        record["grants"].append("table_access|cat.sch.t|intruder")
+        if redigest:
+            record["digest"] = spa._held_digest(t, record)
+    spa.save_journal(harness.env_dir, journal)
+    harness.agent_coverage_rc = 0
+    harness.calls.clear()
+    with pytest.raises(spa.Refused, match="can't be trusted"):
+        harness.controller().rebind()
+    assert harness.calls == []
+    assert "table_access|cat.sch.t|intruder" not in grant_keys(live_state(harness.env_dir))
+
+
+def test_rebind_refuses_ci_even_with_the_opt_out(harness, monkeypatch):
+    deleted_principals(harness)
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("GENIERAILS_ALLOW_CI_APPLY", "1")
+    with pytest.raises(spa.Refused, match="even with GENIERAILS_ALLOW_CI_APPLY=1"):
+        harness.controller().rebind()
+    assert harness.calls == []
+    with pytest.raises(pg.StageError, match="can't run in CI"):
+        pg.run_hook("rebind-protect", {"GENIERAILS_ENV_DIR": str(harness.env_dir), "CI": "true",
+                                       "GENIERAILS_ALLOW_CI_APPLY": "1"})

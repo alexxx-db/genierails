@@ -539,9 +539,13 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
 
 def _runner(env_name: str, layer_dir: Path, *args: str, capture: bool = False) -> str:
     """terraform_layer.sh on the layer, reading the stage's render (never the split config)."""
+    from scripts.environment_lock import STAGE_TOKEN_ENV, stage_token
+
     result = subprocess.run(
         [str(RUNNER), "data_access", env_name, *args],
-        env=os.environ | {"LAYER_ENV_DIR": str(layer_dir), STAGE_CONFIG_ENV: str(stage_config_dir(layer_dir.parent))},
+        env=os.environ | {"LAYER_ENV_DIR": str(layer_dir), STAGE_CONFIG_ENV: str(stage_config_dir(layer_dir.parent)),
+                          # policy_stage and the rebind variables pass terraform_layer.sh only with this.
+                          STAGE_TOKEN_ENV: stage_token(layer_dir.parent)},
         text=True, stdout=subprocess.PIPE if capture else None, check=False,
     )
     if result.returncode:
@@ -601,6 +605,13 @@ def _plan_json(env_name: str, layer_dir: Path, stage: str, plan_file: Path, *ext
     _runner(env_name, layer_dir, "plan", "-input=false", f"-var=policy_stage={stage}", *extra, f"-out={plan_file}")
     shown = _runner(env_name, layer_dir, "show", "-json", str(plan_file), capture=True)
     return json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
+
+
+def saved_plan_variables(env_dir: Path, env_name: str, plan_file: Path) -> dict:
+    """The variables a saved data_access plan was made with (terraform show -json)."""
+    shown = _runner(env_name, Path(env_dir) / "data_access", "show", "-json", str(plan_file), capture=True)
+    plan = json.loads(next(line for line in reversed(shown.splitlines()) if line.startswith("{")))
+    return {name: (value or {}).get("value") for name, value in (plan.get("variables") or {}).items()}
 
 
 def load_sidecar(plan_file: Path | str) -> dict:
@@ -753,16 +764,57 @@ def _binding(policy: dict) -> dict:
     return {k: v for k, v in policy.items() if k not in REBIND_POLICY_FIELDS}
 
 
-def rebind_problems(desired: dict, changed: dict, retained: list[dict]) -> list[str]:
-    """Why the generated config isn't the unfinished change with only its principals moved.
+UNKNOWN = "unknown"  # how Unity Catalog shows a deleted principal in a policy
+
+
+def principal_replacements(desired: dict, changed: dict, approved: set[str]) -> tuple[list[str], dict[str, str]]:
+    """The recreated principals the generated config puts in place of the change's (old -> new), and why not.
+
+    For each policy and each of ``TO``/``EXCEPT``, the generated config may
+    swap exactly one principal of the change's generation for one
+    ``approved`` principal (the env's tier groups, raw_exempt_principals and
+    committed deployer) that the change never named, consistently across
+    every policy, and the replaced principal may appear nowhere in the
+    config. Nothing may be added or removed otherwise: adding an ``EXCEPT``
+    or dropping a ``TO`` would loosen a mask.
+    """
+    problems, mapping = [], {}
+    want = {p["name"]: p for p in desired["fgac_policies"]}
+    have = {p["name"]: p for p in changed["fgac_policies"]}
+    named = {x for p in changed["fgac_policies"] for f in REBIND_POLICY_FIELDS for x in p.get(f) or []}
+    still = {x for p in desired["fgac_policies"] for f in REBIND_POLICY_FIELDS for x in p.get(f) or []}
+    for name in sorted(want.keys() & have.keys()):
+        for field in REBIND_POLICY_FIELDS:
+            removed = sorted(set(have[name].get(field) or []) - set(want[name].get(field) or []))
+            added = sorted(set(want[name].get(field) or []) - set(have[name].get(field) or []))
+            if not removed and not added:
+                continue
+            if len(removed) != 1 or len(added) != 1:
+                problems.append(f"policy {name} changes its {field} beyond replacing one recreated principal "
+                                f"(removes {removed}, adds {added})")
+                continue
+            old, new = removed[0], added[0]
+            if new not in approved or new in named or old in still or mapping.get(old, new) != new:
+                problems.append(f"policy {name} replaces {old} with {new} in its {field}, which isn't a recreated "
+                                "tier group, exempt principal or deployer of this env")
+                continue
+            mapping[old] = new
+    if len(set(mapping.values())) != len(mapping):
+        problems.append(f"two principals are replaced by the same one ({mapping})")
+    return problems, mapping
+
+
+def rebind_problems(desired: dict, changed: dict, retained: list[dict], approved: set[str] = frozenset()) -> list[str]:
+    """Why the generated config isn't the unfinished change with only recreated principals replaced.
 
     ``changed`` is the unfinished change's generation (its snapshot). Its
     policies, conditions, functions and treatment values must be exactly the
-    generated config's. A principal the generated config replaced (a
-    recreated deployer under a new ID) may not be named by a retained
-    generation's policy: the rebind keeps those policies as their generation
-    recorded them, so it can re-point them only at principals recreated under
-    the same name.
+    generated config's, and its principals may differ only by replacing
+    deleted principals with recreated ones (principal_replacements). A
+    principal the generated config replaced (a recreated deployer under a new
+    ID) may not be named by a retained generation's policy: the rebind keeps
+    those policies as their generation recorded them, so it can re-point them
+    only at principals recreated under the same name.
     """
     problems = []
     want = {p["name"]: p for p in desired["fgac_policies"]}
@@ -780,7 +832,9 @@ def rebind_problems(desired: dict, changed: dict, retained: list[dict]) -> list[
         problems.append(f"{len(retagged)} column(s) change their treatment ({', '.join(retagged[:5])})")
     if desired["functions_sql"] != changed["functions_sql"]:
         problems.append("the masking functions change")
-    replaced = set()
+    principal_problems, mapping = principal_replacements(desired, changed, set(approved))
+    problems += principal_problems
+    replaced = set(mapping)
     for name in want.keys() & have.keys():
         for field in REBIND_POLICY_FIELDS:
             replaced |= set(have[name].get(field) or []) - set(want[name].get(field) or [])
@@ -808,6 +862,80 @@ def restore_record_problems(record: dict | None, rendered: dict, changed_fp: str
         problems.append("treatment values differ from the restore render")
     if record["rendered"]["functions_sql"] != rendered["functions_sql"]:
         problems.append("masking functions differ from the restore render")
+    return problems
+
+
+def mapped_principal_problems(recorded: list[dict], rendered: list[dict], mapping: dict[str, str]) -> list[str]:
+    """Rendered policies whose principals aren't the verified restore's with the replacements applied."""
+    before = {p["name"]: p for p in recorded}
+    problems = []
+    for policy in rendered:
+        old = before.get(policy["name"])
+        for field in REBIND_POLICY_FIELDS if old else ():
+            want = sorted(mapping.get(x, x) for x in old.get(field) or [])
+            if sorted(policy.get(field) or []) != want:
+                problems.append(f"policy {policy['name']}'s {field} is {sorted(policy.get(field) or [])}, not the "
+                                f"verified restore's with the recreated principals ({want})")
+    return problems
+
+
+def _plan_policy(values: dict | None) -> dict:
+    values = values or {}
+    conditions = [m.get("condition") for m in values.get("match_columns") or [] if isinstance(m, dict)]
+    return {"to_principals": list(values.get("to_principals") or []),
+            "except_principals": list(values.get("except_principals") or []),
+            "match_condition": next((c for c in conditions if c), "")}
+
+
+def coverage_loss_problems(plan: dict, recorded: list[dict], mapping: dict[str, str], principals: set[str]) -> list[str]:
+    """How a protect plan would loosen a live mask.
+
+    For every updated policy: a ``TO`` entry may leave only as a deleted
+    principal (``unknown``) being replaced, and an ``EXCEPT`` entry may be
+    added only for a deleted one and only if the verified restore excepted
+    it (with the recreated principals). Then, per treatment value, everyone
+    (the env's tier groups, exempt principals and deployer, and every
+    principal named before or after) masked live before the apply must stay
+    masked after it, unless the verified restore left them unmasked: the
+    rebind may only put back what was verified before the deletion.
+    """
+    problems = []
+    recorded_by_name = {p["name"]: p for p in recorded}
+    before_all, after_all = [], []
+    for change in plan.get("resource_changes") or []:
+        if change.get("type") != "databricks_policy_info":
+            continue
+        body = change.get("change") or {}
+        actions = body.get("actions") or []
+        before, after = _plan_policy(body.get("before")), _plan_policy(body.get("after") or body.get("before"))
+        after["match_condition"] = after["match_condition"] or before["match_condition"]
+        if body.get("before"):
+            before_all.append(before | {"name": str(change.get("index") or "")})
+        if body.get("after") or "delete" not in actions:
+            after_all.append(after | {"name": str(change.get("index") or "")})
+        if actions != ["update"]:
+            continue
+        label = f"{change.get('address')}"
+        gone_to = [x for x in before["to_principals"] if x not in after["to_principals"] and x != UNKNOWN]
+        if gone_to:
+            problems.append(f"{label} drops {gone_to} from TO (only a deleted principal may be replaced)")
+        rec = recorded_by_name.get(str(change.get("index") or "")) or {}
+        allowed = {mapping.get(x, x) for x in rec.get("except_principals") or []}
+        added = [x for x in after["except_principals"] if x not in before["except_principals"]]
+        if [x for x in added if x not in allowed] or len(added) > before["except_principals"].count(UNKNOWN):
+            problems.append(f"{label} adds {added} to EXCEPT beyond the deleted principals it replaces "
+                            f"(the verified restore excepted {sorted(allowed)})")
+    mapped = [p | {f: [mapping.get(x, x) for x in p.get(f) or []] for f in REBIND_POLICY_FIELDS} for p in recorded]
+    universe = set(principals) | {x for p in before_all + after_all + mapped for f in REBIND_POLICY_FIELDS
+                                  for x in p.get(f) or []}
+    universe = (universe - {UNKNOWN, ALL_USERS}) | {OUTSIDER}
+    for value in sorted({policy_value(p) for p in before_all + after_all} - {""}):
+        was = masks_by_principal(before_all, value, universe)
+        now = masks_by_principal(after_all, value, universe)
+        verified = masks_by_principal(mapped, value, universe)
+        for who in sorted(universe):
+            if was[who] and not now[who] and verified[who]:
+                problems.append(f"the protect plan would unmask {value} for {who}, which the verified restore masked")
     return problems
 
 
@@ -860,7 +988,8 @@ def held_grants(plan: dict) -> tuple[list[str], list[str]]:
     return sorted(held), problems
 
 
-def rebind_violations(plan: dict, stage: str, table_grants=frozenset(), *, drops=None) -> list[str]:
+def rebind_violations(plan: dict, stage: str, allowed_grants=frozenset(), *, drops=None,
+                      coverage: dict | None = None) -> list[str]:
     """Changes a rebind phase's plan may not make.
 
     ``rebind-protect`` may only update a mask policy's ``TO``/``EXCEPT``
@@ -870,11 +999,14 @@ def rebind_violations(plan: dict, stage: str, table_grants=frozenset(), *, drops
     is only updated in place, and ``masking_functions`` has no destroy-time
     provisioner (``redeploy_drops_functions``), so it re-runs CREATE OR
     REPLACE of the same definitions and no function a live policy uses is
-    dropped. ``rebind-access`` may only create the access grants, table
-    SELECT only for ``table_grants`` (the grants applied before their
-    principals were deleted). Anything else refuses: a treatment tag change, a
-    policy create or delete, a policy's condition or function, another
-    resource.
+    dropped. Its principal updates may not loosen a live mask
+    (coverage_loss_problems, with ``coverage``: the verified restore's
+    policies, the principal replacements and the env's principals).
+    ``rebind-access`` may only create the grants in ``allowed_grants``
+    (``<resource>|<key>``: exactly what the protect phase held back, as the
+    controller validated it against the saved protect plans). Anything else
+    refuses: a treatment tag change, a policy create or delete, a policy's
+    condition or function, another resource.
     """
     problems = []
     for change in plan.get("resource_changes") or []:
@@ -886,7 +1018,7 @@ def rebind_violations(plan: dict, stage: str, table_grants=frozenset(), *, drops
         label = f"{address}: {'/'.join(actions)}"
         if stage == "rebind-access":
             if rtype == "databricks_grant" and change.get("name") in ACCESS_GRANTS and actions == ["create"] \
-                    and (change.get("name") != "table_access" or str(change.get("index") or "") in table_grants):
+                    and f"{change.get('name')}|{change.get('index') or ''}" in allowed_grants:
                 continue
             problems.append(f"{label} (the access phase only creates the grants the deleted principals lost)")
             continue
@@ -911,6 +1043,11 @@ def rebind_violations(plan: dict, stage: str, table_grants=frozenset(), *, drops
             continue
         problems.append(f"{label} (the protect phase only re-points policies, redeploys the functions and "
                         "restarts the enforcement wait)")
+    if stage == "rebind-protect":
+        if coverage is None:
+            problems.append("the protect plan can't be checked for loosened masks (no verified restore given)")
+        else:
+            problems += coverage_loss_problems(plan, coverage["recorded"], coverage["mapping"], coverage["principals"])
     return problems
 
 
@@ -923,6 +1060,10 @@ def planned_summary(plan: dict) -> list[str]:
 
 def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     """Plan (PLAN_OUT) or apply exactly (SAVED_PLAN) one phase of make policy-rebind."""
+    from scripts.staged_policy_apply import _in_ci
+
+    if _in_ci(environ, opt_out=False):
+        raise StageError(f"{stage} can't run in CI (GENIERAILS_ALLOW_CI_APPLY doesn't apply to policy-rebind)")
     env_name = environ.get("GENIERAILS_ENV_NAME") or env_dir.name
     layer_dir = env_dir / "data_access"
     changed_fp = environ.get("GENIERAILS_POLICY_FINGERPRINT", "")
@@ -940,12 +1081,20 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     # The restore render, with the generated config's principals for the change's own policies.
     staged = plan_stage("restore", desired, old, retire, keep_new_tags=keep_new_tags)
     rendered = staged["rendered"]
-    problems = rebind_problems(desired, changed, [g for g in (old, retire) if g]) + staged["problems"]
+    settings = desired.get("settings") or {}
+    deployer = str(_load(env_dir / "env.auto.tfvars").get("deployer_principal_id") or "")
+    approved = set(settings.get("access_tier_groups") or []) | set(settings.get("raw_exempt_principals") or []) \
+        | ({deployer} if deployer else set())
+    problems = rebind_problems(desired, changed, [g for g in (old, retire) if g], approved) + staged["problems"]
+    mapping = principal_replacements(desired, changed, approved)[1]
+    record = load_stage_record(env_dir)
     off = sorted(c for c in rendered["tags"].keys() | ((old or {}).get("tags") or {}).keys()
                  if rendered["tags"].get(c) != ((old or {}).get("tags") or {}).get(c))
     if off:
         problems.append(f"{len(off)} column(s) would not be on the previous generation ({', '.join(off[:5])})")
-    problems += restore_record_problems(load_stage_record(env_dir), rendered, changed_fp, old_fp)
+    problems += restore_record_problems(record, rendered, changed_fp, old_fp)
+    if not problems:
+        problems += mapped_principal_problems(record["rendered"]["fgac_policies"], rendered["fgac_policies"], mapping)
     if problems:
         print(f"ERROR: {stage}: the generated config isn't the unfinished change with only its principals moved; "
               "nothing was applied:", file=sys.stderr)
@@ -972,6 +1121,7 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
                              keep_new_tags)
     plan_file = Path(plan_out)
     table_grants = sorted(json.loads(environ.get("GENIERAILS_REBIND_TABLE_GRANTS") or "[]"))
+    allowed = set(json.loads(environ.get("GENIERAILS_REBIND_ALLOWED_GRANTS") or "[]"))
     kept = f"-var=rebind_table_grants={json.dumps(table_grants)}"
     held: list[str] = []
     problems = []
@@ -983,7 +1133,8 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     if not problems:
         plan = _plan_json(env_name, layer_dir, "rebind", plan_file, kept,
                           f"-var=held_access_grants={json.dumps(held)}")
-        problems = rebind_violations(plan, stage, set(table_grants))
+        problems = rebind_violations(plan, stage, allowed, coverage={
+            "recorded": record["rendered"]["fgac_policies"], "mapping": mapping, "principals": approved})
     if problems:
         print(f"ERROR: the {stage} plan makes changes a rebind may not; nothing was applied:", file=sys.stderr)
         for problem in problems:

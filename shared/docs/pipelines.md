@@ -245,7 +245,7 @@ Applying targets (`apply`, `apply-governance`, `apply-genie`, `apply-account`,
 `ungovern`, `detach-agent`, `destroy*`, `import`, `migrate-state`,
 `migrate-state-dir`, `policy-abandon`, `policy-rebind`) refuse when they
 detect CI: `CI=true|1|yes`, or `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`,
-`BUILDKITE` or `CIRCLECI` set. The sole exception is exactly
+`BUILDKITE` or `CIRCLECI` set (`policy-rebind` even with `GENIERAILS_ALLOW_CI_APPLY=1`). The sole exception is exactly
 `make rehearse ENV=dev`, on `<cloud>/envs/dev` itself (not a promote-to
 destination), and only when `envs/dev/remote_state.hcl` configures a locked
 backend (S3 plus DynamoDB or `use_lockfile` on AWS; Azure Storage blob leases on

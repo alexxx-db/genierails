@@ -341,7 +341,10 @@ class Controller:
 
     # -- running hooks ---------------------------------------------------------
     def _hook_env(self, t: dict) -> dict:
-        return self.environ | {
+        # The env lock's nonce (env_lock exports it once taken): the hooks' Terraform calls derive
+        # the token terraform_layer.sh needs for policy_stage from it (environment_lock.stage_token).
+        var = environment_lock.nonce_var(self.env_dir)
+        return self.environ | ({var: os.environ[var]} if os.environ.get(var) else {}) | {
             "GENIERAILS_ENV_DIR": str(self.env_dir), "GENIERAILS_ENV_NAME": self.env_name,
             "GENIERAILS_POLICY_FINGERPRINT": t["to"], "GENIERAILS_OLD_POLICY_FINGERPRINT": t["from"],
             "GENIERAILS_RETIRE_FINGERPRINT": t["retain"],
@@ -858,9 +861,10 @@ class Controller:
             return 0
         from scripts.release_gate import PROMOTED, env_role
 
-        if _in_ci(self.environ):
-            raise Refused("policy-rebind applies to the data_access layer; it can't run in CI. "
-                          "Run it on the deployment machine.")
+        # No GENIERAILS_ALLOW_CI_APPLY opt-out: an integration workflow has no rolled-back live change to repair.
+        if _in_ci(self.environ, opt_out=False):
+            raise Refused("policy-rebind applies to the data_access layer; it can't run in CI, even with "
+                          "GENIERAILS_ALLOW_CI_APPLY=1. Run it on the deployment machine.")
         if env_role(self.env_dir) == PROMOTED:
             raise Refused(f"ENV={self.env_name} is promoted: its applies come only from a make release-plan "
                           "manifest, and policy-rebind doesn't make one yet. It runs on the rehearse env "
@@ -884,11 +888,13 @@ class Controller:
             if desired["fingerprint"] == t["to"]:
                 raise Refused(f"the generated config is the unfinished change's own generation {t['to']}; "
                               "there is nothing to re-point. Re-run the command that started it to resume it.")
+            plan_dir = pg.ledger_dir(self.env_dir) / "rebind"
+            # Grants earlier protect phases of this rebind held back, each proven by its saved plan.
+            held = self._validated_held(t, plan_dir)
             env = self._hook_env(t) | {"GENIERAILS_REBIND_FINGERPRINT": desired["fingerprint"],
-                                       "GENIERAILS_REBIND_TABLE_GRANTS": json.dumps(t.get("rebind_table_grants") or [])}
+                                       "GENIERAILS_REBIND_TABLE_GRANTS": json.dumps(_table_keys(held))}
             print(f"=== Policy rebind ({self.env_name}): run {t['run_id']} (generation {t['to']}) with the "
                   f"principals of {desired['fingerprint']} ===", flush=True)
-            plan_dir = pg.ledger_dir(self.env_dir) / "rebind"
             plan_dir.mkdir(parents=True, exist_ok=True)
 
             # 1. Protection: policies' principals and functions; no grant.
@@ -897,12 +903,14 @@ class Controller:
                 raise Refused("the rebind-protect plan was refused or couldn't be made (see above); "
                               "nothing was applied")
             rerun = f"re-run make policy-rebind ENV={self.env_name}"
-            # Table SELECT the protect phase holds back: once it is applied, Terraform's state no longer
-            # records it, so the journal keeps it for the access phase (and a re-run).
-            held = pg.load_sidecar(plan_file).get("held") or []
-            t["rebind_table_grants"] = sorted(set(t.get("rebind_table_grants") or [])
-                                              | {h.split("|", 1)[1] for h in held if h.startswith("table_access|")})
-            env["GENIERAILS_REBIND_TABLE_GRANTS"] = json.dumps(t["rebind_table_grants"])
+            # The grants this protect plan holds back, bound to the plan: once it is applied, Terraform's
+            # state no longer records the lost ones, so the access phase may create exactly these (and a
+            # re-run, after validating the saved plan, carries the lost table SELECT on).
+            record = self._held_record(t, plan_dir, plan_file, planned)
+            t["rebind_held"] = [r for r in t.get("rebind_held") or [] if r["sha256"] != planned] + [record]
+            held = sorted(set(held) | set(record["grants"]))
+            env["GENIERAILS_REBIND_TABLE_GRANTS"] = json.dumps(_table_keys(held))
+            env["GENIERAILS_REBIND_ALLOWED_GRANTS"] = json.dumps(held)
             t["rebind_incomplete"] = {"phase": "rebind-protect", "generation": desired["fingerprint"],
                                       "at": _now(), "reason": "it was interrupted",
                                       "next": f"Re-run make policy-rebind ENV={self.env_name}."}
@@ -941,12 +949,45 @@ class Controller:
                 return self._rebind_failed(journal, t, "rebind-access", "the live check or verify-access after "
                                            "the access phase failed", f"Fix what the check lists, then {rerun}.")
             t.pop("rebind_incomplete", None)
-            t.pop("rebind_table_grants", None)
+            t.pop("rebind_held", None)
             t["rebound"] = {"at": _now(), "generation": desired["fingerprint"]}
             self._save(journal)
             print(f"Policy rebind: run {t['run_id']} is on the previous protection ({t['from'] or 'none'}) with "
                   f"the current principals, verified live. Next: make policy-abandon ENV={self.env_name}.")
             return 0
+
+    def _held_record(self, t: dict, plan_dir: Path, plan_file: Path, planned: str) -> dict:
+        """The protect plan's held grants, kept with a copy of the plan and a digest binding them to it."""
+        import shutil
+
+        kept = plan_dir / f"{t['run_id']}-held-{planned[:16]}.tfplan"
+        if not kept.exists():
+            shutil.copyfile(plan_file, kept)
+        grants = sorted(pg.saved_plan_variables(self.env_dir, self.env_name, kept).get("held_access_grants") or [])
+        if grants != sorted(pg.load_sidecar(plan_file).get("held") or []) or _sha256(kept) != planned:
+            raise Refused(f"the saved rebind-protect plan {plan_file} doesn't hold back what its record says; "
+                          "nothing was applied")
+        record = {"plan": kept.name, "sha256": planned, "grants": grants}
+        return record | {"digest": _held_digest(t, record)}
+
+    def _validated_held(self, t: dict, plan_dir: Path) -> list[str]:
+        """The grants the journal says earlier protect plans held back, each checked against that plan."""
+        held = set()
+        for record in t.get("rebind_held") or []:
+            kept = plan_dir / str(record.get("plan") or "")
+            problem = ""
+            if not record.get("plan") or not kept.is_file() or _sha256(kept) != record.get("sha256"):
+                problem = "its saved protect plan is missing or changed"
+            elif record.get("digest") != _held_digest(t, record):
+                problem = "its digest doesn't match"
+            elif sorted(pg.saved_plan_variables(self.env_dir, self.env_name, kept).get("held_access_grants")
+                        or []) != sorted(record.get("grants") or []):
+                problem = "the saved protect plan held back other grants"
+            if problem:
+                raise Refused(f"the journal's record of the grants rebind held back ({record.get('plan')}) can't "
+                              f"be trusted: {problem}. Nothing was applied; restore the journal from a backup.")
+            held |= set(record["grants"])
+        return sorted(held)
 
     def _rebind_plan(self, t: dict, env: dict, stage: str, plan_dir: Path) -> tuple[Path | None, str]:
         """A saved plan of one rebind phase and its sha256 (None when the hook refused it)."""
@@ -1081,11 +1122,24 @@ class Controller:
                 "A new policy change can't start until this one is finished: " + "; ".join(options) + ".")
 
 
-def _in_ci(environ: dict) -> bool:
-    """CI, as make's _guard-not-ci-apply sees it (GENIERAILS_ALLOW_CI_APPLY=1 opts out)."""
-    if environ.get("GENIERAILS_ALLOW_CI_APPLY") == "1":
+def _in_ci(environ: dict, *, opt_out: bool = True) -> bool:
+    """CI, as make's _guard-not-ci-apply sees it (GENIERAILS_ALLOW_CI_APPLY=1 opts out when ``opt_out``)."""
+    if opt_out and environ.get("GENIERAILS_ALLOW_CI_APPLY") == "1":
         return False
     return str(environ.get("CI") or "").lower() in ("true", "1", "yes") or any(environ.get(m) for m in CI_MARKERS)
+
+
+def _table_keys(grants) -> list[str]:
+    return sorted(g.split("|", 1)[1] for g in grants if g.startswith("table_access|"))
+
+
+def _held_digest(t: dict, record: dict) -> str:
+    """Binds a held-grant record to its run, its change and its saved protect plan."""
+    import hashlib
+
+    bound = {"run_id": t["run_id"], "from": t["from"], "to": t["to"], "plan": record.get("plan"),
+             "sha256": record.get("sha256"), "grants": sorted(record.get("grants") or [])}
+    return hashlib.sha256(json.dumps(bound, sort_keys=True).encode()).hexdigest()
 
 
 def _unabandonable(reason: str) -> str:

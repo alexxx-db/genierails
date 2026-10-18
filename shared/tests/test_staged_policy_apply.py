@@ -170,7 +170,16 @@ if command == "plan":
             changes.append({"address": address, "type": kind[0], "name": kind[1], "index": key or None,
                             "change": {"actions": actions, "before": have.get(key), "after": wanted.get(key)},
                             "after": wanted.get(key)})
-    json.dump({"stage": stage, "resource_changes": changes, "functions": functions}, open(flag("-out"), "w"))
+    variables = {}
+    for arg in args:  # like terraform show -json: the variables the plan was made with
+        if arg.startswith("-var="):
+            name, value = arg[5:].split("=", 1)
+            try:
+                variables[name] = {"value": json.loads(value)}
+            except ValueError:
+                variables[name] = {"value": value}
+    json.dump({"stage": stage, "resource_changes": changes, "functions": functions, "variables": variables},
+              open(flag("-out"), "w"))
 elif command == "show":
     print("+ terraform show")
     print(json.dumps(json.load(open(args[-1]))))

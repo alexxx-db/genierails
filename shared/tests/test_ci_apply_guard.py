@@ -230,3 +230,11 @@ def test_env_validator_cli_uses_nonzero_exit_and_stderr(tmp_path):
     assert proc.stdout == ""
     assert "treatment_versions" in proc.stderr
     assert "Traceback" not in proc.stderr
+
+
+@pytest.mark.parametrize("cloud", ["aws", "azure"])
+def test_policy_rebind_ignores_the_ci_apply_opt_out(cloud):
+    """GENIERAILS_ALLOW_CI_APPLY=1 lets throwaway integration workflows apply; never policy-rebind."""
+    proc = _run_guarded_make(cloud, "policy-rebind", env=_clean_env(CI="true", GENIERAILS_ALLOW_CI_APPLY="1"))
+    assert proc.returncode != 0
+    assert "policy-rebind cannot run in CI, even with GENIERAILS_ALLOW_CI_APPLY=1" in proc.stdout + proc.stderr
