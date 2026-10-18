@@ -233,6 +233,8 @@ def _offline(monkeypatch, env_dir):
                         lambda *a, **k: ClassificationSource(tag_rows=TAG_ROWS))
     monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda: {})
     monkeypatch.setattr(generate_abac, "_LIVE_POLICIES_REPORTED", False)
+    # Module state an earlier test in the same process may have filled.
+    monkeypatch.setattr(generate_abac, "_POLICY_AUTOFIXES", set())
     monkeypatch.setattr(generate_abac, "call_with_retries", lambda *a, **k: MODEL_RESPONSE)
 
     def no_network(*_a, **_k):
