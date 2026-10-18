@@ -10,7 +10,7 @@ pipelines run the rest. Design: [section 17](design/deterministic-governance.md#
 # from aws/ (or azure/), as an account admin, once per env
 make bootstrap-sp ACCOUNT_PROFILE=<profile> ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws> TARGET_CATALOG=<dev-catalog> YES=1
 #   commit its application ID as deployer_principal_id in envs/dev/env.auto.tfvars
-make setup ENV=dev GITIGNORE=customer          # .gitignore that commits envs/ and ignores runtime files
+make setup ENV=dev                             # in your repo: writes the .gitignore that commits envs/ and ignores runtime files
 make bootstrap-pipelines ENV=dev  CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws>  REPO=<owner>/<name> PLAN=1
 make bootstrap-pipelines ENV=dev  CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<dev-ws>  REPO=<owner>/<name>
 make bootstrap-pipelines ENV=prod CI=github ACCOUNT_ID=<id> WORKSPACE_ID=<prod-ws> REPO=<owner>/<name> WAREHOUSE_ID=<id>
@@ -46,7 +46,7 @@ read-only SP that already holds more than it should. Fix that and re-run.
 | 3. Dev rehearsal | dev pipeline, each merge to `main`, in order | `make rehearse ENV=dev` | dev |
 | 4. Prod release | deployment machine in v1, after stage 3 passes on the commit | `make release-plan ENV=prod`, approve its manifest, `make release ENV=prod MANIFEST=<manifest>` ([release gating](#release-gating-deterministic-envs)) | prod |
 | 5. Keep protected | deployment machine in v1, on a schedule, at the last released commit | `make maintain ENV=prod` | prod, governance only |
-| 6. Operations | deployment machine, one approval per operation | `make detach-agent`, `make apply-account`, migration phases | prod or account |
+| 6. Operations | deployment machine, one approval per operation | `make detach-agent`, `make account-plan` then `make apply-account`, migration phases | prod or account |
 
 - **Stage 3 runs in CI once dev has remote state.** Until then the operator
   runs it. Stages 4 to 6 stay on the [deployment machine](deployment-machine.md)
@@ -61,11 +61,11 @@ Which commands each person runs: [agents](playbooks/agents.md),
 
 ## What to commit
 
-GenieRails' own `.gitignore` ignores `envs/`. In your repo, opt in once from the
-cloud dir:
+GenieRails' own `.gitignore` ignores `envs/`. In your own repo, `make setup`
+writes a `.gitignore` that commits `envs/`:
 
 ```bash
-make setup ENV=dev GITIGNORE=customer
+make setup ENV=dev
 git status          # pass looks like: no auth.auto.tfvars, *.tfstate or .genie_* files
 ```
 
@@ -76,9 +76,9 @@ checks. Never commit `auth.auto.tfvars`, state, locks, receipts or any dot-file
 under `envs/`.
 
 <a id="setting-up-git-tracking"></a>
-**How the `.gitignore` block works.** `make setup ... GITIGNORE=customer`
-writes a GenieRails block into `<cloud>/.gitignore` (and prints it as a diff).
-It re-includes `envs/` and ignores every runtime file: credentials, Terraform
+**How the `.gitignore` block works.** In your own repo `make setup` writes a
+GenieRails block into `<cloud>/.gitignore` (and prints it as a diff). It
+re-includes `envs/` and ignores every runtime file: credentials, Terraform
 state and plans, `.terraform/`, locks, receipts, Genie ID and adoption markers
 (`.genie_*`), every dot-file under `envs/` (such as `generated/.runtime/` and
 `data_access/.policy_generations/`), `classification.auto.tfvars`,
@@ -86,11 +86,16 @@ state and plans, `.terraform/`, locks, receipts, Genie ID and adoption markers
 and, for each deterministic env, its layer files (applying commands re-derive
 those).
 
-- **`GITIGNORE=customer`** writes the block, or refreshes it.
-- **No `GITIGNORE`** (the default): `make setup` refreshes the block if the
-  file already has it, and otherwise only prints how to opt in. The GenieRails
-  repo never has the block, so `make setup` never changes it there.
-- **`GITIGNORE=off`** leaves the file alone.
+`make setup` decides from the `origin` remote. If `origin` is
+`github.com/databricks-solutions/genierails` (https or ssh), it is GenieRails'
+own repo, which must never commit `envs/`: it writes nothing and only prints how
+to opt in (as it does outside a git checkout). Any other checkout (your fork, an
+internal mirror, no origin yet) gets the block, even if it keeps GenieRails as
+an `upstream` remote for upgrades. An existing block is always refreshed. The
+overrides: `GITIGNORE=customer` forces the write anywhere, `GITIGNORE=off`
+leaves the file alone. If you contribute to GenieRails from a fork, pass
+`GITIGNORE=off`; setup prints a note naming it whenever it writes the block in a
+repo with a GenieRails remote.
 
 Only the lines between the block's markers are rewritten. The block names each
 deterministic env, so re-run `make setup ENV=<env>` after adding an env or
@@ -289,8 +294,8 @@ key_prefix = "genierails"
   example `terraform state push`), or the first plan sees an empty env.
 - The dev pipeline also plans the account layer read-only (rehearse refuses a
   non-empty account plan), so commit `envs/account/remote_state.hcl` with the
-  account's real state too. The deployment machine's `make apply-account` then
-  uses the same remote state.
+  account's real state too. The deployment machine's `make account-plan` and
+  `make apply-account` then use the same remote state.
 
 **Receipts.** A receipt counts only in the store that wrote it. The dev
 pipeline uploads its receipt as an artifact for the record, but `release-plan`
@@ -322,6 +327,17 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   fresh `release-plan`, if the commit, a state serial, a saved plan, the
   effective config or live Unity Catalog changed. Plain `make release ENV=prod`
   refuses in a deterministic env.
+- **`make account-plan` / `make apply-account`** is the account
+  operation equivalent: `account-plan` refuses unless the checkout is clean and
+  exactly current `origin/main`, saves one account plan and immutable manifest,
+  and changes nothing live. The manifest records the saved plan hash, account
+  input hashes and the replace-mode tag-policy diff. `apply-account` chooses
+  the single unreceipted manifest for `HEAD` (or accepts `MANIFEST=<path>` as an
+  explicit override) and refuses in CI, from a dirty checkout, from any commit
+  other than the manifest commit and the exact current `origin/main` tip, if
+  the account state, manifest, saved plan, input hashes or tag-policy diff
+  changed, or if the manifest already has a receipt. Under the account lock it
+  applies the saved plan and writes an account receipt.
 - **Staged policy changes take one manifest per phase.** A change that
   replaces policies or moves tiers is planned one changing phase at a time:
   each `release` applies that phase and says to run `release-plan` again
@@ -352,7 +368,8 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   | `destroy`, `destroy-governance`, `destroy-genie` | needs `CONFIRM_DESTROY=<env>` on the command line | unchanged |
   | `release` without `MANIFEST=` | refused | refused |
 
-  Not gated: `apply-account` (its own account lock and approval),
+  Not gated by the env side-door: `apply-account` (its own account manifest,
+  account lock and approval),
   `enable-classification` (classification config only), `import`,
   `migrate-state`, `rebuild-governed-tables` (state or a local record), and
   `policy-abandon` (drops only a staged change that never switched). Each

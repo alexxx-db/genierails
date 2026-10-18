@@ -86,9 +86,11 @@ def classification_cloud(tmp_path):
                            cwd=REPO / "aws", text=True, capture_output=True, env=_clean_env())
     assert setup.returncode == 0, setup.stdout + setup.stderr
     env_file = cloud_root / "envs/dev/env.auto.tfvars"
+    # These tests edit an inline agent given only by ID (the champion template
+    # keeps agents in agents/ files; discovery treats both alike).
     env_file.write_text(
         TEMPLATE.read_text()
-        .replace("<your-genie-space-id>", SPACE_ID)
+        .replace("genie_spaces = []", f'genie_spaces = [\n  {{ genie_space_id = "{SPACE_ID}" }},\n]')
         .replace("<your-deployer-principal-id>", "d0000000-0000-0000-0000-00000000d001")
         .replace("<most-privileged-group>", "payments_ops")
         .replace("<least-privileged-group>", "viewers")
@@ -925,7 +927,12 @@ def test_release_needs_no_key_and_proves_keys_before_applying(tmp_path, env_text
     assert result.returncode == 0, result.stdout + result.stderr
     keys = calls.index("verify-access-keys ENV=prod")
     assert keys < calls.index("apply ENV=prod APPLY_FLAGS= _STAGED_CONFIRM=0")
-    assert "_verify-access-gate ENV=prod VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in calls
+    # Release verifies as a gate (main 9c2ad7b): the spec cannot narrow the
+    # minimum, and the staged-verify inputs are cleared so none can redirect it.
+    # The gate is _verify-access-gate's override, not a VERIFY_GATE=1 argument.
+    gate = [c for c in calls if c.startswith("_verify-access-gate ENV=prod ")]
+    assert gate == ["_verify-access-gate ENV=prod VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE="], gate
+    assert not [c for c in calls if c.startswith("verify-access ENV=prod ")]
 
 
 def _proof(tmp_path, payload=MASK_PASS):

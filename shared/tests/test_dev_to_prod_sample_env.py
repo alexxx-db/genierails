@@ -98,11 +98,22 @@ def test_create_groups_requires_account_id():
 
 
 def test_snippet_includes_access_tier_groups_only_when_created():
-    plain = sample._tfvars("space-1", ["c.s.t"], "wh-1")
-    tiers = sample._tfvars("space-1", ["c.s.t"], "wh-1", sample.SAMPLE_GROUPS)
+    plain = sample._tfvars(["c.s.t"], "wh-1")
+    tiers = sample._tfvars(["c.s.t"], "wh-1", sample.SAMPLE_GROUPS)
 
     assert "access_tier_groups" not in plain
     assert f'access_tier_groups = ["{sample.SAMPLE_GROUPS[0]}", ' in tiers
+    # The agent ID lives in the agent's own file, not in env.auto.tfvars.
+    assert "genie_spaces" not in plain and "genie_spaces" not in tiers
+
+
+def test_agent_file_acl_is_created_tiers_else_placeholder():
+    plain = sample._agent_tfvars("space-1")
+    tiers = sample._agent_tfvars("space-1", sample.SAMPLE_GROUPS)
+
+    assert 'genie_space_id = "space-1"' in plain and 'genie_space_id = "space-1"' in tiers
+    assert f'acl_groups     = ["{sample.ACL_PLACEHOLDER}"]' in plain
+    assert 'acl_groups     = [' + ", ".join(f'"{g}"' for g in sample.SAMPLE_GROUPS) + "]" in tiers
 
 
 def test_account_host_follows_workspace_cloud():

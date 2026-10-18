@@ -23,6 +23,7 @@ Usage:
     python3 scripts/sync_tag_policies.py [--mode add-only|replace] [path/to/abac.auto.tfvars]
 """
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -77,7 +78,10 @@ def _str(v):
     return (v[0] if isinstance(v, list) else v or "").strip()
 
 
-APPLY_ACCOUNT_HINT = "Run 'make apply-account' in the approved operations stage to remove them."
+APPLY_ACCOUNT_HINT = (
+    "Run 'make account-plan', get its manifest approved, then run 'make apply-account' "
+    "in the approved operations stage to remove them."
+)
 
 
 def plan_updates(desired_policies, existing, mode):
@@ -120,14 +124,28 @@ def plan_updates(desired_policies, existing, mode):
     return updates, refused
 
 
+def update_diff(updates):
+    """Stable JSON shape for the values a replace sync would add/remove."""
+    return [
+        {"key": actual_key, "added": list(added), "removed": list(removed)}
+        for actual_key, _values, added, removed in updates
+        if added or removed
+    ]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Sync tag policy values to Databricks.")
     parser.add_argument("--mode", choices=("add-only", "replace"), default="add-only")
+    parser.add_argument("--dry-run", action="store_true", help="plan changes but do not write them")
+    parser.add_argument("--json", action="store_true", help="with --dry-run, print the add/remove diff as JSON")
     parser.add_argument("tfvars", nargs="?", default=str(WORK_DIR / "abac.auto.tfvars"))
     args = parser.parse_args(argv)
     tfvars_path = Path(args.tfvars)
     if not tfvars_path.exists():
-        print(f"  [SKIP] {tfvars_path} not found")
+        if args.dry_run and args.json:
+            print("[]")
+        else:
+            print(f"  [SKIP] {tfvars_path} not found")
         return
 
     import hcl2
@@ -137,7 +155,10 @@ def main(argv=None):
 
     desired_policies = config.get("tag_policies", [])
     if not desired_policies:
-        print("  [SKIP] No tag_policies found in config")
+        if args.dry_run and args.json:
+            print("[]")
+        else:
+            print("  [SKIP] No tag_policies found in config")
         return
 
     auth_cfg = _load_auth()
@@ -179,6 +200,19 @@ def main(argv=None):
         raise SystemExit(1)
 
     updates, refused = plan_updates(desired_policies, existing, args.mode)
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(update_diff(updates), sort_keys=True))
+        else:
+            for actual_key, _values, missing, removed in updates:
+                changes = []
+                if missing:
+                    changes.append(f"would add {missing}")
+                if removed:
+                    changes.append(f"would remove {removed}")
+                print(f"  [PLAN] {actual_key}: {', '.join(changes) if changes else 'already in sync'}")
+        return
+
     if refused:
         # Nothing is written: a partial sync would leave the account half-updated.
         print("  [ERROR] Tag policy values are live but no longer desired; this sync only adds values:")
