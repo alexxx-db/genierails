@@ -38,7 +38,20 @@ no agent's config, so it never waits for an agent that's mid-curation.
   the mask library: [REFERENCE.md](../../REFERENCE.md).
 
 <a id="govern-tables-only"></a>
-## Govern tables only (no agents)
+## Govern tables only
+
+Use this when GenieRails manages table protection by itself, for example:
+
+- **A central data governance team** defines the rules for the organisation's
+  tables (which classified columns are masked and how, row filters, who reads
+  each table), reviews them in a PR and promotes them from dev to prod. Agent
+  teams build on the protected tables without owning those rules.
+- **A platform team securing catalogs ahead of Genie**, so the tables are
+  already protected when the first agent arrives. Adding agents later doesn't
+  disturb the governance that's in place.
+- **Tables read by more than Genie**: Unity Catalog enforces the masks and row
+  filters on every query, so SQL, notebook and BI users get the same
+  protection.
 
 ```bash
 make setup ENV=dev
