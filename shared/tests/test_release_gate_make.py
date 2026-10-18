@@ -62,6 +62,14 @@ from pathlib import Path
 with open({log!r}, "a") as log:
     log.write(json.dumps([{name!r}] + sys.argv[1:]) + "\n")
 args = sys.argv[1:]
+if {name!r} == "runner" and len(args) >= 3 and args[0] == "account" and args[2] == "plan":
+    for arg in args:
+        if arg.startswith("-out="):
+            Path(arg.split("=", 1)[1]).write_bytes(b"account saved plan")
+    sys.exit(2)
+if {name!r} == "runner" and len(args) >= 3 and args[0] == "account" and args[2] == "show":
+    print(json.dumps({{"resource_changes": [{{"change": {{"actions": ["create"]}}}}]}}))
+    sys.exit(0)
 if {name!r} == "reports" and "--plan-dir" in args:
     Path(args[args.index("--plan-dir") + 1], "reports.json").write_text(json.dumps({{"ok": True}}))
 if {name!r} == "live":
@@ -237,6 +245,182 @@ def test_release_plan_refused_by_the_reports_writes_no_manifest(make, repo):
 def test_release_plan_refuses_in_ci(tmp_path, repo, cloud):
     result = Make(tmp_path, repo, cloud)("release-plan", "prod", ci=True)
     assert result.returncode != 0 and "applying targets cannot run in CI" in result.stderr
+
+
+# -- account-plan / apply-account -------------------------------------------------------
+
+def _account_planned(make: Make) -> Path:
+    result = make("account-plan", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    make.reset()
+    return Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                     if "Manifest (immutable):" in line))
+
+
+def test_account_plan_writes_an_immutable_manifest_from_clean_origin_main(make, repo):
+    result = make("account-plan", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                         if "Manifest (immutable):" in line))
+    data = json.loads(manifest.read_text())
+    assert data["kind"] == "account-manifest"
+    assert data["commit"] == repo.head()
+    assert data["plan"]["sha256"] == rg.sha256_bytes(b"account saved plan")
+    assert data["plan"]["summary"]["resource_changes"] == {"create": 1}
+    assert data["inputs"]
+    assert data["tag_sync"] == []
+    runner = [c for c in make.calls() if c[0] == "runner"]
+    assert runner[0][:6] == ["runner", "account", "account", "plan", "-input=false", "-detailed-exitcode"]
+    assert runner[0][6].startswith("-out=") and Path(runner[0][6].split("=", 1)[1]).name == "account.tfplan"
+    assert runner[1][:5] == ["runner", "account", "account", "show", "-json"]
+    assert Path(runner[1][5]).name == "account.tfplan"
+    assert not (manifest.parent / "account.show.json").exists()
+
+
+def test_account_plan_refuses_dirty_checkout_before_planning(make, repo):
+    (repo.cloud / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = false\n# local\n")
+    result = make("account-plan", "account")
+    assert result.returncode != 0 and "checkout is not clean" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner"]
+
+
+def test_account_plan_refuses_when_head_is_not_origin_main(make, repo):
+    repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# local\n"}, push=False)
+    result = make("account-plan", "account")
+    assert result.returncode != 0 and "not exactly origin/main" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner"]
+
+
+def test_apply_account_refuses_without_any_manifest(make, repo):
+    result = make("apply-account", "account")
+    assert result.returncode != 0
+    assert "no unreceipted account manifest for HEAD" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner"]
+
+
+def test_apply_account_refuses_in_ci(make, repo):
+    result = make("apply-account", "account", "MANIFEST=/m/manifest.json", ci=True)
+    assert result.returncode != 0 and "applying targets cannot run in CI" in result.stderr
+    assert make.calls() == []
+
+
+def test_apply_account_applies_only_the_saved_plan_under_the_account_lock_and_writes_receipt(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    result = make("apply-account", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Selected account manifest" in result.stderr
+    calls = make.calls()
+    apply_calls = [c for c in calls if c[:4] == ["runner", "account", "account", "apply-plan"]]
+    assert len(apply_calls) == 1
+    applied_plan = Path(apply_calls[0][4])
+    assert applied_plan.name == "account.tfplan" and applied_plan.parent != manifest.parent
+    assert not applied_plan.exists()
+    assert not [c for c in calls if c[0] == "runner" and c[3:4] in (["apply"], ["plan"])]
+    receipts = rg.account_receipts(repo.cloud, "account")
+    assert receipts and receipts[-1]["commit"] == repo.head()
+    assert receipts[-1]["manifest"]["path"] == str(manifest)
+
+
+def test_apply_account_explicit_manifest_override_still_works(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Selected account manifest" in result.stdout
+
+
+@pytest.mark.parametrize("drift", ["commit", "not-origin-main", "origin-moved-ahead", "dirty", "serial", "plan", "manifest", "inputs"])
+def test_apply_account_refuses_a_stale_or_tampered_manifest_and_applies_nothing(tmp_path, repo, drift):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    if drift == "commit":
+        repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# later\n"})
+    elif drift == "not-origin-main":
+        repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# local\n"}, push=False)
+    elif drift == "origin-moved-ahead":
+        other = tmp_path / "other"
+        subprocess.run(["git", "clone", "-q", str(repo.origin), str(other)], check=True, env=os.environ | repo.env)
+        (other / "aws" / "envs" / "prod" / "ack.txt").write_text("# newer\n")
+        for args in (("add", "-A"), ("commit", "-q", "-m", "newer"), ("push", "-q", "origin", "main")):
+            subprocess.run(["git", "-C", str(other), *args], check=True, env=os.environ | repo.env)
+    elif drift == "dirty":
+        (repo.cloud / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = false\n# local\n")
+    elif drift == "serial":
+        state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"version": 4, "serial": 3, "lineage": "A"}))
+    elif drift == "plan":
+        plan = manifest.parent / "account.tfplan"
+        os.chmod(plan, 0o644)
+        plan.write_bytes(b"tampered")
+    elif drift == "manifest":
+        os.chmod(manifest, 0o644)
+        data = json.loads(manifest.read_text())
+        data["plan"]["file"] = "other.tfplan"
+        manifest.write_text(json.dumps(data))
+    else:
+        (repo.cloud / "envs" / "account" / "abac.auto.tfvars").write_text("tag_policies = []\n")
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "Run make account-plan again" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner" and c[3:4] == ["apply-plan"]]
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
+def test_apply_account_refuses_when_the_real_auth_endpoint_changes_after_plan(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    auth = repo.cloud / "envs" / "account" / "auth.auto.tfvars"
+    auth.write_text('databricks_account_host = "https://accounts.cloud.databricks.com"\n'
+                    'databricks_account_id = "acc-123"\n'
+                    'databricks_workspace_host = "https://workspace.one.example"\n'
+                    'databricks_client_id = "client"\n'
+                    'databricks_client_secret = "secret-not-hashed"\n')
+    manifest = _account_planned(make)
+    auth.write_text(auth.read_text().replace("workspace.one.example", "workspace.two.example"))
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "account input file hashes changed" in result.stderr
+    assert not [c for c in make.calls() if c[:4] == ["runner", "account", "account", "apply-plan"]]
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
+def test_apply_account_pins_the_setup_layout_symlinked_auth_endpoint(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    account_auth = repo.cloud / "envs" / "account" / "auth.auto.tfvars"
+    workspace_auth = repo.cloud / "envs" / "dev" / "auth.auto.tfvars"
+    workspace_auth.write_text('databricks_account_id = "acc-123"\n'
+                              'databricks_workspace_host = "https://workspace.one.example"\n'
+                              'databricks_client_id = "client"\n'
+                              'databricks_client_secret = "secret-not-hashed"\n')
+    account_auth.unlink(missing_ok=True)
+    account_auth.symlink_to("../dev/auth.auto.tfvars")
+    manifest = _account_planned(make)
+    inputs = json.loads(manifest.read_text())["inputs"]
+    assert any(item["path"].startswith("auth.auto.tfvars#databricks_") for item in inputs)
+    workspace_auth.write_text(workspace_auth.read_text().replace("workspace.one.example", "workspace.two.example"))
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "account input file hashes changed" in result.stderr
+    assert not [c for c in make.calls() if c[:4] == ["runner", "account", "account", "apply-plan"]]
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
+def test_apply_account_refuses_several_default_manifests_and_lists_ids(make, repo):
+    first = _account_planned(make)
+    second = _account_planned(make)
+    result = make("apply-account", "account")
+    assert result.returncode != 0
+    assert "multiple unreceipted account manifests" in result.stderr
+    assert first.parent.name in result.stderr and second.parent.name in result.stderr
+
+
+def test_account_bootstrap_targets_do_not_use_the_account_manifest_flow():
+    text = (ROOT / "shared" / "Makefile.shared").read_text()
+    bootstrap = text[text.index("\nbootstrap-sp:"):text.index("\n# Set up the Databricks side")]
+    pipelines = text[text.index("\nbootstrap-pipelines:"):text.index("\ntest-unit:")]
+    assert "apply-account" not in bootstrap + pipelines
+    assert "account-plan" not in bootstrap + pipelines
 
 
 # -- release MANIFEST= ---------------------------------------------------------------
