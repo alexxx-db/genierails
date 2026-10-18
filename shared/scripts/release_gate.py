@@ -1037,7 +1037,8 @@ def manifest_summary(manifest_path: Path, manifest: Mapping) -> list[str]:
     if steps and [s.get("kind") for s in steps] == ["adopt"]:
         lines.append("    data_access:  adopt the legacy policies (one staged phase)")
     elif not imports:
-        lines.append(f"    data_access:  {'saved plan(s) with changes, phase(s) ' + ', '.join(changing) if changing else 'no changes'}"
+        what = f"saved plan(s) with changes, phase(s) {', '.join(changing)}" if changing else "no changes"
+        lines.append(f"    data_access:  {what}"
                      + ("" if manifest.get("final") else " (one phase of a staged policy change)"))
     workspace = plans.get("workspace") or {}
     lines.append("    workspace:    " + (f"not planned ({workspace['skipped']})" if workspace.get("skipped")
