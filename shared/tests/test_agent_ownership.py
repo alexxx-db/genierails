@@ -1220,7 +1220,7 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     assert preflight[1] == "preflight" and sync[1] == "sync"
     assert sync[sync.index("--manifest") + 1] == str(manifest) == preflight[preflight.index("--manifest") + 1]
     first = flat.index("agents")
-    assert first < flat.index("sync-tags") and first < flat.index("staged") and first < flat.index("runner")
+    assert first < flat.index("_sync-tags-add-only-locked") and first < flat.index("staged") and first < flat.index("runner")
     assert flat.index("runner") < len(flat) - flat[::-1].index("agents") - 1 < flat.index("verify-access")
 
 
