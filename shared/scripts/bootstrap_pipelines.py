@@ -565,7 +565,7 @@ def _var_values(cfg: Config, client_id: str | None, host: str) -> dict[str, str]
 
 def _codeowners(cfg: Config) -> list[str]:
     gov, agents, c = cfg.governance_owners, cfg.agent_owners, cfg.cloud
-    pipelines = "/.github/" if cfg.ci == "github" else f"/{c}/azure-pipelines/"
+    pipelines = f"/{c}/.github/" if cfg.ci == "github" else f"/{c}/azure-pipelines/"
     rows = [
         ("# Governance engineer (design 18.1): product code, every env file by default", None),
         ("/shared/", gov),
@@ -615,7 +615,8 @@ def settings(cfg: Config, client_id: str | None, host: str) -> list[str]:
                 "", 'Environment "production-maintain": deployment branches: main only; no '
                 "reviewer (the schedule is never held for approval).",
                 "", "Branch protection on main (no direct pushes, including admins):",
-                '  required status check "make check" (pr-check.yml), branches up to date;',
+                '  required status check "make check" (pr-check.yml), branches up to date '
+                "(or use a merge queue);",
                 "  pull request required, review from Code Owners required, stale approvals dismissed;",
                 "  enforce for admins; no force pushes or deletions. Equivalent command:",
                 f"  gh api -X PUT repos/{cfg.repo}/branches/main/protection --input - <<'EOF'",
@@ -651,7 +652,8 @@ def settings(cfg: Config, client_id: str | None, host: str) -> list[str]:
             "approvers may not approve their own runs), Branch control check (refs/heads/main "
             "only), Exclusive Lock check.",
             "", "Branch policies on main (no bypass, including admins):",
-            f"  build validation: {names['pr']}, required, expires when main is updated;",
+            f"  build validation: {names['pr']}, required, Build expiration = Immediately "
+            "when main is updated;",
             "  require a pull request; minimum one reviewer; reset votes on new pushes;",
             "  automatically included reviewers, required, per path (the CODEOWNERS rules below).",
             "", "Path owners (Azure Repos has no CODEOWNERS file: add each as an automatically",

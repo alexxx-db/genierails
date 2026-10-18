@@ -3,9 +3,11 @@ name: GenieRails PR check (aws)
 # Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull request.
 # Copy this file to .github/workflows/ at the repository root. On main, make
 # this job a required status check and require branches to be up to date
-# before merging. The push job below uses the repository GITHUB_TOKEN to
-# re-run this workflow for every open PR head whenever main moves, so a stale
-# green check cannot be merged.
+# before merging; "Require branches to be up to date" or a merge queue is the
+# stronger repository-level guarantee. The push job below uses the repository
+# GITHUB_TOKEN to re-run this workflow for every open PR head whenever main
+# moves, and the check job explicitly merges the PR head with freshly fetched
+# origin/main before running make check.
 #
 #   make check ENV=dev                 always
 #   make check ENV=prod                also, when the PR touches envs/prod/** or
@@ -71,8 +73,11 @@ jobs:
               echo "::notice::PR #${number} has no prior pr-check run to re-run."
               continue
             fi
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/rerun" >/dev/null
-            echo "Re-ran pr-check for PR #${number} (${sha})."
+            if gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/rerun" >/dev/null; then
+              echo "Re-ran pr-check for PR #${number} (${sha})."
+            else
+              echo "::warning::could not re-run pr-check for PR #${number} (${sha}); it may still be running or too old to re-run."
+            fi
           done <<EOF
           $prs
           EOF
@@ -91,6 +96,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Test PR head merged with current main
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin main
+          git fetch --no-tags origin "$HEAD_SHA" || git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+          git checkout --force --detach "$HEAD_SHA"
+          if ! git merge --no-edit --no-ff origin/main; then
+            echo "::error::PR head $HEAD_SHA does not merge cleanly with current origin/main; rebase or merge main and re-run checks."
+            exit 1
+          fi
 
       - uses: actions/setup-python@v5
         with:

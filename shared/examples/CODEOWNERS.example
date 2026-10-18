@@ -48,5 +48,7 @@
 # /azure/envs/*/agents/Sales.*  @your-org/sales-analysts
 
 # Pipelines and repo settings.
-/.github/                       @your-org/platform
-/azure-pipelines/               @your-org/platform
+/aws/.github/                   @your-org/platform
+/azure/.github/                 @your-org/platform
+/aws/azure-pipelines/           @your-org/platform
+/azure/azure-pipelines/         @your-org/platform

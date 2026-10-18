@@ -11,8 +11,9 @@ name: GenieRails prod maintain (aws)
 # schedule, at that commit, in the same persistent checkout as releases
 # (`git fetch && git checkout --force --detach <sha>`, an empty
 # `git status --porcelain`, never `git clean -x` or a re-clone; see
-# prod-release.yml). The CI guard refuses every applying target here. Do not
-# set GENIERAILS_ALLOW_CI_APPLY.
+# prod-release.yml). Until then, this CI job runs only the read-only
+# audit-schema drift alert. The CI guard refuses every applying target here.
+# Do not set GENIERAILS_ALLOW_CI_APPLY.
 #
 # Auth: OIDC workload identity federation, no PATs or secrets. The job runs
 # in the "production-maintain" environment (deploys only from main, no
@@ -31,9 +32,10 @@ on:
 # Its own group, never shared with the release workflow: GitHub keeps only
 # one pending run per group, so a shared group let a scheduled maintain
 # cancel a pending release and a release waiting days for approval hold
-# maintain back. Pending maintain runs queue behind the same group; a running
-# one is never cancelled. Release and maintain must never apply to prod at the
-# same time; on the deployment machine the GenieRails env lock serialises them.
+# maintain back. A newer pending maintain may replace an older pending one
+# (the audit is read-only and repeats in full); a running one is never
+# cancelled. Release and maintain must never apply to prod at the same
+# time; on the deployment machine the GenieRails env lock serialises them.
 concurrency:
   group: genierails-prod-maintain-aws
   cancel-in-progress: false
@@ -48,35 +50,13 @@ defaults:
 
 jobs:
   maintain:
-    name: Maintain (requires prod remote state)
+    name: Drift audit (v1; maintain REQUIRES PROD REMOTE STATE)
     runs-on: ubuntu-latest
     environment: production-maintain
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check out the last released commit
-        run: |
-          released_commit="$(python3 - <<'PY'
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, str((Path.cwd() / "../shared/scripts").resolve()))
-          import release_gate
-          receipt = release_gate.last_release(Path.cwd(), "prod")
-          if not receipt or not receipt.get("commit"):
-              raise SystemExit("no prod release receipt found; release prod before running maintain")
-          print(receipt["commit"])
-          PY
-          )"
-          git fetch --no-tags origin "$released_commit"
-          git checkout --force --detach "$released_commit"
-          if [ -n "$(git status --porcelain)" ]; then
-            git status --porcelain
-            exit 1
-          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -100,5 +80,5 @@ jobs:
             "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
             "databricks_workspace_host = \"$HOST\"" > envs/prod/auth.auto.tfvars
 
-      - name: make maintain ENV=prod
-        run: make maintain ENV=prod
+      - name: Read-only drift audit
+        run: make audit-schema ENV=prod

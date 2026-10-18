@@ -48,6 +48,7 @@ BASE_COMMIT = "16c9797a5030e80a8fe0c79eb60c29ad12218407"  # origin/main before s
 CODEOWNERS = SHARED / "examples" / "CODEOWNERS.example"
 CLOUDS = ("aws", "azure")
 DATA_CITIZENS, GOVERNANCE = "@your-org/data-citizens", "@your-org/governance-engineers"
+PLATFORM = "@your-org/platform"
 
 DEV_ENV = f'''governance_mode = "deterministic"
 deployer_principal_id = "{base.DEPLOYER}"
@@ -372,6 +373,9 @@ def test_the_sample_codeowners_splits_data_citizens_from_governance_engineers():
                  "aws/envs/prod/ack.txt", "azure/envs/dev/generated/governed_tables.json",
                  "aws/envs/prod/abac.auto.tfvars", "shared/mask_library.json"):
         assert owners(path) == [GOVERNANCE], path
+    for path in ("aws/.github/workflows/pr-check.yml", "azure/.github/workflows/pr-check.yml",
+                 "aws/azure-pipelines/pr-check.yml", "azure/azure-pipelines/pr-check.yml"):
+        assert owners(path) == [PLATFORM], path
 
 
 def _codeowners_patterns() -> tuple[list[str], list[str]]:
@@ -392,9 +396,10 @@ def test_every_sample_codeowners_rule_is_anchored_to_a_supported_cloud_tree():
     assert examples, "the sample's optional per-agent example is gone"
     for pattern in active + examples:
         assert pattern.startswith("/") and "**" not in pattern, pattern
-        assert pattern.split("/")[1] in ("shared", ".github", "azure-pipelines", *CLOUDS), pattern
+        assert pattern.split("/")[1] in ("shared", *CLOUDS), pattern
     for cloud in CLOUDS:
-        for pattern in (f"/{cloud}/envs/", f"/{cloud}/envs/*/agents/", f"/{cloud}/envs/*/ack.txt"):
+        for pattern in (f"/{cloud}/envs/", f"/{cloud}/envs/*/agents/", f"/{cloud}/envs/*/ack.txt",
+                        f"/{cloud}/.github/", f"/{cloud}/azure-pipelines/"):
             assert pattern in active, pattern
         assert f"/{cloud}/envs/*/agents/Sales.*" in examples, cloud
     # A directory that only happens to be called envs/ is not an env.

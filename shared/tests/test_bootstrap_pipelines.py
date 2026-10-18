@@ -319,7 +319,7 @@ def test_codeowners_follow_the_persona_split():
     owners = {line.split()[0]: line.split()[1] for line in lines if not line.startswith("#")}
     assert owners["/aws/envs/*/agents/"] == "@acme/agents"
     for path in ("/shared/", "/aws/envs/", "/aws/envs/*/env.auto.tfvars",
-                 "/aws/envs/*/generated/", "/aws/envs/*/ack.txt", "/.github/"):
+                 "/aws/envs/*/generated/", "/aws/envs/*/ack.txt", "/aws/.github/"):
         assert owners[path] == "@acme/gov"
     # Last match wins: the agents rule must come after the envs catch-all.
     paths = [line.split()[0] for line in lines if not line.startswith("#")]
@@ -406,6 +406,15 @@ def test_prod_release_plan_job_runs_in_production_plan_environment(cloud):
     assert job["permissions"]["id-token"] == "write"
     printed = "\n".join(bp.settings(_cfg(cloud=cloud, env="prod"), "c", "https://h"))
     assert 'Environment "production-plan": deployment branches: main only; no reviewer' in printed
+
+
+def test_bootstrap_settings_name_pr_freshness_controls():
+    github = "\n".join(bp.settings(_cfg(ci="github"), "c", "https://h"))
+    assert "branches up to date (or use a merge queue)" in github
+    ado = "\n".join(bp.settings(_cfg(ci="azure-devops", repo=None, ado_org="acme",
+                                     ado_org_id="11111111-2222-3333-4444-555555555555",
+                                     ado_project="gov"), "c", "https://h"))
+    assert "Build expiration = Immediately when main is updated" in ado
 
 
 def test_refuses_while_the_readonly_sp_is_a_workspace_admin():

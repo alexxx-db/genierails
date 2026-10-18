@@ -208,16 +208,27 @@ def test_pr_check_samples_re_run_after_main_moves():
         assert rerun["if"] == "github.event_name == 'push'"
         assert rerun["permissions"] == {"actions": "write", "contents": "read",
                                         "pull-requests": "read"}
-        assert "actions/workflows/pr-check.yml/runs?event=pull_request" in rerun["steps"][0]["run"]
+        rerun_script = rerun["steps"][0]["run"]
+        assert "actions/workflows/pr-check.yml/runs?event=pull_request" in rerun_script
+        assert "::warning::could not re-run pr-check for PR #" in rerun_script
         check = workflow["jobs"]["check"]
         assert check["if"] == "github.event_name == 'pull_request'"
         assert check["permissions"] == {"contents": "read", "id-token": "write"}
+        merge_step = next(s for s in check["steps"]
+                          if s.get("name") == "Test PR head merged with current main")
+        assert merge_step["env"] == {"HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+                                     "PR_NUMBER": "${{ github.event.pull_request.number }}"}
+        assert "git fetch --no-tags origin main" in merge_step["run"]
+        assert 'git checkout --force --detach "$HEAD_SHA"' in merge_step["run"]
+        assert "git merge --no-edit --no-ff origin/main" in merge_step["run"]
+        assert "does not merge cleanly with current origin/main" in merge_step["run"]
 
         pipeline = yaml.safe_load((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text())
-        assert pipeline["trigger"]["branches"]["include"] == ["main"]
+        assert pipeline["trigger"] == "none"
         assert pipeline["pr"]["branches"]["include"] == ["main"]
-        assert "Build expiration to \"Immediately when main is updated\"" in (
-            ROOT / cloud / "azure-pipelines/pr-check.yml").read_text()
+        ado_text = " ".join((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text().replace("#", "").split())
+        assert "Build expiration to" in ado_text and "Immediately when main is updated" in ado_text
+        assert "GitHub-hosted repositories connected to Azure Pipelines" in ado_text
 
 
 def _github_pr_scope(cloud):
@@ -232,9 +243,7 @@ def _github_pr_scope(cloud):
 def _devops_pr_scope(cloud):
     pipeline = yaml.safe_load((ROOT / cloud / "azure-pipelines/pr-check.yml").read_text())
     prod = next(s for s in pipeline["steps"] if s.get("script") == "make check ENV=prod")
-    assert prod["condition"] == (
-        "and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), "
-        "eq(variables['CHECK_PROD'], 'true'))")
+    assert prod["condition"] == "and(succeeded(), eq(variables['CHECK_PROD'], 'true'))"
     step = next(s for s in pipeline["steps"] if "CHECK_PROD" in s.get("script", ""))
     assert step["workingDirectory"] == cloud
     return step["script"]
