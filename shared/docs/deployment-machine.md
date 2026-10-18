@@ -76,7 +76,7 @@ cause:
 | checkout is not clean | step 2 again |
 | reader or weakening check | add the reviewed lines to `envs/prod/ack.txt` in a PR, or fix the config ([governance](playbooks/governance.md#acknowledge-an-exception)) |
 | coverage check, or an unmapped class | map it in dev and promote ([governance](playbooks/governance.md#map-a-new-class)) |
-| the account plan isn't empty | `make apply-account` first ([operations](#operations)) |
+| the account plan isn't empty | run `make account-plan`, get its manifest approved, then `make apply-account MANIFEST=<manifest>` ([operations](#operations)) |
 | env is locked | another command holds the env lock; wait for it |
 | `release` refuses the manifest | something moved since `release-plan`; run `release-plan` again and get the new manifest approved |
 
@@ -102,9 +102,11 @@ One approval per operation, each from a clean checkout of `main`:
 | Operation | Command | Provenance it checks |
 |---|---|---|
 | Forget a detached agent | `make detach-agent ENV=prod SPACE="<agent>"` | HEAD is the last released commit, and that release had the agent with `detached = true` and `acl_groups = []` ([agents](playbooks/agents.md#remove-an-agent)) |
-| Change the account layer | `make apply-account` | takes the account lock; the only command that removes tag-policy values |
+| Change the account layer | `make account-plan`, approve its manifest, then `make apply-account MANIFEST=<manifest>` | clean checkout at current `origin/main`; saved account plan hash and account state still match; refuses in CI; takes the account lock; writes an account receipt; the only command that removes tag-policy values |
 | Migrate a legacy env | `make migrate-plan`, then `release-plan` / `release` per phase | [legacy-migration.md](legacy-migration.md) |
 | Inspect or drop a staged policy change | `make policy-status ENV=prod`, `make policy-abandon ENV=prod` | `policy-abandon` refuses once a column was retagged or a principal moved |
+
+`bootstrap-sp` and `bootstrap-pipelines` are explicit bootstrap exceptions: they create or authorize service principals and pipeline federation, print repo settings, and do not apply the account Terraform layer or remove tag-policy values.
 
 ## State outside the checkout
 
@@ -157,8 +159,9 @@ everything. Run the older `make migrate-state` (pre-layer layouts) before it.
   `detach-agent` take it; a second command on the same env refuses until the
   first finishes. Because it lives in the state dir, every checkout that shares
   `GENIERAILS_STATE_DIR` shares it.
-- **The account lock** is the env lock of `ENV=account`; `make apply-account`
-  takes it.
+- **The account lock** is the env lock of `ENV=account`;
+  `make apply-account MANIFEST=<manifest>` takes it after checking the approved
+  account manifest.
 - A lock records a random nonce, the holder's pid and that pid's start time, so
   a leftover lock from a crashed run never blocks or passes by accident.
 

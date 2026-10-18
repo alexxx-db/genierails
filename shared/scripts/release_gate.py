@@ -99,6 +99,7 @@ PROMOTE_OWNED = ("abac.auto.tfvars", "masking_functions.sql", "expected_classifi
 CODE_ROOTS = ("shared",)
 CODE_SKIP = ("shared/docs/", "shared/tests/")
 ROOTS = ("account", "data_access", "workspace")
+ACCOUNT_ENV = "account"
 
 
 class Refused(RuntimeError):
@@ -583,6 +584,33 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
     }
 
 
+def account_provenance(env_dir: Path, env: str = ACCOUNT_ENV, *, remote: str = "origin", branch: str = "main",
+                       fetch: bool = True) -> dict:
+    """Everything account-plan/apply-account require of the checkout; raises Refused."""
+    env_dir = Path(env_dir)
+    status = checkout_status(env_dir)
+    repo, commit = Path(status["repo"]), status["commit"]
+    problems = []
+    if env != ACCOUNT_ENV:
+        problems.append(f"account operations use ENV={ACCOUNT_ENV}, not {env}")
+    if not status["clean_tree"]:
+        problems.append("the checkout is not clean:\n      " + "\n      ".join(status["dirty"][:10]))
+    if fetch:
+        git(repo, "fetch", "--quiet", remote, branch)
+    upstream = f"{remote}/{branch}"
+    upstream_commit = ""
+    if not commit_known(repo, upstream):
+        problems.append(f"{upstream} is unknown; fetch it first")
+    else:
+        upstream_commit = git(repo, "rev-parse", upstream).stdout.strip()
+        if commit != upstream_commit:
+            problems.append(f"HEAD {commit[:12]} is not exactly {upstream} ({upstream_commit[:12]}); "
+                            "account operations run only from the current main commit")
+    if problems:
+        raise Refused("account operation refused:\n  - " + "\n  - ".join(problems))
+    return {"commit": commit, "remote": upstream, "remote_commit": upstream_commit, "checked_at": _now()}
+
+
 def _upstream_acks(repo: Path, env_dir: Path, env: str, upstream: str):
     """The acknowledgements in envs/<env>/ack.txt at the tip of upstream (reviewed, code-owned)."""
     from ack_file import parse_text
@@ -961,6 +989,101 @@ def new_plan_dir(env_dir: Path, env: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=".pending-", dir=directory))  # mkdtemp: 0700
 
 
+def account_state_serial(env_dir: Path) -> dict | None:
+    try:
+        state = state_json(Path(env_dir), ACCOUNT_ENV, "account")
+    except RuntimeError as exc:
+        raise Refused(str(exc)) from exc
+    return None if state is None else {"serial": state.get("serial"), "lineage": state.get("lineage")}
+
+
+def _plan_summary(show_json: Path, *, changes: bool) -> dict:
+    summary = {"changes": bool(changes)}
+    data = _read_json(show_json)
+    if data is None:
+        return summary | {"resource_changes": {"unknown": int(bool(changes))}}
+    counts: dict[str, int] = {}
+    for item in data.get("resource_changes") or []:
+        actions = (item.get("change") or {}).get("actions") or []
+        key = ",".join(str(a) for a in actions) if actions else "no-op"
+        counts[key] = counts.get(key, 0) + 1
+    summary["resource_changes"] = counts
+    return summary
+
+
+def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping) -> Path:
+    env_dir, plan_dir = Path(env_dir), Path(plan_dir)
+    status = checkout_status(env_dir)
+    if status["commit"] != prov.get("commit") or not status["clean_tree"]:
+        raise Refused("the checkout changed while account-plan ran; nothing was recorded. Re-run account-plan")
+    info = _read_json(plan_dir / "account.json")
+    if info is None:
+        raise Refused("account-plan didn't record the account plan")
+    plan = plan_dir / str(info.get("file", ""))
+    if not plan.is_file():
+        raise Refused(f"the saved account plan {plan} is missing")
+    created = _now()
+    manifest_id = f"{created[:19].replace(':', '').replace('-', '')}-{prov['commit'][:12]}-account"
+    final_dir = manifests_dir(cloud_dir_of(env_dir), env) / manifest_id
+    plan_name = Path(info["file"]).name
+    manifest = {
+        "kind": "account-manifest", "version": VERSION, "id": manifest_id, "env": env,
+        "cloud": cloud_dir_of(env_dir).name, "commit": prov["commit"], "provenance": dict(prov),
+        "state_serial": account_state_serial(env_dir),
+        "plan": {"file": plan_name, "sha256": sha256_file(plan), "changes": bool(info.get("changes")),
+                 "summary": _plan_summary(plan_dir / "account.show.json", changes=bool(info.get("changes")))},
+        "host": socket.gethostname(), "created_at": created,
+    }
+    _write_once(plan_dir / "manifest.json", manifest)
+    for path in plan_dir.rglob("*"):
+        os.chmod(path, 0o400 if path.is_file() else 0o700)
+    os.rename(plan_dir, final_dir)
+    return final_dir / "manifest.json"
+
+
+def load_account_manifest(path: Path, env: str) -> dict:
+    manifest = _read_json(Path(path))
+    if manifest is None or manifest.get("kind") != "account-manifest" or manifest.get("version") != VERSION:
+        raise Refused(f"{path} is not an account manifest")
+    if manifest.get("env") != env:
+        raise Refused(f"{path} is a manifest for {manifest.get('env')}, not {env}")
+    return manifest
+
+
+def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remote: str = "origin",
+                           branch: str = "main") -> dict:
+    env_dir, manifest_path = Path(env_dir), Path(manifest_path)
+    manifest = load_account_manifest(manifest_path, env)
+    plan_dir = manifest_path.parent
+    drift = []
+    status = checkout_status(env_dir)
+    if status["commit"] != manifest.get("commit"):
+        drift.append(f"HEAD is {status['commit'][:12]}, the manifest planned {manifest.get('commit', '')[:12]}")
+    try:
+        prov = account_provenance(env_dir, env, remote=remote, branch=branch)
+    except Refused as exc:
+        drift.append(str(exc))
+        prov = {}
+    if manifest.get("cloud") != cloud_dir_of(env_dir).name:
+        drift.append(f"the manifest is for {manifest.get('cloud')}, not {cloud_dir_of(env_dir).name}")
+    serial = account_state_serial(env_dir)
+    if serial != manifest.get("state_serial"):
+        drift.append(f"the account state changed since account-plan (serial "
+                     f"{(manifest.get('state_serial') or {}).get('serial')} -> {(serial or {}).get('serial')})")
+    entry = manifest.get("plan") or {}
+    if entry.get("file") != "account.tfplan":
+        drift.append(f"the manifest's account plan is {entry.get('file')!r}, not account.tfplan")
+    else:
+        path = plan_dir / entry["file"]
+        if not path.is_file() or sha256_file(path) != entry.get("sha256"):
+            drift.append(f"the saved account plan {path} changed or is missing")
+    if drift:
+        raise Refused(f"make apply-account refused: {manifest_path} no longer matches:\n  - "
+                      + "\n  - ".join(drift)
+                      + "\nNothing was applied. Run make account-plan again and approve the new manifest.")
+    return manifest
+
+
 def _plan_entry(plan_dir: Path, root: str) -> dict:
     """A saved plan of the account or workspace root (see make release-plan)."""
     info = _read_json(plan_dir / f"{root}.json")
@@ -1143,6 +1266,28 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
     return _write_once(release_dir(cloud_dir, env) / f"{stamp}-{manifest['commit'][:12]}.json", receipt)
 
 
+def account_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
+    env_dir, manifest_path = Path(env_dir), Path(manifest_path)
+    manifest = load_account_manifest(manifest_path, env)
+    cloud_dir = cloud_dir_of(env_dir)
+    status = checkout_status(env_dir)
+    receipt = {
+        "kind": "account", "version": VERSION, "env": env, "cloud": cloud_dir.name,
+        "commit": manifest["commit"], "clean_tree": status["clean_tree"],
+        "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
+        "plan": manifest["plan"], "state_serial": account_state_serial(env_dir),
+        "host": socket.gethostname(), "created_at": _now(),
+    }
+    stamp = receipt["created_at"].replace(":", "").replace(".", "")
+    return _write_once(env_state(cloud_dir, env) / "receipts" / "account" /
+                       f"{stamp}-{manifest['commit'][:12]}.json", receipt)
+
+
+def account_receipts(cloud_dir: Path, env: str = ACCOUNT_ENV) -> list[dict]:
+    return [r for r in _receipts(env_state(cloud_dir, env) / "receipts" / "account")
+            if r.get("kind") == "account"]
+
+
 def phase_record(env_dir: Path, env: str, manifest_path: Path) -> Path:
     """A non-final manifest (one staged policy phase) was applied."""
     manifest = load_manifest(Path(manifest_path), env)
@@ -1284,7 +1429,12 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--remote", default="origin")
     cmd.add_argument("--branch", default="main")
     cmd.add_argument("--out", type=Path)
+    cmd = command("account-provenance")
+    cmd.add_argument("--remote", default="origin")
+    cmd.add_argument("--branch", default="main")
+    cmd.add_argument("--out", type=Path)
     command("plan-dir")
+    command("account-plan-dir")
     cmd = command("reports")
     cmd.add_argument("--plan-dir", type=Path, required=True)
     cmd.add_argument("--provenance", type=Path, required=True)
@@ -1295,12 +1445,21 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--plan-dir", type=Path, required=True)
     cmd.add_argument("--provenance", type=Path, required=True)
     cmd.add_argument("--live-snapshot", required=True)
+    cmd = command("account-manifest-write")
+    cmd.add_argument("--plan-dir", type=Path, required=True)
+    cmd.add_argument("--provenance", type=Path, required=True)
     cmd = command("manifest-check")
     cmd.add_argument("--manifest", type=Path, required=True)
     cmd.add_argument("--live-snapshot", default=None)
     cmd.add_argument("--field", default="", help="print one manifest field (json path a.b) instead")
+    cmd = command("account-manifest-check")
+    cmd.add_argument("--manifest", type=Path, required=True)
+    cmd.add_argument("--remote", default="origin")
+    cmd.add_argument("--branch", default="main")
+    cmd.add_argument("--field", default="", help="print one manifest field (json path a.b) instead")
     for name in ("release-receipt", "phase-record"):
         command(name).add_argument("--manifest", type=Path, required=True)
+    command("account-receipt").add_argument("--manifest", type=Path, required=True)
     command("maintain-check")
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
@@ -1323,7 +1482,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Provenance: {prov['commit'][:12]} is on {prov['remote']}, clean, rehearsed in "
                   f"{prov['source_env']} (receipt matches; envs/{args.env}/generated matches its promotion)"
                   + (f"; ROLLBACK acknowledged ({prov['rollback']['key']})" if prov["rollback"] else ""))
+        elif args.command == "account-provenance":
+            prov = account_provenance(args.env_dir, args.env, remote=args.remote, branch=args.branch)
+            if args.out:
+                args.out.write_text(json.dumps(prov, indent=2, sort_keys=True) + "\n")
+            print(f"Account provenance: {prov['commit'][:12]} is the clean HEAD of {prov['remote']}.")
         elif args.command == "plan-dir":
+            print(new_plan_dir(args.env_dir, args.env))
+        elif args.command == "account-plan-dir":
             print(new_plan_dir(args.env_dir, args.env))
         elif args.command == "reports":
             prov = _read_json(args.provenance) or {}
@@ -1342,6 +1508,9 @@ def main(argv: list[str] | None = None) -> int:
             path = manifest_write(args.env_dir, args.env, args.plan_dir, _read_json(args.provenance) or {},
                                   args.live_snapshot, report)
             print(path)
+        elif args.command == "account-manifest-write":
+            path = account_manifest_write(args.env_dir, args.env, args.plan_dir, _read_json(args.provenance) or {})
+            print(path)
         elif args.command == "manifest-check":
             if args.field:
                 value = load_manifest(args.manifest, args.env)
@@ -1353,8 +1522,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Manifest {args.manifest}: commit, state serials, saved plans"
                   + (", effective config and live snapshot" if args.live_snapshot else " and effective config")
                   + " match.")
+        elif args.command == "account-manifest-check":
+            if args.field:
+                value = load_account_manifest(args.manifest, args.env)
+                for part in args.field.split("."):
+                    value = value.get(part) if isinstance(value, dict) else None
+                print(json.dumps(value) if not isinstance(value, str) else value)
+                return 0
+            account_manifest_check(args.env_dir, args.env, args.manifest, remote=args.remote, branch=args.branch)
+            print(f"Account manifest {args.manifest}: commit, account state serial and saved plan match.")
         elif args.command == "release-receipt":
             print(f"Release receipt: {release_receipt(args.env_dir, args.env, args.manifest)}")
+        elif args.command == "account-receipt":
+            print(f"Account receipt: {account_receipt(args.env_dir, args.env, args.manifest)}")
         elif args.command == "phase-record":
             print(f"Phase record: {phase_record(args.env_dir, args.env, args.manifest)}")
         elif args.command == "apply-guard":

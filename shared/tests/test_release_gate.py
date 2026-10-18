@@ -363,6 +363,108 @@ def test_rehearse_dev_requires_promote_from_for_release_plan(repo):
         rg.source_env(other)
 
 
+# -- account operation provenance -------------------------------------------------------
+
+def test_account_provenance_passes_for_clean_origin_main_head(repo):
+    prov = rg.account_provenance(repo.cloud / "envs" / "account")
+    assert prov["commit"] == repo.head()
+    assert prov["remote"] == "origin/main"
+
+
+def test_account_provenance_refuses_dirty_checkout(repo):
+    (repo.cloud / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = true\n")
+    with pytest.raises(rg.Refused, match="checkout is not clean"):
+        rg.account_provenance(repo.cloud / "envs" / "account")
+
+
+def test_account_provenance_refuses_a_local_only_commit(repo):
+    repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# local\n"}, push=False)
+    with pytest.raises(rg.Refused, match="not exactly origin/main"):
+        rg.account_provenance(repo.cloud / "envs" / "account")
+
+
+def test_account_provenance_refuses_when_origin_main_moved_ahead(repo, tmp_path):
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(repo.origin), str(other)], check=True, env=os.environ | repo.env)
+    (other / "aws" / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = false\n# newer\n")
+    for args in (("add", "-A"), ("commit", "-q", "-m", "newer"), ("push", "-q", "origin", "main")):
+        subprocess.run(["git", "-C", str(other), *args], check=True, env=os.environ | repo.env)
+    with pytest.raises(rg.Refused, match="not exactly origin/main"):
+        rg.account_provenance(repo.cloud / "envs" / "account")
+
+
+def _account_plan_dir(repo: Repo, *, changes: bool = True) -> Path:
+    plan_dir = rg.new_plan_dir(repo.cloud / "envs" / "account", "account")
+    (plan_dir / "account.tfplan").write_bytes(b"account saved plan")
+    (plan_dir / "account.json").write_text(json.dumps({"file": "account.tfplan", "changes": changes}))
+    (plan_dir / "account.show.json").write_text(json.dumps({"resource_changes": [
+        {"change": {"actions": ["create"]}}, {"change": {"actions": ["update"]}},
+    ]}))
+    return plan_dir
+
+
+@pytest.fixture
+def account_manifest(repo):
+    state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"version": 4, "serial": 5, "lineage": "A", "resources": []}))
+    prov = rg.account_provenance(repo.cloud / "envs" / "account")
+    return rg.account_manifest_write(repo.cloud / "envs" / "account", "account", _account_plan_dir(repo), prov)
+
+
+def test_account_plan_writes_one_immutable_manifest(repo, account_manifest):
+    data = json.loads(account_manifest.read_text())
+    assert data["kind"] == "account-manifest"
+    assert data["commit"] == repo.head()
+    assert data["state_serial"] == {"serial": 5, "lineage": "A"}
+    assert data["plan"]["sha256"] == rg.sha256_bytes(b"account saved plan")
+    assert data["plan"]["summary"]["resource_changes"] == {"create": 1, "update": 1}
+    for path in [account_manifest.parent, *account_manifest.parent.rglob("*")]:
+        assert path.stat().st_mode & 0o077 == 0, path
+        if path.is_file():
+            assert not os.access(path, os.W_OK), path
+    assert rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)["id"] == data["id"]
+
+
+def test_account_manifest_refuses_wrong_commit(repo, account_manifest):
+    repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# later\n"})
+    with pytest.raises(rg.Refused, match="manifest planned"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_state_serial_drift(repo, account_manifest):
+    state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
+    state.write_text(json.dumps({"version": 4, "serial": 6, "lineage": "A", "resources": []}))
+    with pytest.raises(rg.Refused, match="account state changed since account-plan"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_plan_hash_mismatch(repo, account_manifest):
+    plan = account_manifest.parent / "account.tfplan"
+    os.chmod(plan, 0o644)
+    plan.write_bytes(b"tampered")
+    with pytest.raises(rg.Refused, match="saved account plan .* changed"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_a_tampered_manifest(repo, account_manifest):
+    os.chmod(account_manifest, 0o644)
+    data = json.loads(account_manifest.read_text())
+    data["plan"]["file"] = "other.tfplan"
+    account_manifest.write_text(json.dumps(data))
+    with pytest.raises(rg.Refused, match="not account.tfplan"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_receipt_records_manifest_and_post_apply_state(repo, account_manifest):
+    path = rg.account_receipt(repo.cloud / "envs" / "account", "account", account_manifest)
+    receipt = json.loads(path.read_text())
+    assert receipt["kind"] == "account"
+    assert receipt["commit"] == repo.head()
+    assert receipt["manifest"]["sha256"] == rg.sha256_file(account_manifest)
+    assert receipt["state_serial"] == {"serial": 5, "lineage": "A"}
+
+
 # -- manifests ------------------------------------------------------------------------
 
 def _plan_dir(repo: Repo, *, final=True) -> Path:

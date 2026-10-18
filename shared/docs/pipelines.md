@@ -46,7 +46,7 @@ read-only SP that already holds more than it should. Fix that and re-run.
 | 3. Dev rehearsal | dev pipeline, each merge to `main`, in order | `make rehearse ENV=dev` | dev |
 | 4. Prod release | deployment machine in v1, after stage 3 passes on the commit | `make release-plan ENV=prod`, approve its manifest, `make release ENV=prod MANIFEST=<manifest>` ([release gating](#release-gating-deterministic-envs)) | prod |
 | 5. Keep protected | deployment machine in v1, on a schedule, at the last released commit | `make maintain ENV=prod` | prod, governance only |
-| 6. Operations | deployment machine, one approval per operation | `make detach-agent`, `make apply-account`, migration phases | prod or account |
+| 6. Operations | deployment machine, one approval per operation | `make detach-agent`, `make account-plan` then `make apply-account MANIFEST=<manifest>`, migration phases | prod or account |
 
 - **Stage 3 runs in CI once dev has remote state.** Until then the operator
   runs it. Stages 4 to 6 stay on the [deployment machine](deployment-machine.md)
@@ -289,8 +289,8 @@ key_prefix = "genierails"
   example `terraform state push`), or the first plan sees an empty env.
 - The dev pipeline also plans the account layer read-only (rehearse refuses a
   non-empty account plan), so commit `envs/account/remote_state.hcl` with the
-  account's real state too. The deployment machine's `make apply-account` then
-  uses the same remote state.
+  account's real state too. The deployment machine's `make account-plan` and
+  `make apply-account MANIFEST=<manifest>` then use the same remote state.
 
 **Receipts.** A receipt counts only in the store that wrote it. The dev
 pipeline uploads its receipt as an artifact for the record, but `release-plan`
@@ -322,6 +322,13 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   fresh `release-plan`, if the commit, a state serial, a saved plan, the
   effective config or live Unity Catalog changed. Plain `make release ENV=prod`
   refuses in a deterministic env.
+- **`make account-plan` / `make apply-account MANIFEST=<path>`** is the account
+  operation equivalent: `account-plan` refuses unless the checkout is clean and
+  exactly current `origin/main`, saves one account plan and immutable manifest,
+  and changes nothing live. `apply-account` refuses without that manifest, in
+  CI, from a dirty checkout or wrong commit, or if the account state, manifest
+  or saved plan changed; under the account lock it applies the saved plan and
+  writes an account receipt.
 - **Staged policy changes take one manifest per phase.** A change that
   replaces policies or moves tiers is planned one changing phase at a time:
   each `release` applies that phase and says to run `release-plan` again
@@ -352,7 +359,8 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   | `destroy`, `destroy-governance`, `destroy-genie` | needs `CONFIRM_DESTROY=<env>` on the command line | unchanged |
   | `release` without `MANIFEST=` | refused | refused |
 
-  Not gated: `apply-account` (its own account lock and approval),
+  Not gated by the env side-door: `apply-account` (its own account manifest,
+  account lock and approval),
   `enable-classification` (classification config only), `import`,
   `migrate-state`, `rebuild-governed-tables` (state or a local record), and
   `policy-abandon` (drops only a staged change that never switched). Each

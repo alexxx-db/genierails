@@ -61,6 +61,14 @@ from pathlib import Path
 with open({log!r}, "a") as log:
     log.write(json.dumps([{name!r}] + sys.argv[1:]) + "\n")
 args = sys.argv[1:]
+if {name!r} == "runner" and len(args) >= 3 and args[0] == "account" and args[2] == "plan":
+    for arg in args:
+        if arg.startswith("-out="):
+            Path(arg.split("=", 1)[1]).write_bytes(b"account saved plan")
+    sys.exit(2)
+if {name!r} == "runner" and len(args) >= 3 and args[0] == "account" and args[2] == "show":
+    print(json.dumps({{"resource_changes": [{{"change": {{"actions": ["create"]}}}}]}}))
+    sys.exit(0)
 if {name!r} == "reports" and "--plan-dir" in args:
     Path(args[args.index("--plan-dir") + 1], "reports.json").write_text(json.dumps({{"ok": True}}))
 if {name!r} == "live":
@@ -234,6 +242,109 @@ def test_release_plan_refused_by_the_reports_writes_no_manifest(make, repo):
 def test_release_plan_refuses_in_ci(tmp_path, repo, cloud):
     result = Make(tmp_path, repo, cloud)("release-plan", "prod", ci=True)
     assert result.returncode != 0 and "applying targets cannot run in CI" in result.stderr
+
+
+# -- account-plan / apply-account MANIFEST= --------------------------------------------
+
+def _account_planned(make: Make) -> Path:
+    result = make("account-plan", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    make.reset()
+    return Path(result.stdout.split("make apply-account MANIFEST=")[-1].strip())
+
+
+def test_account_plan_writes_an_immutable_manifest_from_clean_origin_main(make, repo):
+    result = make("account-plan", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(result.stdout.split("make apply-account MANIFEST=")[-1].strip())
+    data = json.loads(manifest.read_text())
+    assert data["kind"] == "account-manifest"
+    assert data["commit"] == repo.head()
+    assert data["plan"]["sha256"] == rg.sha256_bytes(b"account saved plan")
+    assert data["plan"]["summary"]["resource_changes"] == {"create": 1}
+    runner = [c for c in make.calls() if c[0] == "runner"]
+    assert runner[0][:6] == ["runner", "account", "account", "plan", "-input=false", "-detailed-exitcode"]
+    assert runner[0][6].startswith("-out=") and Path(runner[0][6].split("=", 1)[1]).name == "account.tfplan"
+    assert runner[1][:5] == ["runner", "account", "account", "show", "-json"]
+    assert Path(runner[1][5]).name == "account.tfplan"
+
+
+def test_account_plan_refuses_dirty_checkout_before_planning(make, repo):
+    (repo.cloud / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = false\n# local\n")
+    result = make("account-plan", "account")
+    assert result.returncode != 0 and "checkout is not clean" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner"]
+
+
+def test_account_plan_refuses_when_head_is_not_origin_main(make, repo):
+    repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# local\n"}, push=False)
+    result = make("account-plan", "account")
+    assert result.returncode != 0 and "not exactly origin/main" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner"]
+
+
+def test_apply_account_refuses_without_a_manifest(make, repo):
+    result = make("apply-account", "account")
+    assert result.returncode != 0
+    assert "make account-plan" in result.stderr and "MANIFEST=" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner"]
+
+
+def test_apply_account_refuses_in_ci(make, repo):
+    result = make("apply-account", "account", "MANIFEST=/m/manifest.json", ci=True)
+    assert result.returncode != 0 and "applying targets cannot run in CI" in result.stderr
+    assert make.calls() == []
+
+
+def test_apply_account_applies_only_the_saved_plan_under_the_account_lock_and_writes_receipt(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = make.calls()
+    assert ["runner", "account", "account", "apply-plan", str(manifest.parent / "account.tfplan")] in calls
+    assert not [c for c in calls if c[0] == "runner" and c[3:4] in (["apply"], ["plan"])]
+    receipts = rg.account_receipts(repo.cloud, "account")
+    assert receipts and receipts[-1]["commit"] == repo.head()
+    assert receipts[-1]["manifest"]["path"] == str(manifest)
+
+
+@pytest.mark.parametrize("drift", ["commit", "not-origin-main", "dirty", "serial", "plan", "manifest"])
+def test_apply_account_refuses_a_stale_or_tampered_manifest_and_applies_nothing(tmp_path, repo, drift):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    if drift == "commit":
+        repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# later\n"})
+    elif drift == "not-origin-main":
+        repo.commit({"aws/envs/account/env.auto.tfvars": "manage_groups = false\n# local\n"}, push=False)
+    elif drift == "dirty":
+        (repo.cloud / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = false\n# local\n")
+    elif drift == "serial":
+        state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"version": 4, "serial": 3, "lineage": "A"}))
+    elif drift == "plan":
+        plan = manifest.parent / "account.tfplan"
+        os.chmod(plan, 0o644)
+        plan.write_bytes(b"tampered")
+    else:
+        os.chmod(manifest, 0o644)
+        data = json.loads(manifest.read_text())
+        data["plan"]["file"] = "other.tfplan"
+        manifest.write_text(json.dumps(data))
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "Run make account-plan again" in result.stderr
+    assert not [c for c in make.calls() if c[0] == "runner" and c[3:4] == ["apply-plan"]]
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
+def test_account_bootstrap_targets_do_not_use_the_account_manifest_flow():
+    text = (ROOT / "shared" / "Makefile.shared").read_text()
+    bootstrap = text[text.index("\nbootstrap-sp:"):text.index("\n# Set up the Databricks side")]
+    pipelines = text[text.index("\nbootstrap-pipelines:"):text.index("\ntest-unit:")]
+    assert "apply-account" not in bootstrap + pipelines
+    assert "account-plan" not in bootstrap + pipelines
 
 
 # -- release MANIFEST= ---------------------------------------------------------------

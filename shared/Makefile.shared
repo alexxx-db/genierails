@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory apply-account check policy-status policy-abandon
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan apply-account check policy-status policy-abandon
 
 .PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask adopt-custom-mask
 
@@ -790,7 +790,7 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 
 # In CI the runner's state is throwaway, so the account plan must read the
 # real account state: envs/account/remote_state.hcl (read-only here; only
-# make apply-account, on the deployment machine, applies it).
+# the approved account-plan/apply-account MANIFEST= flow applies it).
 _guard-account-plan-empty:
 	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
 	if { [ "$$ci_value" = true ] || [ "$$ci_value" = 1 ] || [ "$$ci_value" = yes ] || [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; } \
@@ -800,7 +800,7 @@ _guard-account-plan-empty:
 	set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
 	if [ $$status -eq 2 ]; then \
 		echo "ERROR: account plan is non-empty; rehearse/release may only add allowed treatment-tag values." >&2; \
-		echo "Run 'make apply-account' in the approved operations stage." >&2; exit 1; \
+		echo "Run 'make account-plan', get its manifest approved, then 'make apply-account MANIFEST=<manifest>' in the operations stage." >&2; exit 1; \
 	fi; \
 	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
 
@@ -812,12 +812,48 @@ _apply-account-for-workspace:
 		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace; \
 	fi
 
-apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account resources in the approved operations stage
-	@$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)"
+account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/main HEAD -> immutable account manifest to approve
+	@$(_DRY_RUN_GUARD); \
+	export GENIERAILS_RERUN_TARGET=account-plan; \
+	$(MAKE) --no-print-directory _guard-account-config || exit 1; \
+	prov="$$(mktemp)"; \
+	$(_RELEASE_GATE) account-provenance --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
+	plan_dir="$$($(_RELEASE_GATE) account-plan-dir --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)")" || { rm -f "$$prov"; exit 1; }; \
+	cp "$$prov" "$$plan_dir/provenance.json"; rm -f "$$prov"; \
+	echo "=== Saved plan (account) ==="; \
+	set +e; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan"; status=$$?; set -e; \
+	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir"; echo "account-plan: planning failed (above); no manifest was written." >&2; exit 1; fi; \
+	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
+	"$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" show -json "$$plan_dir/account.tfplan" > "$$plan_dir/account.show.json" 2>/dev/null || true; \
+	manifest="$$($(_RELEASE_GATE) account-manifest-write --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json")" || { rm -rf "$$plan_dir"; exit 1; }; \
+	echo ""; \
+	echo "=== Account plan ==="; \
+	echo "  Manifest (immutable): $$manifest"; \
+	echo "  Review it and its saved plan, get it approved, then run:"; \
+	echo "    make apply-account MANIFEST=$$manifest"
+
+apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account resources from an approved account manifest: MANIFEST=<from make account-plan>
+	@if [ -z "$(strip $(MANIFEST))" ]; then \
+		echo "apply-account is two-phase:" >&2; \
+		echo "  1. make account-plan   (checks clean origin/main HEAD, saves the account plan, writes one manifest)" >&2; \
+		echo "  2. get that manifest approved" >&2; \
+		echo "  3. make apply-account MANIFEST=<the manifest account-plan printed>" >&2; \
+		exit 1; \
+	fi
+	@$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$(MANIFEST)"
 
 _apply-account-locked:
-	@$(_DRY_RUN_GUARD); $(call _ENV_LOCK,apply-account); \
-	$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace
+	@$(_DRY_RUN_GUARD); \
+	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
+	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
+	$(call _ENV_LOCK,apply-account); \
+	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
+	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=replace || exit 1; \
+	echo "=== Apply saved plan (account) ==="; \
+	LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" apply-plan "$$plans/account.tfplan" || exit 1; \
+	$(_RELEASE_GATE) account-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	echo ""; \
+	echo "=== Account apply complete ==="
 
 # A deterministic env's rehearse takes the env lock and writes an append-only
 # receipt per commit (scripts/release_gate.py): commit, clean-tree flag, the
@@ -1613,7 +1649,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
 		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
-			echo "=== A deterministic env uses this account layer: applying it through make apply-account (account lock) ==="; \
+			echo "=== A deterministic env uses this account layer: applying it through make apply-account MANIFEST=<manifest> (account lock) ==="; \
 			$(MAKE) --no-print-directory apply-account; \
 		else \
 			$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
