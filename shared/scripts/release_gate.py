@@ -997,9 +997,47 @@ def account_state_serial(env_dir: Path) -> dict | None:
     return None if state is None else {"serial": state.get("serial"), "lineage": state.get("lineage")}
 
 
-def _plan_summary(show_json: Path, *, changes: bool) -> dict:
+ACCOUNT_RUNTIME_INPUTS = ("abac.auto.tfvars", "classification.auto.tfvars", "discovered_uc_tables.auto.tfvars")
+
+
+def account_input_hashes(env_dir: Path) -> list[dict]:
+    """Account-layer inputs that are not protected by git cleanliness.
+
+    ``auth.auto.tfvars`` is deliberately excluded: it can hold a plaintext
+    secret, and the account manifest must not read or persist auth material.
+    """
+    env_dir = Path(env_dir)
+    files = {p.resolve() for p in env_input_files(env_dir)}
+    files.update((env_dir / name).resolve() for name in ACCOUNT_RUNTIME_INPUTS if (env_dir / name).is_file())
+    return [
+        {"path": os.path.relpath(path, env_dir), "sha256": sha256_file(path)}
+        for path in sorted(files)
+        if path.is_file() and not path.is_symlink() and path.name != "auth.auto.tfvars"
+    ]
+
+
+def account_tag_sync_diff(env_dir: Path) -> list[dict]:
+    script = SHARED / "scripts" / "sync_tag_policies.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--mode", "replace", "--dry-run", "--json",
+         str(Path(env_dir) / "abac.auto.tfvars")],
+        cwd=env_dir, text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        message = (result.stderr or result.stdout).strip()
+        raise Refused(f"the account tag-policy replace diff could not be computed"
+                      + (f": {message}" if message else ""))
+    try:
+        value = json.loads(result.stdout or "[]")
+    except ValueError as exc:
+        raise Refused("the account tag-policy replace diff was not valid JSON") from exc
+    if not isinstance(value, list):
+        raise Refused("the account tag-policy replace diff was not a JSON list")
+    return value
+
+
+def _plan_summary_data(data: Mapping | None, *, changes: bool) -> dict:
     summary = {"changes": bool(changes)}
-    data = _read_json(show_json)
     if data is None:
         return summary | {"resource_changes": {"unknown": int(bool(changes))}}
     counts: dict[str, int] = {}
@@ -1009,6 +1047,10 @@ def _plan_summary(show_json: Path, *, changes: bool) -> dict:
         counts[key] = counts.get(key, 0) + 1
     summary["resource_changes"] = counts
     return summary
+
+
+def _plan_summary(show_json: Path, *, changes: bool) -> dict:
+    return _plan_summary_data(_read_json(show_json), changes=changes)
 
 
 def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping) -> Path:
@@ -1022,8 +1064,14 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     plan = plan_dir / str(info.get("file", ""))
     if not plan.is_file():
         raise Refused(f"the saved account plan {plan} is missing")
+    summary = _read_json(plan_dir / "account.summary.json")
+    if summary is None:
+        raise Refused("account-plan didn't record the account plan summary")
+    tag_sync = _read_json(plan_dir / "tag_sync.json")
+    if tag_sync is None or not isinstance(tag_sync.get("diff"), list):
+        raise Refused("account-plan didn't record the account tag-policy replace diff")
     created = _now()
-    manifest_id = f"{created[:19].replace(':', '').replace('-', '')}-{prov['commit'][:12]}-account"
+    manifest_id = f"{created.replace(':', '').replace('.', '').replace('-', '')}-{prov['commit'][:12]}-account"
     final_dir = manifests_dir(cloud_dir_of(env_dir), env) / manifest_id
     plan_name = Path(info["file"]).name
     manifest = {
@@ -1031,7 +1079,9 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
         "cloud": cloud_dir_of(env_dir).name, "commit": prov["commit"], "provenance": dict(prov),
         "state_serial": account_state_serial(env_dir),
         "plan": {"file": plan_name, "sha256": sha256_file(plan), "changes": bool(info.get("changes")),
-                 "summary": _plan_summary(plan_dir / "account.show.json", changes=bool(info.get("changes")))},
+                 "summary": summary},
+        "inputs": account_input_hashes(env_dir),
+        "tag_sync": tag_sync["diff"],
         "host": socket.gethostname(), "created_at": created,
     }
     _write_once(plan_dir / "manifest.json", manifest)
@@ -1050,6 +1100,34 @@ def load_account_manifest(path: Path, env: str) -> dict:
     return manifest
 
 
+def account_manifest_used(cloud_dir: Path, env: str, manifest_id: str) -> bool:
+    return any(((r.get("manifest") or {}).get("id") == manifest_id) for r in account_receipts(cloud_dir, env))
+
+
+def account_manifest_paths(cloud_dir: Path, env: str = ACCOUNT_ENV) -> list[Path]:
+    return sorted(manifests_dir(cloud_dir, env).glob("*/manifest.json"))
+
+
+def select_account_manifest(env_dir: Path, env: str) -> Path:
+    status = checkout_status(env_dir)
+    cloud_dir = cloud_dir_of(env_dir)
+    candidates = []
+    for path in account_manifest_paths(cloud_dir, env):
+        manifest = _read_json(path)
+        if (manifest and manifest.get("kind") == "account-manifest" and manifest.get("version") == VERSION
+                and manifest.get("env") == env and manifest.get("commit") == status["commit"]
+                and not account_manifest_used(cloud_dir, env, str(manifest.get("id") or ""))):
+            candidates.append((path, manifest))
+    if len(candidates) != 1:
+        ids = [f"{m.get('id')} ({p})" for p, m in candidates]
+        if not candidates:
+            raise Refused("make apply-account found no unreceipted account manifest for HEAD. "
+                          "Run make account-plan, get its manifest approved, then run make apply-account.")
+        raise Refused("make apply-account found multiple unreceipted account manifests for HEAD; "
+                      "rerun with MANIFEST=<path> for one of:\n  - " + "\n  - ".join(ids))
+    return candidates[0][0]
+
+
 def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remote: str = "origin",
                            branch: str = "main") -> dict:
     env_dir, manifest_path = Path(env_dir), Path(manifest_path)
@@ -1066,6 +1144,8 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         prov = {}
     if manifest.get("cloud") != cloud_dir_of(env_dir).name:
         drift.append(f"the manifest is for {manifest.get('cloud')}, not {cloud_dir_of(env_dir).name}")
+    if account_manifest_used(cloud_dir_of(env_dir), env, str(manifest.get("id") or "")):
+        drift.append("the manifest already has an account receipt; account manifests are single-use")
     serial = account_state_serial(env_dir)
     if serial != manifest.get("state_serial"):
         drift.append(f"the account state changed since account-plan (serial "
@@ -1077,11 +1157,31 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         path = plan_dir / entry["file"]
         if not path.is_file() or sha256_file(path) != entry.get("sha256"):
             drift.append(f"the saved account plan {path} changed or is missing")
+    current_inputs = account_input_hashes(env_dir)
+    if current_inputs != manifest.get("inputs"):
+        drift.append("the account input file hashes changed since account-plan")
+    try:
+        current_tag_sync = account_tag_sync_diff(env_dir)
+    except Refused as exc:
+        drift.append(str(exc))
+    else:
+        if current_tag_sync != manifest.get("tag_sync"):
+            drift.append("the account tag-policy replace diff changed since account-plan")
     if drift:
         raise Refused(f"make apply-account refused: {manifest_path} no longer matches:\n  - "
                       + "\n  - ".join(drift)
                       + "\nNothing was applied. Run make account-plan again and approve the new manifest.")
     return manifest
+
+
+def require_account_lock(env_dir: Path) -> None:
+    from scripts.environment_lock import held_by_ancestor
+
+    owner = held_by_ancestor(Path(env_dir))
+    if owner in {"apply-account", "release", "rehearse"}:
+        return
+    raise Refused("make sync-tags TAG_SYNC_MODE=replace refused: a deterministic env uses the account layer, "
+                  "so replace syncs may run only under the live account lock held by make apply-account.")
 
 
 def _plan_entry(plan_dir: Path, root: str) -> dict:
@@ -1150,7 +1250,8 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
     agents = _read_json(plan_dir / "agents.json") or {"agents": {}}
     if plans["account"].get("changes"):
         raise Refused(f"the account plan is not empty; rehearse and release may only add treatment-tag values. "
-                      f"Run make apply-account ENV={env} in the operations stage first")
+                      "Run make account-plan, get its manifest approved, then run make apply-account "
+                      "in the operations stage first")
     created = _now()
     manifest_id = f"{created[:19].replace(':', '').replace('-', '')}-{prov['commit'][:12]}"
     final_dir = manifests_dir(cloud_dir_of(env_dir), env) / manifest_id
@@ -1435,6 +1536,12 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--out", type=Path)
     command("plan-dir")
     command("account-plan-dir")
+    cmd = command("account-plan-summary")
+    cmd.add_argument("--show-json", type=Path, required=True)
+    cmd.add_argument("--changes", choices=("true", "false"), required=True)
+    cmd.add_argument("--out", type=Path, required=True)
+    cmd = command("account-tag-sync-diff")
+    cmd.add_argument("--out", type=Path, required=True)
     cmd = command("reports")
     cmd.add_argument("--plan-dir", type=Path, required=True)
     cmd.add_argument("--provenance", type=Path, required=True)
@@ -1457,9 +1564,13 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--remote", default="origin")
     cmd.add_argument("--branch", default="main")
     cmd.add_argument("--field", default="", help="print one manifest field (json path a.b) instead")
+    command("account-manifest-select")
+    cmd = command("account-manifest-info")
+    cmd.add_argument("--manifest", type=Path, required=True)
     for name in ("release-receipt", "phase-record"):
         command(name).add_argument("--manifest", type=Path, required=True)
     command("account-receipt").add_argument("--manifest", type=Path, required=True)
+    command("account-lock-check")
     command("maintain-check")
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
@@ -1491,6 +1602,15 @@ def main(argv: list[str] | None = None) -> int:
             print(new_plan_dir(args.env_dir, args.env))
         elif args.command == "account-plan-dir":
             print(new_plan_dir(args.env_dir, args.env))
+        elif args.command == "account-plan-summary":
+            data = _read_json(args.show_json)
+            if data is None:
+                raise Refused(f"{args.show_json} is not valid terraform show -json output")
+            args.out.write_text(json.dumps(_plan_summary_data(data, changes=args.changes == "true"),
+                                           indent=2, sort_keys=True) + "\n")
+        elif args.command == "account-tag-sync-diff":
+            args.out.write_text(json.dumps({"diff": account_tag_sync_diff(args.env_dir)},
+                                           indent=2, sort_keys=True) + "\n")
         elif args.command == "reports":
             prov = _read_json(args.provenance) or {}
             source = _databricks_reader_source(args.env_dir, args.warehouse_id) if args.warehouse_id else None
@@ -1530,7 +1650,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(value) if not isinstance(value, str) else value)
                 return 0
             account_manifest_check(args.env_dir, args.env, args.manifest, remote=args.remote, branch=args.branch)
-            print(f"Account manifest {args.manifest}: commit, account state serial and saved plan match.")
+            print(f"Account manifest {args.manifest}: commit, account state serial, saved plan, "
+                  "account inputs and tag-policy diff match.")
+        elif args.command == "account-manifest-select":
+            path = select_account_manifest(args.env_dir, args.env)
+            manifest = load_account_manifest(path, args.env)
+            print(path)
+            print(f"Selected account manifest {manifest['id']} (sha256 {sha256_file(path)})", file=sys.stderr)
+        elif args.command == "account-manifest-info":
+            manifest = load_account_manifest(args.manifest, args.env)
+            print(f"Selected account manifest {manifest['id']} (sha256 {sha256_file(args.manifest)})")
         elif args.command == "release-receipt":
             print(f"Release receipt: {release_receipt(args.env_dir, args.env, args.manifest)}")
         elif args.command == "account-receipt":
@@ -1541,6 +1670,8 @@ def main(argv: list[str] | None = None) -> int:
             apply_guard(args.env_dir, args.env, args.target)
         elif args.command == "destroy-guard":
             destroy_guard(args.env_dir, args.env, args.confirm)
+        elif args.command == "account-lock-check":
+            require_account_lock(args.env_dir)
         elif args.command == "legacy-guard":
             legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":

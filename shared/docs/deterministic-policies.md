@@ -167,11 +167,13 @@ values (`sync_tag_policies.py --mode add-only`). Terraform ignores the values,
 so an empty account plan doesn't prove the REST update is safe: when a live
 value is no longer desired, the sync writes nothing, lists the values it would
 remove and fails, pointing at the account operation. Only
-`make apply-account MANIFEST=<manifest>` (CI guard, approved account manifest,
-account lock) runs `--mode replace`, which removes them. While any env of the
-checkout (`envs/*/env.auto.tfvars`) is deterministic, `make apply ENV=account`
-routes to that same manifest-gated operation, and a bare
-`make sync-tags ENV=account` is add-only. Legacy-only checkouts keep `replace`,
-as before.
+`make apply-account` (CI guard, approved single-use account manifest, account
+lock) runs `--mode replace`, which removes them. While any env of the checkout
+(`envs/*/env.auto.tfvars`) is deterministic, `make apply ENV=account` routes
+to that same manifest-gated operation, `_apply-account-for-workspace` stays
+add-only even for a legacy env in that mixed checkout, explicit
+`make sync-tags ENV=account TAG_SYNC_MODE=replace` refuses without the live
+account-lock nonce, and `make destroy ENV=account` refuses. Legacy-only
+checkouts keep `replace`, as before.
 
 Migrating a legacy env: [legacy-migration.md](legacy-migration.md).

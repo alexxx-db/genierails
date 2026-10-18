@@ -790,7 +790,7 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 
 # In CI the runner's state is throwaway, so the account plan must read the
 # real account state: envs/account/remote_state.hcl (read-only here; only
-# the approved account-plan/apply-account MANIFEST= flow applies it).
+# the approved account-plan/apply-account flow applies it).
 _guard-account-plan-empty:
 	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
 	if { [ "$$ci_value" = true ] || [ "$$ci_value" = 1 ] || [ "$$ci_value" = yes ] || [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; } \
@@ -800,13 +800,13 @@ _guard-account-plan-empty:
 	set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
 	if [ $$status -eq 2 ]; then \
 		echo "ERROR: account plan is non-empty; rehearse/release may only add allowed treatment-tag values." >&2; \
-		echo "Run 'make account-plan', get its manifest approved, then 'make apply-account MANIFEST=<manifest>' in the operations stage." >&2; exit 1; \
+		echo "Run 'make account-plan', get its manifest approved, then 'make apply-account' in the operations stage." >&2; exit 1; \
 	fi; \
 	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
 
 _apply-account-for-workspace:
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")"; \
-	if [ "$$mode" = deterministic ]; then \
+	if [ "$$mode" = deterministic ] || [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
 		$(MAKE) --no-print-directory _guard-account-plan-empty ENV="$(ENV)" && $(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only; \
 	else \
 		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace; \
@@ -824,23 +824,28 @@ account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/
 	set +e; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan"; status=$$?; set -e; \
 	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir"; echo "account-plan: planning failed (above); no manifest was written." >&2; exit 1; fi; \
 	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
-	"$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" show -json "$$plan_dir/account.tfplan" > "$$plan_dir/account.show.json" 2>/dev/null || true; \
+	show_json="$$(mktemp)"; \
+	if ! "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" show -json "$$plan_dir/account.tfplan" > "$$show_json"; then rm -f "$$show_json"; rm -rf "$$plan_dir"; echo "account-plan: terraform show failed (above); no manifest was written." >&2; exit 1; fi; \
+	$(_RELEASE_GATE) account-plan-summary --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --show-json "$$show_json" --changes "$$([ $$status -eq 2 ] && echo true || echo false)" --out "$$plan_dir/account.summary.json" || { rm -f "$$show_json"; rm -rf "$$plan_dir"; exit 1; }; \
+	rm -f "$$show_json"; \
+	$(_RELEASE_GATE) account-tag-sync-diff --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --out "$$plan_dir/tag_sync.json" || { rm -rf "$$plan_dir"; exit 1; }; \
 	manifest="$$($(_RELEASE_GATE) account-manifest-write --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json")" || { rm -rf "$$plan_dir"; exit 1; }; \
 	echo ""; \
 	echo "=== Account plan ==="; \
 	echo "  Manifest (immutable): $$manifest"; \
 	echo "  Review it and its saved plan, get it approved, then run:"; \
-	echo "    make apply-account MANIFEST=$$manifest"
+	echo "    make apply-account"
 
-apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account resources from an approved account manifest: MANIFEST=<from make account-plan>
-	@if [ -z "$(strip $(MANIFEST))" ]; then \
-		echo "apply-account is two-phase:" >&2; \
-		echo "  1. make account-plan   (checks clean origin/main HEAD, saves the account plan, writes one manifest)" >&2; \
-		echo "  2. get that manifest approved" >&2; \
-		echo "  3. make apply-account MANIFEST=<the manifest account-plan printed>" >&2; \
-		exit 1; \
-	fi
-	@$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$(MANIFEST)"
+apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account resources from the one approved account manifest (or MANIFEST=<path>)
+	@$(_DRY_RUN_GUARD); \
+	manifest="$(strip $(MANIFEST))"; \
+	if [ -z "$$manifest" ]; then \
+		manifest="$$($(_RELEASE_GATE) account-manifest-select --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)")" || exit 1; \
+	else \
+		manifest="$(abspath $(strip $(MANIFEST)))"; \
+		$(_RELEASE_GATE) account-manifest-info --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --manifest "$$manifest" || exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest"
 
 _apply-account-locked:
 	@$(_DRY_RUN_GUARD); \
@@ -1538,6 +1543,9 @@ sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG
 		if [ -f "$(ENV_DIR)/env.auto.tfvars" ] && [ "$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" = deterministic ]; then mode=add-only; fi; \
 		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then mode=add-only; fi; \
 	fi; \
+	if [ "$$mode" = replace ] && [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
+		$(_RELEASE_GATE) account-lock-check --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" || exit 1; \
+	fi; \
 	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
 
 wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to downstream FGAC APIs
@@ -1649,7 +1657,7 @@ apply: _guard-not-ci-apply _guarded-bootstrap ## Apply the selected layer, or ac
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
 		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then \
-			echo "=== A deterministic env uses this account layer: applying it through make apply-account MANIFEST=<manifest> (account lock) ==="; \
+			echo "=== A deterministic env uses this account layer: applying it through make apply-account (account lock) ==="; \
 			$(MAKE) --no-print-directory apply-account; \
 		else \
 			$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
@@ -1846,6 +1854,7 @@ _destroy-layer: _guard-not-ci-apply
 
 destroy: _guard-not-ci-apply _bootstrap ## Destroy the selected layer or workspace environment
 	@$(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
+		if [ "$$($(_ANY_DETERMINISTIC_ENV))" = 1 ]; then echo "ERROR: make destroy ENV=$(ACCOUNT_ENV) refused: a deterministic env uses the shared account layer; account destroys are outside the manifest flow." >&2; exit 1; fi; \
 		$(MAKE) --no-print-directory _destroy-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	else \
 		$(MAKE) --no-print-directory _destroy-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \

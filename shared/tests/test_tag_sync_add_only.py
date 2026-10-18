@@ -160,7 +160,8 @@ class Repo:
     def account_manifest(self):
         result = self.make("account-plan", "account")
         assert result.returncode == 0, result.stdout + result.stderr
-        return result.stdout.split("make apply-account MANIFEST=", 1)[1].strip()
+        return next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                    if "Manifest (immutable):" in line)
 
     def script(self, *args):
         return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=self.account, env=self.env,
@@ -233,6 +234,30 @@ def test_apply_account_removes_values_no_longer_desired(tmp_path):
     result = repo.make("apply-account", "account", f"MANIFEST={repo.account_manifest()}")
     assert result.returncode == 0, result.stdout + result.stderr
     assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+
+
+def test_apply_account_refuses_if_untracked_account_input_changed_after_plan(tmp_path):
+    live = {"gr_treatment": ["email_partial__string__0a1b2c3d", "new_value", "keep_me"]}
+    repo = Repo(tmp_path, live)
+    (repo.account / "abac.auto.tfvars").write_text(DESIRED.replace('"new_value"', '"new_value", "keep_me"'))
+    manifest = repo.account_manifest()
+    (repo.account / "abac.auto.tfvars").write_text(DESIRED)
+    result = repo.make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "account input file hashes changed" in result.stderr
+    assert repo.wrote() == []
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "keep_me", "new_value"]
+
+
+def test_apply_account_refuses_if_live_replace_diff_changed_after_plan(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    manifest = repo.account_manifest()
+    repo.state.write_text(json.dumps({"gr_treatment": ["email_partial__string__0a1b2c3d", "other_live"]}))
+    result = repo.make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert "tag-policy replace diff changed" in result.stderr
+    assert repo.wrote() == []
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "other_live"]
 
 
 def test_apply_account_keeps_the_ci_guard(tmp_path):
@@ -317,6 +342,36 @@ def test_standalone_sync_tags_env_account_with_a_deterministic_env_is_add_only(t
     result = repo.make("sync-tags", "account")
     assert result.returncode != 0 and "make apply-account" in result.stdout
     assert repo.wrote() == []
+
+
+def test_standalone_sync_tags_replace_env_account_requires_live_account_lock(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    result = repo.make("sync-tags", "account", "TAG_SYNC_MODE=replace")
+    assert result.returncode != 0
+    assert "replace syncs may run only under the live account lock" in result.stderr
+    assert repo.wrote() == []
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+def test_legacy_env_account_apply_is_gated_when_any_env_is_deterministic(tmp_path):
+    repo = Repo(tmp_path, LIVE, mode="legacy")
+    prod = repo.cloud / "envs" / "prod"
+    (prod / "generated").mkdir(parents=True)
+    (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    result = repo.make("_apply-account-for-workspace", "dev")
+    assert result.returncode != 0
+    assert "make apply-account" in (result.stdout + result.stderr)
+    assert repo.applies() == []
+    assert repo.wrote() == []
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+def test_destroy_env_account_refuses_when_any_env_is_deterministic(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    result = repo.make("destroy", "account")
+    assert result.returncode != 0
+    assert "make destroy ENV=account refused" in result.stderr
+    assert repo.applies() == []
 
 
 # make -n runs recipe lines that call $(MAKE); the lock must not be one of them.

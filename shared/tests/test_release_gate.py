@@ -397,14 +397,20 @@ def _account_plan_dir(repo: Repo, *, changes: bool = True) -> Path:
     plan_dir = rg.new_plan_dir(repo.cloud / "envs" / "account", "account")
     (plan_dir / "account.tfplan").write_bytes(b"account saved plan")
     (plan_dir / "account.json").write_text(json.dumps({"file": "account.tfplan", "changes": changes}))
-    (plan_dir / "account.show.json").write_text(json.dumps({"resource_changes": [
-        {"change": {"actions": ["create"]}}, {"change": {"actions": ["update"]}},
+    (plan_dir / "account.summary.json").write_text(json.dumps({
+        "changes": changes, "resource_changes": {"create": 1, "update": 1},
+    }))
+    (plan_dir / "tag_sync.json").write_text(json.dumps({"diff": [
+        {"key": "gr_treatment", "added": ["new"], "removed": ["old"]},
     ]}))
     return plan_dir
 
 
 @pytest.fixture
-def account_manifest(repo):
+def account_manifest(repo, monkeypatch):
+    monkeypatch.setattr(rg, "account_tag_sync_diff", lambda _env_dir: [
+        {"key": "gr_treatment", "added": ["new"], "removed": ["old"]},
+    ])
     state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({"version": 4, "serial": 5, "lineage": "A", "resources": []}))
@@ -419,6 +425,8 @@ def test_account_plan_writes_one_immutable_manifest(repo, account_manifest):
     assert data["state_serial"] == {"serial": 5, "lineage": "A"}
     assert data["plan"]["sha256"] == rg.sha256_bytes(b"account saved plan")
     assert data["plan"]["summary"]["resource_changes"] == {"create": 1, "update": 1}
+    assert {"path": "env.auto.tfvars", "sha256": rg.sha256_file(repo.cloud / "envs" / "account" / "env.auto.tfvars")} in data["inputs"]
+    assert data["tag_sync"] == [{"key": "gr_treatment", "added": ["new"], "removed": ["old"]}]
     for path in [account_manifest.parent, *account_manifest.parent.rglob("*")]:
         assert path.stat().st_mode & 0o077 == 0, path
         if path.is_file():
@@ -453,6 +461,26 @@ def test_account_manifest_refuses_a_tampered_manifest(repo, account_manifest):
     data["plan"]["file"] = "other.tfplan"
     account_manifest.write_text(json.dumps(data))
     with pytest.raises(rg.Refused, match="not account.tfplan"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_account_input_hash_drift(repo, account_manifest):
+    (repo.cloud / "envs" / "account" / "abac.auto.tfvars").write_text("tag_policies = []\n")
+    with pytest.raises(rg.Refused, match="account input file hashes changed"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_tag_sync_diff_drift(repo, account_manifest, monkeypatch):
+    monkeypatch.setattr(rg, "account_tag_sync_diff", lambda _env_dir: [
+        {"key": "gr_treatment", "added": ["other"], "removed": []},
+    ])
+    with pytest.raises(rg.Refused, match="tag-policy replace diff changed"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_already_receipted_manifest(repo, account_manifest):
+    rg.account_receipt(repo.cloud / "envs" / "account", "account", account_manifest)
+    with pytest.raises(rg.Refused, match="single-use"):
         rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
 
 
