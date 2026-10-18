@@ -2195,13 +2195,14 @@ test-ci: _guard-not-ci-apply _guard-account-admin-env ## Full CI pipeline: unit 
 	echo "╚══════════════════════════════════════════════════════════════╝"
 
 integration-test: _guard-not-ci-apply ## Run the full end-to-end integration test (setup → generate → apply → verify → promote → apply prod → verify prod → teardown)
-	@# CI callers may set GENIERAILS_ALLOW_CI_APPLY=1 only when ENV/DEST_ENV are
+	@# CI callers may set GENIERAILS_ALLOW_CI_APPLY=1 only when ENV/ITEST_DEST_ENV are
 	@# freshly provisioned throwaway integration environments.
 	@# Options:
 	@#   ENV=dev              workspace env for dev  (default: dev)
 	@#   ITEST_DEST_ENV=prod  workspace env for prod (default: prod)
 	@#   KEEP_DATA=1          skip teardown so you can inspect results after the run
 	@#   WAREHOUSE_ID=<id>    pin a specific SQL warehouse
+	@if [ "$(origin DEST_ENV)" = "command line" ] || [ "$(origin DEST_ENV)" = "environment" ]; then echo "ERROR: integration-test reads ITEST_DEST_ENV; DEST_ENV is the promote setting" >&2; exit 1; fi
 	$(eval ITEST_DEST_ENV        ?= prod)
 	$(eval _FIN_CAT              := dev_fin)
 	$(eval _CLIN_CAT             := dev_clinical)

@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -44,14 +45,19 @@ def _clean_env():
     }
 
 
-@pytest.mark.parametrize(
-    ("target", "scenario", "other_scenario"),
-    [
-        ("test-multi-space-import", "multi-space-import", "schema-drift"),
-        ("test-schema-drift", "schema-drift", "multi-space-import"),
-    ],
-)
-def test_integration_scenario_targets_dry_run_their_own_recipe(tmp_path, target, scenario, other_scenario):
+def _fixed_scenario_targets():
+    makefile = (ROOT / "shared" / "Makefile.shared").read_text()
+    pairs = []
+    for target, recipe in re.findall(r"(?m)^(test[-\w]+):[^\n]*\n((?:\t.*\n)+)", makefile):
+        match = re.search(r"--scenario ([A-Za-z0-9][\w-]*)", recipe)
+        if match:
+            pairs.append((target, match.group(1)))
+    assert pairs
+    return pairs
+
+
+@pytest.mark.parametrize(("target", "scenario"), _fixed_scenario_targets())
+def test_integration_scenario_targets_dry_run_their_own_recipe(tmp_path, target, scenario):
     result = subprocess.run(
         [
             "make",
@@ -69,9 +75,39 @@ def test_integration_scenario_targets_dry_run_their_own_recipe(tmp_path, target,
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "Nothing to be done" not in output
+    assert output.count("--scenario ") == 1
     assert f"--scenario {scenario}" in output
-    assert f"--scenario {other_scenario}" not in output
     assert f'--auth-file "{tmp_path / "dev" / "auth.auto.tfvars"}"' in output
+
+
+@pytest.mark.parametrize("source", ["command line", "environment"])
+def test_integration_test_rejects_dest_env_old_name(tmp_path, source):
+    args = [
+        "make",
+        "--no-print-directory",
+        "integration-test",
+        f"ENV_DIR={tmp_path / 'dev'}",
+        f"ACCOUNT_ENV_DIR={tmp_path / 'account'}",
+    ]
+    env = _clean_env()
+    if source == "command line":
+        args.append("DEST_ENV=prod")
+    else:
+        env["DEST_ENV"] = "prod"
+
+    result = subprocess.run(
+        args,
+        cwd=CLOUD_ROOT,
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=10,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "integration-test reads ITEST_DEST_ENV; DEST_ENV is the promote setting" in output
+    assert "Step 1" not in output
 
 
 def test_apply_layer_dry_run_prints_but_does_not_execute_side_effects(tmp_path):
