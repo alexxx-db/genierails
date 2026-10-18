@@ -25,9 +25,9 @@ def _clean_env(**updates):
     return env
 
 
-def _run_guarded_make(cloud, target, *, env, timeout=10):
+def _run_guarded_make(cloud, target, *extra_args, env, timeout=10):
     proc = subprocess.Popen(
-        ["make", "-f", str(ROOT / cloud / "Makefile"), target, "ENV=dev"],
+        ["make", "-f", str(ROOT / cloud / "Makefile"), target, "ENV=dev", *extra_args],
         cwd=ROOT,
         env=env,
         text=True,
@@ -51,6 +51,19 @@ def test_every_applying_target_refuses_in_ci(cloud, target):
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0
     assert "applying targets cannot run in CI" in output
+
+
+def test_ci_guard_fires_before_integration_test_dest_env_guard():
+    proc = _run_guarded_make(
+        "aws",
+        "integration-test",
+        "DEST_ENV=prod",
+        env=_clean_env(CI="true"),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "applying targets cannot run in CI" in output
+    assert "integration-test reads ITEST_DEST_ENV" not in output
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
