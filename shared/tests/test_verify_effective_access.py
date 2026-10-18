@@ -1371,6 +1371,95 @@ class TestLiveGuard:
             verifier.assert_query_capable(
                 VerificationPrincipal("viewer", "test", "app", "secret"))
 
+    @staticmethod
+    def _preflight_verifier(monkeypatch):
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        verifier = EffectiveAccessVerifier(
+            {"host": "h", "client_id": "c", "client_secret": "s"},
+            warehouse_id="warehouse-123",
+        )
+        monkeypatch.setattr(verifier, "_ws_for", lambda _principal: object())
+        return verifier
+
+    class _Clock:
+        """Fake monotonic clock that only advances when the code sleeps."""
+
+        def __init__(self, monkeypatch):
+            self.now, self.sleeps = 0.0, []
+            monkeypatch.setattr("verify_effective_access.time.monotonic", lambda: self.now)
+            monkeypatch.setattr("verify_effective_access.time.sleep", self.sleep)
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    def test_nontransient_preflight_error_is_not_retried(self, monkeypatch):
+        verifier = self._preflight_verifier(monkeypatch)
+        clock = self._Clock(monkeypatch)
+        calls = []
+
+        def query(_ws, sql):
+            calls.append(sql)
+            raise RuntimeError("invalid credentials")
+
+        monkeypatch.setattr(verifier, "run_query", query)
+        with pytest.raises(
+            RuntimeError, match="^test principal not query-capable: invalid credentials$",
+        ):
+            verifier.assert_query_capable(
+                VerificationPrincipal("viewer", "test", "app", "secret"))
+        assert calls == ["SELECT 1"]
+        assert clock.sleeps == []
+
+    @pytest.mark.parametrize("message", [
+        "This API is disabled for users without the databricks-sql-access "
+        "or workspace-consume entitlements",
+        "User does not have permission to use warehouse warehouse-123",
+        "Principal does not have CAN USE permission on warehouse",
+        "Principal does not have CAN_USE permission on warehouse",
+    ])
+    def test_each_transient_marker_is_retried_with_backoff(self, monkeypatch, message):
+        import verify_effective_access as vea
+
+        verifier = self._preflight_verifier(monkeypatch)
+        clock = self._Clock(monkeypatch)
+        calls = []
+
+        def query(_ws, sql):
+            calls.append(sql)
+            if len(calls) < 3:
+                raise RuntimeError(message)
+            return [[1]]
+
+        monkeypatch.setattr(verifier, "run_query", query)
+        verifier.assert_query_capable(VerificationPrincipal("viewer", "test", "app", "secret"))
+        assert calls == ["SELECT 1"] * 3
+        assert clock.sleeps == [vea.QUERY_PREFLIGHT_BACKOFF_SECONDS] * 2
+
+    def test_transient_preflight_retry_is_bounded_by_deadline(self, monkeypatch):
+        import verify_effective_access as vea
+
+        verifier = self._preflight_verifier(monkeypatch)
+        clock = self._Clock(monkeypatch)
+        calls = []
+
+        def query(_ws, sql):
+            calls.append(sql)
+            if len(calls) > 1000:
+                pytest.fail("pre-flight retry is unbounded")
+            raise RuntimeError("User does not have permission to use warehouse warehouse-123")
+
+        monkeypatch.setattr(verifier, "run_query", query)
+        with pytest.raises(
+            RuntimeError, match="^test principal not query-capable: .*permission to use warehouse",
+        ):
+            verifier.assert_query_capable(
+                VerificationPrincipal("viewer", "test", "app", "secret"))
+        timeout = vea.QUERY_PREFLIGHT_TIMEOUT_SECONDS
+        backoff = vea.QUERY_PREFLIGHT_BACKOFF_SECONDS
+        assert len(calls) == int(timeout / backoff) + 1  # attempts at t=0, 2, ..., timeout
+        assert clock.now == timeout
+
     def test_verifier_does_not_pick_an_arbitrary_workspace_warehouse(self, monkeypatch):
         monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
         verifier = EffectiveAccessVerifier(
@@ -1514,6 +1603,10 @@ class TestTemporaryWarehouseAccess:
         account = SimpleNamespace(
             service_principals=SimpleNamespace(
                 list=lambda **_: [nonexact_sp, sp], create=create_sp,
+                get=lambda _id: SimpleNamespace(groups=[
+                    SimpleNamespace(value="789", display=membership, type="direct"),
+                    SimpleNamespace(value="555", display="parent", type="indirect"),
+                ]),
             ),
             service_principal_secrets=SimpleNamespace(
                 create=lambda **_: SimpleNamespace(secret="secret"),
@@ -1572,6 +1665,148 @@ class TestTemporaryWarehouseAccess:
             verifier.provision_principal("analysts")
         create.assert_not_called()
         create_secret.assert_not_called()
+
+    @staticmethod
+    def _provisioning_account(monkeypatch, *, existing=(), visible=True, fail=None):
+        """Fake account/workspace clients; ``fail`` names the step that raises."""
+        from unittest.mock import Mock
+
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        monkeypatch.setenv("GENIERAILS_VERIFY_WORKSPACE_SYNC_TIMEOUT", "0")
+        monkeypatch.setattr("verify_effective_access.time.sleep", lambda _seconds: None)
+        verifier = EffectiveAccessVerifier({
+            "host": "h", "client_id": "c", "client_secret": "s",
+            "account_host": "a", "account_id": "1", "workspace_id": "123",
+        })
+        created = SimpleNamespace(
+            id="456", application_id="app-new", display_name="genierails-verify-viewers")
+
+        def step(name, result=None):
+            def call(*_args, **_kwargs):
+                if fail == name:
+                    raise RuntimeError(f"{name} failed")
+                return result
+            return Mock(side_effect=call)
+
+        verifier._account = SimpleNamespace(
+            service_principals=SimpleNamespace(
+                list=lambda **_: list(existing),
+                create=Mock(return_value=created),
+                get=Mock(side_effect=lambda sp_id: next(
+                    sp for sp in existing if sp.id == sp_id)),
+                delete=Mock(),
+            ),
+            service_principal_secrets=SimpleNamespace(
+                create=step("secret", SimpleNamespace(secret="secret"))),
+            groups=SimpleNamespace(patch=step("group-patch")),
+            workspace_assignment=SimpleNamespace(update=step("assignment")),
+        )
+        workspace_sp = SimpleNamespace(id="workspace-456", application_id="app-new")
+        verifier._admin_ws = SimpleNamespace(service_principals=SimpleNamespace(
+            list=lambda **_: [workspace_sp] if visible else []))
+        return verifier
+
+    @pytest.mark.parametrize(("fail", "visible", "error"), [
+        ("secret", True, RuntimeError("secret failed")),
+        ("group-patch", True, RuntimeError("group-patch failed")),
+        ("assignment", True, RuntimeError("assignment failed")),
+        (None, False, TimeoutError("did not become visible before timeout")),
+    ])
+    def test_provision_deletes_created_principal_when_setup_fails(
+        self, monkeypatch, fail, visible, error,
+    ):
+        verifier = self._provisioning_account(monkeypatch, visible=visible, fail=fail)
+        group = SimpleNamespace(id="789", display_name="viewers", members=[])
+
+        with pytest.raises(type(error), match=str(error.args[0])):
+            verifier.provision_principal("viewers", resolved_groups=[group])
+
+        sps = verifier._account.service_principals
+        sps.create.assert_called_once()
+        sps.delete.assert_called_once_with("456")
+
+    def test_provision_failure_surfaces_original_error_when_cleanup_fails(
+        self, monkeypatch, capsys,
+    ):
+        verifier = self._provisioning_account(monkeypatch, fail="group-patch")
+        verifier._account.service_principals.delete.side_effect = RuntimeError("delete denied")
+        group = SimpleNamespace(id="789", display_name="viewers", members=[])
+
+        with pytest.raises(RuntimeError, match="^group-patch failed$"):
+            verifier.provision_principal("viewers", resolved_groups=[group])
+
+        err = capsys.readouterr().err
+        assert "could not delete partially provisioned genierails-verify-viewers" in err
+        assert "app-new" in err and "delete denied" in err
+
+    def test_provision_failure_surfaces_original_error_when_cleanup_interrupted(
+        self, monkeypatch, capsys,
+    ):
+        verifier = self._provisioning_account(monkeypatch, fail="group-patch")
+        verifier._account.service_principals.delete.side_effect = KeyboardInterrupt(
+            "delete interrupted")
+        group = SimpleNamespace(id="789", display_name="viewers", members=[])
+
+        with pytest.raises(RuntimeError, match="^group-patch failed$"):
+            verifier.provision_principal("viewers", resolved_groups=[group])
+
+        err = capsys.readouterr().err
+        assert "could not delete partially provisioned genierails-verify-viewers" in err
+        assert "delete interrupted" in err
+
+    def test_provision_does_not_delete_a_principal_it_did_not_create(self, monkeypatch):
+        existing = SimpleNamespace(
+            id="321", application_id="app-old", display_name="genierails-verify-viewers",
+            groups=[])
+        verifier = self._provisioning_account(
+            monkeypatch, existing=[existing], fail="group-patch")
+        group = SimpleNamespace(id="789", display_name="viewers", members=[])
+
+        with pytest.raises(RuntimeError, match="group-patch failed"):
+            verifier.provision_principal("viewers", resolved_groups=[group])
+
+        sps = verifier._account.service_principals
+        sps.create.assert_not_called()
+        sps.delete.assert_not_called()
+
+    def test_provision_refuses_reused_principal_with_stale_memberships(self, monkeypatch):
+        existing = SimpleNamespace(
+            id="321", application_id="app-old", display_name="genierails-verify-viewers",
+            groups=[
+                SimpleNamespace(value="789", display="viewers", type="direct"),
+                SimpleNamespace(value="999", display="admins", type="direct"),
+                SimpleNamespace(value="555", display="all-staff", type="indirect"),
+            ])
+        verifier = self._provisioning_account(monkeypatch, existing=[existing])
+        group = SimpleNamespace(id="789", display_name="viewers", members=[])
+
+        with pytest.raises(RuntimeError, match=(
+            r"'genierails-verify-viewers' already exists and is a member of account "
+            r"group\(s\) outside its tier: admins\. Delete the service principal")):
+            verifier.provision_principal("viewers", resolved_groups=[group])
+
+        account = verifier._account
+        account.service_principals.get.assert_called_once_with("321")
+        account.service_principal_secrets.create.assert_not_called()
+        account.groups.patch.assert_not_called()
+        account.workspace_assignment.update.assert_not_called()
+        account.service_principals.delete.assert_not_called()
+
+    def test_provision_reuses_principal_whose_memberships_match(self, monkeypatch):
+        existing = SimpleNamespace(
+            id="321", application_id="app-old", display_name="genierails-verify-viewers",
+            groups=[SimpleNamespace(value="789", display="viewers", type="direct")])
+        verifier = self._provisioning_account(monkeypatch, existing=[existing])
+        verifier._admin_ws.service_principals.list = lambda **_: [
+            SimpleNamespace(id="workspace-321", application_id="app-old")]
+        group = SimpleNamespace(
+            id="789", display_name="viewers", members=[SimpleNamespace(value="321")])
+
+        principal = verifier.provision_principal("viewers", resolved_groups=[group])
+
+        assert (principal.sp_id, principal.workspace_sp_id) == ("321", "workspace-321")
+        verifier._account.service_principals.create.assert_not_called()
+        verifier._account.groups.patch.assert_not_called()
 
     def test_warehouse_grant_failure_aborts_verification_setup(self, monkeypatch):
         class FailingPermissions:
