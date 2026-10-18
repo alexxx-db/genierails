@@ -404,7 +404,16 @@ def promote_cloud(tmp_path):
             ["make", "--no-print-directory", *args], cwd=tmp_path, text=True, capture_output=True,
             env=_clean_env(PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}", **env), timeout=120)
 
+    def commit():
+        """Commit the cloud's files: CHECK=1 reruns promote-to from committed files only."""
+        git = ["git", "-C", str(cloud), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+        if not (cloud / ".git").exists():
+            subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "commit"], check=True)
+
     run.envs = cloud / "envs"
+    run.commit = commit
     return run
 
 
@@ -537,6 +546,7 @@ def test_promote_to_check_accepts_documented_detach_removal(promote_cloud, ci):
     assert first.returncode == 0, first.stdout + first.stderr
     (prod / "agents" / "Detached.space.json").unlink()
     (prod / "ack.txt").write_text("prod:detached-agent:detached\n")
+    promote_cloud.commit()
 
     result = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay", "CHECK=1",
                            **({} if ci is None else {"CI": ci}))
@@ -555,6 +565,7 @@ def test_promote_to_check_refuses_tombstone_violation_with_no_source_agents(prom
         'genie_space_id = ""\nacl_groups = ["anyone"]\n'
     )
     (prod / "ack.txt").write_text("prod:detached-agent:retired\n")
+    promote_cloud.commit()
 
     result = promote_cloud("promote-to", "ENV=prod", "FROM=dev", "CATALOG_MAP=paycat=ppay", "CHECK=1",
                            **({} if ci is None else {"CI": ci}))
@@ -984,6 +995,11 @@ def test_verify_result_file_counts_mask_passes_per_key(monkeypatch, tmp_path, ca
     rc, result = _live_main(monkeypatch, tmp_path, {"column_masks": [MASK], "row_filters": [ROW]},
                             {"column-mask": "PASS", "row-filter": "PASS"})
     assert rc == 0
+    assert [(c["kind"], c["status"], c["principals"]) for c in result.pop("checks")] == [
+        ("column-mask", "PASS", {"ops": {"expected": "raw", "observed": "raw"},
+                                 "viewers": {"expected": "masked", "observed": "masked"}}),
+        ("row-filter", "PASS", {"ops": {"expected": "unrestricted", "observed": "unrestricted"},
+                                "viewers": {"expected": "restricted", "observed": "restricted"}})]
     assert result == {"passed": True, "mask_checks_passed": 1,
                       "masked_tables": ["c.s.t"], "mask_keys_complete": False,
                       "mask_checks_passed_by_key": {"customer_id": 1}, "mask_keys_proven_by_table": {},

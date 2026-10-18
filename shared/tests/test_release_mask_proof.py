@@ -118,6 +118,14 @@ def test_a_missing_spec_file_refuses(tmp_path, capsys):
     assert "could not be read" in capsys.readouterr().err
 
 
+def test_a_spec_refuses_when_the_derivation_tfvars_are_missing(tmp_path, capsys):
+    env = _env(tmp_path)
+    missing = env / "data_access" / "abac.auto.tfvars"
+    missing.unlink()
+    assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, FULL_SPEC), tfvars=missing) == 1
+    assert "derivation config" in capsys.readouterr().err
+
+
 def test_a_keyed_spec_covering_every_masked_column_passes(tmp_path):
     env = _env(tmp_path, policies=TAGGED)
     assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, FULL_SPEC)) == 0
@@ -127,6 +135,18 @@ def test_a_keyless_spec_check_is_keyed_live(tmp_path):
     env = _env(tmp_path, policies=TAGGED)
     keyless = {"column_masks": [_mask("cat.sch.customers", "ssn", key=""), _mask("cat.sch.notes", "free_text")]}
     assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, keyless)) == 0
+
+
+def test_a_spec_covering_the_column_but_omitting_a_real_tier_refuses(tmp_path, capsys):
+    env = _env(tmp_path, policies=TAGGED)
+    only_admin = {"column_masks": [
+        {**_mask("cat.sch.customers", "ssn"), "masked_principals": []},
+        {**_mask("cat.sch.notes", "free_text"), "masked_principals": []},
+    ]}
+    assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, only_admin)) == 1
+    err = capsys.readouterr().err
+    assert "weaker than the policy-derived gate spec" in err
+    assert "analysts expected full (missing)" in err
 
 
 def test_before_derivation_a_keyed_mask_spec_passes_and_is_rechecked_later(tmp_path):
@@ -210,6 +230,23 @@ def test_release_refuses_before_its_lock(tmp_path):
     assert _names(log) == ["release-helper require-mask-proof"]
 
 
+def test_release_refuses_an_omitted_real_tier_before_apply(tmp_path):
+    env = _env(tmp_path, policies=TAGGED)
+    only_admin = {"column_masks": [
+        {**_mask("cat.sch.customers", "ssn"), "masked_principals": []},
+        {**_mask("cat.sch.notes", "free_text"), "masked_principals": []},
+    ]}
+    spec = _spec(tmp_path, only_admin)
+    account = tmp_path / "account"
+    account.mkdir()
+    (account / "abac.auto.tfvars").write_text('groups = { analysts = {} }\n')
+    log, overrides = _recorders(tmp_path)
+    result = _release(env, overrides, f"VERIFY_SPEC={spec}", f"ACCOUNT_ENV_DIR={account}")
+    assert result.returncode != 0
+    assert "analysts expected full (missing)" in result.stderr
+    assert _names(log) == ["release-helper require-mask-proof"]
+
+
 @pytest.mark.parametrize("key", ["", "customer_id"])  # no key: picked per table
 def test_release_checks_before_locking_again_before_applying_then_proves_keys(tmp_path, key):
     env = _env(tmp_path, key=key)
@@ -245,6 +282,30 @@ def test_release_verifies_strictly():
     assert "_VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)" in makefile
     verify = makefile[makefile.index("\nverify-access:"):]
     assert "$(_VERIFY_REQUIRE_FLAG)" in verify[:verify.index("\n\n")]
+
+
+def test_every_applying_verify_spec_path_has_a_semantic_minimum_guard():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    rehearse = makefile[makefile.index("override _REHEARSE_STEPS"):makefile.index("\nrehearse:")]
+    maintain = makefile[makefile.index("\nmaintain:"):makefile.index("\nvalidate:")]
+    manifest = makefile[makefile.index("\n_release-manifest:"):makefile.index("\nmaintain:")]
+    release_plan = makefile[makefile.index("\nrelease-plan:"):makefile.index("\n_release-manifest:")]
+    release = makefile[makefile.index("\nrelease:"):makefile.index("\n# Two-phase release")]
+    apply = makefile[makefile.index("\napply:"):makefile.index("\n# Read-only:")]
+    verify = makefile[makefile.index("\nverify-access:"):]
+    assert "require-mask-proof" in rehearse
+    assert "require-mask-proof" in maintain
+    assert manifest.index("$(_REQUIRE_MASK_PROOF)") < manifest.index("apply-saved")
+    assert apply.count("$(_REQUIRE_MASK_PROOF)") >= 2
+    assert "$(_VERIFY_MINIMUM_FLAG)" in verify[:verify.index("\n\ntest-quickstart:")]
+    assert rehearse.count("VERIFY_GATE=1") == 1
+    legacy_rehearse = makefile[makefile.index("\nrehearse:"):makefile.index("\n# A failed $(MAKE)")]
+    assert legacy_rehearse.count("VERIFY_GATE=1") == 1
+    assert "VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in rehearse
+    assert "VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in legacy_rehearse
+    assert release_plan.count("$(_REQUIRE_MASK_PROOF)") == 2
+    assert "VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in release
+    assert "VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in manifest
 
 
 # ── a mask verify-access derives no check for ───────────────────────────────

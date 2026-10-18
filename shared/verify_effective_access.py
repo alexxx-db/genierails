@@ -231,7 +231,7 @@ class EffectiveAccessReport:
         for r in self.results:
             marker = {PASS: "✓", FAIL: "✗", INCONCLUSIVE: "✗"}.get(r.status, "?")
             lines.append(f"  {marker} [{r.status}] {r.target}")
-            if r.status != PASS:
+            if r.status != PASS or "all deterministic tiers matched their exact expected output" in r.detail:
                 lines.append(f"        {r.detail}")
         for r in self.not_verified:
             lines.append(f"  ! [NOT VERIFIED] {r.target}")
@@ -2716,9 +2716,34 @@ def load_key_map(env_file: Optional[Path]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Spec loading (pure)
 # ---------------------------------------------------------------------------
-def load_spec_from_file(path: Path) -> VerificationSpec:
+def load_spec_from_file(path: Path, *, strict: bool = True) -> VerificationSpec:
     """Load a spec from a JSON file (schema mirrors the dataclasses)."""
     data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError("verification spec must be a JSON object")
+    if strict:
+        def reject_unknown(value: Mapping[str, Any], allowed: set[str], where: str) -> None:
+            unknown = sorted(set(value) - allowed)
+            if unknown:
+                raise ValueError(f"unknown verification spec field {where}.{unknown[0]}")
+
+        reject_unknown(data, {"principal_memberships", "column_masks", "row_filters"}, "root")
+        column_keys = {"table", "column", "key_column", "masked_principals", "unmasked_principals",
+                       "policy_name", "mask_function", "expected_tiers", "partial_function",
+                       "full_function", "moving_principals"}
+        row_keys = {"table", "restricted_principals", "unrestricted_principals", "policy_name"}
+        for index, value in enumerate(data.get("column_masks", []) or []):
+            if not isinstance(value, dict):
+                raise ValueError(f"column_masks[{index}] must be an object")
+            reject_unknown(value, column_keys, f"column_masks[{index}]")
+            for principal, tier in (value.get("expected_tiers", {}) or {}).items():
+                if tier not in {"raw", "partial", "full"}:
+                    raise ValueError(f"unknown tier value column_masks[{index}].expected_tiers"
+                                     f"[{principal!r}]={tier!r}")
+        for index, value in enumerate(data.get("row_filters", []) or []):
+            if not isinstance(value, dict):
+                raise ValueError(f"row_filters[{index}] must be an object")
+            reject_unknown(value, row_keys, f"row_filters[{index}]")
     spec = VerificationSpec(principal_memberships={
         str(principal): tuple(map(str, memberships))
         for principal, memberships in (data.get("principal_memberships", {}) or {}).items()})
@@ -2744,6 +2769,103 @@ def load_spec_from_file(path: Path) -> VerificationSpec:
             policy_name=r.get("policy_name", ""),
         ))
     return spec
+
+
+def weaker_explicit_spec_checks(derived: VerificationSpec, explicit: VerificationSpec) -> list[str]:
+    """Describe derived proof semantics omitted or weakened by an explicit gate spec."""
+    rank = {"raw": 0, "partial": 1, "full": 2}
+
+    def expectations(check: ColumnMaskCheck) -> dict[str, str]:
+        if check.expected_tiers:
+            return dict(check.expected_tiers)
+        return ({p: "full" for p in check.masked_principals}
+                | {p: "raw" for p in check.unmasked_principals})
+
+    def memberships(spec: VerificationSpec, principal: str) -> tuple[str, ...]:
+        return tuple(sorted(spec.principal_memberships.get(principal, (principal,))))
+
+    explicit_by_column: dict[tuple[str, str], list[ColumnMaskCheck]] = {}
+    for check in explicit.column_masks:
+        explicit_by_column.setdefault((check.table.lower(), check.column.lower()), []).append(check)
+
+    missing: list[str] = []
+    for check in explicit.column_masks:
+        for principal, tier in check.expected_tiers:
+            if tier not in rank:
+                missing.append(f"{check.table}.{check.column}: {principal} has unknown tier {tier!r}")
+    for check in derived.column_masks:
+        label = f"{check.table}.{check.column}"
+        candidates = explicit_by_column.get((check.table.lower(), check.column.lower()), [])
+        if not candidates:
+            missing.append(f"{label}: derived check missing")
+            continue
+        candidate_problems = []
+        for actual_check in candidates:
+            problems = []
+            expected_tiers, supplied_tiers = expectations(check), expectations(actual_check)
+            if check.expected_tiers and not actual_check.expected_tiers:
+                problems.append("tiered exact-output check replaced by an untiered check")
+            if not check.expected_tiers and actual_check.expected_tiers:
+                mask_function = check.mask_function.lower()
+                supplied_functions = {actual_check.partial_function.lower(), actual_check.full_function.lower()}
+                if not mask_function or supplied_functions != {mask_function}:
+                    problems.append("untiered check may become tiered only when partial_function and "
+                                    "full_function both equal the derived mask_function")
+            for principal, expected in expected_tiers.items():
+                supplied = supplied_tiers.get(principal)
+                if supplied is None:
+                    problems.append(f"{principal} expected {expected} (missing)")
+                elif supplied not in rank or (expected == "raw" and supplied != "raw") \
+                        or (expected != "raw" and rank[supplied] < rank[expected]):
+                    problems.append(f"{principal} expected {expected}, got {supplied}")
+                if memberships(explicit, principal) != memberships(derived, principal):
+                    problems.append(
+                        f"{principal} memberships expected {list(memberships(derived, principal))}, "
+                        f"got {list(memberships(explicit, principal))}")
+            if check.expected_tiers:
+                for field_name in ("partial_function", "full_function"):
+                    expected_fn = getattr(check, field_name).lower()
+                    supplied_fn = getattr(actual_check, field_name).lower()
+                    if supplied_fn != expected_fn:
+                        problems.append(f"{field_name} expected {expected_fn or '<empty>'}, "
+                                        f"got {supplied_fn or '<empty>'}")
+            if actual_check.mask_function and actual_check.mask_function.lower() != check.mask_function.lower():
+                problems.append(f"mask_function expected {check.mask_function or '<empty>'}, "
+                                f"got {actual_check.mask_function or '<empty>'}")
+            if check.key_column and actual_check.key_column.lower() != check.key_column.lower():
+                problems.append(f"key_column expected {check.key_column or '<live-picked>'}, "
+                                f"got {actual_check.key_column or '<live-picked>'}")
+            unexpected_moving = sorted(set(actual_check.moving_principals) - set(check.moving_principals))
+            if unexpected_moving:
+                problems.append(f"moving_principals may not add {unexpected_moving}")
+            if not problems:
+                break
+            candidate_problems.append(problems)
+        else:
+            missing.extend(f"{label}: {problem}" for problem in min(candidate_problems, key=len))
+    explicit_rows: dict[str, dict[str, str]] = {}
+    for check in explicit.row_filters:
+        current = explicit_rows.setdefault(check.table.lower(), {})
+        current.update({p: "restricted" for p in check.restricted_principals})
+        for principal in check.unrestricted_principals:
+            current.setdefault(principal, "unrestricted")
+    for check in derived.row_filters:
+        actual = explicit_rows.get(check.table.lower(), {})
+        for principal in check.restricted_principals:
+            if actual.get(principal) != "restricted":
+                missing.append(f"{check.table}: {principal} expected restricted row access (missing or weakened)")
+            if memberships(explicit, principal) != memberships(derived, principal):
+                missing.append(f"{check.table}: {principal} row-filter memberships expected "
+                               f"{list(memberships(derived, principal))}, got "
+                               f"{list(memberships(explicit, principal))}")
+        for principal in check.unrestricted_principals:
+            if actual.get(principal) != "unrestricted":
+                missing.append(f"{check.table}: {principal} expected unrestricted row baseline (missing or changed)")
+            if memberships(explicit, principal) != memberships(derived, principal):
+                missing.append(f"{check.table}: {principal} row-filter memberships expected "
+                               f"{list(memberships(derived, principal))}, got "
+                               f"{list(memberships(explicit, principal))}")
+    return sorted(set(missing))
 
 
 def load_spec_from_tfvars(
@@ -2931,6 +3053,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Derive the spec from a data_access abac.auto.tfvars.")
     p.add_argument("--account-tfvars", type=Path,
                    help="Optional account abac.auto.tfvars (source of group names).")
+    p.add_argument("--minimum-from-tfvars", type=Path,
+                   help="Gate only: require --spec to include every check derived from these tfvars.")
+    p.add_argument("--minimum-env-file", type=Path,
+                   help="Gate only: env settings used to derive the minimum spec.")
+    p.add_argument("--minimum-account-tfvars", type=Path,
+                   help="Gate only: account groups used to derive the minimum spec.")
     p.add_argument("--key-column", default="",
                    help="Row-pairing key for every masked table that has this column "
                         "(VERIFY_KEY_COLUMN / verify_key_column; optional).")
@@ -2964,7 +3092,7 @@ def _load_spec_from_args(args, key_map: Mapping[str, str]) -> VerificationSpec:
     if args.spec:
         if not args.spec.is_file():
             raise SystemExit(f"ERROR: verification spec not found: {args.spec}")
-        spec = load_spec_from_file(args.spec)
+        spec = load_spec_from_file(args.spec, strict=bool(args.minimum_from_tfvars))
         spec.column_masks = [replace(c, key_column=c.key_column or by_table.get(c.table.lower(), ""))
                              for c in spec.column_masks]
         return spec
@@ -2991,6 +3119,69 @@ def _load_spec_from_args(args, key_map: Mapping[str, str]) -> VerificationSpec:
                              for c in spec.column_masks]
         return spec
     raise SystemExit("Provide either --spec or --from-tfvars.")
+
+
+NOT_VERIFIED = "NOT VERIFIED"
+
+
+def _observed_access(expected: Mapping[str, str], result: Optional[CheckResult]) -> dict[str, dict[str, str]]:
+    """Per principal: the access level the spec expects and what this run proved.
+
+    ``observed`` is the expected level only when the check PASSed; ``raw`` when
+    the check proved that principal saw raw values; ``mismatch`` when its output
+    was not the expected function's; ``fail-closed`` for an accepted moving
+    principal; otherwise ``unproven``. Read-only reporting: it never changes
+    the check's status.
+    """
+    evidence = result.evidence if result else {}
+    leaks = {**(evidence.get("leaks_by_principal") or {}), **(evidence.get("raw_leaks_by_principal") or {})}
+    mismatches = evidence.get("mismatches_by_principal") or {}
+    accepted = set(evidence.get("accepted_fail_closed") or ())
+    out: dict[str, dict[str, str]] = {}
+    for principal, level in sorted(expected.items()):
+        if principal in leaks:
+            observed = "raw"
+        elif principal in mismatches:
+            observed = "mismatch"
+        elif principal in accepted:
+            observed = "fail-closed"
+        elif result is not None and result.status == PASS:
+            observed = level
+        else:
+            observed = "unproven"
+        out[principal] = {"expected": level, "observed": observed}
+    return out
+
+
+def result_checks(report: EffectiveAccessReport, spec: Any = None) -> list[dict[str, Any]]:
+    """One entry per spec check, with the per-principal access it proved."""
+    results = {r.target: r for r in report.results}
+    out: list[dict[str, Any]] = []
+    for check in getattr(spec, "column_masks", []):
+        result = results.get(check.describe())
+        if check.expected_tiers:
+            expected = dict(check.expected_tiers)
+        else:
+            expected = {**{p: "raw" for p in check.unmasked_principals},
+                        **{p: "masked" for p in check.masked_principals}}
+        out.append({
+            "kind": "column-mask", "table": check.table, "column": check.column,
+            "policy": check.policy_name,
+            "status": result.status if result else NOT_VERIFIED,
+            "mask_function": check.mask_function, "partial_function": check.partial_function,
+            "full_function": check.full_function,
+            "principals": _observed_access(expected, result),
+        })
+    for check in getattr(spec, "row_filters", []):
+        result = results.get(check.describe())
+        expected = {**{p: "unrestricted" for p in check.unrestricted_principals},
+                    **{p: "restricted" for p in check.restricted_principals}}
+        out.append({
+            "kind": "row-filter", "table": check.table, "column": "", "policy": check.policy_name,
+            "status": result.status if result else NOT_VERIFIED,
+            "principals": _observed_access(expected, result),
+        })
+    return out
 
 
 def write_result_file(path: Optional[Path], report: EffectiveAccessReport, spec: Any = None) -> None:
@@ -3021,6 +3212,7 @@ def write_result_file(path: Optional[Path], report: EffectiveAccessReport, spec:
         "row_filter_checks_passed": sum(
             1 for r in report.results if r.kind == "row-filter" and r.status == PASS),
     }
+    payload["checks"] = result_checks(report, spec)
     cleanup_failures = [
         {"target": r.target, "detail": r.detail, "evidence": r.evidence}
         for r in report.results if r.kind == "cleanup" and r.status == FAIL
@@ -3062,7 +3254,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         spec = _load_spec_from_args(args, load_key_map(args.env_file))
         validate_spec_identifiers(spec)
-    except ValueError as exc:
+        if args.minimum_from_tfvars:
+            minimum = load_spec_from_tfvars(
+                args.minimum_from_tfvars, args.minimum_account_tfvars,
+                env_file=args.minimum_env_file,
+                key_column=args.key_column,
+                key_column_by_table=load_key_map(args.minimum_env_file),
+            )
+            required = required_mask_columns_from_tfvars(args.minimum_from_tfvars)
+            minimum.column_masks = [
+                check for check in minimum.column_masks
+                if (check.table.lower(), check.column.lower()) in required
+            ]
+            weaker = weaker_explicit_spec_checks(minimum, spec)
+            if weaker:
+                raise ValueError("ERROR: explicit verification spec is weaker than the policy-derived "
+                                 "gate spec; missing or weakened check(s): " + "; ".join(weaker))
+    except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
     sensitive_keys = sorted(

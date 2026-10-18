@@ -22,6 +22,25 @@ are issued only as public `make` targets. Read-only snapshots cover UC grants,
 column tags, effective ABAC policies, mask functions, Genie exports and ACLs,
 Terraform serials, receipts, and manifests.
 
+Two named Day-2 scenarios extend that matrix:
+
+- `tier-groupmap` adds and removes an `access_tier_groups` tier, changes a
+  prod `group_map` with an exact acknowledgement, and finishes with an
+  isolated prod-only agent `acl_groups` PR. Rehearse/release effective-access
+  output plus read-only grant/ACL snapshots prove the tier behavior. The driver
+  requires the new tier's SELECT and CAN_RUN to be the only widenings, requires
+  their exact reader/weakening acknowledgements, proves removal revokes both,
+  and proves the remap/ACL releases change only their named principals.
+- `custom-mask` installs the committed `fixtures/custom_mask_v1.json`, maps a
+  supplied non-secret class, promotes it, and verifies it through rehearsal
+  and release. It then substitutes the independently tested v2 fixture and
+  proves the SQL/generation change is refused until its exact weakening ack.
+  For rehearsal, planning and release, the driver checks the read-only case
+  header and exact fixture output precede the environment-lock marker; release
+  additionally evaluates the typed exact-tier verification result. Both fixtures are
+  already adopted governance JSON with `tested_sha256`; the
+  scenario never drafts, tests, adopts, or otherwise calls an AI helper.
+
 Always inspect the plan first; this neither loads auth nor invokes `make`:
 
 ```bash
@@ -30,7 +49,8 @@ python3 shared/scripts/e2e/driver.py --cloud aws --dry-run \
 ```
 
 Live execution is intentionally explicit and must use the persistent v1
-deployment checkout and an external state directory:
+deployment checkout and an external state directory, which must already exist
+(GenieRails never creates a missing `GENIERAILS_STATE_DIR`):
 
 ```bash
 python3 shared/scripts/e2e/driver.py --cloud aws \
@@ -95,7 +115,95 @@ failure is `ERROR`. S13 runs every refusal command with `CI=true` and without
 
 Scenario values: `agent_a`, `wrong_agent`, `table` (covered), `uncovered_table`,
 `treatment`, `ack_entry` (an exact `prod:<kind>:...` line), `manifest`,
-`tampered_manifest`, `failing_verify_spec` (S17; an absolute path), and the 40-hex commits `u`, `o`, `r`, `r_plus_1`, `x`, `y`.
+`tampered_manifest`, and the 40-hex commits `u`, `o`, `r`, `r_plus_1`, `x`, `y`.
+The typed checks below add: champion `acl_groups`, `dev_tables`, `prod_tables`;
+S2 `mask_column`; S3 `new_table_principals`, `dev_table`, `prod_table`; S4
+`new_column`; S5 `secret_column`; and `agent_a` for champion, S3 and S16. S6's
+`reader_principal` and `reader_table` come from `ack_entry`
+(`prod:reader:<cat.sch.table>:<principal>`). A comma-separated value
+(`acl_groups=a,b`) stands for every combination.
+
+### Typed checks
+
+A step's `assertions=` and a scenario's `checks=` hold typed checks from a
+small vocabulary, never free text. Each has an evaluator that runs in live runs;
+a step's checks fail that step, a scenario's checks fail the scenario after its
+final snapshot. `--dry-run` lists them and exits non-zero if any check has no
+evaluator or is malformed (unknown env or component, wildcards in a grant, an
+unknown level). Their `{placeholders}` are required values.
+
+| Check | Passes when |
+| --- | --- |
+| `GrantDelta(env, added=, may_add=, revoked=)` | Grants added since the baseline are exactly `added` plus a subset of `may_add`, and those revoked are exactly `revoked`. |
+| `AccessLevel(env, target, principal, level)` | The step's verify-access result shows `principal` (`*` = every one checked) at `raw`, `partial`, `full`, `redacted` or `masked` on every checked column under `target`. |
+| `AccessVerified(env, target)` | That result has PASS for every check under `target`, each principal at its expected tier. `ADOPTED_COLUMNS` means every column migrate-plan adopted. |
+| `DiffLimitedTo(env, component, selectors)` | Every changed `uc` resource, `agents` space, `receipts` or `state_serials` path matches a selector. |
+| `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
+| `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
+| `OutputContains(text)` / `OutputOrder(before, after)` | The command emitted exact deterministic evidence, in the required pre-lock order. |
+| `OutputMatches(pattern)` / `OutputLacks(pattern)` | The command output matches, or does not match, the regular expression. |
+| `ProtectionDelta(env, findings)` | Only the named environment, resource and exact policy/custom-adoption effect is permitted. Required deltas also fail when the named finding is absent. |
+| `AcknowledgedWeakening(env, entries, findings)` | The same exact protection keys are permitted only after every exact acknowledgement key is committed or recorded by release. |
+
+A grant is `(principal, privilege, securable)`: a table, schema or catalog, or
+`agent:<key>` for Genie CAN_RUN. `USE_CATALOG`/`USE_SCHEMA` on a table mean its
+catalog/schema. Every protection check includes UC grants and non-inherited
+CAN_RUN. After each applying step, each release phase and at the scenario end, a
+new grant that no check of the scenario declares in `added` or `may_add` fails,
+including in S8/S9, which may otherwise weaken protection. The restore and
+final checks allow no new grant. Example:
+
+```python
+_scenario("s6", ..., checks=(
+    GrantDelta("dev"),
+    GrantDelta("prod", added=(("{reader_principal}", "SELECT", "{reader_table}"),),
+               may_add=_business_grants("{reader_principal}", "{reader_table}")),
+))
+```
+
+Access checks read `<cloud>/envs/<env>/generated/.verify_access.json`, the file
+`release`, `rehearse` and `verify-access` write. A file the step did not rewrite
+is stale and fails the check. The file's `checks` list gives, per column and
+principal, the expected tier and what the run proved (`raw`, `mismatch`,
+`fail-closed` or `unproven` when it did not prove the expected tier).
+`redacted` means `full` through a never-raw (`unmapped_redact`) mask.
+
+`tier-groupmap` additionally needs `tier_group`, `group_map_source`,
+`mapped_group`, `prod_agent` (the committed agent filename stem), `tier_table_dev` and
+`tier_table_prod` (exact three-part keys in their respective environments' `table_readers`), and
+`acl_group`, plus `tier_add_acks`: the exact acknowledgement lines printed by
+the initial refused tier plan, separated by `;;` (normally one `prod:reader:`
+and one `prod:weaken:` entry for the governed grant target). Catalog-level ABAC policies are
+reported once for every table that inherits them; protection allowances expand only across
+the exact generated policy identities and tables in the committed governed-catalog set.
+An ungoverned catalog remains outside the allowance. Prod preflight also requires every
+kept dev-source policy name to have its exact committed `catalog_map` entry. The driver derives the one exact
+`prod:weaken:group_map:<source>=<mapped_group>` acknowledgement. `custom-mask` needs
+`custom_mask_class` (for example `class.postcode`), `custom_mask_column_dev`,
+`custom_mask_column_prod`,
+`custom_install_ack`, and
+`custom_mask_ack` (the
+exact `prod:weaken:<column>:<principal>` line printed by the weakening check).
+All named groups must already be real account groups. A unit governance-state
+fixture proves both tier addition and fail-safe-to-custom-mask adoption are
+weakenings, so neither positive release is attempted before its refusal and
+exact acknowledgement. Tier removal deliberately needs no weakening acknowledgement:
+it revokes access and strengthens protection. Custom-mask adoption retains the staged
+The named columns must be dedicated `gr_e2e_*` fixture columns in catalogs isolated from
+other fail-safe STRING fixtures. The custom-mask preflight refuses before any mutation
+and names every conflicting column unless each named column is the only fail-safe STRING
+column in its catalog. Adoption retains that fail-safe generation
+until the next successful run; its later policy/function retirement
+has a separate, exact required protection delta on the next dev rehearse and prod maintain.
+Tier addition/removal updates only that exact table's readers and the named agent's
+`acl_groups`, and reverses both fixture edits on removal. The scenarios run
+unchanged with `--cloud aws` and `--cloud azure`; their final restoration uses
+the standard forward-release lifecycle. It derives and commits an exact reverse
+group-map acknowledgement from the product checker, releases the baseline,
+then removes that temporary acknowledgement. The baseline tree removes all
+authored tier/ACL/custom-mask fixtures. Account groups are pre-existing inputs,
+not created by the driver. Any restore failure stops the run as `RESTORE FAILED`
+and reports the manual forward-release commands; it never claims cleanup passed.
 
 S17 (`policy-ops`) covers the day-2 policy operations in design section 17 and
 `docs/deterministic-policies.md` with public targets only. It starts with
@@ -104,16 +212,13 @@ and nothing unfinished or waiting to retire. A reviewed mask-only dev change
 (no tier move, no new `table_readers`) is authored, regenerated and merged.
 Then the steps are:
 
-1. **Failure.** `make rehearse ENV=dev VERIFY_SPEC=<failing_verify_spec>`
-   fails at `verify-created`. The injection is the documented `verify-access`
-   option, which reaches the staged verification as a command-line make
-   variable, so no product backdoor is involved. The spec is a reviewed JSON
-   file outside the checkout. Its `column_masks` check lists a tier-1 principal
-   under `masked_principals`, so the read-only verification can't pass after
-   `create`. The step must print `ERROR: policy phase verify-created failed`.
-   Every tag, grant and earlier policy must be unchanged, no mask may be lost,
-   and a new policy may exist only if it matches no value a column carries
-   (nothing switched).
+1. **Failure.** The driver writes a `VERIFY_SPEC` file to the reports
+   directory (outside the checkout) and runs `make rehearse ENV=dev
+   VERIFY_SPEC=<that file>`, which must fail at `verify-created` and print
+   `ERROR: policy phase verify-created failed`. See *S17's failure
+   injection* below. Every tag, grant and earlier policy must be unchanged,
+   no mask may be lost, and a new policy may exist only if it matches no
+   value a column carries (nothing switched).
 2. **Status.** `make policy-status ENV=dev` must report the unfinished change,
    `failed at verify-created`, and the previous protection with no column
    retagged.
@@ -133,13 +238,41 @@ Then the steps are:
 
 Every applying step is checked for weaker protection, as in the other scenarios.
 
-Output assertions (`assertions` must match, `forbidden` must not) apply to a
-step that otherwise passed. `protection_checkpoint` records dev and prod
+S17's output checks are `OutputMatches` and `OutputLacks`.
+`protection_checkpoint` records dev and prod
 protection under a name, and a later `protection_matches` step compares
 against it. A positive `make apply-account` scenario is not encoded yet:
 `apply-account` has the CI guard and the account lock, but none of the
 section 17 provenance (clean `origin/main` HEAD, saved account plan and
 manifest, account receipt) it would assert. S13 keeps its CI refusal.
+
+#### S17's failure injection
+
+The failure uses the public `VERIFY_SPEC` option, and the spec can only be
+stricter than the real verification. Every applying gate refuses a spec that
+drops or weakens a policy-derived check
+(`docs/effective-access-verification.md`, *Explicit spec*). Rehearse checks
+the spec against the desired render after deriving and before `apply`. Each
+staged verify checks it again against the render of the stage it verifies.
+
+After the reviewed change is merged, the driver derives the gate spec for dev
+from the same inputs `require-mask-proof` reads: the effective generated
+`abac.auto.tfvars`, the account groups, the pairing keys and
+`env.auto.tfvars`. It writes every derived check unchanged, then adds one
+copy of a column check in which a raw tier group (not the admin or a
+synthetic `__...__` test principal) is expected to see `full`. A gate accepts added checks, so the spec passes before
+apply. After `create` that principal still reads the column raw, so
+`verify-created` fails before anything is switched. If the stage's own render
+expects functions the spec's checks don't name, the verify-created gate
+refuses the spec at the same phase, also before any query or switch. The
+driver reads the file back with the strict loader and refuses to run the step
+unless the file is no weaker than the derivation. The report records the
+column and group of the added check.
+
+A dev env where no tier group reads a masked column raw can't host S17; the
+driver stops before the failing step. A spec that omits a real tier is refused
+before apply (`shared/tests/test_release_mask_proof.py`), and the driver then
+reports `ERROR`, because it needs the verify-created failure.
 
 Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
 (`databricks_workspace_host`, `databricks_client_id`,
@@ -171,7 +304,7 @@ guard only sees what the log says: a wholly quiet internal exposure still cannot
 be observed, so the engine must preserve its internal masks-before-access
 ordering. The driver then
 re-snapshots dev and prod. A column that lost a tag, a removed mask or policy, a
-newly exempted or uncovered principal, or a new grant compared with the
+newly exempted or uncovered principal, or a new grant or CAN_RUN compared with the
 scenario's baseline is `RESTORE FAILED`. `<reports>/final-protection.json`
 repeats that check against the run's first baseline. Logs and reports redact
 secret-named keys, every value in the cloud's auth files, `Authorization`,

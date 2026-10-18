@@ -97,6 +97,11 @@ def remap_policy_name(name: str, src: str, dest: str) -> str:
     return re.sub(rf"(?<![A-Za-z0-9]){re.escape(src)}(?![A-Za-z0-9])", dest, name)
 
 
+def remote_policy_name(catalog: str, key: str) -> str:
+    """The PolicyInfo name materialized by modules/data_access main.tf."""
+    return f"{catalog}_{key}"
+
+
 def read_state_policy_keys(path: Path | None = None, *, state: dict | None = None) -> set[tuple[str, str]] | None:
     """Return (catalog, key) of the data_access policies in a Terraform state.
 
@@ -245,8 +250,8 @@ def remap_policy_names(
                 live_cache[dest] = live_names(dest) if live_names else None
             live = live_cache[dest]
             managed = state_keys or set()
-            old_remote = f"{dest}_{name}"
-            new_remote = f"{dest}_{new_name}"
+            old_remote = remote_policy_name(dest, name)
+            new_remote = remote_policy_name(dest, new_name)
             if (dest, name) in managed or (live is not None and old_remote in live):
                 notes.append(f"  kept policy name {old_remote} (deployed in {dest})")
                 new_name = name

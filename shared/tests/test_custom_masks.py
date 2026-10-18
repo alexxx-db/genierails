@@ -785,10 +785,47 @@ def test_the_weakening_cli_reads_the_value(tmp_path):
 
 # ── No model in governance ──────────────────────────────────────────────────
 
+def _model_import_names(names):
+    return {
+        name for name in names
+        if name.split(".")[0] in {"anthropic", "openai"}
+        or "ai_helpers" in name.split(".")
+    }
+
+
+@pytest.mark.parametrize(("statement", "expected"), [
+    ("from scripts import ai_helpers\n", "scripts.ai_helpers"),
+    ("import scripts.ai_helpers as client\n", "scripts.ai_helpers"),
+    ("import anthropic.types\n", "anthropic.types"),
+    ("from openai import OpenAI\n", "openai"),
+])
+def test_the_custom_mask_model_import_guard_catches_mutations(tmp_path, statement, expected):
+    assert _model_import_names({
+        "openai",
+        "anthropic.types",
+        "scripts.ai_helpers",
+        "scripts.ai_helpers.Client",
+        "foo.ai_helpers",
+        "governance_ai_helpers_notes",
+    }) == {"openai", "anthropic.types", "scripts.ai_helpers", "scripts.ai_helpers.Client", "foo.ai_helpers"}
+
+    from tests.test_no_model_in_governance import _import_closure
+
+    mutant = tmp_path / "mutant.py"
+    mutant.write_text(statement)
+    imports = _import_closure([mutant])[mutant]
+    assert expected in imports
+    assert expected in _model_import_names(imports)
+
+
 def test_custom_masks_never_imports_the_model_client():
     from tests.test_no_model_in_governance import _import_closure
 
     closure = _import_closure([SHARED / "scripts" / "custom_masks.py"])
-    assert not any("ai_helpers" in name or name in {"anthropic", "openai"}
-                   for names in closure.values() for name in names), closure
+    model_imports = {
+        path: _model_import_names(names) for path, names in closure.items()
+        if _model_import_names(names)
+    }
+    assert model_imports == {}, closure
+    assert SHARED / "governed_tables_record.py" in closure
     assert "serving_endpoints" not in (SHARED / "scripts" / "custom_masks.py").read_text()
