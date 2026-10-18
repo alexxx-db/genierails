@@ -70,7 +70,7 @@ HANDLED_ACTIONS = frozenset({
     "checkout_value", "add_ack", "add_acks", "remove_ack", "local_merge",
     "tier_add", "tier_remove", "group_map_change", "add_group_map_ack",
     "remove_group_map_ack", "prod_acl_change", "custom_mask_install",
-    "custom_mask_change", "snapshot_checkpoint", "verify_effect",
+    "custom_mask_change", "snapshot_checkpoint", "verify_effect", "write_agent_file",
 })
 # Scenarios whose purpose is to remove or loosen protection mid-scenario. The
 # post-restore check still applies to them.
@@ -343,6 +343,14 @@ def _business_grants(principals: str, tables: str) -> tuple[Grant, ...]:
 
 
 APPLY_RELEASE = "Apply approved manifest"
+# The champion writes dev agent A's file (envs/dev/agents/<agent_a>.auto.tfvars)
+# from these required values: who may run an agent is its acl_groups (design
+# decision 4; a missing value stops make generate). agent_a must be its own
+# Terraform key, so ``agent:{agent_a}`` names the same agent in dev and prod.
+AGENT_FILE_VALUES = ("agent_a", "dev_agent_id", "acl_groups")
+AGENT_KEY = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
+AGENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+GROUP_NAME = re.compile(r"[^\s\"'<>{}\[\],#]+(?: [^\s\"'<>{}\[\],#]+)*")
 
 
 def custom_mask_checks(expected: str, *, verify: bool = False) -> tuple[Any, ...]:
@@ -355,10 +363,11 @@ def custom_mask_checks(expected: str, *, verify: bool = False) -> tuple[Any, ...
 
 SCENARIOS: tuple[Scenario, ...] = (
     _scenario("champion", "First champion deployment", (
-        "Fresh prefixed dev agent A and matching test-only dev/prod tables exist.",
-        "Catalog mapping, tier groups, acl_groups and external state directory are reviewed.",
+        "Fresh prefixed dev agent A (ID dev_agent_id) and matching test-only dev/prod tables exist.",
+        "Catalog mapping, tier groups, acl_groups (who may run A) and external state directory are reviewed.",
     ), (
         mk("Scaffold dev environment", "setup", "dev"),
+        action("Write dev agent A's file: genie_space_id and acl_groups", "write_agent_file"),
         Step("Review dev classification", human_prompt="In dev Catalog Explorer review classification, exclude false positives and enable auto-tagging."),
         mk("Generate reviewed dev configuration", "generate", "dev"),
         AUTHOR_MERGE,
@@ -1149,6 +1158,9 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
     for step in scenario.steps:
         if step.action in ("checkout_value", "add_ack", "add_acks", "remove_ack") and not values.get(step.value or ""):
             missing.append(step.value or "")
+        if step.action == "write_agent_file":
+            missing += [name for name in AGENT_FILE_VALUES if not values.get(name)]
+            missing += agent_file_value_problems(values)
         missing.extend(name for name in step.fixture_args
                        if step.action not in {"snapshot_checkpoint", "verify_effect"}
                        and not values.get(name))
@@ -1166,6 +1178,41 @@ def unresolved_values(scenario: Scenario, values: Mapping[str, str]) -> list[str
         if step.action == "checkout_value" and values.get(step.value or "") and not re.fullmatch(r"[0-9a-fA-F]{40}", values[step.value or ""]):
             missing.append(f"{step.value} (must be a 40-hex commit)")
     return sorted(set(missing))
+
+
+def _acl_groups(value: str) -> list[str]:
+    return [group.strip() for group in value.split(",") if group.strip()]
+
+
+def agent_file_value_problems(values: Mapping[str, str]) -> list[str]:
+    """Each supplied agent-file value that can't be written as given (missing ones are reported apart)."""
+    problems = []
+    if values.get("agent_a") and not AGENT_KEY.fullmatch(values["agent_a"]):
+        problems.append("agent_a (must be the agent's Terraform key: lowercase letters, digits and '_')")
+    if values.get("dev_agent_id") and not AGENT_ID.fullmatch(values["dev_agent_id"]):
+        problems.append("dev_agent_id (must be a Genie agent ID: letters, digits, '_' or '-')")
+    if values.get("acl_groups") and not (
+            _acl_groups(values["acl_groups"])
+            and all(GROUP_NAME.fullmatch(group) for group in _acl_groups(values["acl_groups"]))):
+        problems.append("acl_groups (must be comma-separated group names)")
+    return problems
+
+
+def write_agent_file(env_dir: Path, values: Mapping[str, str]) -> None:
+    """Write dev agent A's settings file; an existing file must already say the same."""
+    problems = [f"missing value: {name}" for name in AGENT_FILE_VALUES if not values.get(name)]
+    problems += agent_file_value_problems(values)
+    if problems: raise RuntimeError("cannot write the agent file: " + "; ".join(problems))
+    groups = _acl_groups(values["acl_groups"])
+    path = env_dir / "agents" / f"{values['agent_a']}.auto.tfvars"
+    if path.exists():
+        config = _load_hcl(path)
+        if config.get("genie_space_id") != values["dev_agent_id"] or config.get("acl_groups") != groups:
+            raise RuntimeError(f"{path} already sets a different genie_space_id or acl_groups; nothing was written")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"genie_space_id = {json.dumps(values['dev_agent_id'])}\n"
+                    f"acl_groups     = [{', '.join(json.dumps(group) for group in groups)}]\n", encoding="utf-8")
 
 
 def governance_only_env(cloud_root: Path, env: str) -> bool:
@@ -1756,6 +1803,29 @@ def protection_diff_envs(baseline: Mapping[str, Any], current: Mapping[str, Any]
                                         allowed_grants=grants.get(env, ()), **kwargs))}
 
 
+def _pinned_governed_catalogs(snapshot: Mapping[str, Any]) -> dict[str, frozenset[str]]:
+    return {env: frozenset((snap or {}).get("governed_catalogs") or ())
+            for env, snap in snapshot.items()}
+
+
+def governed_catalog_pin_problems(pinned: Mapping[str, Iterable[str]],
+                                  snapshot: Mapping[str, Any]) -> list[str]:
+    problems: list[str] = []
+    for env, expected_items in sorted(pinned.items()):
+        expected = set(expected_items)
+        actual = set((snapshot.get(env, {}) or {}).get("governed_catalogs") or ())
+        if actual == expected: continue
+        added, removed = sorted(actual - expected), sorted(expected - actual)
+        pieces = []
+        if added: pieces.append(f"added {', '.join(added)}")
+        if removed: pieces.append(f"removed {', '.join(removed)}")
+        problems.append(
+            f"{env}: governed catalog set changed from the scenario baseline "
+            f"({'; '.join(pieces)}); protection allowances are pinned to "
+            f"{', '.join(sorted(expected)) or '<none>'} and will not widen")
+    return problems
+
+
 def live_protection_diff(scenario: Scenario, before: Mapping[str, Any], after: Mapping[str, Any], *,
                          allowed_adoptions: Mapping[str, Mapping[str, Adoption]],
                          allowed_grants: Mapping[str, Iterable[Grant]],
@@ -1780,12 +1850,14 @@ def live_protection_diff(scenario: Scenario, before: Mapping[str, Any], after: M
 
 
 def _finding_matches(key: ProtectionKey, actual: Mapping[str, list[str]],
-                     before: Mapping[str, Any], after: Mapping[str, Any]) -> set[tuple[str, str]]:
+                     before: Mapping[str, Any], after: Mapping[str, Any],
+                     governed_catalogs: Iterable[str] | None = None) -> set[tuple[str, str]]:
     """Concrete findings selected by one narrow semantic protection key."""
     category, resource, change = key
     if category == "policies":
         if resource == "governed":
-            catalogs = set(before.get("governed_catalogs") or ()) | set(after.get("governed_catalogs") or ())
+            catalogs = set(governed_catalogs if governed_catalogs is not None
+                           else (before.get("governed_catalogs") or ()))
         else:
             anchor = resource.removeprefix("catalog:")
             catalogs = {anchor.split(".", 1)[0]}
@@ -1989,6 +2061,7 @@ class CheckContext:
     adoptions: Mapping[str, Mapping[str, Adoption]] = dataclasses.field(default_factory=dict)
     output: str = ""
     acknowledged: frozenset[str] = frozenset()
+    governed_catalogs: Mapping[str, Iterable[str]] = dataclasses.field(default_factory=dict)
 
 
 VERIFY_RESULT = Path("generated") / ".verify_access.json"
@@ -2247,8 +2320,9 @@ def _protection_delta_problems(env: str, keys: Iterable[ProtectionKey], ctx: Che
                                *, required: bool = True) -> list[str]:
     if not required: return []
     actual = protection_diff(ctx.before.get(env, {}), ctx.after.get(env, {}), include_grants=False)
+    governed = ctx.governed_catalogs.get(env) if ctx.governed_catalogs else None
     return [f"{env}: expected protection finding was not produced: {key!r}" for key in keys
-            if not _finding_matches(key, actual, ctx.before.get(env, {}), ctx.after.get(env, {}))]
+            if not _finding_matches(key, actual, ctx.before.get(env, {}), ctx.after.get(env, {}), governed)]
 
 
 def _eval_protection_delta(check: ProtectionDelta, ctx: CheckContext) -> list[str]:
@@ -2362,7 +2436,9 @@ def weakening_allowances(checks: Iterable[Any], acknowledged: Iterable[str]) -> 
 
 
 def weakening_finding_allowances(checks: Iterable[Any], acknowledged: Iterable[str],
-                                 before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, set[tuple[str, str]]]:
+                                 before: Mapping[str, Any], after: Mapping[str, Any],
+                                 pinned_governed_catalogs: Mapping[str, Iterable[str]] | None = None
+                                 ) -> dict[str, set[tuple[str, str]]]:
     committed = set(acknowledged)
     allowed: dict[str, set[tuple[str, str]]] = {}
     for check in checks:
@@ -2371,9 +2447,10 @@ def weakening_finding_allowances(checks: Iterable[Any], acknowledged: Iterable[s
         elif not isinstance(check, ProtectionDelta):
             continue
         actual = protection_diff(before.get(check.env, {}), after.get(check.env, {}), include_grants=False)
+        governed = None if pinned_governed_catalogs is None else pinned_governed_catalogs.get(check.env, ())
         for key in check.findings:
             allowed.setdefault(check.env, set()).update(
-                _finding_matches(key, actual, before.get(check.env, {}), after.get(check.env, {})))
+                _finding_matches(key, actual, before.get(check.env, {}), after.get(check.env, {}), governed))
     return allowed
 
 
@@ -2434,6 +2511,9 @@ def _run_action(step: Step, scenario: Scenario, repo: Checkout, values: Mapping[
         return
     if step.action == "local_merge":
         repo.local_merge(scenario.key)
+        return
+    if step.action == "write_agent_file":
+        write_agent_file(repo.runner.cwd / "envs" / "dev", values)
         return
     if step.action in {"tier_add", "tier_remove"}:
         group, dev_table, prod_table, agent = (values[name] for name in step.fixture_args)
@@ -2687,7 +2767,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
         raise SystemExit(
             f"live execution requires a customer-shaped checkout that commits envs/; {checkout_dir} at "
             f"{args.commit[:12]} does not:\n" + "".join(f"  - {p}\n" for p in problems)
-            + f"  Fix: cd {args.cloud} && make setup ENV=dev GITIGNORE=customer && "
+            + f"  Fix: with origin at GenieRails plain make setup won't write the block "
+            f"(GITIGNORE=customer forces it): cd {args.cloud} && make setup ENV=dev GITIGNORE=customer && "
             f"make setup ENV=prod GITIGNORE=customer, commit {args.cloud}/.gitignore "
             f"and {args.cloud}/envs/, check that commit out and pass it as --commit. Nothing was run.")
     log_root = reports / "logs"; log_root.mkdir(parents=True, exist_ok=True)
@@ -2703,6 +2784,16 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
     def capture() -> dict[str, Any]:
         snaps = {env: provider.capture(env) for env in ("dev", "prod")}
         runner.secrets = tuple(set(runner.secrets) | set(getattr(provider, "secret_values", ())))
+        return snaps
+
+    def capture_pinned(pinned: Mapping[str, Iterable[str]], item: dict[str, Any] | None = None) -> dict[str, Any]:
+        # Allowances use the governed set pinned at the scenario's baseline
+        # capture; a later snapshot may not widen (or narrow) its own allowance.
+        snaps = capture()
+        if problems := governed_catalog_pin_problems(pinned, snaps):
+            if item is not None:
+                item["status"] = "ERROR"; item["assertion"] = "; ".join(problems)
+            raise RuntimeError("governed catalog set changed mid-scenario: " + "; ".join(problems))
         return snaps
 
     failed = False
@@ -2753,6 +2844,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
             recorded_ack_keys: set[str] = set()
             scenario_check_results: list[dict[str, Any]] = []
             checkpoints: dict[str, dict[str, Any]] = {}
+            pinned_governed: dict[str, frozenset[str]] = {}
             try:
                 # Pin: every scenario starts at exactly the requested commit.
                 repo.switch(repo.baseline, f"{scenario.key}-pin")
@@ -2760,6 +2852,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     repo.init_remote(); remote_ready = True
                 scenario_verify = verify_signatures(cloud_root)
                 before = capture()
+                pinned_governed = _pinned_governed_catalogs(before)
                 if scenario.key == "custom-mask":
                     preflight = custom_mask_preflight_problems(before, values)
                     if preflight:
@@ -2780,7 +2873,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         if step.action == "snapshot_checkpoint":
                             prod_cfg = _load_hcl(cloud_root / "envs" / "prod" / "env.auto.tfvars")
                             checkpoints[step.fixture_args[0]] = {
-                                "snapshot": capture(),
+                                "snapshot": capture_pinned(pinned_governed, item),
                                 "prod_group_map": dict(prod_cfg.get("group_map") or {}),
                             }
                             if step.fixture_args == ("before-group-map",):
@@ -2799,7 +2892,8 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                                 if not isinstance(old_target, str) or not old_target:
                                     raise RuntimeError(f"checkpoint prod group_map has no target for {source!r}")
                                 arguments.append(old_target)
-                            verify_live_effect(kind, checkpoints[checkpoint]["snapshot"], capture(), arguments)
+                            verify_live_effect(kind, checkpoints[checkpoint]["snapshot"],
+                                               capture_pinned(pinned_governed, item), arguments)
                         else:
                             _run_action(step, scenario, repo, values)
                         item["status"] = "passed"; continue
@@ -2810,7 +2904,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                     applying = step.target in APPLYING
                     if applying: repo.require_clean(label)
                     step_verify = verify_signatures(cloud_root)
-                    step_before = capture() if (step.expect_failure or applying or step_snapshots) else None
+                    step_before = capture_pinned(pinned_governed, item) if (step.expect_failure or applying or step_snapshots) else None
                     # Assume a mutation from the moment an applying command
                     # starts (it may be interrupted half-way); a refusal that
                     # held with an unchanged snapshot takes the assumption back.
@@ -2834,7 +2928,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         ok = False
                         item["assertion"] = "deterministic apply attempted to clear gr_treatment"
                     item["status"] = "passed" if ok else "ERROR"
-                    step_after = capture() if step_before is not None else None
+                    step_after = capture_pinned(pinned_governed, item) if step_before is not None else None
                     if step.expect_failure and step_before is not None and step_after is not None:
                         mutation = snapshot_diff(step_before, step_after)
                         refusal_diffs.append({"step": step.name, "env": step.env or "account", "diff": mutation})
@@ -2849,7 +2943,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             allowed_grants=grant_allowances(declared_checks, step_before, step_after),
                             allowed_weakening_findings=weakening_finding_allowances(
                                 declared_checks, _current_acks(cloud_root) | recorded_ack_keys,
-                                step_before, step_after))
+                                step_before, step_after, pinned_governed))
                         if weak_step:
                             item["status"] = "ERROR"
                             if "assertion" not in item:
@@ -2868,11 +2962,11 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             if not release_needs_another_phase(phase_output): break
                             repo.verify(f"{label}-phase-{phase}")
                             repo.require_clean(f"{label}-phase-{phase}")
-                            phase_before = capture()
+                            phase_before = capture_pinned(pinned_governed, item)
                             plan_result = runner.run(("make", "release-plan", "ENV=prod"),
                                                      f"{label}-release-plan-phase-{phase}")
                             if plan_result.returncode: raise RuntimeError(f"release phase {phase} plan failed")
-                            phase_plan_after = capture()
+                            phase_plan_after = capture_pinned(pinned_governed, item)
                             plan_diff = snapshot_diff(phase_before, phase_plan_after)
                             successful_step_diffs.append({"step": f"{step.name} phase {phase} plan", "env": "prod", "diff": plan_diff})
                             if release_plan_workspace_diff(phase_before, phase_plan_after):
@@ -2881,7 +2975,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                             phase_release = runner.run(("make", "release", "ENV=prod", f"MANIFEST={manifest}"),
                                                        f"{label}-release-phase-{phase}")
                             if phase_release.returncode: raise RuntimeError(f"release phase {phase} failed")
-                            phase_after = capture()
+                            phase_after = capture_pinned(pinned_governed, item)
                             successful_step_diffs.append({"step": f"{step.name} phase {phase}", "env": "prod",
                                                           "diff": snapshot_diff(phase_plan_after, phase_after)})
                             if deterministic_env(cloud_root, "prod") and import_unset_treatment(
@@ -2892,7 +2986,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                                 allowed_grants=grant_allowances(declared_checks, phase_plan_after, phase_after),
                                 allowed_weakening_findings=weakening_finding_allowances(
                                     declared_checks, _current_acks(cloud_root) | recorded_ack_keys,
-                                    phase_plan_after, phase_after))
+                                    phase_plan_after, phase_after, pinned_governed))
                             if weak_phase:
                                 raise RuntimeError(f"release phase {phase} weakened protection: {weak_phase}")
                             phase_output = plan_result.stdout + "\n" + phase_release.stdout
@@ -2903,23 +2997,23 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
                         if step.target == "release":
                             recorded_ack_keys.update(weakening_allowances(step_checks, _current_acks(cloud_root)))
                         item["checks"] = evaluate_checks(step_checks, CheckContext(
-                            step_before or {}, capture() if step_snapshots else {}, cloud_root,
+                            step_before or {}, capture_pinned(pinned_governed, item) if step_snapshots else {}, cloud_root,
                             step_verify, allowed_adoptions, result.stdout,
-                            _current_acks(cloud_root) | frozenset(recorded_ack_keys)))
+                            _current_acks(cloud_root) | frozenset(recorded_ack_keys), pinned_governed))
                         if failures := failed_checks(item["checks"]):
                             item["status"] = "ERROR"; item["assertion"] = "; ".join(failures)
                             raise RuntimeError(f"step did not satisfy its checks: {step.name}: {'; '.join(failures)}")
                     if applying: repo.require_clean(f"after-{label}")
-                after = capture()
+                after = capture_pinned(pinned_governed)
                 weak = live_protection_diff(scenario, before, after, allowed_adoptions=allowed_adoptions,
                                             allowed_grants=grant_allowances(declared_checks, before, after),
                                             allowed_weakening_findings=weakening_finding_allowances(
                                                 declared_checks, _current_acks(cloud_root) | recorded_ack_keys,
-                                                before, after))
+                                                before, after, pinned_governed))
                 if weak: raise RuntimeError(f"protection became weaker or access widened: {weak}")
                 scenario_check_results = evaluate_checks(scenario_checks, CheckContext(
                     before, after, cloud_root, scenario_verify, allowed_adoptions, "",
-                    _current_acks(cloud_root) | frozenset(recorded_ack_keys)))
+                    _current_acks(cloud_root) | frozenset(recorded_ack_keys), pinned_governed))
                 if failures := failed_checks(scenario_check_results):
                     raise RuntimeError(f"scenario checks failed: {'; '.join(failures)}")
                 unexpected = unexpected_changes(scenario.key, before, after)

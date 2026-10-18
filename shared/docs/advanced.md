@@ -62,9 +62,10 @@ make generate GENERATE_ARGS='--create-groups'
 
 `--create-groups` lets the LLM invent access-tier names and skips the preflight. To have Terraform create them, also set `manage_groups = true` in `envs/account/env.auto.tfvars` (the only place that flag belongs). Keep workspace and `data_access` envs on the default `manage_groups = false` (lookup-only) regardless.
 
-## ABAC-Only Mode (No Genie agent)
+<a id="abac-only-mode-no-genie-agent"></a>
+## ABAC-Only Mode (tables only)
 
-See [govern tables only](playbooks/governance.md#govern-tables-only) for the full step-by-step.
+For teams that govern tables centrally, independent of any agent. See [govern tables only](playbooks/governance.md#govern-tables-only) for the full step-by-step.
 
 ## Existing Masking Functions
 
