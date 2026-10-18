@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import hcl2
@@ -42,7 +43,8 @@ def _promoted_tfvars(env_dir: Path) -> Path:
 
 
 def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
-                       account_tfvars: Path | None = None, tfvars: Path | None = None) -> int:
+                       account_tfvars: Path | None = None, tfvars: Path | None = None,
+                       env_file: Path | None = None) -> int:
     """Refuse a release whose verify-access could not prove every mask.
 
     The masked columns to prove are every column a column-mask policy's tags
@@ -56,13 +58,17 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
     VERIFY_KEY_COLUMN), and release proves them all as the admin
     (verify-access --check-keys-only) before it applies. Run before the
     release lock and again after release promotes the live-derived config
-    (prod's tag assignments only exist then), before it applies.
+    (prod's tag assignments only exist then), before it applies. ``env_file``
+    is the env settings the checks are derived with (default the env's own; the
+    staged policy controller passes a stage's, before it applies the stage).
     """
     from verify_effective_access import (
         load_key_map, load_spec_from_file, load_spec_from_tfvars, required_mask_columns_from_tfvars,
-        unchecked_mask_columns, weaker_explicit_spec_checks,
+        self_keyed_mask_checks, unchecked_mask_columns, validate_spec_identifiers, weaker_explicit_spec_checks,
+        with_table_keys,
     )
 
+    env_file = env_file or env_dir / "env.auto.tfvars"
     masks = column_mask_policies(env_dir)
     if not masks and not spec.strip():
         return 0
@@ -84,7 +90,7 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
         try:
             checks = load_spec_from_tfvars(
                 tfvars, account_tfvars, key_column=key.strip(),
-                key_column_by_table=load_key_map(env_dir / "env.auto.tfvars"),
+                key_column_by_table=load_key_map(env_file),
             ).column_masks
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return _refuse(env, f"verify-access could not derive its checks from {tfvars} ({exc})")
@@ -103,6 +109,17 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
         checks = explicit.column_masks
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         return _refuse(env, f"VERIFY_SPEC {path} could not be read ({exc})")
+    # What verify-access refuses before it runs a check, refused here before
+    # anything is applied: names it can't quote, and a key that is the masked
+    # column itself (with the env's per-table keys filled in, as it runs them).
+    try:
+        validate_spec_identifiers(explicit)
+        keyed = replace(explicit, column_masks=with_table_keys(checks, load_key_map(env_file)))
+    except (ValueError, KeyError, TypeError) as exc:
+        return _refuse(env, f"VERIFY_SPEC {path} is not runnable ({exc})")
+    self_keyed = self_keyed_mask_checks(keyed)
+    if self_keyed:
+        return _refuse(env, f"VERIFY_SPEC {path} pairs rows by the masked column itself: {', '.join(self_keyed)}")
     if masks and not checks:
         return _refuse(env, f"VERIFY_SPEC {path} has no column-mask checks, so it proves none of "
                             f"the {len(masks)} column mask(s)")
@@ -117,8 +134,7 @@ def require_mask_proof(env_dir: Path, env: str, key: str, spec: str,
         try:
             derived = load_spec_from_tfvars(
                 tfvars, account_tfvars, key_column=key.strip(),
-                key_column_by_table=load_key_map(env_dir / "env.auto.tfvars"),
-                env_file=env_dir / "env.auto.tfvars",
+                key_column_by_table=load_key_map(env_file), env_file=env_file,
             )
             derived.column_masks = [
                 check for check in derived.column_masks

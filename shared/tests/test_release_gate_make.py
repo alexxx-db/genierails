@@ -257,7 +257,7 @@ def test_release_applies_only_the_saved_plans_then_verifies_and_writes_a_receipt
     runner = [c for c in calls if c[0] == "runner"]
     assert runner == [["runner", "workspace", "prod", "apply-plan", str(manifest.parent / "workspace.tfplan")]]
     assert not [c for c in calls if c[0] == "runner" and ("plan" in c or "apply" in c)]
-    assert "verify-access" in make.names()
+    assert "_verify-access-gate" in make.names()
     receipt = rg.last_release(repo.cloud, "prod")
     assert receipt["commit"] == repo.head() and receipt["manifest"]["path"] == str(manifest)
 
@@ -418,7 +418,7 @@ def test_rehearse_writes_a_receipt_and_reuses_it_without_reapplying(make, repo):
     result = make("rehearse", "dev")
     assert result.returncode == 0, result.stdout + result.stderr
     assert make.names() == ["_derive-before-exposure", "validate-generated", "coverage-gate", "apply",
-                            "verify-access"]
+                            "_verify-access-gate"]
     first = rg.passing_receipt(repo.cloud, "dev", repo.head())
     assert first and first["applied"] is True and first["targets"]["prod"]["digest"]
     commit = repo.commit({"aws/envs/prod/ack.txt": "# prod-only change\n"})
@@ -636,7 +636,7 @@ def test_rehearse_runs_the_custom_mask_cases_before_the_lock_and_before_any_step
     assert result.returncode == 0, result.stdout + result.stderr
     assert make.calls()[0] == ["cases", "unlocked", "dev"]
     assert make.names() == ["cases", "_derive-before-exposure", "validate-generated", "coverage-gate", "apply",
-                            "verify-access"]
+                            "_verify-access-gate"]
 
 
 def test_a_failing_custom_mask_case_stops_rehearse_before_the_lock_and_the_receipt(make, repo):

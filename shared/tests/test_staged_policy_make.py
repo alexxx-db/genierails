@@ -81,11 +81,28 @@ def test_deterministic_data_access_apply_runs_only_through_the_staged_controller
     staged = [c for c in calls if c[0] == "staged"]
     assert len(staged) == 1 and staged[0][1:4] == ["run", "--env-dir", str(env_dir)]
     verify = staged[0][staged[0].index("--verify-access-cmd") + 1]
-    assert "verify-access" in verify and "VERIFY_REQUIRE_MASKS=1" in verify
+    assert "_verify-access-gate" in verify and "VERIFY_REQUIRE_MASKS=1" in verify
     assert 'VERIFY_FROM_TFVARS="$GENIERAILS_VERIFY_TFVARS"' in verify
     assert 'VERIFY_ENV_FILE="$GENIERAILS_VERIFY_ENV_FILE"' in verify
     # Terraform never applies the data_access layer in one shot.
     assert not [c for c in calls if c[0] == "runner" and "apply" in c]
+
+
+def test_the_staged_controller_gets_the_verify_spec_to_check_before_create(tmp_path):
+    result, calls, _ = _apply_layer(tmp_path, "deterministic", "VERIFY_SPEC=/specs/s.json", "VERIFY_KEY_COLUMN=id",
+                                    "ACCOUNT_ENV_DIR=/acct")
+    assert result.returncode == 0, result.stdout + result.stderr
+    staged = [c for c in calls if c[0] == "staged"][0]
+    flags = {staged[i]: staged[i + 1] for i in range(len(staged) - 1) if staged[i].startswith("--")}
+    assert flags["--verify-spec"] == "/specs/s.json" and flags["--verify-key"] == "id"
+    assert flags["--account-tfvars"] == "/acct/abac.auto.tfvars"
+
+
+def test_every_staged_controller_apply_and_plan_gets_the_verify_spec():
+    makefile = (ROOT / "shared" / "Makefile.shared").read_text()
+    for command in ("run", "apply-saved", "plan"):
+        lines = [line for line in makefile.splitlines() if f"$(_STAGED_POLICY) {command} " in line]
+        assert lines and all("$(_STAGED_SPEC_FLAGS)" in line for line in lines), (command, lines)
 
 
 def test_legacy_data_access_apply_is_unchanged(tmp_path):
@@ -126,7 +143,7 @@ def test_rehearse_and_release_confirm_only_after_their_own_verification(cloud, t
     out = result.stdout
     assert "_STAGED_CONFIRM=0" in out
     apply_at = out.index("_STAGED_CONFIRM=0")
-    verify_at = out.index("verify-access ENV=", apply_at)
+    verify_at = out.index("_verify-access-gate ENV=", apply_at)
     confirm_at = out.index("staged_policy_apply.py\" confirm", verify_at)
     assert apply_at < verify_at < confirm_at
 

@@ -233,7 +233,8 @@ def _hcl_value(value) -> str:
 class Controller:
     def __init__(self, env_dir: Path, env_name: str = "", *, hook_dir: Path = HOOK_DIR,
                  verify_access_cmd: str = "", inventory_cmd: list[str] | None = None,
-                 commit: str = "", environ: dict | None = None, run=subprocess.run):
+                 commit: str = "", environ: dict | None = None, run=subprocess.run,
+                 verify_spec: str = "", verify_key: str = "", account_tfvars: Path | None = None):
         self.env_dir = env_dir.resolve()
         self.env_name = env_name or self.env_dir.name
         self.hook_dir = hook_dir
@@ -242,6 +243,10 @@ class Controller:
         self.commit = commit
         self.environ = dict(os.environ if environ is None else environ)
         self.run_cmd = run
+        # The VERIFY_SPEC every verify-access below runs, its key and account config.
+        self.verify_spec = verify_spec
+        self.verify_key = verify_key
+        self.account_tfvars = account_tfvars
 
     # -- journal -------------------------------------------------------------
     def _save(self, journal: dict) -> None:
@@ -354,21 +359,24 @@ class Controller:
         if not record or record.get("stage") not in stages:
             raise Refused(f"expected a {'/'.join(stages)} stage to be applied, found "
                           f"{(record or {}).get('stage') or 'none'}")
-        rendered = record["rendered"]
-        before_switch = record["stage"] in ("create", "restore")
+        verify_dir = pg.ledger_dir(self.env_dir) / "verify"
+        # The applied stage's render (policy_generations.write_stage), else the split config.
+        layer_tfvars = pg.stage_config_dir(self.env_dir) / "abac.auto.tfvars"
+        if not layer_tfvars.is_file():
+            layer_tfvars = self.env_dir / "data_access" / "abac.auto.tfvars"
+        return self._verification_files(t, record["stage"], record["rendered"], layer_tfvars, verify_dir)
+
+    def _verification_files(self, t: dict, stage: str, rendered: dict, layer_tfvars: Path,
+                            verify_dir: Path) -> tuple[Path, Path] | None:
+        before_switch = stage in ("create", "restore")
         basis = self._snapshot(t["from"]) if before_switch and t["from"] else self._snapshot(t["to"])
         tags = dict(rendered["tags"])
         if before_switch:
             tags = {c: v for c, v in tags.items() if c in (basis or {}).get("tags", {})}
         if not tags:
             return None
-        verify_dir = pg.ledger_dir(self.env_dir) / "verify"
         verify_dir.mkdir(parents=True, exist_ok=True)
-        # The applied stage's render (policy_generations.write_stage), else the split config.
-        layer_tfvars = pg.stage_config_dir(self.env_dir) / "abac.auto.tfvars"
-        if not layer_tfvars.is_file():
-            layer_tfvars = self.env_dir / "data_access" / "abac.auto.tfvars"
-        tfvars = verify_dir / f"{record['stage']}.abac.auto.tfvars"
+        tfvars = verify_dir / f"{stage}.abac.auto.tfvars"
         tfvars.write_text(layer_tfvars.read_text())
         _write_subset(tfvars, tags)
         env_cfg = pg._load(self.env_dir / "env.auto.tfvars")
@@ -379,9 +387,39 @@ class Controller:
                               "protection can't be verified across a tier move")
             settings = {}
         env_cfg.update(settings)
-        env_file = verify_dir / f"{record['stage']}.env.auto.tfvars"
+        env_file = verify_dir / f"{stage}.env.auto.tfvars"
         env_file.write_text("".join(f"{key} = {_hcl_value(value)}\n" for key, value in env_cfg.items()))
         return tfvars, env_file
+
+    def refuse_weaker_spec(self, t: dict) -> None:
+        """Refuse, before create is applied, a VERIFY_SPEC verify-created would refuse.
+
+        verify-created holds the spec to the generation the columns still carry
+        (its tiers and functions), not the desired one make checked it against,
+        so a spec written for the desired generation can fail there only after
+        create applied. Its inputs come from the same render the create hook
+        applies (policy_generations.render_stage).
+        """
+        if not self.verify_spec.strip() or "verify-created" not in t["phases"] or "create" in t["completed"]:
+            return
+        import tempfile
+
+        from scripts.release_helpers import require_mask_proof
+        from scripts.resolve_env_config import resolve_verify_key
+
+        desired = pg.desired_generation(self.env_dir)
+        old = self._snapshot(t["from"]) if t["from"] else None
+        retire = self._snapshot(t["retain"]) if t["retain"] not in {"", t["to"], t["from"]} else None
+        rendered = pg.render_stage("create", desired, old, retire)
+        with tempfile.TemporaryDirectory() as tmp:
+            layer = pg.write_stage(self.env_dir / "data_access", rendered, out_dir=Path(tmp) / "create")
+            inputs = self._verification_files(t, "create", rendered, layer / "abac.auto.tfvars", Path(tmp))
+            if inputs is None:
+                return
+            if require_mask_proof(self.env_dir, self.env_name, resolve_verify_key(self.env_dir, self.verify_key),
+                                  self.verify_spec, self.account_tfvars, tfvars=inputs[0], env_file=inputs[1]):
+                raise Refused(f"verify-created would refuse VERIFY_SPEC against generation {t['from']}, which "
+                              "the columns carry until switch (above); omit VERIFY_SPEC for this change")
 
     def _verify(self, t: dict, phase: str) -> int:
         stages, with_access = VERIFY_PHASES[phase]
@@ -462,8 +500,10 @@ class Controller:
                 if t["restoring"] or t["restore_failed"]:
                     if not self._restore(journal, t):
                         return 1
+                self.refuse_weaker_spec(t)
             else:
                 t = self._new_transition(journal, desired)
+                self.refuse_weaker_spec(t)
                 journal["transition"] = t
                 self._save(journal)
                 print(f"=== Policy staged apply ({self.env_name}): {' -> '.join(t['phases'])} ===")
@@ -509,6 +549,7 @@ class Controller:
                 return self._plan_adoption(out_dir, desired)
             journal = journal or self._adopt(desired)
             t = self._transition_for(journal, desired)
+            self.refuse_weaker_spec(t)
             remaining = [p for p in t["phases"] if p not in t["completed"]]
             steps: list[dict] = []
             basis = ""
@@ -578,6 +619,7 @@ class Controller:
                                   f"now {t[key]!r}); run make release-plan again")
             if sorted(t["completed"]) != sorted(planned["completed"]):
                 raise Refused("policy phases were applied since release-plan; run make release-plan again")
+            self.refuse_weaker_spec(t)
             if not journal.get("transition"):
                 journal["transition"] = t
                 self._save(journal)
@@ -831,6 +873,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="shell command verifying every tier's output; gets GENIERAILS_VERIFY_TFVARS "
                              "and GENIERAILS_VERIFY_ENV_FILE")
     parser.add_argument("--inventory-cmd", default="", help="override the live policy check (argv, shell-split)")
+    parser.add_argument("--verify-spec", default="", help="VERIFY_SPEC, if given: refused before create when "
+                                                         "verify-created would refuse it")
+    parser.add_argument("--verify-key", default="", help="VERIFY_KEY_COLUMN, if given")
+    parser.add_argument("--account-tfvars", type=Path, default=None,
+                        help="Account abac.auto.tfvars (group names), as verify-access uses")
     parser.add_argument("--commit", default="")
     parser.add_argument("--out-dir", type=Path, help="plan: where the saved phase plans go")
     parser.add_argument("--plan-dir", type=Path, help="apply-saved: the saved phase plans to apply")
@@ -839,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         args.env_dir, args.env_name, hook_dir=args.hook_dir, verify_access_cmd=args.verify_access_cmd,
         inventory_cmd=shlex.split(args.inventory_cmd) if args.inventory_cmd else None,
         commit=args.commit or _git_head(),
+        verify_spec=args.verify_spec, verify_key=args.verify_key, account_tfvars=args.account_tfvars,
     )
     try:
         if args.command == "status":

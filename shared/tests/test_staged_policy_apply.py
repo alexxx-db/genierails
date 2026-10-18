@@ -744,6 +744,66 @@ def _final_inputs(harness):
     return harness.controller().verification_inputs(t, ("switch",))
 
 
+def _spec_file(path: Path, spec) -> str:
+    """A VERIFY_SPEC JSON of a derived spec, without mask_function (optional; the derived one
+    names whichever of a value's policies the render lists first)."""
+    path.write_text(json.dumps({
+        "principal_memberships": {p: list(m) for p, m in spec.principal_memberships.items()},
+        "column_masks": [{
+            "table": c.table, "column": c.column, "key_column": c.key_column,
+            "masked_principals": list(c.masked_principals), "unmasked_principals": list(c.unmasked_principals),
+            "policy_name": c.policy_name,
+            "expected_tiers": dict(c.expected_tiers), "partial_function": c.partial_function,
+            "full_function": c.full_function, "moving_principals": list(c.moving_principals),
+        } for c in spec.column_masks],
+        "row_filters": [],
+    }))
+    return str(path)
+
+
+@pytest.mark.parametrize("before, after", [
+    (["raw", "regional", "masked"], ["raw", "masked"]),               # regional's partial check goes
+    (["raw", "regional", "masked"], ["regional", "raw", "masked"]),   # raw's raw baseline becomes partial
+])
+def test_a_spec_for_the_desired_tiers_that_verify_created_would_refuse_is_refused_before_create(
+        harness, tmp_path, before, after):
+    from scripts.release_helpers import require_mask_proof
+
+    released(harness, tiers=before)
+    write_env(harness.env_dir, tiers=after)
+    env_file = harness.env_dir / "env.auto.tfvars"
+    desired_spec = load_spec_from_tfvars(harness.env_dir / "data_access" / "abac.auto.tfvars",
+                                         env_file=env_file, key_column="id")
+    spec = _spec_file(tmp_path / "spec.json", desired_spec)
+    # make's own pre-apply check (against the desired config) passes it ...
+    assert require_mask_proof(harness.env_dir, "dev", "id", spec) == 0
+    # ... but verify-created checks the old tiers, so the controller refuses it before create.
+    for start in (lambda c: c.run(), lambda c: c.plan(tmp_path / "plans")):
+        controller = spa.Controller(harness.env_dir, "dev", hook_dir=Path("/hooks"), verify_access_cmd="simulated",
+                                    inventory_cmd=["inventory"], commit="abc123", run=harness.run,
+                                    verify_spec=spec, verify_key="id")
+        with pytest.raises(spa.Refused, match="verify-created would refuse VERIFY_SPEC"):
+            start(controller)
+        assert harness.calls == []
+        assert not harness.journal().get("transition")
+    # Without the spec, the derived checks cover both generations.
+    assert harness.apply() == 0
+
+
+def test_a_spec_the_live_generation_satisfies_runs_every_phase(harness, tmp_path):
+    # Derived from the released config: what verify-created holds it to.
+    released(harness, tiers=["raw", "regional", "masked"])
+    spec = _spec_file(tmp_path / "spec.json", load_spec_from_tfvars(
+        harness.env_dir / "data_access" / "abac.auto.tfvars", env_file=harness.env_dir / "env.auto.tfvars",
+        key_column="id"))
+    write_env(harness.env_dir, tiers=["raw", "masked"])
+    controller = spa.Controller(harness.env_dir, "dev", hook_dir=Path("/hooks"), verify_access_cmd="simulated",
+                                inventory_cmd=["inventory"], commit="abc123", run=harness.run,
+                                verify_spec=spec, verify_key="id")
+    assert controller.run() == 0
+    assert harness.calls[:3] == ["create", "inventory:create/restore", "verify-access:create"]
+
+
 def test_failed_switch_of_a_tier_move_goes_back_through_tighten(harness):
     old = released(harness)
     write_env(harness.env_dir, tiers=["raw", "analysts", "masked"])

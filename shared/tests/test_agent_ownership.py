@@ -792,7 +792,7 @@ def test_release_pushes_agents_after_apply_and_writes_the_receipt_last():
     makefile = (SHARED / "Makefile.shared").read_text()
     release = makefile[makefile.index("\nrelease:"):makefile.index("\nmaintain:")]
     order = [release.index(s) for s in ("restore-ids", '$(MAKE) apply ENV="$(ENV)"', "$(_AGENT_OWNERSHIP) sync",
-                                        "verify-access ENV", "$(_AGENT_OWNERSHIP) receipt", "Release complete")]
+                                        "_verify-access-gate ENV", "$(_AGENT_OWNERSHIP) receipt", "Release complete")]
     assert order == sorted(order)
     rehearse = makefile[makefile.index("\nrehearse:"):makefile.index("\noverride _RUN_AUDIT_RULEBOOK")]
     maintain = makefile[makefile.index("\nmaintain:"):makefile.index("\nvalidate:")]
@@ -1050,7 +1050,7 @@ def test_the_release_targets_carry_agents_through_the_manifest():
     order = [release.index(s) for s in ("manifest-check", "_ENV_LOCK,release", "$(_AGENT_OWNERSHIP) preflight",
                                         "sync-tags", "apply-saved", "apply-plan",
                                         '$(_AGENT_OWNERSHIP) sync --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest',
-                                        "verify-access ENV", "release-receipt")]
+                                        "_verify-access-gate ENV", "release-receipt")]
     assert order == sorted(order)
     roots = makefile[makefile.index("\n_release-plan-roots:"):makefile.index("\n_release-manifest:")]
     assert roots.index("guard-removals") < roots.index('workspace "$(ENV)" plan')
@@ -1084,7 +1084,7 @@ def test_make_release_plan_then_release_push_agents_through_the_manifest(tmp_pat
     assert sync[sync.index("--manifest") + 1] == str(manifest) == preflight[preflight.index("--manifest") + 1]
     first = flat.index("agents")
     assert first < flat.index("sync-tags") and first < flat.index("staged") and first < flat.index("runner")
-    assert flat.index("runner") < len(flat) - flat[::-1].index("agents") - 1 < flat.index("verify-access")
+    assert flat.index("runner") < len(flat) - flat[::-1].index("agents") - 1 < flat.index("_verify-access-gate")
 
 
 def test_make_release_plan_refuses_revived_tombstone_before_lock_or_plan(tmp_path, monkeypatch):
@@ -1127,7 +1127,7 @@ def test_make_release_fails_without_a_receipt_when_the_agent_push_fails(tmp_path
     assert result.returncode != 0 and "Genie agent config was not pushed" in result.stderr
     assert "rejected the captured config" in result.stderr
     assert rg.last_release(repo.cloud, "prod") is None
-    assert "verify-access" not in make.names()
+    assert not {"verify-access", "_verify-access-gate"} & set(make.names())
 
 # ── Review fixes (PR #129): preflight before any mutation, ID identity, delete acks ──
 

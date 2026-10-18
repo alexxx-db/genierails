@@ -204,12 +204,20 @@ exceptions must be preserved. Masked expectations may only move toward a more
 protective tier (`partial` to `full`); raw and unrestricted baselines are exact
 positive assertions and cannot be replaced by masked/restricted assertions.
 Unknown or unverifiable fields are refused before mutation with the missing or
-changed check named.
+changed check named, and so is anything verify-access itself refuses before it
+runs a check: a table, column or key it can't quote, or a check keyed by the
+masked column itself.
+
+Applying gates always run verify-access through `make _verify-access-gate`,
+whose `override VERIFY_GATE` beats the command line, `MAKEFLAGS` and `make -e`
+(on Apple make 3.81, `make -e VERIFY_GATE=` used to clear a sub-make's
+`VERIFY_GATE=1`); verify-access `--gate` refuses a `--spec` run without the
+policy-derived minimum.
 
 The controller also compares the spec with each staged render. During a policy
-generation change, `verify-created` proves the still-live old generation and
-therefore can refuse an explicit spec after the additive `create` phase but
-before any tag switch, principal move, retirement, or access grant. Because a
+generation change, `verify-created` proves the still-live old generation, so
+before it applies (or plans) `create` the controller checks the spec against
+that generation's render too and refuses it with nothing applied. Because a
 single explicit spec must satisfy both old and desired generations, omit
 `VERIFY_SPEC` for a tier move whose generations require incompatible exact
 expectations; the derived verifier covers both automatically.
