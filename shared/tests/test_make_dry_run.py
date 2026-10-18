@@ -80,20 +80,28 @@ def test_integration_scenario_targets_dry_run_their_own_recipe(tmp_path, target,
     assert f'--auth-file "{tmp_path / "dev" / "auth.auto.tfvars"}"' in output
 
 
-@pytest.mark.parametrize("source", ["command line", "environment"])
-def test_integration_test_rejects_dest_env_old_name(tmp_path, source):
+@pytest.mark.parametrize(
+    ("extra_args", "extra_env", "refused"),
+    [
+        (["DEST_ENV=prod"], {}, True),
+        (["DEST_ENV="], {}, False),
+        ([], {"DEST_ENV": "prod"}, False),
+    ],
+)
+def test_integration_test_dest_env_guard_only_rejects_nonempty_command_line(
+    tmp_path, extra_args, extra_env, refused
+):
     args = [
         "make",
+        "-n",
         "--no-print-directory",
         "integration-test",
         f"ENV_DIR={tmp_path / 'dev'}",
         f"ACCOUNT_ENV_DIR={tmp_path / 'account'}",
+        *extra_args,
     ]
     env = _clean_env()
-    if source == "command line":
-        args.append("DEST_ENV=prod")
-    else:
-        env["DEST_ENV"] = "prod"
+    env.update(extra_env)
 
     result = subprocess.run(
         args,
@@ -105,9 +113,34 @@ def test_integration_test_rejects_dest_env_old_name(tmp_path, source):
     )
 
     output = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert "integration-test reads ITEST_DEST_ENV; DEST_ENV is the promote setting" in output
-    assert "Step 1" not in output
+    message = "integration-test reads ITEST_DEST_ENV; DEST_ENV is the promote setting"
+    assert (result.returncode != 0) is refused, output
+    assert (message in output) is refused
+
+
+@pytest.mark.parametrize("target", ["promote", "help"])
+def test_dest_env_command_line_guard_is_scoped_to_integration_test(tmp_path, target):
+    result = subprocess.run(
+        [
+            "make",
+            "-n",
+            "--no-print-directory",
+            target,
+            "DEST_ENV=prod",
+            "DEST_CATALOG_MAP=dev=prod",
+            f"ENV_DIR={tmp_path / 'dev'}",
+            f"ACCOUNT_ENV_DIR={tmp_path / 'account'}",
+            f"DEST_ENV_DIR={tmp_path / 'prod'}",
+        ],
+        cwd=CLOUD_ROOT,
+        text=True,
+        capture_output=True,
+        env=_clean_env(),
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "integration-test reads ITEST_DEST_ENV" not in output
 
 
 def test_apply_layer_dry_run_prints_but_does_not_execute_side_effects(tmp_path):

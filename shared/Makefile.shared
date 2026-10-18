@@ -2202,7 +2202,7 @@ integration-test: _guard-not-ci-apply ## Run the full end-to-end integration tes
 	@#   ITEST_DEST_ENV=prod  workspace env for prod (default: prod)
 	@#   KEEP_DATA=1          skip teardown so you can inspect results after the run
 	@#   WAREHOUSE_ID=<id>    pin a specific SQL warehouse
-	@if [ "$(origin DEST_ENV)" = "command line" ] || [ "$(origin DEST_ENV)" = "environment" ]; then echo "ERROR: integration-test reads ITEST_DEST_ENV; DEST_ENV is the promote setting" >&2; exit 1; fi
+	$(if $(and $(filter command line,$(origin DEST_ENV)),$(strip $(DEST_ENV))),$(error integration-test reads ITEST_DEST_ENV; DEST_ENV is the promote setting))
 	$(eval ITEST_DEST_ENV        ?= prod)
 	$(eval _FIN_CAT              := dev_fin)
 	$(eval _CLIN_CAT             := dev_clinical)
