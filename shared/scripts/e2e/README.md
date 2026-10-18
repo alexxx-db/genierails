@@ -3,8 +3,8 @@
 The driver encodes the champion flow from
 `shared/docs/design/deterministic-governance.md` sections 9, 12, 13 and 17,
 plan scenarios S1–S16, cross-cutting
-manifest/concurrency checks, the report-only migration operation, and the
-migration cutover. A scenario that is expected to fail until a fix lands
+manifest/concurrency checks, the report-only migration operation, the
+migration cutover, and S17 (`policy-ops`, staged policy operations). A scenario that is expected to fail until a fix lands
 carries `known_failure="<branch>"`: it reports `ERROR (expected until ...)`, and
 if it passes its status is `UNEXPECTED PASS — remove known_failure ...` and the
 run fails, so the marker gets removed. No scenario carries one now: the
@@ -149,6 +149,7 @@ unknown level). Their `{placeholders}` are required values.
 | `Unchanged(env, component, selectors=("*",))` | Nothing matching the selectors changed. |
 | `AgentIdUnchanged(env, agent)` | The agent's Genie space ID is the baseline's, so it was not recreated and its conversations remain. |
 | `OutputContains(text)` / `OutputOrder(before, after)` | The command emitted exact deterministic evidence, in the required pre-lock order. |
+| `OutputMatches(pattern)` / `OutputLacks(pattern)` | The command output matches, or does not match, the regular expression. |
 | `ProtectionDelta(env, findings)` | Only the named environment, resource and exact policy/custom-adoption effect is permitted. Required deltas also fail when the named finding is absent. |
 | `AcknowledgedWeakening(env, entries, findings)` | The same exact protection keys are permitted only after every exact acknowledgement key is committed or recorded by release. |
 
@@ -211,6 +212,77 @@ then removes that temporary acknowledgement. The baseline tree removes all
 authored tier/ACL/custom-mask fixtures. Account groups are pre-existing inputs,
 not created by the driver. Any restore failure stops the run as `RESTORE FAILED`
 and reports the manual forward-release commands; it never claims cleanup passed.
+
+S17 (`policy-ops`) covers the day-2 policy operations in design section 17 and
+`docs/deterministic-policies.md` with public targets only. It starts with
+`make policy-status` in dev and prod, which must show an active generation
+and nothing unfinished or waiting to retire. A reviewed mask-only dev change
+(no tier move, no new `table_readers`) is authored, regenerated and merged.
+Then the steps are:
+
+1. **Failure.** The driver writes a `VERIFY_SPEC` file to the reports
+   directory (outside the checkout) and runs `make rehearse ENV=dev
+   VERIFY_SPEC=<that file>`, which must fail at `verify-created` and print
+   `ERROR: policy phase verify-created failed`. See *S17's failure
+   injection* below. Every tag, grant and earlier policy must be unchanged,
+   no mask may be lost, and a new policy may exist only if it matches no
+   value a column carries (nothing switched).
+2. **Status.** `make policy-status ENV=dev` must report the unfinished change,
+   `failed at verify-created`, and the previous protection with no column
+   retagged.
+3. **Abandon.** `make policy-abandon ENV=dev` must print `Abandoned
+   generation ...`. Dev and prod protection must then equal the checkpoint
+   recorded before step 1: same tags, grants and policies. Unreferenced
+   functions left by `create` are not protection.
+4. **Success.** `make rehearse ENV=dev` must run `create -> verify-created ->
+   switch -> verify-switched -> grant`. `policy-status` must then show the
+   superseded dev generation as confirmed.
+5. **Promotion and retire.** Then come the promotion steps of the day-2
+   sequence (promote, merge, prod check, `CHECK=1`, rehearse the merge) and
+   the prod release, which needs at least two `release-plan`/`release
+   MANIFEST=` pairs, each with a fresh manifest (one approval per changing
+   phase). A later `make maintain ENV=prod` must print `retired <generation>`,
+   and prod `policy-status` must show nothing waiting to retire.
+
+Every applying step is checked for weaker protection, as in the other scenarios.
+
+S17's output checks are `OutputMatches` and `OutputLacks`.
+`protection_checkpoint` records dev and prod
+protection under a name, and a later `protection_matches` step compares
+against it. A positive `make apply-account` scenario is not encoded yet:
+`apply-account` has the CI guard and the account lock, but none of the
+section 17 provenance (clean `origin/main` HEAD, saved account plan and
+manifest, account receipt) it would assert. S13 keeps its CI refusal.
+
+#### S17's failure injection
+
+The failure uses the public `VERIFY_SPEC` option, and the spec can only be
+stricter than the real verification. Every applying gate refuses a spec that
+drops or weakens a policy-derived check
+(`docs/effective-access-verification.md`, *Explicit spec*). Rehearse checks
+the spec against the desired render after deriving and before `apply`. Each
+staged verify checks it again against the render of the stage it verifies.
+
+After the reviewed change is merged, the driver derives the gate spec for dev
+from the same inputs `require-mask-proof` reads: the effective generated
+`abac.auto.tfvars`, the account groups, the pairing keys and
+`env.auto.tfvars`. It writes every derived check unchanged, then adds one
+copy of a column check in which a raw tier group (not the admin or a
+synthetic `__...__` test principal) is expected to see `full`. A gate accepts added checks, so the spec passes before
+apply. After `create` that principal still reads the column raw, so
+`verify-created` fails before anything is switched. If the stage's own render
+expects functions the spec's checks don't name, the verify-created gate
+refuses the spec at the same phase, also before any query or switch. The
+driver reads the file back with the strict loader and refuses to run the step
+unless the file is no weaker than the derivation. The report records the
+column and group of the added check.
+
+A dev env where no tier group reads a masked column raw can't host S17; the
+driver stops before the failing step. A spec that omits a real tier is refused
+before apply (`shared/tests/test_release_mask_proof.py`; for S17's own spec,
+`test_s17_spec_omitting_a_real_tier_is_refused_before_apply` in
+`shared/tests/test_e2e_driver.py`), and the driver then reports `ERROR`,
+because it needs the verify-created failure.
 
 Snapshots read `<cloud>/envs/<env>/auth.auto.tfvars`
 (`databricks_workspace_host`, `databricks_client_id`,
