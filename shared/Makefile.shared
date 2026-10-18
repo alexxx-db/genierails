@@ -1749,7 +1749,7 @@ policy-status: _guard-workspace-target ## Show the staged policy journal (determ
 # Drops an unfinished staged policy change that never retagged a column or
 # moved a principal (its new policies match no column), so a corrected config
 # can start a new one. Takes the env lock.
-policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched (deterministic envs)
+policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched or was rolled back (deterministic envs)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
 
 # Read-only dry run of moving a legacy env to deterministic governance (design

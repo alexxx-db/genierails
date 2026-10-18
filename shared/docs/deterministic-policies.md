@@ -121,8 +121,48 @@ any unfinished transition with its completed phases. Writes are atomic.
   stale journal) is refused. With no journal, a state that exactly matches
   the generated config is adopted; any other is refused.
 - `make policy-status ENV=<env>` prints the journal. `make policy-abandon
-  ENV=<env>` drops an unfinished change that never retagged a column or moved
-  a principal, so a corrected config can start a new one.
+  ENV=<env>` drops an unfinished change (removing the policies it created),
+  so a corrected config can start a new one. It abandons a change that never
+  retagged a column or moved a principal, or one whose switch was **rolled
+  back**: the automatic restore after a failed `switch` or `verify-switched`
+  completed and was verified live (the journal's `restored` marker), the last
+  applied stage is still that restore, and it puts every column on exactly
+  the previous generation's value (a newly governed column keeping its new
+  mask doesn't qualify) and every retained policy on its previous principals.
+  A journal written before the marker existed qualifies only in the exact
+  shape a verified restore left (`completed` is just `create`, the failure
+  was in `switch` or `verify-switched`, no restore in progress or failed);
+  abandon says when it relies on that, and every other check still runs.
+  This is the way out when the config must change after a rolled-back switch
+  (for example a recreated deployer or tier groups), which the unfinished
+  change would otherwise refuse.
+
+  Abandon holds the env lock from its first check to its last, and binds
+  the live check to what it applies:
+
+  1. It saves a refreshed plan of the abandon render (the previous
+     generation without the change's policies). That plan may only delete
+     the policies the unfinished generation created, as the journal's
+     generations record them; the enforcement wait those deletes restart is
+     the one other change allowed. Any other change refuses before anything
+     is applied: a treatment tag update (a column retagged to the new value
+     since the restore shows up as one), a policy's `TO`, `EXCEPT` or match,
+     a function, a grant, or a create.
+  2. For a rolled-back switch it then runs the live check (the
+     `verify-created`/`verify-switched` check: policies, `TO`/`EXCEPT`
+     principals, functions and treatment tags) against the restore. A
+     difference, or a check that can't run, refuses.
+  3. It applies exactly the saved plan, refusing if the plan file's hash
+     differs from the one recorded when it was made (the saved-plan pattern
+     `make release` uses).
+  4. It runs the live check on the result. If that fails, abandon says so
+     (`ABANDON INCOMPLETE`), and the journal keeps the change, marked
+     incomplete rather than abandoned. Put back what the check lists, then
+     re-run `make policy-abandon`.
+
+  Unity Catalog has no transaction across tags and policies, so a retag
+  between step 2 and the apply can't be prevented. Step 4 catches it, and
+  the change stays recorded until a check passes.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
 
