@@ -1000,20 +1000,35 @@ def account_state_serial(env_dir: Path) -> dict | None:
 ACCOUNT_RUNTIME_INPUTS = ("abac.auto.tfvars", "classification.auto.tfvars", "discovered_uc_tables.auto.tfvars")
 
 
+def _account_auth_endpoint_hash(env_dir: Path) -> dict | None:
+    """Hash only the non-secret auth fields that select the account REST endpoint."""
+    auth = Path(env_dir) / "auth.auto.tfvars"
+    if not auth.is_file() or auth.is_symlink():
+        return None
+    values = _load_hcl(auth)
+    endpoint = {name: values[name] for name in ("host", "account_id") if name in values}
+    return {"path": "auth.auto.tfvars#host,account_id", "sha256": _json_digest(endpoint)}
+
+
 def account_input_hashes(env_dir: Path) -> list[dict]:
     """Account-layer inputs that are not protected by git cleanliness.
 
-    ``auth.auto.tfvars`` is deliberately excluded: it can hold a plaintext
-    secret, and the account manifest must not read or persist auth material.
+    Only ``host`` and ``account_id`` are represented from ``auth.auto.tfvars``;
+    their canonical digest pins the REST destination without hashing or
+    persisting any secret field.
     """
     env_dir = Path(env_dir)
     files = {p.resolve() for p in env_input_files(env_dir)}
     files.update((env_dir / name).resolve() for name in ACCOUNT_RUNTIME_INPUTS if (env_dir / name).is_file())
-    return [
+    result = [
         {"path": os.path.relpath(path, env_dir), "sha256": sha256_file(path)}
         for path in sorted(files)
         if path.is_file() and not path.is_symlink() and path.name != "auth.auto.tfvars"
     ]
+    endpoint = _account_auth_endpoint_hash(env_dir)
+    if endpoint:
+        result.append(endpoint)
+    return sorted(result, key=lambda item: item["path"])
 
 
 def account_tag_sync_diff(env_dir: Path) -> list[dict]:
@@ -1077,6 +1092,8 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     manifest = {
         "kind": "account-manifest", "version": VERSION, "id": manifest_id, "env": env,
         "cloud": cloud_dir_of(env_dir).name, "commit": prov["commit"], "provenance": dict(prov),
+        # account-plan does not lock state. Terraform's saved-plan stale-state
+        # check is the final backstop if state changes after this serial read.
         "state_serial": account_state_serial(env_dir),
         "plan": {"file": plan_name, "sha256": sha256_file(plan), "changes": bool(info.get("changes")),
                  "summary": summary},
@@ -1178,7 +1195,7 @@ def require_account_lock(env_dir: Path) -> None:
     from scripts.environment_lock import held_by_ancestor
 
     owner = held_by_ancestor(Path(env_dir))
-    if owner in {"apply-account", "release", "rehearse"}:
+    if owner == "apply-account":
         return
     raise Refused("make sync-tags TAG_SYNC_MODE=replace refused: a deterministic env uses the account layer, "
                   "so replace syncs may run only under the live account lock held by make apply-account.")

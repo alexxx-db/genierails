@@ -122,6 +122,26 @@ def test_a_promoted_env_refuses_a_direct_layer_apply(tmp_path, envs, layer):
     assert calls == []
 
 
+def test_account_layer_refuses_a_direct_apply_when_any_env_is_deterministic(tmp_path, envs):
+    cloud, _ = envs
+    result, calls = run(tmp_path, envs, "_apply-layer", "account", "LAYER=account",
+                        "TARGET_ENV=account", f"LAYER_ENV_DIR={cloud / 'envs' / 'account'}")
+    assert result.returncode != 0
+    assert "direct account-layer apply refused" in result.stderr
+    assert "make account-plan" in result.stderr and "make apply-account" in result.stderr
+    assert not [c for c in calls if c[0] == "runner"]
+
+
+def test_account_layer_refuses_a_direct_destroy_when_any_env_is_deterministic(tmp_path, envs):
+    cloud, _ = envs
+    result, calls = run(tmp_path, envs, "_destroy-layer", "account", "LAYER=account",
+                        "TARGET_ENV=account", f"LAYER_ENV_DIR={cloud / 'envs' / 'account'}")
+    assert result.returncode != 0
+    assert "direct account-layer destroy refused" in result.stderr
+    assert "make account-plan" in result.stderr and "make apply-account" in result.stderr
+    assert not [c for c in calls if c[0] == "runner"]
+
+
 @pytest.mark.parametrize("owner", ["release", "release-plan", "rehearse", "ungovern", "apply-account"])
 def test_no_other_lock_owner_opens_a_promoted_env(tmp_path, envs, lock, owner):
     lock("prod", owner)

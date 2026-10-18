@@ -470,6 +470,19 @@ def test_account_manifest_refuses_account_input_hash_drift(repo, account_manifes
         rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
 
 
+def test_account_input_hashes_pin_auth_endpoint_but_not_auth_secrets(tmp_path):
+    env_dir = tmp_path / "envs" / "account"
+    env_dir.mkdir(parents=True)
+    auth = env_dir / "auth.auto.tfvars"
+    auth.write_text('host = "https://one.example"\naccount_id = "123"\nclient_secret = "first"\n')
+    first = rg.account_input_hashes(env_dir)
+    assert [item["path"] for item in first] == ["auth.auto.tfvars#host,account_id"]
+    auth.write_text('host = "https://one.example"\naccount_id = "123"\nclient_secret = "second"\n')
+    assert rg.account_input_hashes(env_dir) == first
+    auth.write_text('host = "https://two.example"\naccount_id = "123"\nclient_secret = "second"\n')
+    assert rg.account_input_hashes(env_dir) != first
+
+
 def test_account_manifest_refuses_tag_sync_diff_drift(repo, account_manifest, monkeypatch):
     monkeypatch.setattr(rg, "account_tag_sync_diff", lambda _env_dir: [
         {"key": "gr_treatment", "added": ["other"], "removed": []},

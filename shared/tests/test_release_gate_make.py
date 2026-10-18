@@ -308,7 +308,11 @@ def test_apply_account_applies_only_the_saved_plan_under_the_account_lock_and_wr
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"Selected account manifest" in result.stderr
     calls = make.calls()
-    assert ["runner", "account", "account", "apply-plan", str(manifest.parent / "account.tfplan")] in calls
+    apply_calls = [c for c in calls if c[:4] == ["runner", "account", "account", "apply-plan"]]
+    assert len(apply_calls) == 1
+    applied_plan = Path(apply_calls[0][4])
+    assert applied_plan.name == "account.tfplan" and applied_plan.parent != manifest.parent
+    assert not applied_plan.exists()
     assert not [c for c in calls if c[0] == "runner" and c[3:4] in (["apply"], ["plan"])]
     receipts = rg.account_receipts(repo.cloud, "account")
     assert receipts and receipts[-1]["commit"] == repo.head()
