@@ -689,9 +689,19 @@ class Controller:
         previous generation's value and every retained policy on its previous
         principals, and a fresh live check shows Unity Catalog still matches it.
         Then abandon ends where it would for a change that never switched.
+
+        A journal written before the marker existed has no ``restored`` key;
+        there only a successful, verified restore leaves completed == ["create"]
+        after a failed switch with no restore in progress or failed, so that
+        exact shape stands in for the marker. Every other check still runs.
         """
-        if not t.get("restored") or t["restoring"] or t["restore_failed"]:
+        if t["restoring"] or t["restore_failed"]:
             return "no verified restore of the previous protection is recorded"
+        if not t.get("restored"):
+            if not _pre_marker_restored(t):
+                return "no verified restore of the previous protection is recorded"
+            print("  The journal predates the restore marker; treating the recorded failed switch as restored "
+                  "after a fresh live check.")
         record = pg.load_stage_record(self.env_dir)
         if not record or record.get("stage") not in ("restore", "abandon") \
                 or record.get("desired") != t["to"] or record.get("old") != t["from"]:
@@ -736,7 +746,7 @@ class Controller:
                 if reason:
                     raise Refused("this change already retagged columns or moved principals; it can't be "
                                   f"abandoned ({reason}). Re-run the command that started it to resume it.")
-                print(f"  The switch of run {t['run_id']} was rolled back after {t['restored']['after']} and "
+                print(f"  The switch of run {t['run_id']} was rolled back after {t['failed_phase']} and "
                       f"the live check confirms the previous protection ({t['from'] or 'none'}).")
             print(f"=== Policy staged apply: abandoning run {t['run_id']} (generation {t['to']}) ===")
             if self._hook(t, "abandon") or self._inventory(t, ("abandon",)):
@@ -840,11 +850,18 @@ class Controller:
         options = [f"re-run the same command at commit {t['commit'] or '?'} (generation {t['to']}) to resume it"]
         if not t["switch_attempted"]:
             options.append(f"or drop it with make policy-abandon ENV={self.env_name}")
-        elif t.get("restored") and not t["restore_failed"]:
+        elif (t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t):
             options.append(f"or drop it with make policy-abandon ENV={self.env_name} (the switch was rolled "
                            "back; abandon re-checks live protection first)")
         return (self.describe_transition(t) + f"\nThe generated config is now generation {desired['fingerprint']}. "
                 "A new policy change can't start until this one is finished: " + "; ".join(options) + ".")
+
+
+def _pre_marker_restored(t: dict) -> bool:
+    """A journal from before the ``restored`` marker, in the one shape a verified restore of a switch leaves."""
+    return ("restored" not in t and t["completed"] == ["create"]
+            and t["failed_phase"] in ("switch", "verify-switched")
+            and not t["restoring"] and not t["restore_failed"])
 
 
 def _write_subset(tfvars: Path, tags: dict) -> None:

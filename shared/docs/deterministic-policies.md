@@ -132,7 +132,11 @@ any unfinished transition with its completed phases. Writes are atomic.
   policy on its previous principals, and a fresh live check (the
   `verify-created`/`verify-switched` check: policies, `TO`/`EXCEPT`
   principals, functions and treatment tags) still finds exactly that. It
-  refuses otherwise, including when the live check can't run. This is the way
+  refuses otherwise, including when the live check can't run. A journal
+  written before the marker existed qualifies only in the exact shape a
+  verified restore left (`completed` is just `create`, the failure was in
+  `switch` or `verify-switched`, no restore in progress or failed), and every
+  other check above still runs; abandon says when it relies on that. This is the way
   out when the config must change after a rolled-back switch (for example a
   recreated deployer or tier groups), which the unfinished change would
   otherwise refuse.

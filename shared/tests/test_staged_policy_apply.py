@@ -767,14 +767,95 @@ def test_abandon_of_a_rolled_back_switch_refuses_when_the_live_check_cannot_run(
     assert live_tags(live_state(harness.env_dir)) == old["tags"]
 
 
-def test_abandon_of_a_switch_is_refused_without_the_restored_marker(harness):
-    _rolled_back_switch(harness)
+def _pre_marker_journal(harness, **shape):
+    """The rolled-back switch as a journal written before the restored marker existed."""
     journal = harness.journal()
-    journal["transition"].pop("restored")  # a journal written before the marker existed
+    journal["transition"].pop("restored")
+    journal["transition"].update(shape)
     spa.save_journal(harness.env_dir, journal)
+    return journal
+
+
+PRE_MARKER_MESSAGE = ("journal predates the restore marker; treating the recorded failed switch as restored "
+                      "after a fresh live check")
+
+
+def test_abandon_of_a_pre_marker_journal_runs_every_check_and_drops_the_change(harness, capsys):
+    old, failed = _rolled_back_switch(harness)
+    _pre_marker_journal(harness)
+    capsys.readouterr()
+    assert harness.controller().abandon() == 0
+    assert PRE_MARKER_MESSAGE in capsys.readouterr().out
+    assert harness.calls == ["inventory:restore", "abandon", "inventory:abandon"]
+    state = live_state(harness.env_dir)
+    assert {p["name"] for p in live_policies(state)} == {p["name"] for p in old["fgac_policies"]}
+    assert live_tags(state) == old["tags"]
+    journal = harness.journal()
+    assert journal["transition"] is None and journal["history"][-1]["abandoned"] == failed["fingerprint"]
+
+
+def test_abandon_of_a_pre_marker_journal_refuses_when_a_column_is_live_on_the_new_value(harness):
+    old, failed = _rolled_back_switch(harness)
+    before = _pre_marker_journal(harness)
+    (column, value), = ((c, v) for c, v in failed["tags"].items() if v != old["tags"].get(c))
+    path = harness.env_dir / "data_access" / "terraform.tfstate"
+    state = live_state(harness.env_dir)
+    for resource in state["resources"]:
+        for instance in resource["instances"]:
+            if instance["attributes"].get("entity_name") == column:
+                instance["attributes"]["tag_value"] = value
+    path.write_text(json.dumps(state))
+    harness.live_check = "real"
+    with pytest.raises(spa.Refused, match=r"can't be abandoned \(the live check found"):
+        harness.controller().abandon()
+    assert harness.calls == ["inventory:restore"] and harness.journal() == before
+
+
+@pytest.mark.parametrize("shape", [
+    {"completed": ["create", "verify-created", "switch"]},
+    {"completed": []},
+    {"restoring": True},
+    {"restore_failed": True},
+    {"failed_phase": "tighten"},
+    {"failed_phase": "grant"},
+    {"restored": None},  # a journal from after the marker existed: only the marker counts
+], ids=lambda shape: "-".join(f"{k}={v}" for k, v in shape.items()))
+def test_abandon_refuses_any_other_markerless_shape(harness, capsys, shape):
+    _rolled_back_switch(harness)
+    before = _pre_marker_journal(harness, **shape)
+    capsys.readouterr()
     with pytest.raises(spa.Refused, match="no verified restore"):
         harness.controller().abandon()
-    assert harness.calls == []
+    assert harness.calls == [] and harness.journal() == before
+    assert PRE_MARKER_MESSAGE not in capsys.readouterr().out
+
+
+def test_abandon_of_a_pre_marker_journal_refuses_when_the_last_stage_is_not_its_restore(harness):
+    _rolled_back_switch(harness)
+    before = _pre_marker_journal(harness)
+    record = pg.load_stage_record(harness.env_dir)
+    pg.write_json(pg.stage_record_path(harness.env_dir), record | {"stage": "switch"})
+    with pytest.raises(spa.Refused, match="last applied stage is switch"):
+        harness.controller().abandon()
+    assert harness.calls == [] and harness.journal() == before
+
+
+def test_abandon_of_a_pre_marker_journal_refuses_when_the_live_check_cannot_run(harness):
+    old, _ = _rolled_back_switch(harness)
+    before = _pre_marker_journal(harness)
+    real_run = harness.run
+
+    def unreadable(argv, env=None, check=False):
+        if argv[0] == "inventory":
+            harness.calls.append("inventory:unreadable")
+            return SimpleNamespace(returncode=2)
+        return real_run(argv, env=env, check=check)
+
+    harness.run = unreadable
+    with pytest.raises(spa.Refused, match="live check couldn't run"):
+        harness.controller().abandon()
+    assert harness.calls == ["inventory:unreadable"] and harness.journal() == before
+    assert live_tags(live_state(harness.env_dir)) == old["tags"]
 
 
 def test_abandon_of_a_rolled_back_switch_refuses_when_a_new_column_keeps_its_new_mask(harness):
