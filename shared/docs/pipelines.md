@@ -86,15 +86,16 @@ state and plans, `.terraform/`, locks, receipts, Genie ID and adoption markers
 and, for each deterministic env, its layer files (applying commands re-derive
 those).
 
-`make setup` writes the block only in a customer repo, which it detects from the
-git remotes: a checkout whose remotes don't include
-`github.com/databricks-solutions/genierails` (https or ssh). In the GenieRails
-repo itself, a contributor clone (any remote is that URL), or a checkout with no
-remote it writes nothing and only prints how to opt in — the upstream repo must
-never commit `envs/`. So run it before you add a GenieRails remote for
-upgrades; after that an existing block is always refreshed. The overrides:
-`GITIGNORE=customer` forces the write anywhere, `GITIGNORE=off` leaves the file
-alone.
+`make setup` decides from the `origin` remote. If `origin` is
+`github.com/databricks-solutions/genierails` (https or ssh), it is GenieRails'
+own repo, which must never commit `envs/`: it writes nothing and only prints how
+to opt in (as it does outside a git checkout). Any other checkout (your fork, an
+internal mirror, no origin yet) gets the block, even if it keeps GenieRails as
+an `upstream` remote for upgrades. An existing block is always refreshed. The
+overrides: `GITIGNORE=customer` forces the write anywhere, `GITIGNORE=off`
+leaves the file alone. If you contribute to GenieRails from a fork, pass
+`GITIGNORE=off`; setup prints a note naming it whenever it writes the block in a
+repo with a GenieRails remote.
 
 Only the lines between the block's markers are rewritten. The block names each
 deterministic env, so re-run `make setup ENV=<env>` after adding an env or

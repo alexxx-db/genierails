@@ -2687,7 +2687,7 @@ def main(argv: Sequence[str] | None = None, *, snapshot_factory: Callable[[Path,
         raise SystemExit(
             f"live execution requires a customer-shaped checkout that commits envs/; {checkout_dir} at "
             f"{args.commit[:12]} does not:\n" + "".join(f"  - {p}\n" for p in problems)
-            + f"  Fix: this is a GenieRails clone, so plain make setup won't write the block "
+            + f"  Fix: with origin at GenieRails plain make setup won't write the block "
             f"(GITIGNORE=customer forces it): cd {args.cloud} && make setup ENV=dev GITIGNORE=customer && "
             f"make setup ENV=prod GITIGNORE=customer, commit {args.cloud}/.gitignore "
             f"and {args.cloud}/envs/, check that commit out and pass it as --commit. Nothing was run.")

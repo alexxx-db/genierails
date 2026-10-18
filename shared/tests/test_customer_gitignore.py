@@ -1,14 +1,14 @@
 """make setup's customer-repo .gitignore (design section 9, rollout step 15).
 
 The GenieRails repo ignores envs/ everywhere; a customer repo commits it. A
-plain (auto) make setup writes the managed block into <cloud>/.gitignore only in
-a customer repo, which it detects from the git remotes: a checkout whose remotes
-don't include github.com/databricks-solutions/genierails. The upstream repo, a
-contributor clone (any such remote), or a checkout with no remote gets nothing
-but the opt-in hint; GITIGNORE=customer forces the write and GITIGNORE=off skips
-it, and an existing block is always refreshed. A real `git status --ignored`
-over a sample legacy + deterministic env proves every runtime file is ignored
-and every committed file is tracked.
+plain (auto) make setup writes the managed block into <cloud>/.gitignore in any
+git checkout whose origin isn't github.com/databricks-solutions/genierails:
+forks, internal mirrors and checkouts with no origin, even ones that keep a
+GenieRails upstream remote. GenieRails' own repo (origin at GenieRails) and a
+directory outside git get nothing but the opt-in hint; GITIGNORE=customer
+forces the write and GITIGNORE=off skips it, and an existing block is always
+refreshed. A real `git status --ignored` over a sample legacy + deterministic
+env proves every runtime file is ignored and every committed file is tracked.
 """
 
 import os
@@ -51,7 +51,7 @@ def test_upstream_gitignore_has_no_customer_block(cloud):
 
 
 @pytest.mark.parametrize("cloud", CLOUDS)
-def test_plain_setup_never_writes_the_gitignore(cloud, tmp_path):
+def test_plain_setup_outside_git_never_writes_the_gitignore(cloud, tmp_path):
     cloud_root = tmp_path / cloud
     cloud_root.mkdir()
     (cloud_root / ".gitignore").write_text(USER_LINES)
@@ -114,13 +114,16 @@ def test_damaged_markers_and_bad_values_refuse_without_writing(tmp_path, capsys)
     assert "use customer, auto (the default) or off" in capsys.readouterr().err
 
 
-# ── auto detects the repo kind from the git remotes ──────────────────────────
+# ── auto detects the repo kind from the origin remote ────────────────────────
 
 UPSTREAM_HTTPS = "https://github.com/databricks-solutions/genierails.git"
 UPSTREAM_SSH = "git@github.com:databricks-solutions/genierails.git"
 UPSTREAM_HTTPS_BARE = "https://github.com/databricks-solutions/genierails"
 UPSTREAM_SSH_URL = "ssh://git@github.com/databricks-solutions/genierails.git"
-CUSTOMER_REMOTE = "https://github.com/acme-corp/genierails.git"
+UPSTREAM_MIXED_CASE = "https://GitHub.com/Databricks-Solutions/GenieRails.git"
+CUSTOMER_FORK = "https://github.com/acme-corp/genierails.git"
+CUSTOMER_MIRROR = "git@gitlab.acme.internal:data/genierails.git"
+FORK_NOTE = "pass GITIGNORE=off"
 
 
 def _isolate_git(monkeypatch, ceiling: Path):
@@ -137,8 +140,15 @@ def _git_init(path: Path, *remotes: tuple[str, str]):
         subprocess.run(["git", "-C", str(path), "remote", "add", name, url], check=True, env=env)
 
 
-@pytest.mark.parametrize("url", [UPSTREAM_HTTPS, UPSTREAM_SSH, UPSTREAM_HTTPS_BARE, UPSTREAM_SSH_URL])
-def test_auto_does_not_write_in_the_upstream_repo_or_a_contributor_clone(url, tmp_path, monkeypatch, capsys):
+def _assert_written(cloud: Path, out: str):
+    text = (cloud / ".gitignore").read_text()
+    assert text.count(cg.BEGIN) == 1 and text.endswith(cg.END + "\n")
+    assert "+!/envs/" in out and "wrote the GenieRails block" in out
+
+
+@pytest.mark.parametrize("url", [UPSTREAM_HTTPS, UPSTREAM_SSH, UPSTREAM_HTTPS_BARE, UPSTREAM_SSH_URL,
+                                 UPSTREAM_MIXED_CASE])
+def test_auto_leaves_genierails_own_repo_untouched(url, tmp_path, monkeypatch, capsys):
     cloud = tmp_path / "aws"
     _git_init(cloud, ("origin", url))
     _isolate_git(monkeypatch, tmp_path)
@@ -147,32 +157,46 @@ def test_auto_does_not_write_in_the_upstream_repo_or_a_contributor_clone(url, tm
     assert "make setup ENV=dev writes aws/.gitignore" in capsys.readouterr().out
 
 
-def test_auto_does_not_write_when_an_upstream_remote_sits_beside_a_customer_origin(tmp_path, monkeypatch, capsys):
+def test_auto_judges_by_origin_alone_when_origin_is_genierails(tmp_path, monkeypatch, capsys):
+    # A GenieRails clone that also pushes to a personal remote is still GenieRails' own repo.
     cloud = tmp_path / "aws"
-    _git_init(cloud, ("origin", CUSTOMER_REMOTE), ("upstream", UPSTREAM_HTTPS))
+    _git_init(cloud, ("origin", UPSTREAM_HTTPS), ("mine", CUSTOMER_FORK))
     _isolate_git(monkeypatch, tmp_path)
     assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
     assert not (cloud / ".gitignore").exists()
 
 
-def test_auto_writes_in_a_customer_only_repo(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("remotes", [
+    (("origin", CUSTOMER_FORK), ("upstream", UPSTREAM_HTTPS)),
+    (("origin", CUSTOMER_MIRROR), ("genierails", UPSTREAM_SSH)),
+], ids=["fork-with-upstream", "mirror-with-genierails-remote"])
+def test_auto_writes_in_a_customer_repo_that_keeps_a_genierails_remote(remotes, tmp_path, monkeypatch, capsys):
     cloud = tmp_path / "aws"
-    _git_init(cloud, ("origin", CUSTOMER_REMOTE))
+    _git_init(cloud, *remotes)
     _isolate_git(monkeypatch, tmp_path)
+    (cloud / ".gitignore").write_text(USER_LINES)
     assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
-    text = (cloud / ".gitignore").read_text()
-    assert text.count(cg.BEGIN) == 1 and text.endswith(cg.END + "\n")
     out = capsys.readouterr().out
-    assert "+!/envs/" in out and "wrote the GenieRails block" in out
+    _assert_written(cloud, out)
+    assert (cloud / ".gitignore").read_text().startswith(USER_LINES)
+    assert FORK_NOTE in out  # a contributor fork is told how to opt out
+    # Idempotent: a second run changes nothing.
+    first = (cloud / ".gitignore").read_text()
+    assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
+    assert (cloud / ".gitignore").read_text() == first
+    assert "up to date" in capsys.readouterr().out
 
 
-def test_auto_does_not_write_in_a_checkout_without_a_remote(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("remotes", [(("origin", CUSTOMER_FORK),), (("origin", CUSTOMER_MIRROR),), ()],
+                         ids=["fork", "mirror", "no-remote"])
+def test_auto_writes_in_a_customer_repo(remotes, tmp_path, monkeypatch, capsys):
     cloud = tmp_path / "aws"
-    _git_init(cloud)  # a checkout, but no remote declared yet
+    _git_init(cloud, *remotes)
     _isolate_git(monkeypatch, tmp_path)
     assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
-    assert not (cloud / ".gitignore").exists()
-    assert "make setup ENV=dev writes aws/.gitignore" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    _assert_written(cloud, out)
+    assert FORK_NOTE not in out  # no GenieRails remote, no note
 
 
 def test_auto_does_not_write_outside_a_git_checkout(tmp_path, monkeypatch, capsys):
@@ -184,24 +208,26 @@ def test_auto_does_not_write_outside_a_git_checkout(tmp_path, monkeypatch, capsy
     assert "make setup ENV=dev writes aws/.gitignore" in capsys.readouterr().out
 
 
-def test_customer_and_off_overrides_ignore_repo_detection(tmp_path, monkeypatch, capsys):
-    # customer forces the write even in a GenieRails clone; off never writes,
-    # even in a customer repo auto would write in.
+def test_customer_and_off_overrides_win_over_detection(tmp_path, monkeypatch, capsys):
+    # customer forces the write even in GenieRails' own repo; off never writes,
+    # even in a customer fork auto would write in.
     clone = tmp_path / "aws"
     _git_init(clone, ("origin", UPSTREAM_HTTPS))
     _isolate_git(monkeypatch, tmp_path)
     assert cg.main(["--cloud-dir", str(clone), "--mode", "customer"]) == 0
-    assert cg.BEGIN in (clone / ".gitignore").read_text()
-    capsys.readouterr()
+    _assert_written(clone, out := capsys.readouterr().out)
+    assert FORK_NOTE in out
 
-    customer = tmp_path / "azure"
-    _git_init(customer, ("origin", CUSTOMER_REMOTE))
-    assert cg.main(["--cloud-dir", str(customer), "--mode", "off"]) == 0
-    assert not (customer / ".gitignore").exists()
+    fork = tmp_path / "azure"
+    _git_init(fork, ("origin", CUSTOMER_FORK), ("upstream", UPSTREAM_HTTPS))
+    (fork / ".gitignore").write_text(USER_LINES)
+    assert cg.main(["--cloud-dir", str(fork), "--mode", "off"]) == 0
+    assert (fork / ".gitignore").read_text() == USER_LINES
+    assert capsys.readouterr().out == ""
 
 
 def test_auto_always_refreshes_an_existing_block_regardless_of_remote(tmp_path, monkeypatch, capsys):
-    # Even in an upstream clone (where auto would not write a new block), an
+    # Even in GenieRails' own repo (where auto would not write a new block), an
     # existing block is always refreshed, so a stale block never lingers.
     cloud = tmp_path / "aws"
     _git_init(cloud, ("origin", UPSTREAM_HTTPS))

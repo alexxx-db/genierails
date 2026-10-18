@@ -75,9 +75,9 @@ git, that:
 - `git check-ignore` ignores neither file.
 
 If any check fails it exits non-zero with what is missing and the fix, and
-runs nothing. Prepare the checkout once. This checkout is a GenieRails clone
-(its remote is `databricks-solutions/genierails`), so `make setup` detects the
-upstream and won't write the block on its own; `GITIGNORE=customer` forces it:
+runs nothing. Prepare the checkout once. If its `origin` is
+`databricks-solutions/genierails`, plain `make setup` treats it as GenieRails'
+own repo and won't write the block; `GITIGNORE=customer` forces it:
 
 ```bash
 cd aws

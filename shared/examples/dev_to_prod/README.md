@@ -114,9 +114,9 @@ It masks newly tagged columns, never grants access past a passing coverage check
 
 Put it in your own repo (create an empty one first) and open the first PR. From `aws/` (or `azure/`):
 ```bash
-git remote set-url origin <your-repo-url>
-make setup ENV=prod                      # your own repo: writes .gitignore (commits envs/, ignores credentials, state and runtime files)
-git remote add genierails https://github.com/databricks-solutions/genierails.git   # keep GenieRails for upgrades
+git remote rename origin genierails      # keep GenieRails for upgrades
+git remote add origin <your-repo-url>
+make setup ENV=prod                      # origin is your repo: writes .gitignore (commits envs/, ignores credentials, state and runtime files)
 git push -u origin main
 git switch -c first-agent
 git add .gitignore envs/                 # plus any ../shared/ file a coverage fix changed
