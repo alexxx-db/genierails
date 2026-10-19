@@ -15,7 +15,7 @@ New here? Pick a path in the [project overview](../../README.md#pick-your-path):
 ### Set up & operate
 - **[Prerequisites](prerequisites.md)** — OS, Python, Terraform, network, Databricks account, cloud credentials.
 - **[Pipelines](pipelines.md)** — what to commit, CODEOWNERS, `bootstrap-pipelines`, OIDC, the GitHub Actions and Azure DevOps samples.
-- **[Deployment machine](deployment-machine.md)** — releasing prod in v1: persistent checkout, `GENIERAILS_STATE_DIR`, locks, `release-plan` and `release MANIFEST=`.
+- **[Deployment machine](deployment-machine.md)** — releasing prod in v1: persistent checkout, `GENIERAILS_STATE_DIR`, locks, `release-plan` and `release`.
 - **[Architecture](architecture.md)** — layers, artifact ownership, config files, Genie agent lifecycle.
 - **[Access](access.md)** — `table_readers`, `acl_groups`, `group_map`, the deployer SP.
 - **[Scheduled governance](scheduled-governance.md)** — the opt-in read-only scheduled job.

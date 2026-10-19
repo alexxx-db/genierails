@@ -152,7 +152,7 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
         "  5. Run: make release-plan ENV=prod",
-        "make release ENV=prod MANIFEST=<the manifest it printed>",
+        "Get that manifest approved, then: make release ENV=prod\n",
         "make maintain ENV=prod",
     ]
     positions = [out.index(step) for step in order]

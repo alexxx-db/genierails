@@ -22,7 +22,7 @@ make promote-to ENV=prod               # 2d. prod's draft from dev's; add the re
 make migrate-plan ENV=prod        # 3. repeat until "the cutover may proceed"; PR, review, merge
 make rehearse ENV=dev             # 4. dev migrates here (and writes the receipt prod needs)
 make release-plan ENV=prod        # 5. one manifest per phase: approve, then
-make release ENV=prod MANIFEST=<manifest>   #    repeat 5 until "Release complete"
+make release ENV=prod             #    repeat 5 until "Release complete"
 ```
 
 Steps 2a and 2c are required. A legacy env already has treatment tags deployed but no
@@ -108,7 +108,7 @@ adopts the legacy deployment as the live generation:
 4. **grant**: `SELECT` from `table_readers` and `CAN_RUN` from `acl_groups`.
 
 `release-plan` changes nothing: in prod the first manifest holds only the
-approved state moves, which `release MANIFEST=` runs before stopping; the next
+approved state moves, which `release` runs before stopping; the next
 `release-plan` plans **create** against the moved state. In dev, `rehearse`
 adopts and runs every phase in one go.
 

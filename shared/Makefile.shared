@@ -341,7 +341,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
 		if [ "$$det" = 1 ]; then \
 			echo "  5. Run: make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
-			echo "     Get that manifest approved, then: make release ENV=$(ENV) MANIFEST=<the manifest it printed>"; \
+			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \
 			echo "  5. Run: make release ENV=$(ENV)"; \
 		fi; \
@@ -517,7 +517,7 @@ ungovern: _guard-not-ci-apply ## Remove governance (treatment tags, masks) from 
 	$(_STICKY) ungovern --env-dir "$(ENV_DIR)" --table "$(TABLE)" --commit >/dev/null || exit 1; \
 	if [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" = promoted ]; then \
 		echo "ungovern: removed $(TABLE) from $(_SETUP_ENV_REL)/generated; ENV=$(ENV) is promoted, so nothing was applied."; \
-		echo "  Commit it in a PR; after rehearse, make release-plan ENV=$(ENV) and make release ENV=$(ENV) MANIFEST=<manifest> apply the removal."; \
+		echo "  Commit it in a PR; after rehearse, make release-plan ENV=$(ENV) and make release ENV=$(ENV) apply the removal."; \
 		exit 0; \
 	fi; \
 	if ! GENIERAILS_UNGOVERN_TABLE="$(TABLE)" $(MAKE) --no-print-directory apply-governance ENV="$(ENV)" APPLY_FLAGS=; then \
@@ -782,7 +782,7 @@ override _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --en
 # only under the env lock of the command allowed to run them there: rehearse
 # (and ungovern's governance apply) in the rehearse env, maintain's governance
 # apply in a promoted env (promote_from set, or prod), which otherwise changes
-# only through release MANIFEST=. Legacy envs are never gated.
+# only through release (a manifest's saved plans). Legacy envs are never gated.
 override _APPLY_GUARD = $(_RELEASE_GATE) apply-guard --env-dir "$(1)" --env "$(2)" --target $(3)
 # A legacy env whose state a migration to deterministic already changed refuses
 # every legacy applying command (scripts/migration.py; no way back).
@@ -793,7 +793,7 @@ override _CONFIRM_DESTROY = $(if $(filter command line,$(origin CONFIRM_DESTROY)
 override _EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"
 override _CLASSIFICATION_CHECK = python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)"
 # Every adopted custom mask's cases, read-only on the env's SQL warehouse (no-op without
-# custom_masks/). rehearse, release-plan and release MANIFEST= run it before the env lock.
+# custom_masks/). rehearse, release-plan and a manifest release run it before the env lock.
 override _CUSTOM_MASK_CASES = python3 "$(SHARED_ROOT)/scripts/custom_masks.py" live-check --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
 _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
@@ -907,7 +907,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 	$(_DRY_RUN_GUARD); \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
 		if [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" = promoted ]; then \
-			echo "rehearse: ENV=$(ENV) is promoted (promote_from is set): rehearse its source env, then make release-plan ENV=$(ENV) and make release ENV=$(ENV) MANIFEST=<manifest>." >&2; \
+			echo "rehearse: ENV=$(ENV) is promoted (promote_from is set): rehearse its source env, then make release-plan ENV=$(ENV) and make release ENV=$(ENV)." >&2; \
 			exit 1; \
 		fi; \
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
@@ -994,7 +994,7 @@ certify:
 	@echo "  To review before granting, run make plan ENV=$(or $(ENV),<env>) and gate make release behind your approval step." >&2
 	@exit 1
 
-release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove coverage, audit, apply all layers, and verify access (deterministic envs: MANIFEST=<from make release-plan>)
+release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove coverage, audit, apply all layers, and verify access (deterministic envs: the current manifest from make release-plan; MANIFEST=<path> to name one)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
@@ -1083,7 +1083,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	$(_DRY_RUN_GUARD); \
 	export GENIERAILS_RERUN_TARGET=release-plan; \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" != 1 ]; then \
-		echo "release-plan: ENV=$(ENV) is not in deterministic governance mode; release-plan and MANIFEST releases are for deterministic envs. Legacy envs keep: make release ENV=$(ENV)" >&2; \
+		echo "release-plan: ENV=$(ENV) is not in deterministic governance mode; release-plan and manifest releases are for deterministic envs. Legacy envs keep: make release ENV=$(ENV)" >&2; \
 		exit 1; \
 	fi; \
 	$(_DEPLOYER_CHECK) "make release-plan" || exit 1; \
@@ -1136,8 +1136,10 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	echo ""; \
 	echo "=== Release plan ($(ENV)) ==="; \
 	echo "  Manifest (immutable): $$manifest"; \
+	echo "  It is now ENV=$(ENV)'s current manifest (it supersedes any earlier unreleased one)."; \
 	echo "  Review it and its saved plans, get it approved, then run:"; \
-	echo "    make release ENV=$(ENV) MANIFEST=$$manifest"
+	echo "    make release ENV=$(ENV)"; \
+	echo "  A pipeline names it explicitly: make release ENV=$(ENV) MANIFEST=$$manifest"
 
 # Saves one plan per root into PLAN_DIR for release-plan. The account plan must
 # be empty (only make apply-account changes the account layer). data_access is
@@ -1164,7 +1166,7 @@ _release-plan-roots:
 		mkdir -p "$$plan_dir/data_access"; \
 		echo '{"steps": [], "final": false, "imports_only": true}' > "$$plan_dir/data_access/phases.json"; \
 		echo '{"skipped": "deferred: existing resources are imported first; the next release-plan plans the rest"}' > "$$plan_dir/workspace.json"; \
-		echo "  $$(wc -l < "$$record" | tr -d ' ') import(s)/cleanup(s) recorded: this manifest only imports them (make release MANIFEST=, under the lock)."; \
+		echo "  $$(wc -l < "$$record" | tr -d ' ') import(s)/cleanup(s) recorded: this manifest only imports them (make release, under the lock)."; \
 		exit 0; \
 	fi; \
 	$(_COVERAGE_GATE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" $(if $(filter 1,$(VERBOSE)),--verbose,); \
@@ -1189,24 +1191,33 @@ _release-plan-roots:
 		printf '{"file": "workspace.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/workspace.json"; \
 	fi
 
-# make release ENV=<deterministic env> MANIFEST=<path>: applies ONLY the
-# manifest's saved plans (data_access through the staged policy controller),
-# then verifies. It refuses, and asks for a fresh release-plan, if the commit,
-# any state serial, a saved plan, the effective config or live UC changed. A
-# finished release writes the release receipt make maintain checks.
+# make release ENV=<deterministic env>: applies ONLY the saved plans of the
+# env's current manifest (the one the last release-plan wrote; it prints its
+# path, commit and changes first), data_access through the staged policy
+# controller, then verifies. MANIFEST=<path> names a manifest explicitly
+# (pipelines). It refuses, and asks for a fresh release-plan, if the manifest
+# was already released or superseded by a newer release-plan, or if the
+# commit, any state serial, a saved plan, the effective config or live UC
+# changed. A finished release writes the release receipt make maintain checks.
 _release-manifest: _guard-not-ci-apply
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	export GENIERAILS_RERUN_TARGET=release; \
-	if [ -z "$(strip $(MANIFEST))" ]; then \
-		echo "release: ENV=$(ENV) is in deterministic governance mode, where releases are two-phase:" >&2; \
-		echo "  1. make release-plan ENV=$(ENV)   (checks provenance, saves every plan, writes one manifest)" >&2; \
-		echo "  2. get that manifest approved" >&2; \
-		echo "  3. make release ENV=$(ENV) MANIFEST=<the manifest release-plan printed>" >&2; \
-		exit 1; \
-	fi; \
 	$(_DEPLOYER_CHECK) "make release" || exit 1; \
-	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
+	if [ -z "$(strip $(MANIFEST))" ]; then \
+		if ! manifest="$$($(_RELEASE_GATE) current-manifest --env-dir "$(ENV_DIR)" --env "$(ENV)")"; then \
+			echo "  ENV=$(ENV) is in deterministic governance mode, where releases are two-phase:" >&2; \
+			echo "  1. make release-plan ENV=$(ENV)   (checks provenance, saves every plan, writes the current manifest)" >&2; \
+			echo "  2. get that manifest approved" >&2; \
+			echo "  3. make release ENV=$(ENV)        (releases the current manifest; MANIFEST=<path> names one explicitly)" >&2; \
+			exit 1; \
+		fi; \
+		echo "=== Release the current manifest ($(ENV)) ==="; \
+		$(_RELEASE_GATE) manifest-summary --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	else \
+		manifest="$(abspath $(strip $(MANIFEST)))"; \
+	fi; \
+	plans="$$(dirname "$$manifest")"; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
 	$(_CUSTOM_MASK_CASES) || exit 1; \
@@ -1226,7 +1237,7 @@ _release-manifest: _guard-not-ci-apply
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest imported existing resources into Terraform state; nothing else was applied."; \
-		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV) MANIFEST=<it>."; \
+		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV)."; \
 		exit 0; \
 	fi; \
 	$(_AGENT_OWNERSHIP) preflight --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || { echo "release: the Genie agents no longer match the manifest (above); nothing was applied." >&2; exit 1; }; \
@@ -1239,7 +1250,7 @@ _release-manifest: _guard-not-ci-apply
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest held one phase of a staged policy change; it is applied and verified."; \
-		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV) MANIFEST=<it>."; \
+		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV)."; \
 		exit 0; \
 	fi; \
 	if [ $$staged_rc -ne 0 ]; then \
@@ -1759,7 +1770,7 @@ policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target #
 # state moves, with the ack.txt entries it needs. The proposed table_readers
 # (today's GenieRails grants) goes to the ignored state dir; nothing committed
 # or live changes. The cutover runs through rehearse (dev) or release-plan and
-# release MANIFEST= (one manifest and approval per phase).
+# release (one manifest and approval per phase).
 migrate-plan: _guard-workspace-target ## [migration] Read-only dry run of legacy -> deterministic: per column and principal, revocations, proposed table_readers
 	@$(_GUARD_WORKSPACE_ENV); \
 	out="$$($(_RELEASE_GATE) state-dir --env-dir "$(ENV_DIR)" --env "$(ENV)")/migration" || exit 1; \

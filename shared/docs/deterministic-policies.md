@@ -171,8 +171,8 @@ command. A prod release is two-phase (rollout step 9, [pipelines.md](pipelines.m
 `make release-plan` runs the controller's `plan --out-dir`, which saves the
 plan of each remaining apply phase in order (a phase that changes nothing is
 recorded and planning goes on) and stops after the first phase that changes
-something, with the verifications right after it; `make release
-MANIFEST=...` runs `apply-saved`, which applies exactly those saved plans
+something, with the verifications right after it; `make release`
+runs `apply-saved`, which applies exactly those saved plans
 (a saved plan that changes nothing isn't applied) and runs those
 verifications. It refuses when the journal, the generated config or a stage's
 render moved since the plan. A change that replaces policies or moves tiers
