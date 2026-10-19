@@ -817,7 +817,7 @@ def _stub_make(tmp_path, result_path, *, result=None, fail=None):
     stub = tmp_path / "make-stub"
     body = ["#!/bin/sh", f"printf '%s\\n' \"$*\" >> '{log}'"]
     if result is not None:
-        body.append(f"""if [ "$1" = "verify-access" ]; then printf '%s' '{json.dumps(result)}' > '{result_path}'; fi""")
+        body.append(f"""if [ "$1" = "_verify-access-gate" ]; then printf '%s' '{json.dumps(result)}' > '{result_path}'; fi""")
     if fail:
         body.append(f'[ "$1" = "{fail}" ] && exit 1')
     stub.write_text("\n".join(body + ["exit 0"]) + "\n")
@@ -852,14 +852,14 @@ PROVEN = {"passed": True, "mask_checks_passed": 3, "mask_checks_passed_by_key": 
 def test_rehearse_with_no_key_saves_the_proven_map(tmp_path, cloud):
     proc, env_file, calls = _run_make(tmp_path, "rehearse", "dev", result=PROVEN, cloud=cloud)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert ["verify-access", "ENV=dev", "VERIFY_GATE=1", "VERIFY_FROM_TFVARS=",
+    assert ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=",
             "VERIFY_ENV_FILE="] in calls                              # no key flag anywhere
     assert not any("VERIFY_KEY_COLUMN" in w for call in calls for w in call)
     assert hcl2.loads(env_file.read_text())["verify_key_columns"] == PROVEN["mask_keys_proven_by_table"]
     assert "verify_key_column " not in env_file.read_text()
 
 
-@pytest.mark.parametrize("result, fail", [({**PROVEN, "passed": False}, None), (PROVEN, "verify-access")],
+@pytest.mark.parametrize("result, fail", [({**PROVEN, "passed": False}, None), (PROVEN, "_verify-access-gate")],
                          ids=["not-passed", "verify-failed"])
 def test_rehearse_saves_no_map_without_a_passing_proof(tmp_path, result, fail):
     proc, env_file, _ = _run_make(tmp_path, "rehearse", "dev", result=result, fail=fail)
@@ -892,7 +892,7 @@ def test_release_key_check_refuses_before_apply(tmp_path, cloud):
     assert proc.returncode != 0
     names = [c[1] if c[0] == "--no-print-directory" else c[0] for c in calls]
     assert names[-1] == "verify-access-keys", names
-    assert "apply" not in names and "audit-rulebook" not in names and "verify-access" not in names
+    assert "apply" not in names and "audit-rulebook" not in names and "_verify-access-gate" not in names
     assert "release: no provable row-pairing key for every masked table (above); nothing was applied." in proc.stderr
     assert env_file.read_text() == "enable_classification = true\n"
 
@@ -903,9 +903,9 @@ def test_release_with_no_key_reaches_apply_after_the_key_check(tmp_path, cloud):
     proc, _env_file, calls = _run_make(tmp_path, "release", "prod", result=PROVEN, cloud=cloud)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     names = [c[1] if c[0] == "--no-print-directory" else c[0] for c in calls]
-    assert names.index("verify-access-keys") < names.index("apply") < names.index("verify-access")
+    assert names.index("verify-access-keys") < names.index("apply") < names.index("_verify-access-gate")
     assert ["verify-access-keys", "ENV=prod"] in calls
-    assert ["verify-access", "ENV=prod", "VERIFY_GATE=1", "VERIFY_REQUIRE_MASKS=1",
+    assert ["_verify-access-gate", "ENV=prod", "VERIFY_REQUIRE_MASKS=1",
             "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="] in calls
 
 

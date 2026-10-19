@@ -824,7 +824,7 @@ def _stub_make(tmp_path, fail=None, result=None, result_path=None):
     stub = tmp_path / "make-stub"
     body = ["#!/bin/sh", f"printf '%s\\n' \"$*\" >> '{log}'"]
     if result is not None:
-        body.append(f"""if [ "$1" = "verify-access" ]; then printf '%s' '{json.dumps(result)}' > '{result_path}'; fi""")
+        body.append(f"""if [ "$1" = "_verify-access-gate" ]; then printf '%s' '{json.dumps(result)}' > '{result_path}'; fi""")
     if fail:
         body.append(f'[ "$1" = "{fail}" ] && exit 1')
     stub.write_text("\n".join(body + ["exit 0"]) + "\n")
@@ -874,7 +874,7 @@ def test_pass_without_mask_proof_never_saves_the_key(tmp_path, target, env_name,
 
 @pytest.mark.parametrize(("target", "env_name"), [("rehearse", "dev"), ("release", "prod")])
 def test_failed_verify_never_saves_the_key(tmp_path, target, env_name):
-    result, env_file = _run_target(tmp_path, target, env_name, "VERIFY_KEY_COLUMN=customer_id", fail="verify-access")
+    result, env_file = _run_target(tmp_path, target, env_name, "VERIFY_KEY_COLUMN=customer_id", fail="_verify-access-gate")
 
     assert result.returncode != 0
     assert env_file.read_text() == "enable_classification = true\n"
@@ -929,8 +929,10 @@ def test_release_needs_no_key_and_proves_keys_before_applying(tmp_path, env_text
     assert keys < calls.index("apply ENV=prod APPLY_FLAGS= _STAGED_CONFIRM=0")
     # Release verifies as a gate (main 9c2ad7b): the spec cannot narrow the
     # minimum, and the staged-verify inputs are cleared so none can redirect it.
-    gate = [c for c in calls if c.startswith("verify-access ENV=prod ")]
-    assert gate == ["verify-access ENV=prod VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE="], gate
+    # The gate is _verify-access-gate's override, not a VERIFY_GATE=1 argument.
+    gate = [c for c in calls if c.startswith("_verify-access-gate ENV=prod ")]
+    assert gate == ["_verify-access-gate ENV=prod VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE="], gate
+    assert not [c for c in calls if c.startswith("verify-access ENV=prod ")]
 
 
 def _proof(tmp_path, payload=MASK_PASS):

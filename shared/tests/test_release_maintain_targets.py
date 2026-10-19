@@ -104,7 +104,7 @@ def test_release_runs_unified_pipeline_in_order_and_writes_no_receipt(tmp_path):
         ["verify-access-keys", "ENV=prod", "VERIFY_KEY_COLUMN=customer_id"],
         ["audit-rulebook", "ENV=prod"],
         ["apply", "ENV=prod", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", TOKEN],
-        ["verify-access", "ENV=prod", "VERIFY_GATE=1", "VERIFY_REQUIRE_MASKS=1",
+        ["_verify-access-gate", "ENV=prod", "VERIFY_REQUIRE_MASKS=1",
          "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate to open or persist: release neither passes nor writes it. The
@@ -128,7 +128,7 @@ def test_release_coverage_failure_never_applies(tmp_path):
 
 def test_release_verify_failure_prints_rollback_guidance(tmp_path):
     env_dir = _env_dir(tmp_path)
-    stub, _log, audit = _stub(tmp_path, fail="verify-access")
+    stub, _log, audit = _stub(tmp_path, fail="_verify-access-gate")
     result = _make("release", env_dir, stub, audit)
     assert result.returncode != 0
     assert "verify-access failed" in result.stderr
@@ -150,7 +150,7 @@ def test_maintain_remains_governance_only_and_writes_no_receipt(tmp_path):
     # Like release, the rulebook is audited before anything is applied.
     assert names == ["audit-schema", "derive-assignments", "coverage-gate",
                      "validate-generated", "audit-rulebook", "apply-governance"]
-    assert "apply" not in names and "verify-access" not in names
+    assert "apply" not in names and "_verify-access-gate" not in names
     assert not list(env_dir.rglob(".certified*"))
 
 
@@ -294,7 +294,7 @@ def test_release_without_key_still_calls_verify_access(tmp_path):
     stub, log, audit = _stub(tmp_path)
     result = _make("release", env_dir, stub, audit)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _calls(log)[-1] == ["verify-access", "ENV=prod", "VERIFY_GATE=1", "VERIFY_REQUIRE_MASKS=1",
+    assert _calls(log)[-1] == ["_verify-access-gate", "ENV=prod", "VERIFY_REQUIRE_MASKS=1",
                                 "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="]
 
 

@@ -1560,6 +1560,18 @@ def validate_spec_identifiers(spec: VerificationSpec) -> None:
         quote_table(r.table)
 
 
+def with_table_keys(checks: Sequence["ColumnMaskCheck"], key_map: Mapping[str, str]) -> list["ColumnMaskCheck"]:
+    """Each mask check keyed by its table's explicit key when it names none ("" = pick one live)."""
+    by_table = {t.lower(): k for t, k in key_map.items()}
+    return [replace(c, key_column=c.key_column or by_table.get(c.table.lower(), "")) for c in checks]
+
+
+def self_keyed_mask_checks(spec: VerificationSpec) -> list[str]:
+    """Mask checks that pair rows by the masked column itself, as "table.key"."""
+    return sorted(f"{c.table}.{c.key_column}" for c in spec.column_masks
+                  if c.key_column and c.key_column.lower() == c.column.lower())
+
+
 # At most this many key values are bound into one statement; longer key lists
 # are read in batches, so a large tier count can't overflow a statement.
 KEY_PARAM_BATCH = 100
@@ -3154,6 +3166,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Derive the spec from a data_access abac.auto.tfvars.")
     p.add_argument("--account-tfvars", type=Path,
                    help="Optional account abac.auto.tfvars (source of group names).")
+    p.add_argument("--gate", action="store_true",
+                   help="An applying gate (make _verify-access-gate): --spec needs --minimum-from-tfvars.")
     p.add_argument("--minimum-from-tfvars", type=Path,
                    help="Gate only: require --spec to include every check derived from these tfvars.")
     p.add_argument("--minimum-env-file", type=Path,
@@ -3194,8 +3208,7 @@ def _load_spec_from_args(args, key_map: Mapping[str, str]) -> VerificationSpec:
         if not args.spec.is_file():
             raise SystemExit(f"ERROR: verification spec not found: {args.spec}")
         spec = load_spec_from_file(args.spec, strict=bool(args.minimum_from_tfvars))
-        spec.column_masks = [replace(c, key_column=c.key_column or by_table.get(c.table.lower(), ""))
-                             for c in spec.column_masks]
+        spec.column_masks = with_table_keys(spec.column_masks, key_map)
         return spec
     if args.from_tfvars:
         if not args.from_tfvars.is_file():
@@ -3355,6 +3368,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         spec = _load_spec_from_args(args, load_key_map(args.env_file))
         validate_spec_identifiers(spec)
+        if args.gate and args.spec and not args.minimum_from_tfvars:
+            raise ValueError("ERROR: an applying verification gate needs --minimum-from-tfvars with --spec, "
+                             "so the explicit spec can't be weaker than the policy-derived checks")
         if args.minimum_from_tfvars:
             minimum = load_spec_from_tfvars(
                 args.minimum_from_tfvars, args.minimum_account_tfvars,
@@ -3374,11 +3390,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
-    sensitive_keys = sorted(
-        f"{check.table}.{check.key_column}"
-        for check in spec.column_masks
-        if check.key_column and check.key_column.lower() == check.column.lower()
-    )
+    sensitive_keys = self_keyed_mask_checks(spec)
     if sensitive_keys:
         raise SystemExit(
             "ERROR: verify key column is itself classified sensitive/masked: "

@@ -128,6 +128,52 @@ def test_a_spec_with_unknown_fields_refuses_before_apply(tmp_path, capsys, spec,
     assert "could not be read" in err and field in err and "nothing was applied" in err
 
 
+# Covering, policy-strength specs that verify-access itself refuses before it
+# runs a check. As an applying gate that refusal comes after the apply, so
+# require_mask_proof must refuse them first.
+UNRUNNABLE_SPECS = {
+    "keyed by the masked column": (
+        {"column_masks": [_mask("cat.sch.customers", "ssn", key="ssn"), _mask("cat.sch.notes", "free_text")]},
+        "pairs rows by the masked column itself: cat.sch.customers.ssn", "itself classified sensitive"),
+    "unquotable key": (
+        {"column_masks": [_mask("cat.sch.customers", "ssn", key="id`; --"), _mask("cat.sch.notes", "free_text")]},
+        "is not runnable", "unsafe SQL identifier"),
+    "unquotable extra mask table": (
+        {"column_masks": [*FULL_SPEC["column_masks"], _mask("cat.sch.t;drop", "x")]},
+        "is not runnable", "unsafe SQL identifier"),
+    "unquotable extra row filter": (
+        {**FULL_SPEC, "row_filters": [{**ROW_FILTER_SPEC["row_filters"][0], "table": "cat.sch.a b"}]},
+        "is not runnable", "unsafe SQL identifier"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNRUNNABLE_SPECS))
+def test_a_spec_verify_access_would_refuse_refuses_before_apply(tmp_path, capsys, case):
+    import verify_effective_access as vea
+
+    spec, message, gate_message = UNRUNNABLE_SPECS[case]
+    env = _env(tmp_path, policies=TAGGED)
+    path = _spec(tmp_path, spec)
+    # The gate verify-access run refuses it (only after release has applied) ...
+    tfvars = env / "data_access" / "abac.auto.tfvars"
+    with pytest.raises(SystemExit) as refused:
+        vea.main(["--spec", path, "--minimum-from-tfvars", str(tfvars),
+                  "--minimum-env-file", str(env / "env.auto.tfvars"), "--env-file", str(env / "env.auto.tfvars")])
+    assert gate_message in str(refused.value.code)
+    # ... so the pre-apply check refuses it first.
+    assert rh.require_mask_proof(env, "prod", "", path) == 1
+    err = capsys.readouterr().err
+    assert message in err and "nothing was applied" in err
+
+
+def test_a_spec_keyed_by_the_masked_column_through_the_env_key_map_refuses(tmp_path, capsys):
+    env = _env(tmp_path, policies=TAGGED)
+    (env / "env.auto.tfvars").write_text('verify_key_columns = { "cat.sch.notes" = "free_text" }\n')
+    keyless = {"column_masks": [_mask("cat.sch.customers", "ssn"), _mask("cat.sch.notes", "free_text", key="")]}
+    assert rh.require_mask_proof(env, "prod", "", _spec(tmp_path, keyless)) == 1
+    assert "nothing was applied" in capsys.readouterr().err
+
+
 def test_a_missing_spec_file_refuses(tmp_path, capsys):
     assert rh.require_mask_proof(_env(tmp_path), "prod", "", str(tmp_path / "absent.json")) == 1
     assert "could not be read" in capsys.readouterr().err
@@ -262,6 +308,19 @@ def test_release_refuses_an_omitted_real_tier_before_apply(tmp_path):
     assert _names(log) == ["release-helper require-mask-proof"]
 
 
+def test_release_refuses_a_self_keyed_spec_before_its_lock(tmp_path):
+    env = _env(tmp_path, policies=TAGGED)
+    spec = _spec(tmp_path, UNRUNNABLE_SPECS["keyed by the masked column"][0])
+    account = tmp_path / "account"
+    account.mkdir()
+    (account / "abac.auto.tfvars").write_text('groups = { analysts = {} }\n')
+    log, overrides = _recorders(tmp_path)
+    result = _release(env, overrides, f"VERIFY_SPEC={spec}", f"ACCOUNT_ENV_DIR={account}")
+    assert result.returncode != 0
+    assert "pairs rows by the masked column itself" in result.stderr
+    assert _names(log) == ["release-helper require-mask-proof"]
+
+
 @pytest.mark.parametrize("key", ["", "customer_id"])  # no key: picked per table
 def test_release_checks_before_locking_again_before_applying_then_proves_keys(tmp_path, key):
     env = _env(tmp_path, key=key)
@@ -275,7 +334,7 @@ def test_release_checks_before_locking_again_before_applying_then_proves_keys(tm
     assert names[promote + 1] == "release-helper require-mask-proof", names  # re-check on the derived config
     assert names[promote + 2] == "make verify-access-keys", names  # admin key proof before any apply
     assert names.index("make apply") > promote + 2
-    assert names[-2:] == ["make verify-access", "lock unlock"], names
+    assert names[-2:] == ["make _verify-access-gate", "lock unlock"], names
     assert "VERIFY_REQUIRE_MASKS=1" in _calls(log)[-2]
 
 
@@ -313,14 +372,14 @@ def test_every_applying_verify_spec_path_has_a_semantic_minimum_guard():
     assert manifest.index("$(_REQUIRE_MASK_PROOF)") < manifest.index("apply-saved")
     assert apply.count("$(_REQUIRE_MASK_PROOF)") >= 2
     assert "$(_VERIFY_MINIMUM_FLAG)" in verify[:verify.index("\n\ntest-quickstart:")]
-    assert rehearse.count("VERIFY_GATE=1") == 1
+    assert rehearse.count("$(MAKE) _verify-access-gate ENV=") == 1
     legacy_rehearse = makefile[makefile.index("\nrehearse:"):makefile.index("\n# A failed $(MAKE)")]
-    assert legacy_rehearse.count("VERIFY_GATE=1") == 1
+    assert legacy_rehearse.count("$(MAKE) _verify-access-gate ENV=") == 1
     assert "VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in rehearse
     assert "VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in legacy_rehearse
     assert release_plan.count("$(_REQUIRE_MASK_PROOF)") == 2
-    assert "VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in release
-    assert "VERIFY_GATE=1 VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in manifest
+    assert "_verify-access-gate ENV=\"$(ENV)\" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in release
+    assert "_verify-access-gate ENV=\"$(ENV)\" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=" in manifest
 
 
 # ── a mask verify-access derives no check for ───────────────────────────────
