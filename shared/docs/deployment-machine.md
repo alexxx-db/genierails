@@ -19,7 +19,7 @@ git fetch && git checkout --force --detach <sha>
 git status --porcelain                         # pass looks like: prints nothing
 make release-plan ENV=prod                     # prints the manifest path; changes nothing
 #   get the manifest approved
-make release ENV=prod MANIFEST=<manifest>      # applies exactly that manifest
+make release ENV=prod                          # applies exactly that manifest
 
 # on a schedule, at the last released commit
 make maintain ENV=prod
@@ -57,10 +57,13 @@ make maintain ENV=prod
    **Pass looks like:** `git status --porcelain` prints nothing.
 3. **Plan.** `make release-plan ENV=prod`. **Pass looks like:**
    `=== Release plan (prod) ===` and `Manifest (immutable): <path>`, then the
-   exact `make release` command to run.
+   `make release` command to run. That manifest is now prod's current one; a
+   later `release-plan` supersedes it.
 4. **Approve.** A governance code owner reviews the manifest's reports
    (readers, weakening, field-level agent overwrite) and saved plans.
-5. **Release.** `make release ENV=prod MANIFEST=<manifest>`. **Pass looks
+5. **Release.** `make release ENV=prod`. It prints the current manifest's
+   path, commit and changes before applying; check they are what was
+   approved (a pipeline passes `MANIFEST=<path>` instead). **Pass looks
    like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
 6. **More phases?** If it says to run `release-plan` again (a staged policy
    change, tier move or recorded imports), repeat steps 3 to 5 until
@@ -104,7 +107,7 @@ One approval per operation, each from a clean checkout of `main`:
 | Forget a detached agent | `make detach-agent ENV=prod SPACE="<agent>"` | HEAD is the last released commit, and that release had the agent with `detached = true` and `acl_groups = []` ([agents](playbooks/agents.md#remove-an-agent)) |
 | Change the account layer | `make account-plan`, approve its manifest, then `make apply-account` | clean checkout at the exact current `origin/main` tip; saved account plan hash, account input hashes, account state and tag-policy replace diff still match; refuses in CI; takes the account lock; writes an account receipt; manifests are single-use; the only command that removes tag-policy values |
 | Migrate a legacy env | `make migrate-plan`, then `release-plan` / `release` per phase | [legacy-migration.md](legacy-migration.md) |
-| Inspect or drop a staged policy change | `make policy-status ENV=prod`, `make policy-abandon ENV=prod` | `policy-abandon` refuses once a column was retagged or a principal moved |
+| Inspect or drop a staged policy change | `make policy-status ENV=prod`, `make policy-abandon ENV=prod` | `policy-abandon` refuses once a column was retagged or a principal moved, unless the switch was rolled back and a live check confirms it ; `make policy-rebind` (after deleted principals were recreated) runs on dev only and refuses prod |
 
 `bootstrap-sp` and `bootstrap-pipelines` are explicit bootstrap exceptions: they create or authorize service principals and pipeline federation, print repo settings, and do not apply the account Terraform layer or remove tag-policy values.
 

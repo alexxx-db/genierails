@@ -252,6 +252,12 @@ variable "auth_file" {
   description = "Path to the layer's auth.auto.tfvars; deploy_masking_functions.py reads the current SP credentials from it."
 }
 
+variable "held_access_grants" {
+  type        = list(string)
+  default     = []
+  description = "\"<grant resource>|<key>\" grants to leave out of this plan (catalog_access, schema_access, table_access, terraform_sp_manage_catalog). Set only in the first phase of make policy-rebind, so re-pointed protection is applied and checked live before the grants deleted principals lost are created again."
+}
+
 variable "withhold_new_table_grants" {
   type        = bool
   default     = false

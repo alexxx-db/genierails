@@ -38,8 +38,16 @@ It proves the live state matches what GenieRails applied (a GenieRails mask on
 every classified column, readable by every acl_groups group): masks or
 grants changed outside GenieRails after the last apply are caught here.
 
+``check-masks`` runs check 1 alone and records nothing: make policy-rebind
+runs it before it creates the grants deleted principals lost, when check 2
+can't pass yet. It also counts the policies of the last applied staged
+render (``.policy_generations/stage.json``; the live policy check has just
+proved they are live as rendered), so a column still on a migrated legacy
+generation's mask counts as covered.
+
 Exit codes: 0 the check completed (``--strict``: and every agent passed),
-1 ``--strict`` and an agent failed, 2 the check couldn't run (recorded failed).
+1 ``--strict`` and an agent failed (``check-masks``: a column has no
+GenieRails mask), 2 the check couldn't run (recorded failed).
 """
 
 from __future__ import annotations
@@ -156,10 +164,11 @@ def read_problem(group: str, table: str, snapshot: Snapshot) -> str | None:
     return None
 
 
-def _policy_covers(policy: Mapping, tags: set[tuple[str, str]]) -> bool:
+def _policy_covers(policy: Mapping, tags: set[tuple[str, str]], own: frozenset[str] = frozenset()) -> bool:
     if str(policy.get("policy_type") or "").upper() not in COLUMN_MASK:
         return False
-    if not is_own_policy(str(policy.get("name") or ""), str(policy.get("function_name") or "")):
+    name = str(policy.get("name") or "")
+    if not (is_own_policy(name, str(policy.get("function_name") or "")) or name in own):
         return False
     keys = {key for key, _ in tags}
     for condition in policy.get("conditions") or []:
@@ -169,15 +178,15 @@ def _policy_covers(policy: Mapping, tags: set[tuple[str, str]]) -> bool:
     return False
 
 
-def mask_problems(table: str, snapshot: Snapshot) -> list[str]:
-    """Classified columns of ``table`` that no GenieRails mask covers."""
+def mask_problems(table: str, snapshot: Snapshot, own: frozenset[str] = frozenset()) -> list[str]:
+    """Classified columns of ``table`` that no GenieRails mask covers (``own``: more live policy names that count)."""
     problems = []
     for column, tags in sorted(snapshot.column_tags.get(table, {}).items()):
         classes = sorted(key for key, _ in tags if key.startswith("class."))
         if not classes:
             continue
         name = f"{table}.{column}"
-        if any(_policy_covers(policy, tags) for policy in snapshot.policies.get(table, [])):
+        if any(_policy_covers(policy, tags, own) for policy in snapshot.policies.get(table, [])):
             continue
         attached = " (only a table-attached mask, which GenieRails doesn't support)" if name.lower() in {
             masked.lower() for masked in snapshot.table_masks} else ""
@@ -408,6 +417,39 @@ def run(env_dir: Path, env_name: str, runner: Path, apply_flags: str, *, strict:
     return 1 if strict and failed else 0
 
 
+def check_masks(env_dir: Path, env_name: str, runner: Path, apply_flags: str = "", *,
+                snapshot_factory: Callable[[Path], object] = LiveSnapshot) -> int:
+    """Check 1 only (a GenieRails mask on every classified column of every agent's tables); records nothing."""
+    from scripts.policy_generations import load_stage_record
+    from table_readers import deterministic, env_config
+
+    env_dir = env_dir.resolve()
+    if not deterministic(env_config(env_dir)):
+        return 0
+    problems: list[str] = []
+    try:
+        rendered = (load_stage_record(env_dir) or {}).get("rendered") or {}
+        own = frozenset(f"{p['catalog']}_{p['name']}" for p in rendered.get("fgac_policies") or [])
+        value = query_inputs(runner, env_name, env_dir, apply_flags)
+        agents = agent_tables(env_dir, value["inputs"]["agents"])
+        if any(agent.get("tables") for agent in agents.values()):
+            live = snapshot_factory(env_dir)
+            tables = sorted({t for agent in agents.values() for t in live.expand(agent.get("tables") or [])})
+            snapshot = live.read(set(tables))
+            for table in tables:
+                if table in snapshot.missing:
+                    problems.append(f"{table} does not exist or is not visible to the deployer")
+                else:
+                    problems += mask_problems(table, snapshot, own)
+    except Exception as exc:  # an incomplete check never passes
+        print(f"ERROR: live agent mask check for workspace:{env_name} could not run: {exc}", file=sys.stderr)
+        return 2
+    print(f"=== Live agent mask check (workspace:{env_name}): {len(problems)} problem(s) ===")
+    for problem in problems:
+        print(f"  - {problem}", file=sys.stderr)
+    return 1 if problems else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -417,12 +459,19 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--runner", type=Path, default=RUNNER)
     command.add_argument("--apply-flags", default="")
     command.add_argument("--strict", action="store_true", help="exit 1 when any agent fails (maintain)")
+    masks = sub.add_parser("check-masks", help="check only that agent tables' classified columns are masked; "
+                                               "records nothing")
+    masks.add_argument("--env-dir", required=True, type=Path)
+    masks.add_argument("--env-name", required=True)
+    masks.add_argument("--runner", type=Path, default=RUNNER)
     stale = sub.add_parser("invalidate", help="mark the recorded result failed")
     stale.add_argument("--env-dir", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "invalidate":
         invalidate(args.env_dir, "invalidated")
         return 0
+    if args.command == "check-masks":
+        return check_masks(args.env_dir, args.env_name, args.runner)
     return run(args.env_dir, args.env_name, args.runner, args.apply_flags, strict=args.strict)
 
 

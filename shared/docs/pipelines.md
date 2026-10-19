@@ -44,7 +44,7 @@ read-only SP that already holds more than it should. Fix that and re-run.
 | 1. Author | a person's machine | `make capture ENV=dev SPACE="<agent>"`, `make generate ENV=dev`, `make scaffold-treatments`, `make promote-to ENV=prod`; commit, open a PR | no |
 | 2. PR check | CI, every PR | `make check ENV=dev`; also `make check ENV=prod` when the PR touches `envs/prod/**` or `shared/**` | no |
 | 3. Dev rehearsal | dev pipeline, each merge to `main`, in order | `make rehearse ENV=dev` | dev |
-| 4. Prod release | deployment machine in v1, after stage 3 passes on the commit | `make release-plan ENV=prod`, approve its manifest, `make release ENV=prod MANIFEST=<manifest>` ([release gating](#release-gating-deterministic-envs)) | prod |
+| 4. Prod release | deployment machine in v1, after stage 3 passes on the commit | `make release-plan ENV=prod`, approve its manifest, `make release ENV=prod` ([release gating](#release-gating-deterministic-envs)) | prod |
 | 5. Keep protected | deployment machine in v1, on a schedule, at the last released commit | `make maintain ENV=prod` | prod, governance only |
 | 6. Operations | deployment machine, one approval per operation | `make detach-agent`, `make account-plan` then `make apply-account`, migration phases | prod or account |
 
@@ -248,9 +248,9 @@ committed config against empty state, live tags not re-read). It is safe under
 Applying targets (`apply`, `apply-governance`, `apply-genie`, `apply-account`,
 `rehearse`, `release-plan`, `release`, `maintain`, `enable-classification`,
 `ungovern`, `detach-agent`, `destroy*`, `import`, `migrate-state`,
-`migrate-state-dir`, `policy-abandon`) refuse when they
+`migrate-state-dir`, `policy-abandon`, `policy-rebind`) refuse when they
 detect CI: `CI=true|1|yes`, or `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`,
-`BUILDKITE` or `CIRCLECI` set. The sole exception is exactly
+`BUILDKITE` or `CIRCLECI` set (`policy-rebind` even with `GENIERAILS_ALLOW_CI_APPLY=1`). The sole exception is exactly
 `make rehearse ENV=dev`, on `<cloud>/envs/dev` itself (not a promote-to
 destination), and only when `envs/dev/remote_state.hcl` configures a locked
 backend (S3 plus DynamoDB or `use_lockfile` on AWS; Azure Storage blob leases on
@@ -320,13 +320,16 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   tags into `envs/prod/generated/.runtime/` (ignored), keeps the policy names
   prod already deploys, runs the reader inventory and refuse-weakening against
   the deployed state (reconciling every `ack.txt` entry once), saves a
-  Terraform plan for every root and writes **one immutable manifest**. It
+  Terraform plan for every root and writes **one immutable manifest**, which
+  becomes prod's current manifest (a newer `release-plan` supersedes it). It
   changes nothing in Databricks. The account plan must be empty.
-- **`make release ENV=prod MANIFEST=<path>`** applies only the saved plans,
-  then verifies, and writes a release receipt. It refuses, and asks for a
-  fresh `release-plan`, if the commit, a state serial, a saved plan, the
-  effective config or live Unity Catalog changed. Plain `make release ENV=prod`
-  refuses in a deterministic env.
+- **`make release ENV=prod`** releases the current manifest: it prints the
+  manifest's path, commit and changes, applies only its saved plans, then
+  verifies, and writes a release receipt. It refuses, and asks for a fresh
+  `release-plan`, if there is no current manifest, it was already released,
+  or the commit, a state serial, a saved plan, the effective config or live
+  Unity Catalog changed. A pipeline passes `MANIFEST=<path>` to name the
+  approved manifest explicitly; a superseded or already released one refuses.
 - **`make account-plan` / `make apply-account`** is the account
   operation equivalent: `account-plan` refuses unless the checkout is clean and
   exactly current `origin/main`, saves one account plan and immutable manifest,
@@ -344,14 +347,14 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   ([staged policy changes](deterministic-policies.md#staged-policy-changes-rollout-step-6)).
 - **Existing resources are imported by their own manifest.** When resources
   exist in Databricks but not in state, `release-plan` records the imports in
-  the manifest and plans nothing else; `release MANIFEST=` runs exactly those.
+  the manifest and plans nothing else; `release` runs exactly those.
 - **Rollback.** Merge `prod:rollback:<commit>` into `envs/prod/ack.txt` on
   `main` in a reviewed PR, then run `release-plan` with that older commit
   checked out.
 - **`make maintain ENV=prod`** refuses unless HEAD is the last release
   receipt's commit, the checkout is clean, and the digests match the receipt.
 - **No side door.** A promoted env (one with `promote_from`, or `prod`)
-  changes only through `release MANIFEST=` and `maintain`; dev only through
+  changes only through `release` (a manifest's saved plans) and `maintain`; dev only through
   `rehearse`. Every other target that applies the data_access or workspace
   root refuses there and says which command to run. The gate is the env lock
   of the command that runs the target, checked by a nonce, the holder's pid and
@@ -366,13 +369,15 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   | `rehearse` | refused (rehearse the source env) | the way to apply it |
   | `ungovern` | edits the governed-table list only; the next release applies it | edits, then applies governance |
   | `destroy`, `destroy-governance`, `destroy-genie` | needs `CONFIRM_DESTROY=<env>` on the command line | unchanged |
-  | `release` without `MANIFEST=` | refused | refused |
+  | `release` | only a manifest from `release-plan` (the current one, or `MANIFEST=<path>`) | refused (rehearse it) |
 
   Not gated by the env side-door: `apply-account` (its own account manifest,
   account lock and approval),
   `enable-classification` (classification config only), `import`,
   `migrate-state`, `rebuild-governed-tables` (state or a local record), and
-  `policy-abandon` (drops only a staged change that never switched). Each
+  `policy-abandon` (drops only a staged change that never switched, or whose
+  switch was rolled back and still is, live). `policy-rebind` refuses a
+  promoted env. Each
   moves a state serial or a committed file, so a manifest planned before it is
   refused.
 

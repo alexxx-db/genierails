@@ -335,6 +335,41 @@ def test_abandon_removes_only_the_replacement_and_keeps_old_tags(tmp_path):
     assert set(planned["allowed_policy_deletes"]) == {p["name"] for p in failed["fgac_policies"]}
 
 
+def test_an_abandon_plan_may_only_delete_the_unfinished_changes_policies():
+    tag = "columns|c.s.t.x|gr_treatment"
+    allowed = pg.plan_violations({"resource_changes": [
+        _change("databricks_policy_info", "gr_mask_new", "delete"),
+        _change("databricks_policy_info", "gr_mask_kept", "no-op"),
+        _change("databricks_entity_tag_assignment", tag, "no-op"),
+        # Deleting a policy restarts the enforcement wait (its trigger hashes the policy map).
+        _change("time_sleep", "", "delete", "create",
+                address="module.data_access.time_sleep.wait_for_policy_enforcement"),
+    ]}, "abandon", {"gr_mask_new"})
+    assert allowed == []
+    refused = [
+        _change("databricks_entity_tag_assignment", tag, "update"),  # a column retagged since the restore
+        _change("databricks_policy_info", "gr_mask_kept", "update"),  # TO / EXCEPT / match changed
+        _change("databricks_policy_info", "gr_mask_kept", "delete"),  # not the change's policy
+        _change("databricks_policy_info", "gr_mask_new", "delete", "create"),
+        _change("databricks_policy_info", "gr_mask_other", "create"),
+        _change("databricks_entity_tag_assignment", tag, "delete"),
+        _change("terraform_data", "", "update", address="module.data_access.terraform_data.masking_functions"),
+        _change("databricks_grant", "x", "delete", address='module.data_access.databricks_grant.table_access["x"]'),
+        _change("time_sleep", "", "create", address="module.data_access.time_sleep.wait_for_tag_propagation"),
+    ]
+    for change in refused:
+        assert pg.plan_violations({"resource_changes": [change]}, "abandon", {"gr_mask_new"}), change
+    # Another stage keeps its own rules: a create plan may retag nothing it doesn't delete.
+    assert pg.plan_violations({"resource_changes": [refused[0]]}, "create") == []
+
+
+def test_an_abandon_plan_records_the_policies_it_deletes():
+    plan = {"resource_changes": [_change("databricks_policy_info", "gr_mask_b", "delete"),
+                                 _change("databricks_policy_info", "gr_mask_a", "delete"),
+                                 _change("databricks_policy_info", "gr_mask_c", "no-op")]}
+    assert pg.planned_policy_deletes(plan) == ["gr_mask_a", "gr_mask_b"]
+
+
 def test_drop_functions_drops_only_functions_no_kept_generation_defines(tmp_path):
     env_dir = tmp_path / "dev"
     retired = _generation(env_dir, versions={"ip_address": {"partial": "redacted"}})

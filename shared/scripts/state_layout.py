@@ -445,6 +445,12 @@ def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
 
 # Variables only terraform_layer.sh sets: where the roots read their state and Genie ID files.
 RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir")
+# Variables only the staged policy controller sets (policy_generations._runner), as -var with the
+# env-lock token (environment_lock.stage_token). policy_stage selects which grants a plan withholds
+# and whether the staged guard applies; the rebind variables hold grants back. make's own
+# preview plan and destroy are the two plain -var=policy_stage uses.
+STAGE_VARS = ("policy_stage", "held_access_grants", "rebind_table_grants")
+MAKE_STAGES = {("plan", "preview"), ("destroy", "destroy")}
 
 
 def _assigned_names(args: list[str], source: str) -> list[tuple[str, str]]:
@@ -459,12 +465,13 @@ def _assigned_names(args: list[str], source: str) -> list[tuple[str, str]]:
                 i += 1
                 value = args[i] if i < len(args) else ""
             if flag == "var":
-                found.append((value.split("=", 1)[0].strip(), f"{source}: {arg}{'' if eq else ' ' + value}"))
+                found.append((value.split("=", 1)[0].strip(), f"{source}: {arg}{'' if eq else ' ' + value}",
+                              value.split("=", 1)[1] if "=" in value else ""))
             else:
                 files.append(value)
         i += 1
     for path in files:
-        found += _file_names(Path(path), f"{source}: -var-file={path}")
+        found += [(name, where, None) for name, where in _file_names(Path(path), f"{source}: -var-file={path}")]
     return found
 
 
@@ -485,25 +492,52 @@ def _file_names(path: Path, where: str) -> list[tuple[str, str]]:
 
 
 def runner_var_overrides(args: list[str], command: str, var_files: list[Path] = (),
-                         environ: dict | None = None) -> list[str]:
-    """Where a caller tries to set a variable only the runner may set (RUNNER_VARS).
+                         environ: dict | None = None, env_dir: Path | None = None) -> list[str]:
+    """Where a caller tries to set a variable only the runner (RUNNER_VARS) or the controller (STAGE_VARS) may.
 
     Covers -var name=value in both forms, -var-file contents (the caller's and
-    the env's own tfvars), and TF_CLI_ARGS / TF_CLI_ARGS_<command>, which
-    Terraform appends after every other argument. Names are case-sensitive,
-    as in Terraform. A var file that can't be read counts as an override.
+    the env's own tfvars), TF_CLI_ARGS / TF_CLI_ARGS_<command>, which
+    Terraform appends after every other argument, and, for STAGE_VARS,
+    TF_VAR_<name>. Names are case-sensitive, as in Terraform. A var file that
+    can't be read counts as an override. A STAGE_VARS name passes only as a
+    -var argument with the controller's env-lock token
+    (environment_lock.stage_token of ``env_dir``), or as make's own
+    -var=policy_stage=preview (plan) or =destroy (destroy); APPLY_FLAGS and
+    DESTROY_FLAGS arrive here as arguments.
     """
     import shlex
 
     environ = os.environ if environ is None else environ
-    found = _assigned_names(list(args), "arguments")
+    found = [(name, where, value, True) for name, where, value in _assigned_names(list(args), "arguments")]
     for path in var_files:
-        found += _file_names(Path(path), f"var file {path}")
+        found += [(name, where, None, False) for name, where in _file_names(Path(path), f"var file {path}")]
     for name in ("TF_CLI_ARGS", f"TF_CLI_ARGS_{command}"):
         if environ.get(name, "").strip():
-            found += _assigned_names(shlex.split(environ[name]), name)
-    return [f"{where} sets {name}" if name != "<unreadable>" else f"{where} can't be read"
-            for name, where in found if name in RUNNER_VARS or name == "<unreadable>"]
+            found += [(n, w, v, False) for n, w, v in _assigned_names(shlex.split(environ[name]), name)]
+    found += [(name, f"TF_VAR_{name}", None, False) for name in STAGE_VARS if f"TF_VAR_{name}" in environ]
+    token_ok = None
+
+    def stage_allowed(name, value, is_arg) -> bool:
+        nonlocal token_ok
+        if not is_arg:
+            return False
+        if name == "policy_stage" and (command, value) in MAKE_STAGES:
+            return True
+        if token_ok is None:
+            from environment_lock import STAGE_TOKEN_ENV, valid_stage_token
+
+            token_ok = env_dir is not None and valid_stage_token(Path(env_dir), environ.get(STAGE_TOKEN_ENV, ""))
+        return token_ok
+
+    out = []
+    for name, where, value, is_arg in found:
+        if name == "<unreadable>":
+            out.append(f"{where} can't be read")
+        elif name in RUNNER_VARS:
+            out.append(f"{where} sets {name}")
+        elif name in STAGE_VARS and not stage_allowed(name, value, is_arg):
+            out.append(f"{where} sets {name}, which only the staged policy controller sets")
+    return out
 
 
 def root_state_paths(env_dir: Path) -> dict[str, Path]:
@@ -743,6 +777,7 @@ def main() -> int:
     check = commands.add_parser("check-runner-vars")
     check.add_argument("--tf-command", required=True)
     check.add_argument("--var-file", type=Path, action="append", default=[])
+    check.add_argument("--env-dir", type=Path)
     check.add_argument("args", nargs=argparse.REMAINDER)
     for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file",
                  "records-dir"):
@@ -762,7 +797,7 @@ def main() -> int:
     try:
         if args.command == "check-runner-vars":
             caller = args.args[1:] if args.args[:1] == ["--"] else args.args
-            overrides = runner_var_overrides(caller, args.tf_command, args.var_file)
+            overrides = runner_var_overrides(caller, args.tf_command, args.var_file, env_dir=args.env_dir)
             for line in overrides:
                 print(f"  {line}", file=sys.stderr)
             return 2 if overrides else 0

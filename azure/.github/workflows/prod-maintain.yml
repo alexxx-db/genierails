@@ -5,17 +5,15 @@ name: GenieRails prod maintain (azure)
 #
 #   make maintain ENV=prod     at the last released commit
 #
-# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the release
-# receipt (rollout step 9), which names the last released commit. Until both
-# exist the operator runs make maintain ENV=prod on the deployment machine,
-# on its own schedule, at the last released commit, in the same persistent
-# checkout as releases (`git fetch && git checkout --force --detach <sha>`,
-# an empty `git status --porcelain`, never `git clean -x` or a re-clone; see
-# prod-release.yml). The CI guard refuses every applying target here.
-# Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 this job runs the read-only
-# drift audit, which exits non-zero when sensitive columns are untagged or
-# tag assignments are stale; GitHub's failed-run notification alerts the
-# owning team.
+# REQUIRES PROD REMOTE STATE (deferred; design section 15). The release
+# receipt names the last released commit; until prod has remote state, the
+# operator runs make maintain ENV=prod on the deployment machine, on its own
+# schedule, at that commit, in the same persistent checkout as releases
+# (`git fetch && git checkout --force --detach <sha>`, an empty
+# `git status --porcelain`, never `git clean -x` or a re-clone; see
+# prod-release.yml). Until then, this CI job runs only the read-only
+# audit-schema drift alert. The CI guard refuses every applying target here.
+# Do not set GENIERAILS_ALLOW_CI_APPLY.
 #
 # Auth: OIDC workload identity federation, no PATs or secrets. The job runs
 # in the "production-maintain" environment (deploys only from main, no
@@ -58,8 +56,6 @@ jobs:
     env:
       DATABRICKS_AUTH_TYPE: github-oidc
     steps:
-      # TODO(rollout step 9): check out the last released commit, read from
-      # the release receipt, instead of main.
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5

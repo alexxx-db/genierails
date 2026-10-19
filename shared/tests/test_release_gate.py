@@ -8,6 +8,7 @@ runtime files ignored). Receipts go to GENIERAILS_STATE_DIR in tmp_path.
 from __future__ import annotations
 
 import json
+import time
 import os
 import subprocess
 import sys
@@ -660,6 +661,80 @@ def test_manifest_drift_kept_names(repo, manifest):
 def test_manifest_for_another_env_is_refused(repo, manifest):
     with pytest.raises(rg.Refused, match="manifest for prod, not dev"):
         rg.manifest_check(repo.dev, "dev", manifest)
+
+
+# -- the current manifest (plain make release) ------------------------------------------
+
+def _second_manifest(repo: Repo) -> Path:
+    time.sleep(1.1)  # manifest ids are per second
+    return rg.manifest_write(repo.prod, "prod", _plan_dir(repo), rg.provenance(repo.prod, "prod"), "live-1",
+                             {"ok": True})
+
+
+def test_release_plan_records_its_manifest_as_the_current_one(repo, manifest):
+    assert rg.current_manifest(repo.prod, "prod") == manifest
+    pointer = rg.current_pointer(repo.cloud, "prod")
+    assert pointer.parent == rg.manifests_dir(repo.cloud, "prod")  # under the state dir, next to the manifests
+    assert json.loads(pointer.read_text())["id"] == json.loads(manifest.read_text())["id"]
+    assert pointer.stat().st_mode & 0o077 == 0
+
+
+def test_the_current_manifest_lives_in_the_state_dir(repo, manifest):
+    state = Path(os.environ[rg.STATE_DIR_ENV])
+    assert rg.current_pointer(repo.cloud, "prod") == state / repo.cloud.name / "prod" / "manifests" / "CURRENT"
+    assert not list((repo.cloud / "envs" / "prod").rglob("CURRENT"))  # nothing in the checkout
+
+
+def test_no_current_manifest_refuses_with_a_pointer_to_release_plan(repo):
+    with pytest.raises(rg.Refused, match="has no current release manifest. Run make release-plan ENV=prod"):
+        rg.current_manifest(repo.prod, "prod")
+
+
+def test_a_newer_release_plan_supersedes_the_current_manifest(repo, manifest):
+    newer = _second_manifest(repo)
+    assert rg.current_manifest(repo.prod, "prod") == newer
+    with pytest.raises(rg.Refused, match="was superseded by a newer make release-plan"):
+        rg.manifest_check(repo.prod, "prod", manifest, live="live-1")
+    assert rg.manifest_check(repo.prod, "prod", newer, live="live-1")["id"] == json.loads(newer.read_text())["id"]
+
+
+@pytest.mark.parametrize("how", ["release", "phase"])
+def test_a_released_manifest_is_never_released_again(repo, manifest, how):
+    (rg.release_receipt if how == "release" else rg.phase_record)(repo.prod, "prod", manifest)
+    with pytest.raises(rg.Refused, match="was already released .*Run make release-plan ENV=prod"):
+        rg.current_manifest(repo.prod, "prod")
+    with pytest.raises(rg.Refused, match="was already released"):
+        rg.manifest_check(repo.prod, "prod", manifest, live="live-1")
+
+
+def test_a_manifest_from_before_the_current_pointer_still_releases_explicitly(repo, manifest):
+    rg.current_pointer(repo.cloud, "prod").unlink()
+    assert rg.manifest_check(repo.prod, "prod", manifest, live="live-1")
+    with pytest.raises(rg.Refused, match="has no current release manifest"):
+        rg.current_manifest(repo.prod, "prod")
+
+
+@pytest.mark.parametrize("value", ['{"id": "../elsewhere"}', '{"id": ""}', '{}'])
+def test_a_malformed_current_pointer_refuses(repo, manifest, value):
+    pointer = rg.current_pointer(repo.cloud, "prod")
+    pointer.write_text(value)
+    with pytest.raises(rg.Refused, match="names no manifest"):
+        rg.current_manifest(repo.prod, "prod")
+
+
+def test_a_missing_current_manifest_refuses(repo, manifest):
+    rg.current_pointer(repo.cloud, "prod").write_text('{"id": "20990101T000000-000000000000"}')
+    with pytest.raises(rg.Refused, match="is missing. Run make release-plan ENV=prod"):
+        rg.current_manifest(repo.prod, "prod")
+
+
+def test_the_summary_names_path_commit_and_changes(repo, manifest):
+    data = json.loads(manifest.read_text())
+    lines = rg.manifest_summary(manifest, data)
+    assert lines[0] == f"  Manifest: {manifest}"
+    assert lines[1].startswith(f"  Commit:   {repo.head()} (planned ")
+    assert "    data_access:  saved plan(s) with changes, phase(s) grant" in lines
+    assert "    workspace:    saved plan with changes" in lines
 
 
 # -- release receipt and maintain ----------------------------------------------------

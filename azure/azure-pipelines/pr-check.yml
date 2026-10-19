@@ -2,9 +2,12 @@
 #
 # Stage 2, "PR check", of shared/docs/pipelines.md: read-only, on every pull
 # request. Create a pipeline from this file. For Azure Repos, add it to the
-# main branch policy as a required build validation (the pr: block below only
-# applies to GitHub and Bitbucket repos), and set the policy to re-run when
-# main changes, so every open PR re-checks against the latest main.
+# main branch policy as a required build validation. In Azure Repos, set that
+# build validation policy's Build expiration to "Immediately when main is
+# updated"; that is the mechanism that re-queues every open PR validation
+# after main moves. For GitHub-hosted repositories connected to Azure
+# Pipelines, keep the pr: trigger below and use the host's up-to-date branch
+# requirement or merge queue for the stronger freshness guarantee.
 #
 #   make check ENV=dev                 always
 #   make check ENV=prod                also, when the PR touches envs/prod/** or

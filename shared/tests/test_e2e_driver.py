@@ -1219,7 +1219,7 @@ def test_read_only_drift_reports_manual_restore_and_stops(tmp_path, live):
     assert report["manual_restore_commands"] == [
         "make rehearse ENV=dev",
         "make release-plan ENV=prod",
-        "make release ENV=prod MANIFEST=<path-from-release-plan>",
+        "make release ENV=prod",
         "make maintain ENV=prod",
     ]
     assert report["snapshot_diff"]

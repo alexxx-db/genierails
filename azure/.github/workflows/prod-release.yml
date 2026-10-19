@@ -14,12 +14,12 @@ name: GenieRails prod release (azure)
 #   (required approval on the "production" environment)
 #   make release ENV=prod MANIFEST=<manifest>      applies exactly that manifest
 #
-# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the two-phase
-# release (rollout step 9). Until both exist the operator releases on the
-# deployment machine with make release ENV=prod, at the commit this run names,
-# in that machine's one persistent checkout: v1 keeps Terraform state, the
-# env lock and the Genie ID files under its gitignored envs/, so a re-clone
-# loses them. Move the checkout with
+# REQUIRES PROD REMOTE STATE (deferred; design section 15) before CI can apply
+# prod. Until prod has remote state, the operator releases on the deployment
+# machine with make release ENV=prod, at the commit this run names, in that
+# machine's one persistent checkout: v1 keeps Terraform state, the env lock
+# and the Genie ID files under its gitignored envs/, so a re-clone loses them.
+# Move the checkout with
 # `git fetch && git checkout --force --detach <sha>` (--force drops earlier
 # runs' edits to tracked generated/ and layer files and leaves the ignored
 # state alone), confirm `git status --porcelain` prints nothing, and never
@@ -190,8 +190,9 @@ jobs:
             "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
             "databricks_workspace_host = \"$HOST\"" > envs/prod/auth.auto.tfvars
 
-      # TODO(rollout step 9): run the release plan here and upload its
-      # manifest as an artifact; the release job applies that manifest.
+      # TODO(deferred, section 15): once prod has remote state, run
+      # release-plan here and upload its manifest. Until then, this CI job
+      # only re-checks the commit that the deployment machine will release.
       - name: Read-only check of the commit to release
         run: make check ENV=prod
 
@@ -202,7 +203,8 @@ jobs:
     environment: production
     steps:
       # TODO(deferred, section 15): apply the approved manifest here once prod
-      # has remote state with locking.
+      # has remote state with locking. Until then, the approved handoff is the
+      # commit named below, applied from the deployment machine.
       - name: Release runs on the deployment machine (v1)
         run: |
           {

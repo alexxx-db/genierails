@@ -779,7 +779,7 @@ def sync(env_dir: Path, env: str, api=None) -> dict[str, list[str]]:
         return {}
     if deterministic(env_dir):
         raise AgentError("a deterministic env pushes agent config only from an approved manifest: "
-                         f"make release-plan ENV={env}, then make release ENV={env} MANIFEST=<it>")
+                         f"make release-plan ENV={env}, then make release ENV={env}")
     reports: dict[str, list[str]] = {}
     for agent in agent_files.load_all(env_dir):
         name = agent["name"]
@@ -881,7 +881,7 @@ def _manifest_entries(env_dir: Path, env: str, manifest_path: Path, *, applied: 
         raise AgentError("dev's agent config is never overwritten")
     owner = _lock_owner(env_dir)
     if owner != "release":
-        raise AgentError("agent config in a deterministic env is pushed only by make release MANIFEST=<it>, "
+        raise AgentError(f"agent config in a deterministic env is pushed only by make release ENV={env} (a manifest), "
                          f"under its env lock{f' (this runs under make {owner})' if owner else ''}")
     manifest = _gate().load_manifest(Path(manifest_path), env)
     configured = agent_files.load_all(env_dir)

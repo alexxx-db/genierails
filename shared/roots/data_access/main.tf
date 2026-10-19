@@ -165,7 +165,7 @@ locals {
   _policy_stage_guarded = var.governance_mode == "deterministic" && contains(["", "create", "tighten", "grant"], var.policy_stage)
   # New SELECT opens only in the grant phase, after every staged phase is
   # applied and verified (scripts/staged_policy_apply.py).
-  withhold_new_table_grants = var.governance_mode == "deterministic" && contains(["create", "tighten", "switch", "restore", "retire", "abandon"], var.policy_stage)
+  withhold_new_table_grants = var.governance_mode == "deterministic" && contains(["create", "tighten", "switch", "restore", "retire", "abandon", "rebind"], var.policy_stage)
   staged_policy_violations = local._policy_stage_guarded ? concat(
     [for name, live in local._applied_mask_policies : "${name} removed" if !contains(keys(local._config_mask_policies), name)],
     [for name, live in local._applied_mask_policies : "${name} changes its function" if contains(keys(local._config_mask_policies), name) && try(local._config_mask_policies[name].function, "") != live.function],
@@ -180,9 +180,28 @@ variable "policy_stage" {
   default     = ""
   description = "Set only by scripts/policy_generations.py (one value per staged phase), preview by make plan and destroy by make destroy."
   validation {
-    condition     = contains(["", "preview", "destroy", "create", "tighten", "switch", "restore", "retire", "abandon", "grant"], var.policy_stage)
-    error_message = "policy_stage must be empty or one of preview, destroy, create, tighten, switch, restore, retire, abandon, grant."
+    condition     = contains(["", "preview", "destroy", "create", "tighten", "switch", "restore", "retire", "abandon", "rebind", "grant"], var.policy_stage)
+    error_message = "policy_stage must be empty or one of preview, destroy, create, tighten, switch, restore, retire, abandon, rebind, grant."
   }
+}
+
+# Set only by scripts/policy_generations.py in the first phase of make
+# policy-rebind: "<grant resource>|<key>" entries (catalog_access,
+# schema_access, table_access, terraform_sp_manage_catalog) to leave out, so
+# the re-pointed protection is applied and checked live before any grant the
+# deleted principals lost is created again.
+variable "held_access_grants" {
+  type    = list(string)
+  default = []
+}
+
+# Also set only by make policy-rebind: table_access keys ("<table>|<group>")
+# that were applied before their principals were deleted (Terraform's refresh
+# then drops them from state). The rebind keeps them as applied grants, so the
+# access phase grants them again; no other new SELECT opens.
+variable "rebind_table_grants" {
+  type    = list(string)
+  default = []
 }
 
 variable "env_dir" {
@@ -581,7 +600,7 @@ module "data_access" {
   coverage_ddl_file                        = "${var.env_dir}/../ddl/_fetched.sql"
   coverage_acknowledged_columns            = var.coverage_acknowledged_columns
   coverage_gate_max_age                    = var.coverage_gate_max_age
-  applied_table_grants                     = local.applied_table_grants
+  applied_table_grants                     = var.policy_stage == "rebind" ? distinct(concat(local.applied_table_grants, var.rebind_table_grants)) : local.applied_table_grants
   applied_protection_fingerprint           = local.applied_protection_fingerprint
   applied_protection                       = local.applied_protection
   deployment_binding                       = local.deployment_binding
@@ -594,6 +613,7 @@ module "data_access" {
   governance_mode                          = var.governance_mode
   table_readers                            = local.full_table_readers
   withhold_new_table_grants                = local.withhold_new_table_grants
+  held_access_grants                       = var.policy_stage == "rebind" ? var.held_access_grants : []
   access_tier_groups                       = var.access_tier_groups
   raw_exempt_principals                    = var.raw_exempt_principals
   governed_tables                          = local.governed_tables
@@ -611,6 +631,14 @@ check "business_select_withheld" {
   assert {
     condition     = length(module.data_access.withheld_table_grants.grants) == 0
     error_message = "Coverage check ${module.data_access.withheld_table_grants.status}: ${module.data_access.withheld_table_grants.problem}. New business SELECT withheld: ${join(", ", module.data_access.withheld_table_grants.grants)}. Removals and existing grants still apply. Run this layer through make (make apply ENV=${basename(dirname(var.env_dir))}), which refreshes live tags and DDL and runs the coverage check."
+  }
+}
+
+# Holding grants back would revoke them in any other plan.
+check "rebind_grants_only_in_rebind" {
+  assert {
+    condition     = length(var.held_access_grants) + length(var.rebind_table_grants) == 0 || var.policy_stage == "rebind"
+    error_message = "held_access_grants and rebind_table_grants are set only by make policy-rebind (policy_stage = \"rebind\"); they are ignored in this ${var.policy_stage == "" ? "plan" : "${var.policy_stage} plan"}."
   }
 }
 
