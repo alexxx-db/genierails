@@ -3058,8 +3058,12 @@ def _load_auth_cfg(auth_file: Path) -> dict:
     """Load databricks credentials from auth.auto.tfvars."""
     _ensure_packages()
     import hcl2
-    with open(auth_file) as f:
-        return hcl2.load(f)
+    try:
+        with open(auth_file) as f:
+            return hcl2.load(f)
+    except Exception:
+        # Parser text can echo credential fragments; never surface it.
+        raise SystemExit(f"ERROR: {auth_file} is not valid HCL") from None
 
 
 def _configure_sdk_env(cfg: dict) -> None:

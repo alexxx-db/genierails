@@ -633,8 +633,9 @@ def workspace_client(auth_file: Path):
     if auth_file.is_file():
         try:
             auth = hcl2.loads(auth_file.read_text())
-        except Exception as exc:
-            raise Refused(f"{auth_file} is not valid HCL: {exc}") from exc
+        except Exception:
+            # Parser text can echo credential fragments; never surface it.
+            raise Refused(f"{auth_file} is not valid HCL") from None
     kwargs = {key: str(auth.get(name) or "").strip() for key, name in (
         ("host", "databricks_workspace_host"), ("client_id", "databricks_client_id"),
         ("client_secret", "databricks_client_secret"))}

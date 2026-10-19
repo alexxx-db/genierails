@@ -31,6 +31,7 @@ override _DRY_RUN_GUARD = if [ -n "$(_MAKE_DRY_RUN)" ]; then exit 0; fi
 
 ACCOUNT_ENV := account
 DATA_ACCESS_SUBDIR := data_access
+export DATA_ACCESS_SUBDIR
 DEFAULT_ENV := dev
 ENV ?= $(DEFAULT_ENV)
 SOURCE_ENV ?= $(ENV)
@@ -183,22 +184,38 @@ _prepare-env:
 			mkdir -p "$$env_dir/ddl" "$$env_dir/generated"; \
 			gov_dir="$$env_dir/$(DATA_ACCESS_SUBDIR)"; \
 			mkdir -p "$$gov_dir"; \
-			if [ ! -e "$$gov_dir/auth.auto.tfvars" ]; then ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars"; fi; \
-			if [ ! -e "$$gov_dir/env.auto.tfvars" ]; then ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars"; fi; \
+			if [ -L "$$gov_dir/auth.auto.tfvars" ] && [ ! -e "$$gov_dir/auth.auto.tfvars" ]; then \
+				echo "ERROR: $$gov_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+			fi; \
+			if [ ! -e "$$gov_dir/auth.auto.tfvars" ] && [ ! -L "$$gov_dir/auth.auto.tfvars" ]; then \
+				ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars"; \
+			fi; \
+			if [ -L "$$gov_dir/env.auto.tfvars" ] && [ ! -e "$$gov_dir/env.auto.tfvars" ]; then \
+				echo "ERROR: $$gov_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+			fi; \
+			if [ ! -e "$$gov_dir/env.auto.tfvars" ] && [ ! -L "$$gov_dir/env.auto.tfvars" ]; then \
+				ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars"; \
+			fi; \
 		fi; \
 		if [ -n "$$owned" ]; then \
 			rm -f "$$env_dir"/*.tf; \
 			rm -f "$$env_dir"/*.py "$$env_dir"/ABAC_PROMPT.md; \
 			rm -rf "$$env_dir/scripts"; \
 		fi; \
-		if [ ! -e "$$env_dir/auth.auto.tfvars" ]; then \
+		if [ -L "$$env_dir/auth.auto.tfvars" ] && [ ! -e "$$env_dir/auth.auto.tfvars" ]; then \
+			echo "ERROR: $$env_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+		fi; \
+		if [ ! -e "$$env_dir/auth.auto.tfvars" ] && [ ! -L "$$env_dir/auth.auto.tfvars" ]; then \
 			if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
 				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars"; \
 			else \
 				cp "$(SHARED_ROOT)/auth.auto.tfvars.example" "$$env_dir/auth.auto.tfvars"; \
 			fi; \
 		fi; \
-		if [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
+		if [ -L "$$env_dir/env.auto.tfvars" ] && [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
+			echo "ERROR: $$env_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+		fi; \
+		if [ ! -e "$$env_dir/env.auto.tfvars" ] && [ ! -L "$$env_dir/env.auto.tfvars" ]; then \
 			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars"; \
 			if [ "$$env_name" = "$(ACCOUNT_ENV)" ] || [ "$${_SEED_PROMOTION_SETTINGS:-1}" = 0 ]; then \
 				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars"; \
@@ -2454,10 +2471,16 @@ migrate-root-to-env: _prepare-env ## Move existing root working files into envs/
 		echo "Moved $$(basename "$$path")"; \
 		found=1; \
 	done; \
-	if [ ! -f "$(ENV_DIR)/auth.auto.tfvars" ]; then \
+	if [ -L "$(ENV_DIR)/auth.auto.tfvars" ] && [ ! -e "$(ENV_DIR)/auth.auto.tfvars" ]; then \
+		echo "ERROR: $(ENV_DIR)/auth.auto.tfvars is a dangling symlink; fix or remove it before migrating."; exit 1; \
+	fi; \
+	if [ ! -e "$(ENV_DIR)/auth.auto.tfvars" ] && [ ! -L "$(ENV_DIR)/auth.auto.tfvars" ]; then \
 		cp "$(SHARED_ROOT)/auth.auto.tfvars.example" "$(ENV_DIR)/auth.auto.tfvars"; \
 	fi; \
-	if [ ! -f "$(ENV_DIR)/env.auto.tfvars" ]; then \
+	if [ -L "$(ENV_DIR)/env.auto.tfvars" ] && [ ! -e "$(ENV_DIR)/env.auto.tfvars" ]; then \
+		echo "ERROR: $(ENV_DIR)/env.auto.tfvars is a dangling symlink; fix or remove it before migrating."; exit 1; \
+	fi; \
+	if [ ! -e "$(ENV_DIR)/env.auto.tfvars" ] && [ ! -L "$(ENV_DIR)/env.auto.tfvars" ]; then \
 		cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$(ENV_DIR)/env.auto.tfvars"; \
 	fi; \
 	if [ "$$found" -eq 0 ]; then \

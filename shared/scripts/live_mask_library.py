@@ -172,7 +172,11 @@ def main() -> int:
         import hcl2
         from databricks.sdk import WorkspaceClient
 
-        auth = hcl2.load(args.auth_file.open())
+        try:
+            auth = hcl2.load(args.auth_file.open())
+        except Exception:
+            # Parser text can echo credential fragments; never surface it.
+            raise SystemExit(f"ERROR: {args.auth_file} is not valid HCL") from None
         env = hcl2.load(args.env_file.open())
         w = WorkspaceClient(
             host=auth["databricks_workspace_host"], client_id=auth["databricks_client_id"],

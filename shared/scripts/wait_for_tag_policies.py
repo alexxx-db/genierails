@@ -41,7 +41,11 @@ def _load_auth() -> dict:
     auth_path = WORK_DIR / "auth.auto.tfvars"
     if not auth_path.exists():
         return {}
-    cfg = _load_hcl(auth_path)
+    try:
+        cfg = _load_hcl(auth_path)
+    except Exception:
+        # Parser text can echo credential fragments; never surface it.
+        raise SystemExit(f"ERROR: {auth_path} is not valid HCL") from None
     mapping = {
         "databricks_workspace_host": "DATABRICKS_HOST",
         "databricks_client_id": "DATABRICKS_CLIENT_ID",

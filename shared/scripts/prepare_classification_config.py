@@ -18,8 +18,14 @@ from scripts.footprint import FootprintError, resolve_footprint
 
 
 def _load(path: Path) -> dict:
-    with path.open() as handle:
-        return hcl2.load(handle)
+    try:
+        with path.open() as handle:
+            return hcl2.load(handle)
+    except Exception:
+        if path.name == "auth.auto.tfvars":
+            # Parser text can echo credential fragments; never surface it.
+            raise SystemExit(f"ERROR: {path} is not valid HCL") from None
+        raise
 
 
 def _value(config: dict, key: str) -> str:

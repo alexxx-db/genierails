@@ -55,8 +55,12 @@ def _load_auth():
         )
         import hcl2
 
-    with open(auth_path) as f:
-        cfg = hcl2.load(f)
+    try:
+        with open(auth_path) as f:
+            cfg = hcl2.load(f)
+    except Exception:
+        # Parser text can echo credential fragments; never surface it.
+        raise SystemExit(f"ERROR: {auth_path} is not valid HCL") from None
 
     mapping = {
         "databricks_workspace_host": "DATABRICKS_HOST",

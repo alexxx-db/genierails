@@ -35,6 +35,9 @@ def load_hcl(path: Path) -> dict:
         with path.open() as handle:
             value = hcl2.load(handle)
     except Exception as exc:
+        # Auth files can embed secrets; never echo parser text.
+        if path.name == "auth.auto.tfvars":
+            raise FootprintError(f"cannot parse {path}: not valid HCL") from None
         raise FootprintError(f"cannot parse {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise FootprintError(f"invalid {path}: expected top-level object")
