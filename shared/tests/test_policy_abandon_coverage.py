@@ -113,6 +113,27 @@ sys.exit(rc)
 '''
 
 
+# Below make as scripts/derive_assignments.py (make's live refresh before the staged
+# controller): writes the live DDL and the refresh record as the real script does, and
+# logs whether the env lock was held, without reading Unity Catalog.
+DERIVE = r'''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, {shared!r})
+from scripts import coverage_gate as cg, environment_lock
+
+args = sys.argv[1:]
+ddl, record = Path(args[args.index("--write-ddl") + 1]), Path(args[args.index("--refresh-record") + 1])
+env_dir = Path.cwd()
+ddl.parent.mkdir(exist_ok=True)
+ddl.write_text({ddl!r})
+config = None if "--ddl-only" in args else Path(args[args.index("--config") + 1])
+cg.write_refresh_record(record, mode="ddl" if config is None else "full", ddl_path=ddl, config_path=config)
+with open(os.environ["DERIVE_LOG"], "a") as log:
+    log.write(json.dumps({{"args": args, "locked": environment_lock.lock_path(env_dir).is_file()}}) + "\n")
+'''
+
+
 def _refresh(env_dir: Path, config: Path) -> None:
     """What derive-assignments leaves: live DDL and a refresh of ``config``'s tags."""
     ddl = env_dir / "ddl" / "_fetched.sql"
@@ -164,8 +185,8 @@ def _delete_principals(h) -> None:
     access_file(h).write_text(json.dumps({"grants": GRANTS, "client_id": NEW_SP, "gone": gone}))
 
 
-def rebound(h, tmp_path: Path, monkeypatch) -> Path:
-    """The AWS shape: a rolled-back change rebound by make policy-rebind, table SELECT kept, gate on its render."""
+def _before_rebind(h) -> None:
+    """A rolled-back change whose principals were deleted and recreated: what make policy-rebind fixes."""
     old = released(h)
     failed = write_env(h.env_dir, versions=VERSIONS, deployer=OLD_SP)
     h.fail_verify = {"switch"}
@@ -175,6 +196,11 @@ def rebound(h, tmp_path: Path, monkeypatch) -> Path:
     _delete_principals(h)
     fixed = write_env(h.env_dir, versions=VERSIONS, deployer=NEW_SP)
     _promoted(h, old, failed, fixed)
+
+
+def rebound(h, tmp_path: Path, monkeypatch) -> Path:
+    """The AWS shape: a rolled-back change rebound by make policy-rebind, table SELECT kept, gate on its render."""
+    _before_rebind(h)
     # The live refresh behind both renders: the restored (previous) generation's tags.
     out = pg.write_stage(h.env_dir / "data_access", _abandon_render(h), tmp_path / "refreshed")
     _refresh(h.env_dir, out / "abac.auto.tfvars")
@@ -195,18 +221,36 @@ def _table_grants(h) -> list[str]:
             if (r["type"], r["name"]) == ("databricks_grant", "table_access") for i in r["instances"]]
 
 
-def _make_abandon(h, tmp_path: Path, runner: Path) -> subprocess.CompletedProcess:
-    controller = tmp_path / "controller.py"
+def _make(target: str, h, tmp_path: Path, runner: Path, **stubs: str) -> subprocess.CompletedProcess:
+    controller, derive = tmp_path / "controller.py", tmp_path / "derive.py"
     controller.write_text(CONTROLLER.format(shared=str(SHARED)))
-    bin_dir = script_stubs.install(tmp_path / "stub-bin", {"staged_policy_apply.py": script_stubs.python_file(controller)})
+    derive.write_text(DERIVE.format(shared=str(SHARED), ddl=DDL))
+    bin_dir = script_stubs.install(tmp_path / "stub-bin", {
+        "staged_policy_apply.py": script_stubs.python_file(controller),
+        "derive_assignments.py": script_stubs.python_file(derive),
+        "external_mask_inventory.py": "true", **stubs})
     (tmp_path / "harness").mkdir(exist_ok=True)
-    environ = {k: v for k, v in os.environ.items()
+    environ = {k: v for k, v in script_stubs.without_ci(os.environ).items()
                if k not in ("MAKEFLAGS", "MAKELEVEL", "APPLY_FLAGS", "GENIERAILS_COVERAGE_GATE_RUNNER")}
     environ |= {"PATH": f"{bin_dir}:{os.environ['PATH']}", "HARNESS_TMP": str(tmp_path / "harness"),
-                "GATED_RUNNER": str(runner), "GIT_CONFIG_GLOBAL": "/dev/null"}
+                "GATED_RUNNER": str(runner), "DERIVE_LOG": str(tmp_path / "derive.log"),
+                "GIT_CONFIG_GLOBAL": "/dev/null"}
     return subprocess.run(
-        ["make", "--no-print-directory", "policy-abandon", "ENV=dev", f"ENV_DIR={h.env_dir}", f"ROOT_RUNNER={runner}"],
+        ["make", "--no-print-directory", target, "ENV=dev", f"ENV_DIR={h.env_dir}", f"ROOT_RUNNER={runner}"],
         cwd=ROOT / "aws", text=True, capture_output=True, env=environ, timeout=600)
+
+
+# make policy-rebind's preflight checks, which read live identities; not what these tests cover.
+REBIND_CHECKS = {"deployer_identity.py check": "true", "group_map.py check": "true"}
+
+
+def _make_abandon(h, tmp_path: Path, runner: Path) -> subprocess.CompletedProcess:
+    return _make("policy-abandon", h, tmp_path, runner)
+
+
+def _derives(tmp_path: Path) -> list[dict]:
+    log = tmp_path / "derive.log"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.is_file() else []
 
 
 # -- the AWS shape -------------------------------------------------------------------------
@@ -252,6 +296,72 @@ def test_abandon_of_a_change_that_never_switched_with_table_grants_rechecks_its_
     assert result.returncode == 0, result.stdout + result.stderr
     assert {p["name"] for p in live_policies(live_state(harness.env_dir))} == {p["name"] for p in old["fgac_policies"]}
     assert _table_grants(harness) and harness.journal()["transition"] is None
+
+
+# -- make re-reads live UC first --------------------------------------------------------------
+def test_make_policy_abandon_with_no_live_refresh_recorded_refreshes_it_under_the_lock(harness, tmp_path,
+                                                                                      monkeypatch):
+    """The live AWS shape after #196: no generated/.live_refresh.json (an earlier step invalidated it).
+
+    The abandon hook's coverage check refused with "no live refresh of tags/DDL recorded ... re-run the
+    same make command", and re-running didn't help: make policy-abandon never refreshed. It now does,
+    under the env lock, before the controller plans.
+    """
+    runner = rebound(harness, tmp_path, monkeypatch)
+    t = harness.journal()["transition"]
+    (harness.env_dir / cg.REFRESH_RELPATH).unlink()
+
+    result = _make_abandon(harness, tmp_path, runner)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "no live refresh of tags/DDL recorded" not in out and f"Abandoned generation {t['to']}" in out
+    derives = _derives(tmp_path)
+    assert len(derives) == 1 and derives[0]["locked"], derives
+    assert out.index("GenieRails environment lock acquired (dev, policy-abandon)") < out.index(
+        "=== Refresh Live DDL (dev) ===") < out.index("abandoning run")
+    assert harness.journal()["transition"] is None and harness.journal()["active"] == t["from"]
+
+
+def test_make_policy_abandon_stops_before_the_controller_when_the_live_refresh_fails(harness, tmp_path,
+                                                                                   monkeypatch):
+    runner = rebound(harness, tmp_path, monkeypatch)
+    before = (harness.journal(), live_state(harness.env_dir))
+    result = _make("policy-abandon", harness, tmp_path, runner, **{"derive_assignments.py": "false"})
+    assert result.returncode != 0
+    assert "abandoning run" not in result.stdout + result.stderr
+    assert harness.calls == [] and (harness.journal(), live_state(harness.env_dir)) == before
+
+
+def test_make_policy_rebind_with_no_live_refresh_recorded_refreshes_it_under_the_lock(harness, tmp_path,
+                                                                                    monkeypatch):
+    """policy-rebind's access phase runs the same coverage check, so it had the same gap."""
+    _before_rebind(harness)
+    (harness.env_dir / cg.REFRESH_RELPATH).unlink(missing_ok=True)
+    runner = _gated(harness, tmp_path, monkeypatch)
+    harness.calls.clear()
+
+    result = _make("policy-rebind", harness, tmp_path, runner, **REBIND_CHECKS)
+    out = result.stdout + result.stderr
+    assert "no live refresh of tags/DDL recorded" not in out, out
+    assert result.returncode == 0, out
+    derives = _derives(tmp_path)
+    assert len(derives) == 1 and derives[0]["locked"], derives
+    assert out.index("GenieRails environment lock acquired (dev, policy-rebind)") < out.index(
+        "=== Refresh Live DDL (dev) ===") < out.index("=== Policy rebind (dev)")
+    assert harness.journal()["transition"]["rebound"]
+
+
+def test_make_policy_rebind_stops_before_the_controller_when_the_live_refresh_fails(harness, tmp_path,
+                                                                                  monkeypatch):
+    _before_rebind(harness)
+    runner = _gated(harness, tmp_path, monkeypatch)
+    harness.calls.clear()
+    before = (harness.journal(), live_state(harness.env_dir))
+    result = _make("policy-rebind", harness, tmp_path, runner, **REBIND_CHECKS, **{"derive_assignments.py": "false"})
+    assert result.returncode != 0
+    assert "=== Policy rebind (dev)" not in result.stdout + result.stderr
+    assert harness.calls == [] and (harness.journal(), live_state(harness.env_dir)) == before
+    assert not harness.journal()["transition"].get("rebound")
 
 
 # -- the check is not weakened ----------------------------------------------------------------

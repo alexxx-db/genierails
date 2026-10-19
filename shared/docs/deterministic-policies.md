@@ -138,7 +138,10 @@ any unfinished transition with its completed phases. Writes are atomic.
   change would otherwise refuse.
 
   Abandon holds the env lock from its first check to its last, and binds
-  the live check to what it applies:
+  the live check to what it applies. Under the lock, make first re-reads
+  live tags and DDL (`derive-assignments`, or the DDL alone, as `rehearse`
+  does), which records the live refresh the coverage check needs; a failed
+  refresh stops abandon before it plans anything.
 
   1. It saves a refreshed plan of the abandon render (the previous
      generation without the change's policies). That plan may only delete
@@ -187,7 +190,9 @@ any unfinished transition with its completed phases. Writes are atomic.
   policy naming a principal the config replaced (rebind can re-point those
   only at principals recreated under the same name). Adding an `EXCEPT` or
   dropping a `TO` refuses. It re-applies the restore render with the
-  config's principals, under the env lock, in two phases:
+  config's principals, under the env lock, in two phases. Like abandon, it
+  first re-reads live tags and DDL under the lock for the access phase's
+  coverage check; a failed refresh stops rebind before it plans anything.
 
   1. **Protection.** Every policy depends on the grants in Terraform, so
      `-target` can't leave them out. Instead rebind plans the whole render,
