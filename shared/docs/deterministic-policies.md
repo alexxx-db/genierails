@@ -147,7 +147,8 @@ any unfinished transition with its completed phases. Writes are atomic.
      generation without the change's policies). That plan may only delete
      the policies the unfinished generation created, as the journal's
      generations record them; the enforcement wait those deletes restart is
-     the one other change allowed. Any other change refuses before anything
+     the one other change allowed, besides the one-time masking re-key
+     (below). Any other change refuses before anything
      is applied: a treatment tag update (a column retagged to the new value
      since the restore shows up as one), a policy's `TO`, `EXCEPT` or match,
      a function, a grant, or a create. Before planning, it re-runs the
@@ -242,6 +243,54 @@ any unfinished transition with its completed phases. Writes are atomic.
   exceptions.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
+
+### Masking functions and checkout paths
+
+`terraform_data.masking_functions` is replaced, which re-runs `CREATE OR
+REPLACE FUNCTION` and drops nothing, only when what it deploys changes: the
+normalized SQL hash, the warehouse, the workspace host or the deployer's
+client ID. It records no file paths, so a plan from another checkout of the
+same state (a teammate's clone, a CI runner, a moved repo,
+`GENIERAILS_STATE_DIR`) changes nothing. Edits to
+`deploy_masking_functions.py` itself don't replace it either; they apply on
+the next SQL change.
+
+`terraform_data.masking_functions_drop`, whose destroy-time provisioner drops
+the functions, records its SQL and auth files relative to the env dir and its
+script relative to `shared/`. The destroy resolves them in the checkout that
+runs it: the script under that run's module, the files under
+`GENIERAILS_MASKING_BASE_DIR`, which `scripts/terraform_layer.sh` exports (the
+env dir). A raw `terraform destroy` without that variable fails before
+dropping anything rather than guess; run it through `make destroy`. Only a
+real destroy drops the functions; a path change is never even an update.
+
+**Once, after upgrading**, state written by an earlier version still records
+absolute paths, so the first data_access plan shows:
+
+```
+# module.data_access.terraform_data.masking_functions must be replaced
+      ~ triggers_replace = {
+          - auth_file    = "/old/checkout/.../auth.auto.tfvars"
+          - script       = "/old/checkout/shared/deploy_masking_functions.py"
+          - sql_file     = "/old/checkout/.../masking_functions.sql"
+            # (4 unchanged attributes hidden)
+        }
+# module.data_access.terraform_data.masking_functions_drop will be updated in-place
+# module.data_access.time_sleep.wait_for_policy_enforcement must be replaced
+```
+
+followed by `Note: this replacement only stops recording checkout paths`. That
+is a re-key: the same functions are redeployed on the same warehouse and
+nothing is dropped. It is safe to apply, including in prod. The staged
+controller treats it as one: abandon allows it (`masking_rekey` in
+`scripts/policy_generations.py`) and every stage prints `Policy stage <stage>:
+terraform_data.masking_functions is replaced only to stop recording checkout
+paths ...`. Rebind already allows a redeploy with the same SQL hash. It is
+only a re-key when `sql_hash`, `warehouse_id`, `host` and `client_id` are all
+recorded and unchanged and the only other changes are the path keys. The
+drop's update must keep its warehouse and host, and no stage may delete or
+replace `masking_functions_drop`. Anything else is refused as before. After
+that one apply, plans from any checkout show no masking change.
 
 In `rehearse`, `apply` and `maintain` these phases run inside the applying
 command. A prod release is two-phase (rollout step 9, [pipelines.md](pipelines.md#release-gating-deterministic-envs)):

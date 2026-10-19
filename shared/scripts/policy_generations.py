@@ -149,6 +149,16 @@ BUSINESS_GRANTS = {"catalog_access", "schema_access", "table_access"}
 ACCESS_GRANTS = BUSINESS_GRANTS | {"terraform_sp_manage_catalog"}
 MASKING_FUNCTIONS = "terraform_data.masking_functions"
 FUNCTION_DROP = "terraform_data.masking_functions_drop"
+# What a masking_functions replace deploys and where (its triggers since the
+# paths left them); a replace that keeps all four only re-keys it.
+DEPLOY_TRIGGERS = ("sql_hash", "warehouse_id", "host", "client_id")
+# Checkout paths, which older states recorded in masking_functions' triggers
+# and masking_functions_drop's input (as absolute paths).
+PATH_KEYS = frozenset({"sql_file", "script", "auth_file", "relative_base"})
+DROP_TARGET = ("warehouse_id", "host")
+REKEY_NOTE = ("terraform_data.masking_functions is replaced only to stop recording checkout paths "
+              "(sql_file, script, auth_file): the SQL, warehouse, host and client are unchanged, so it "
+              "re-runs CREATE OR REPLACE of the same functions and drops nothing. This happens once.")
 # What a rebind may change on a mask policy; everything else must be planned unchanged.
 REBIND_POLICY_FIELDS = ("to_principals", "except_principals")
 POLICY_BINDING = ("name", "on_securable_type", "on_securable_fullname", "policy_type", "for_securable_type",
@@ -501,7 +511,8 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
     new protection is switched in. ``abandon`` may only delete those policies:
     any other change (a treatment tag retagged since the restore, a policy's
     principals or match, a function, a grant, a create) is refused, apart from
-    the enforcement wait that a policy delete restarts.
+    the enforcement wait that a policy delete restarts and a path-only re-key
+    of the masking functions (``masking_rekey``).
     """
     problems = []
     for change in plan.get("resource_changes") or []:
@@ -513,6 +524,8 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
             if actions == ["delete"] and rtype == "databricks_policy_info" and key in allowed_policy_deletes:
                 continue
             if address.endswith(ENFORCEMENT_WAIT):
+                continue
+            if masking_rekey(change):  # the one-time move of the paths out of state
                 continue
             problems.append(f"{address}: {'/'.join(actions)} (abandon only deletes the unfinished change's policies)")
             continue
@@ -704,6 +717,8 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
             return 1
+        for note in rekey_notes(plan):
+            print(f"Policy stage {stage}: {note}")
         if plan_out:
             write_json(sidecar_path(plan_file), record | {"changes": plan_changes(plan),
                                                           "policy_deletes": planned_policy_deletes(plan)})
@@ -939,10 +954,52 @@ def coverage_loss_problems(plan: dict, recorded: list[dict], mapping: dict[str, 
     return problems
 
 
-def _trigger(values: dict | None, field: str):
-    value = (values or {}).get("triggers_replace")
+def _values(values: dict | None, field: str) -> dict:
+    value = (values or {}).get(field)
     value = value.get("value", value) if isinstance(value, dict) and "type" in value else value
-    return (value or {}).get(field) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _trigger(values: dict | None, field: str):
+    return _values(values, "triggers_replace").get(field)
+
+
+def _path_only(before: dict, after: dict, kept: tuple[str, ...]) -> bool:
+    """Every key in ``kept`` is set and unchanged, and every other change is a checkout path."""
+    if not all(before.get(k) and before.get(k) == after.get(k) for k in kept):
+        return False
+    return all(before.get(k) == after.get(k) for k in before.keys() | after.keys() if k not in PATH_KEYS)
+
+
+def masking_rekey(change: dict) -> bool:
+    """Whether a planned change only moves checkout paths out of the masking resources' state.
+
+    masking_functions once recorded sql_file, script and auth_file in its
+    triggers, so every checkout planned a replace, and the first plan without
+    them replaces it once more. A replace that keeps sql_hash, warehouse_id,
+    host and client_id re-runs CREATE OR REPLACE of the same functions on the
+    same warehouse, and (with no destroy-time provisioner on masking_functions:
+    redeploy_drops_functions) drops nothing. masking_functions_drop's input
+    moving from absolute to relative paths is an in-place update that keeps the
+    warehouse and host. Anything else, including any delete of
+    masking_functions_drop (the destroy that drops the functions), is not.
+    """
+    address = str(change.get("address") or "")
+    body = change.get("change") or {}
+    actions = sorted(body.get("actions") or [])
+    before, after = body.get("before"), body.get("after")
+    if address.endswith(MASKING_FUNCTIONS) and actions == ["create", "delete"]:
+        return (_path_only(_values(before, "triggers_replace"), _values(after, "triggers_replace"),
+                           DEPLOY_TRIGGERS) and not redeploy_drops_functions())
+    if address.endswith(FUNCTION_DROP) and actions == ["update"]:
+        return _path_only(_values(before, "input"), _values(after, "input"), DROP_TARGET)
+    return False
+
+
+def rekey_notes(plan: dict) -> list[str]:
+    """The note for a plan that re-keys the masking functions (masking_rekey), else none."""
+    return [REKEY_NOTE] if any(masking_rekey(c) and str(c.get("address") or "").endswith(MASKING_FUNCTIONS)
+                               for c in plan.get("resource_changes") or []) else []
 
 
 def redeploy_drops_functions(module_main: Path = SHARED / "modules" / "data_access" / "main.tf") -> bool:
@@ -1147,6 +1204,8 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     print(f"Policy stage {stage}: planned into {plan_file}" + ("" if summary else " (no changes)"))
     for line in summary:
         print(f"  {line}")
+    for note in rekey_notes(plan):
+        print(f"Policy stage {stage}: {note}")
     if held:
         print(f"  held back until the access phase: {len(held)} grant(s)")
     return 0

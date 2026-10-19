@@ -148,10 +148,11 @@ def test_masking_resource_keeps_no_secret_and_ignores_nothing():
     block = _resource_block(MODULE_TF.read_text(), 'resource "terraform_data" "masking_functions" {')
     triggers = re.search(r"triggers_replace = \{(.*?)\n  \}", block, re.S).group(1)
     keys = set(re.findall(r"^\s*(\w+)\s*=", triggers, re.M))
-    assert keys == {"sql_hash", "sql_file", "script", "auth_file", "warehouse_id", "host", "client_id"}
+    # What is deployed and where; never a checkout path (test_masking_checkout_paths.py).
+    assert keys == {"sql_hash", "warehouse_id", "host", "client_id"}
     assert "secret" not in block
     assert "ignore_changes" not in block
-    assert block.count("--auth-file ${self.triggers_replace.auth_file}") == 1
+    assert block.count("--auth-file ${var.auth_file}") == 1
     # Replacing it (any SQL change) must never drop the functions live policies use.
     assert "when    = destroy" not in block and "--drop" not in block
 
@@ -230,6 +231,10 @@ def _masking_root(tf: str) -> str:
         for header in ('resource "terraform_data" "masking_functions" {',
                        'resource "terraform_data" "masking_functions_drop" {')
         if header in tf)  # the drop resource only exists from PR #76 on
+    # From the checkout-path fix on, the drop records relative paths computed here.
+    paths = re.search(r"\nlocals \{\n(?:  #[^\n]*\n)*  masking_project_root.*?\n\}\n", tf, re.S)
+    if paths:
+        blocks = paths.group(0) + 'variable "masking_paths_base" {\n  default = ""\n}\n' + blocks
     removed = re.search(r"removed \{.*?\n\}\n", tf, re.S).group(0)
     return (
         'terraform {\n  required_providers {\n'

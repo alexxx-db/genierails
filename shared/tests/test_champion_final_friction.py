@@ -318,6 +318,10 @@ MASKING = "module.data_access.terraform_data.masking_functions[0]"
     (_plan((MASKING, "is tainted, so must be replaced")), True),
     (_plan((MASKING, "must be replaced"), ("module.data_access.databricks_grant.x", "will be destroyed")), False),
     (_plan((MASKING, "must be replaced"), ("module.data_access.databricks_policy_info.p", "must be replaced")), False),
+    # The policy-enforcement wait is keyed on masking_functions' id, so it is replaced with it.
+    (_plan((MASKING, "must be replaced"), ("module.data_access.time_sleep.wait_for_policy_enforcement",
+                                           "must be replaced")), True),
+    (_plan(("module.data_access.time_sleep.wait_for_policy_enforcement", "must be replaced")), False),
     (_plan((MASKING, "will be destroyed")), False),
     (_plan((MASKING, "must be replaced"), destroy=2), False),
     (["No changes. Your infrastructure matches the configuration."], False),

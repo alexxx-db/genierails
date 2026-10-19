@@ -9,6 +9,12 @@ Usage:
   python3 deploy_masking_functions.py --sql-file masking_functions.sql \
       --warehouse-id <id> --auth-file auth.auto.tfvars --host <workspace-url>
   python3 deploy_masking_functions.py ... --drop
+  python3 deploy_masking_functions.py ... --drop --base-dir <env-dir>
+
+terraform_data.masking_functions_drop records --sql-file and --auth-file
+relative to the env dir, so its destroy-time drop passes --base-dir (the
+GENIERAILS_MASKING_BASE_DIR terraform_layer.sh exports) and runs from any
+checkout. Absolute paths are used as given.
 """
 
 import argparse
@@ -392,6 +398,25 @@ def load_credentials(auth_file: str, host: str) -> None:
     os.environ["DATABRICKS_CLIENT_SECRET"] = values["databricks_client_secret"]
 
 
+def resolve_paths(args) -> None:
+    """Resolve relative --sql-file/--auth-file against --base-dir, or exit."""
+    if args.base_dir is None:
+        return
+    relative = [p for p in (args.sql_file, args.auth_file) if not os.path.isabs(p)]
+    if relative and not args.base_dir:
+        print(
+            "ERROR: masking_functions_drop records "
+            f"{', '.join(relative)} relative to the env dir, but "
+            "GENIERAILS_MASKING_BASE_DIR is unset, so the drop can't find "
+            "them. Run the destroy through terraform_layer.sh (make destroy), "
+            "which sets it; nothing was dropped.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    args.sql_file = os.path.join(args.base_dir, args.sql_file)
+    args.auth_file = os.path.join(args.base_dir, args.auth_file)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Deploy or drop masking functions via "
@@ -425,7 +450,14 @@ def main():
         required=True,
         help="Workspace URL the functions belong to; must match --auth-file",
     )
+    parser.add_argument(
+        "--base-dir",
+        default=None,
+        help="Directory relative --sql-file and --auth-file are resolved "
+        "against (the env dir); given but empty, relative paths refuse",
+    )
     args = parser.parse_args()
+    resolve_paths(args)
     load_credentials(args.auth_file, args.host)
 
     if args.drop:

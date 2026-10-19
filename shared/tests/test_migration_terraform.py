@@ -31,7 +31,7 @@ from governance_policies import build_model
 from scripts import migration
 from scripts import policy_generations as pg
 from scripts.staged_policy_apply import _hcl_value
-from tests.terraform_helpers import tf, tf_env, tf_init
+from tests.terraform_helpers import MASKING_REKEY, is_masking_rekey, tf, tf_env, tf_init
 
 ROOT = Path(__file__).parents[2]
 SHARED = ROOT / "shared"
@@ -353,9 +353,10 @@ def test_old_code_apply_then_new_code_migration_destroys_nothing_and_leaves_no_g
     runs = _sections(result.stdout)
     assert all(section.startswith("pass") for section in runs.values()), result.stdout
 
-    # Never opted in: nothing at all changes.
-    assert "No changes. Your infrastructure matches the configuration." in runs["untouched_replan"], \
-        runs["untouched_replan"]
+    # Never opted in: nothing changes but the one-time masking re-key (the
+    # legacy module recorded checkout paths in masking_functions' triggers).
+    assert set(CHANGE.findall(runs["untouched_replan"])) == MASKING_REKEY, runs["untouched_replan"]
+    assert is_masking_rekey(runs["untouched_replan"]), runs["untouched_replan"]
     # Create: the tag moves to its stable key (no destroy/create), the new policies are added,
     # the legacy policy and every grant are untouched.
     create = runs["create_plan"]
@@ -363,7 +364,9 @@ def test_old_code_apply_then_new_code_migration_destroys_nothing_and_leaves_no_g
            f"{moves[0][1].removeprefix('module.data_access.')}" in create, create
     for name in ("create", "switch", "grant"):
         assert _destroyed(runs[f"{name}_plan"]) == set(), (name, runs[f"{name}_plan"])
-    assert "Plan: 2 to add, 1 to change, 0 to destroy." in runs["create_plan"]  # the two new policies
+    # The two new policies, and the one-time masking re-key on this legacy state.
+    assert set(CHANGE.findall(runs["create_plan"])) >= MASKING_REKEY and is_masking_rekey(runs["create_plan"])
+    assert "Plan: 3 to add, 2 to change, 1 to destroy." in runs["create_plan"]
     assert "Plan: 0 to add, 1 to change, 0 to destroy." in runs["switch_plan"]  # the retag
     assert "No changes." in runs["grant_plan"]
     changes = {phase: dict((a, c) for a, c in CHANGE.findall(runs[f"{phase}_plan"]))

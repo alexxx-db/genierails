@@ -1247,7 +1247,7 @@ def _main_tree(tmp_path: Path) -> Path:
 @pytest.mark.parametrize("root_name,body", [("data_access", LEGACY_DATA_ACCESS_TEST), ("workspace", LEGACY_WORKSPACE_TEST)],
                          ids=["data_access", "workspace"])
 def test_legacy_roots_applied_by_main_plan_no_changes(root_name, body, tmp_path, tf_plugin_cache):
-    from tests.terraform_helpers import shared_copy, tf, tf_env, tf_init
+    from tests.terraform_helpers import MASKING_REKEY, is_masking_rekey, shared_copy, tf, tf_env, tf_init
 
     legacy = _main_tree(tmp_path)
     copy = shared_copy(tmp_path)
@@ -1284,7 +1284,11 @@ def test_legacy_roots_applied_by_main_plan_no_changes(root_name, body, tmp_path,
         assert not re.search(r"(?:will be|must be) (?:created|updated|replaced|destroyed)", replan), replan
         assert replan.count("Changes to Outputs:") == 1, replan
     else:
-        assert "No changes. Your infrastructure matches the configuration." in replan, replan
+        # main recorded checkout paths in masking_functions' triggers: the one
+        # drop-free re-key, and nothing else.
+        changes = set(re.findall(r"# module\.data_access\.(\S+) (will be \S+(?: in-place)?|must be replaced)", replan))
+        assert changes == MASKING_REKEY, replan
+        assert is_masking_rekey(replan), replan
 
 
 # -- check-masks (make policy-rebind, before it creates grants again) -------------------------

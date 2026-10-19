@@ -330,6 +330,13 @@ fi
 if [ "$LAYER_CONFIG_DIR" != "$ENV_DIR" ]; then
   RUNNER_VARS+=(-var="masking_sql_file=$LAYER_CONFIG_DIR/masking_functions.sql")
 fi
+# masking_functions_drop records its SQL and auth files relative to the env
+# dir (the data_access root's dirname(env_dir)); its destroy-time drop
+# resolves them here, in whichever checkout runs the destroy.
+if [ "$LAYER" = "data_access" ]; then
+  GENIERAILS_MASKING_BASE_DIR="$(dirname "$ENV_DIR")"
+  export GENIERAILS_MASKING_BASE_DIR
+fi
 
 # The roots read state with file(): the workspace root its own and the
 # data_access state (the CAN_RUN on record, the applied coverage check and
