@@ -709,6 +709,22 @@ def test_rehearse_writes_a_receipt_and_reuses_it_without_reapplying(make, repo):
     assert _no_lock(repo, "dev")
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ((), ["verify-access", "ENV=dev", "VERIFY_GATE=1", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="]),
+        (("VERIFY_KEY_COLUMN=customer_id",),
+         ["verify-access", "ENV=dev", "VERIFY_GATE=1", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=",
+          "VERIFY_KEY_COLUMN=customer_id"]),
+    ],
+    ids=["autopick", "explicit-key"],
+)
+def test_deterministic_rehearse_pins_verify_access_arguments(make, extra, expected):
+    result = make("rehearse", "dev", *extra)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [call for call in make.calls() if call[:1] == ["verify-access"]] == [expected]
+
+
 def test_a_failed_rehearse_step_writes_a_failed_receipt(tmp_path, repo):
     make = Make(tmp_path, repo, fail="coverage-gate")
     result = make("rehearse", "dev")
