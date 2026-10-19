@@ -143,6 +143,17 @@ def test_every_applying_verify_access_runs_through_the_gate_target():
     assert all("_verify-access-gate ENV=" in line and "VERIFY_GATE=" not in line for line in callers), callers
 
 
+def test_every_staged_controller_verify_command_is_the_gate_target():
+    # run, apply-saved and policy-rebind each hand the controller the one gated command.
+    makefile = (SHARED / "Makefile.shared").read_text()
+    assert re.search(r"^override _STAGED_VERIFY_ACCESS = \$\(MAKE\) --no-print-directory _verify-access-gate ENV=",
+                     makefile, re.M)
+    commands = re.findall(r"--verify-access-cmd ('[^']*')", makefile)
+    assert len(commands) == 3 and set(commands) == {"'$(_STAGED_VERIFY_ACCESS)'"}, commands
+    rebind = makefile[makefile.index("\npolicy-rebind:"):]
+    assert "--verify-access-cmd '$(_STAGED_VERIFY_ACCESS)'" in rebind[:rebind.index("\n\n")]
+
+
 def test_a_gate_run_with_a_spec_and_no_minimum_refuses(tmp_path):
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps({"column_masks": [], "row_filters": []}))
