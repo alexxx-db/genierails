@@ -157,8 +157,18 @@ def _abandon_render(h) -> dict:
     return pg.plan_stage("abandon", changed, old, None, keep_new_tags=t["switch_attempted"])["rendered"]
 
 
+GROUPS = "groups = {\n  raw = {}\n  regional = {}\n  masked = {}\n}\n\n"
+
+
 def _promoted(h, *generations) -> None:
-    """The split config as promote leaves it: the account groups, and tag policies in the account layer."""
+    """The split config as promote leaves it: the account groups, and tag policies in the account layer.
+
+    The generated config carries the groups too, so a promote under make (policy-abandon and
+    policy-rebind re-split after their live refresh) splits the same config out again.
+    """
+    generated = h.env_dir / "generated" / "abac.auto.tfvars"
+    if not generated.read_text().startswith(GROUPS):
+        generated.write_text(GROUPS + generated.read_text())
     values = sorted({v for g in generations for v in g["tags"].values()})
     account = h.env_dir.parent / "account"
     account.mkdir(exist_ok=True)
@@ -167,7 +177,7 @@ def _promoted(h, *generations) -> None:
         f"    values = {json.dumps(values)}\n  }}\n]\n")
     layer = h.env_dir / "data_access" / "abac.auto.tfvars"
     rest = layer.read_text().split("tag_assignments = [", 1)[1]
-    layer.write_text("groups = {\n  raw = {}\n  regional = {}\n  masked = {}\n}\n\ntag_assignments = [" + rest)
+    layer.write_text(GROUPS + "tag_assignments = [" + rest)
 
 
 def _delete_principals(h) -> None:

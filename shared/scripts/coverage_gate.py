@@ -16,13 +16,17 @@
      Unity Catalog (generated/.live_refresh.json): it must match the DDL and
      the tags being gated, else the gate fails. Its time becomes the result's
      refreshed_at. One exception, for a staged phase only (``--stage``): the
-     phases before the switch of a recorded legacy migration keep the legacy
-     tag values live, while the refresh recorded the versioned values the
-     switch applies. There the tags must be exactly the desired config the
-     refresh recorded, with each treatment tag at the value the adopted legacy
-     generation recorded (staged_migration_assignments). Without an adopted
-     migration record, a policy journal moving from it and a snapshot that
-     matches its fingerprint, the mismatch fails as before.
+     phases before the switch (create, tighten, restore, abandon) keep the
+     active generation's treatment values live, while the refresh recorded
+     the desired values the switch applies. There the tags must be exactly
+     the desired config the refresh recorded, with each treatment tag at the
+     value the active generation recorded (staged_kept_assignments): an
+     adopted legacy migration's (staged_migration_assignments), or a
+     deterministic generation's (staged_generation_assignments). Without a
+     policy journal moving from that generation and a snapshot that matches
+     its fingerprint (and, for a legacy one, an adopted migration record), the
+     mismatch fails as before. The result records the generation kept
+     (kept_from) and the governed columns the phase leaves untagged.
   5. Ask Terraform for the fingerprint again and write the result to
      envs/<env>/data_access/.coverage_gate.json.
 
@@ -317,45 +321,193 @@ def staged_migration_assignments(env_dir: Path, stage: str, old_fingerprint: str
     return desired, staged
 
 
+def _is_treatment(item: dict) -> bool:
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from governance_policies import TAG_KEY
+
+    return item.get("entity_type") == "columns" and item.get("tag_key") == TAG_KEY
+
+
+def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: str, keep_new_tags: bool = False,
+                                  rebind_fingerprint: str = "", opens_access: bool = False) -> tuple[list, list, dict]:
+    """(desired, staged, kept) tag assignments of a phase that keeps a deterministic generation's values.
+
+    The deterministic counterpart of staged_migration_assignments: ``staged``
+    is what policy_generations.plan_stage renders for ``stage`` from the
+    effective config the refresh recorded (``desired``): its non-treatment
+    assignments, every treatment tag at the value generation
+    ``old_fingerprint`` recorded and, after an attempted switch
+    (``keep_new_tags``, except for abandon), newly governed columns at their
+    desired value. ``kept`` is what the result records: the generation kept
+    (``kept_from``) and the columns the refresh governs that the render
+    leaves untagged (``uncovered_columns``). Raises GateError, failing closed,
+    unless:
+
+    * the stage keeps the old values (pg.KEEP_TAG_STAGES);
+    * the policy journal's active generation and transition start are
+      ``old_fingerprint``, and the transition ends at the effective config's
+      generation (not checked for abandon, which drops a transition the
+      config may have moved on from). A rebind (``rebind_fingerprint``,
+      judged as restore) instead needs the effective config to be that
+      generation and to differ from the transition's only by recreated
+      principals (pg.rebind_problems);
+    * the snapshot of ``old_fingerprint`` still hashes to it;
+    * a phase that can open access (``rebind_fingerprint`` or
+      ``opens_access``: the rebind phases, a grant re-check) leaves no
+      governed column untagged. The other phases refuse every business
+      grant create (pg.plan_violations), so a column the refresh governs but
+      the render doesn't tag (a new column before the switch) gains no
+      reader through them.
+    """
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from governance_policies import TAG_KEY, model_fingerprint
+    from scripts import policy_generations as pg
+    from scripts import staged_policy_apply as spa
+    from scripts.runtime_overlay import effective
+
+    if stage not in pg.KEEP_TAG_STAGES:
+        raise GateError(f"the {stage} phase applies the desired values")
+    if not old_fingerprint:
+        raise GateError("no active generation is recorded for the phase to keep")
+    try:
+        journal = spa.load_journal(env_dir) or {}
+        snapshot = pg.load_snapshot(env_dir, old_fingerprint)
+        generation = pg.desired_generation(env_dir)
+    except (spa.Refused, pg.StageError, OSError, ValueError) as exc:
+        raise GateError(str(exc)) from exc
+    target = generation["fingerprint"]
+    transition = journal.get("transition") or {}
+    if journal.get("active") != old_fingerprint or transition.get("from") != old_fingerprint:
+        raise GateError(f"the policy journal records no transition from {old_fingerprint}")
+    if rebind_fingerprint:
+        if stage != "restore":
+            raise GateError(f"a rebind is judged as the restore it re-applies, not as {stage}")
+        if target != rebind_fingerprint:
+            raise GateError(f"the generated config is generation {target}, not {rebind_fingerprint}, which the "
+                            "rebind re-points to")
+        changed_fp, retain_fp = transition.get("to") or "", transition.get("retain") or ""
+        try:
+            changed = pg.load_snapshot(env_dir, changed_fp)
+            retire = pg.load_snapshot(env_dir, retain_fp) if retain_fp not in {"", changed_fp, old_fingerprint} \
+                else None
+        except (pg.StageError, OSError, ValueError) as exc:
+            raise GateError(str(exc)) from exc
+        if changed is None:
+            raise GateError("the policy journal records no unfinished change to re-point")
+        problems = pg.rebind_problems(generation, changed, [g for g in (snapshot, retire) if g],
+                                      pg.rebind_approved(env_dir, generation))
+        if problems:
+            raise GateError(f"the generated config isn't the unfinished change {changed_fp} with only its "
+                            f"principals moved: {'; '.join(problems[:3])}")
+    elif stage != "abandon" and transition.get("to") != target:
+        raise GateError(f"the policy journal records no transition from {old_fingerprint} to {target}")
+    try:
+        old_tags = dict(snapshot["tags"])
+        recorded = {"fgac_policies": snapshot["fgac_policies"], "tag_assignments": [
+            {"entity_type": "columns", "entity_name": column, "tag_key": TAG_KEY, "tag_value": value}
+            for column, value in old_tags.items()]}
+        intact = model_fingerprint(recorded, snapshot["functions_sql"]) == old_fingerprint
+    except (KeyError, TypeError, ValueError, AttributeError):
+        intact = False
+    if not intact:
+        raise GateError(f"the snapshot of {old_fingerprint} doesn't match its fingerprint (edited since it was "
+                        "recorded)")
+
+    desired = list(_load_tfvars(effective(env_dir, "abac.auto.tfvars")).get("tag_assignments") or [])
+    tags = dict(old_tags)
+    if keep_new_tags and stage != "abandon":
+        tags.update({i.get("entity_name"): i.get("tag_value") for i in desired
+                     if _is_treatment(i) and i.get("entity_name") not in old_tags})
+    staged = [i for i in desired if not _is_treatment(i)] + [
+        {"entity_type": "columns", "entity_name": column, "tag_key": TAG_KEY, "tag_value": value}
+        for column, value in sorted(tags.items())]
+    uncovered = sorted({i.get("entity_name") for i in desired if _is_treatment(i)} - tags.keys())
+    if uncovered and (rebind_fingerprint or opens_access):
+        raise GateError(f"{len(uncovered)} column(s) the live refresh governs have no treatment tag in this render "
+                        f"({', '.join(uncovered[:5])}), and this phase opens access; the refresh's columns must "
+                        "all be covered")
+    return desired, staged, {"kept_from": old_fingerprint, "uncovered_columns": uncovered}
+
+
+def staged_kept_assignments(env_dir: Path, stage: str, old_fingerprint: str, keep_new_tags: bool = False,
+                            rebind_fingerprint: str = "", opens_access: bool = False) -> tuple[list, list, dict]:
+    """(desired, staged, kept) of a phase that keeps the active generation's values: legacy or deterministic."""
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from scripts import migration
+
+    if old_fingerprint.startswith(migration.LEGACY_PREFIX):
+        desired, staged = staged_migration_assignments(env_dir, stage, old_fingerprint, keep_new_tags)
+        return desired, staged, {}
+    return staged_generation_assignments(env_dir, stage, old_fingerprint, keep_new_tags,
+                                         rebind_fingerprint, opens_access)
+
+
 def live_refresh(env_dir: Path, tfvars: Path, staged: dict | None = None) -> tuple[str | None, str]:
     """The refreshed_at of a live refresh that matches the gated inputs, or why not.
 
-    ``staged`` (stage, old_fingerprint, keep_new_tags) names the staged phase
-    that rendered ``tfvars``; see staged_migration_assignments.
+    ``staged`` (stage, old_fingerprint, keep_new_tags, and optionally
+    rebind_fingerprint and opens_access) names the staged phase that rendered
+    ``tfvars``; see staged_kept_assignments.
     """
+    return _live_refresh(env_dir, tfvars, staged)[:2]
+
+
+def _live_refresh(env_dir: Path, tfvars: Path, staged: dict | None = None) -> tuple[str | None, str, dict]:
+    """live_refresh, with what a pass records about the generation a staged phase kept."""
     path = env_dir / REFRESH_RELPATH
     hint = "make runs derive-assignments first; re-run the same make command"
     if not path.is_file():
-        return None, f"no live refresh of tags/DDL recorded ({path}); {hint}"
+        return None, f"no live refresh of tags/DDL recorded ({path}); {hint}", {}
     try:
         record = json.loads(path.read_text())
         refreshed_at = str(record["refreshed_at"])
         datetime.strptime(refreshed_at, "%Y-%m-%dT%H:%M:%SZ")
         mode = record["mode"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        return None, f"unreadable live-refresh record {path}: {exc}"
+        return None, f"unreadable live-refresh record {path}: {exc}", {}
     if mode not in ("full", "ddl"):
-        return None, f"unknown live-refresh mode {mode!r} in {path}"
+        return None, f"unknown live-refresh mode {mode!r} in {path}", {}
     if record.get("ddl_sha256") != file_sha256(env_dir / "ddl" / "_fetched.sql"):
-        return None, f"ddl/_fetched.sql changed since the last live refresh; {hint}"
+        return None, f"ddl/_fetched.sql changed since the last live refresh; {hint}", {}
     gated = tag_assignments_digest(_load_tfvars(tfvars).get("tag_assignments") or [])
     if mode == "full" and record.get("tag_assignments_sha256") != gated:
         if not staged:
             return None, ("the data_access tag_assignments don't match the last live refresh "
-                          f"(promote hasn't re-split it, or it was edited); {hint}")
-        stage = staged["stage"]
+                          f"(promote hasn't re-split it, or it was edited); {hint}"), {}
+        if str(SHARED_ROOT) not in sys.path:
+            sys.path.insert(0, str(SHARED_ROOT))
+        from scripts.migration import LEGACY_PREFIX
+
+        stage, old = staged["stage"], staged["old_fingerprint"]
+        legacy = old.startswith(LEGACY_PREFIX)
         try:
-            desired, kept = staged_migration_assignments(env_dir, **staged)
+            desired, kept, facts = staged_kept_assignments(env_dir, **staged)
         except GateError as exc:
+            if legacy:
+                return None, (f"the {stage} render's tag_assignments don't match the last live refresh, and it "
+                              f"isn't a phase that keeps a recorded legacy migration's values: {exc}"), {}
             return None, (f"the {stage} render's tag_assignments don't match the last live refresh, and it "
-                          f"isn't a phase that keeps a recorded legacy migration's values: {exc}")
+                          f"isn't a phase that keeps the active generation's recorded values: {exc}"), {}
         if record.get("tag_assignments_sha256") != tag_assignments_digest(desired):
-            return None, f"the generated config's tag_assignments don't match the last live refresh; {hint}"
+            return None, f"the generated config's tag_assignments don't match the last live refresh; {hint}", {}
         if gated != tag_assignments_digest(kept):
-            return None, (f"the {stage} render's tag_assignments are neither the live refresh's nor the "
-                          f"legacy values generation {staged['old_fingerprint']} keeps until the switch")
-        return refreshed_at, f"{mode}; {stage} keeps legacy generation {staged['old_fingerprint']}'s values"
-    return refreshed_at, mode
+            if legacy:
+                return None, (f"the {stage} render's tag_assignments are neither the live refresh's nor the "
+                              f"legacy values generation {old} keeps until the switch"), {}
+            return None, (f"the {stage} render's tag_assignments are neither the live refresh's nor the values "
+                          f"generation {old} keeps until the switch"), {}
+        if legacy:
+            return refreshed_at, f"{mode}; {stage} keeps legacy generation {old}'s values", {}
+        uncovered = facts["uncovered_columns"]
+        detail = f"{mode}; {stage} keeps generation {old}'s values (kept_from {old})"
+        if uncovered:
+            detail += (f"; {len(uncovered)} column(s) the live refresh governs stay untagged in this phase, which "
+                       f"opens no access ({', '.join(uncovered[:5])})")
+        return refreshed_at, detail, facts
+    return refreshed_at, mode, {}
 
 
 def query_inputs(runner: Path, env_name: str, layer_dir: Path, flags: list[str],
@@ -660,11 +812,11 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
     if validation.returncode != 0:
         return _failed(gate_path, record, inputs, env_name,
                        "coverage check failed (validate_abac.py --coverage-gate; see the report above)")
-    refreshed_at, detail = live_refresh(env_dir, tfvars, staged)
+    refreshed_at, detail, kept = _live_refresh(env_dir, tfvars, staged)
     if refreshed_at is None:
         return _failed(gate_path, record, inputs, env_name, detail)
     print(f"  Live refresh ({detail}) at {refreshed_at}")
-    record.update(status="pass", refreshed_at=refreshed_at)
+    record.update(status="pass", refreshed_at=refreshed_at, **kept)
     write_result(gate_path, record)
     return 0
 
@@ -794,6 +946,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--stage", default="", help="the staged phase that rendered --layer-config-dir")
     run.add_argument("--old-fingerprint", default="", help="the active generation the phase keeps live")
     run.add_argument("--keep-new-tags", action="store_true", help="a switch was attempted (the phase's KEEP_NEW_TAGS)")
+    run.add_argument("--rebind-fingerprint", default="",
+                     help="make policy-rebind: the generation whose principals the restore render takes")
+    run.add_argument("--opens-access", action="store_true",
+                     help="the render is applied with new grants allowed (the grant phase)")
     derive = sub.add_parser("needs-derive", help="print the live refresh make must run first: full, ddl or none")
     derive.add_argument("--env-dir", required=True, type=Path)
     derive.add_argument("--apply-flags", default="")
@@ -852,7 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"live refresh before exposure ({mode}): {reason}", file=sys.stderr)
             return 0
         staged = ({"stage": args.stage, "old_fingerprint": args.old_fingerprint,
-                   "keep_new_tags": args.keep_new_tags} if args.stage else None)
+                   "keep_new_tags": args.keep_new_tags, "rebind_fingerprint": args.rebind_fingerprint,
+                   "opens_access": args.opens_access} if args.stage else None)
         return run_gate(args.env_dir.resolve(), args.env_name, args.runner, args.apply_flags, args.verbose,
                         args.layer_config_dir.resolve() if args.layer_config_dir else None, staged)
     except GateError as exc:

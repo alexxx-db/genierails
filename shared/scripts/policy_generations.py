@@ -30,9 +30,12 @@ scripts/terraform_layer.sh). They read:
   governed columns may already carry their new value; keep it.
 * ``GENIERAILS_COVERAGE_GATE_RUNNER``: when set, the coverage check re-runs on
   each render, so its result matches what the stage applies. It is told the
-  stage and the active generation, so the stages that keep a recorded legacy
-  migration's tag values (create, tighten, restore, abandon) aren't judged against the
-  versioned values the live refresh derived (scripts/coverage_gate.py).
+  stage and the active generation, so the stages that keep the active
+  generation's tag values (create, tighten, restore, abandon), a recorded
+  legacy migration's or a deterministic one's, aren't judged against the
+  desired values the live refresh derived (scripts/coverage_gate.py
+  staged_kept_assignments). A rebind is judged as its restore, told the
+  generation it re-points to; the grant re-check is told it opens access.
 * ``GENIERAILS_POLICY_PLAN_OUT=<file>`` (make release-plan): render, check and
   plan the stage into ``<file>``, record the render and whether the plan
   changes anything in ``<file>.json``, and apply nothing.
@@ -491,6 +494,26 @@ def write_stage(layer_dir: Path, rendered: dict, out_dir: Path | None = None) ->
     return out_dir
 
 
+def split_assignment_problems(env_dir: Path) -> list[str]:
+    """The non-treatment tag assignments the split data_access config and the effective config disagree on.
+
+    write_stage takes those from the split (the last promote), while the
+    live refresh records the effective config's; when they differ, the
+    coverage check and the stage's plan judge different assignments.
+    """
+    from scripts.runtime_overlay import effective
+
+    def others(path: Path) -> set[str]:
+        return {"|".join(str(item.get(f, "")) for f in ("entity_type", "entity_name", "tag_key", "tag_value"))
+                for item in _load(path).get("tag_assignments") or []
+                if not (item.get("entity_type") == "columns" and item.get("tag_key") == TAG_KEY)}
+
+    split = others(Path(env_dir) / "data_access" / "abac.auto.tfvars")
+    generated = others(effective(Path(env_dir), "abac.auto.tfvars"))
+    return ([f"{key} is in the generated config only" for key in sorted(generated - split)]
+            + [f"{key} is in the split data_access config only" for key in sorted(split - generated)])
+
+
 def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
                     allowed_tag_deletes=frozenset()) -> list[str]:
     """Changes in a plan that the stage may not make.
@@ -554,12 +577,15 @@ def _runner(env_name: str, layer_dir: Path, *args: str, capture: bool = False) -
 
 
 def _rerun_coverage_gate(env_dir: Path, env_name: str, runner: str, stage: str = "",
-                         old_fp: str = "", keep_new_tags: bool = False) -> None:
+                         old_fp: str = "", keep_new_tags: bool = False, *, rebind_fp: str = "",
+                         opens_access: bool = False) -> None:
     """Re-judge the coverage check on the render, so its result matches what is applied."""
     command = [sys.executable, str(COVERAGE_GATE), "run", "--env-dir", str(env_dir),
                "--env-name", env_name, "--runner", runner, "--layer-config-dir", str(stage_config_dir(env_dir))]
     if stage:
         command += ["--stage", stage, "--old-fingerprint", old_fp] + (["--keep-new-tags"] if keep_new_tags else [])
+        command += (["--rebind-fingerprint", rebind_fp] if rebind_fp else []) + (
+            ["--opens-access"] if opens_access else [])
     result = subprocess.run(command, check=False)
     if result.returncode:
         raise StageError(f"the coverage check stopped the stage (exit {result.returncode})")
@@ -739,7 +765,7 @@ def grant(env_dir: Path, environ: dict) -> int:
         # The render is the last stage's, so it is judged as that stage.
         _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"],
                              str(record.get("stage") or ""), str(record.get("old") or ""),
-                             bool(record.get("keep_new_tags")))
+                             bool(record.get("keep_new_tags")), opens_access=True)
     with tempfile.TemporaryDirectory() as tmp:
         plan_file = Path(plan_out) if plan_out else Path(tmp) / "grant.tfplan"
         plan = _plan_json(env_name, layer_dir, "grant", plan_file)
@@ -844,6 +870,14 @@ def rebind_problems(desired: dict, changed: dict, retained: list[dict], approved
                 problems.append(f"policy {policy['name']} of generation {generation['fingerprint']} names {who}, "
                                 "which the generated config replaced")
     return problems
+
+
+def rebind_approved(env_dir: Path, desired: dict) -> set[str]:
+    """The principals a rebind may put in place of deleted ones: tier groups, exempt principals, deployer."""
+    settings = desired.get("settings") or {}
+    deployer = str(_load(Path(env_dir) / "env.auto.tfvars").get("deployer_principal_id") or "")
+    return set(settings.get("access_tier_groups") or []) | set(settings.get("raw_exempt_principals") or []) \
+        | ({deployer} if deployer else set())
 
 
 def restore_record_problems(record: dict | None, rendered: dict, changed_fp: str, old_fp: str) -> list[str]:
@@ -1081,10 +1115,7 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     # The restore render, with the generated config's principals for the change's own policies.
     staged = plan_stage("restore", desired, old, retire, keep_new_tags=keep_new_tags)
     rendered = staged["rendered"]
-    settings = desired.get("settings") or {}
-    deployer = str(_load(env_dir / "env.auto.tfvars").get("deployer_principal_id") or "")
-    approved = set(settings.get("access_tier_groups") or []) | set(settings.get("raw_exempt_principals") or []) \
-        | ({deployer} if deployer else set())
+    approved = rebind_approved(env_dir, desired)
     problems = rebind_problems(desired, changed, [g for g in (old, retire) if g], approved) + staged["problems"]
     mapping = principal_replacements(desired, changed, approved)[1]
     record = load_stage_record(env_dir)
@@ -1118,7 +1149,7 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     write_stage(layer_dir, rendered)
     if environ.get("GENIERAILS_COVERAGE_GATE_RUNNER"):
         _rerun_coverage_gate(env_dir, env_name, environ["GENIERAILS_COVERAGE_GATE_RUNNER"], "restore", old_fp,
-                             keep_new_tags)
+                             keep_new_tags, rebind_fp=desired["fingerprint"])
     plan_file = Path(plan_out)
     table_grants = sorted(json.loads(environ.get("GENIERAILS_REBIND_TABLE_GRANTS") or "[]"))
     allowed = set(json.loads(environ.get("GENIERAILS_REBIND_ALLOWED_GRANTS") or "[]"))

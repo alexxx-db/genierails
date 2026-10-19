@@ -1778,11 +1778,13 @@ policy-status: _guard-workspace-target ## Show the staged policy journal (determ
 # coverage check on the abandon render (the previous generation it leaves
 # live), like every other stage: the last check judged another render, so
 # kept SELECT grants would otherwise fail the plan as stale. That check needs
-# a live refresh, so under the lock this re-reads live UC first, as rehearse does.
+# a live refresh, so under the lock this re-reads live UC first, as rehearse does,
+# and re-splits the result (PROMOTE_AFTER=1, as make plan does): the render takes
+# its non-treatment assignments from the split, the refresh from the generated config.
 policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched or was rolled back (deterministic envs)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); \
 	$(call _ENV_LOCK,policy-abandon); \
-	$(MAKE) --no-print-directory _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= || exit 1; \
+	$(MAKE) --no-print-directory _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= PROMOTE_AFTER=1 || exit 1; \
 	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
 
 # After the principals of a rolled-back change were deleted and recreated
@@ -1790,13 +1792,13 @@ policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target #
 # restore render with the generated config's principals, protection first,
 # then the lost grants, so policy-abandon can drop the change. Dev only (v1).
 # Its access phase runs the coverage check, so under the lock it re-reads live
-# UC first, like policy-abandon.
+# UC first and re-splits it, like policy-abandon.
 policy-rebind: _guard-not-ci-apply _guard-not-ci-rebind _guarded-bootstrap _guard-workspace-target ## Re-point a rolled-back policy change at recreated principals, then restore its lost grants (deterministic dev; then policy-abandon)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); \
 	$(_DEPLOYER_CHECK) "make policy-rebind" || exit 1; \
 	$(_GROUP_CHECK) "make policy-rebind" || exit 1; \
 	$(call _ENV_LOCK,policy-rebind); \
-	$(MAKE) --no-print-directory _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= || exit 1; \
+	$(MAKE) --no-print-directory _derive-before-exposure ENV="$(ENV)" APPLY_FLAGS= PROMOTE_AFTER=1 || exit 1; \
 	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) rebind --env-dir "$(ENV_DIR)" --env-name "$(ENV)" \
 		--verify-access-cmd '$(_STAGED_VERIFY_ACCESS)'
 
