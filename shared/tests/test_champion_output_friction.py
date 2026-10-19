@@ -121,16 +121,48 @@ def test_self_service_genie_next_steps_unchanged(tmp_path):
 def test_champion_full_mode_points_to_rehearse_or_release(tmp_path, env_name, next_cmd):
     lines = generate_next_steps(tmp_path, "full", env_name, has_sql=True, champion_flow=True)
 
-    assert lines[-1] == f"    2. {next_cmd}"
+    assert lines[-2] == (
+        f"    2. git add envs/ && git commit, then: make check ENV={env_name}   (reads committed files only)"
+    )
+    assert lines[-1].startswith(f"    3. {next_cmd}")
     assert not any("VERIFY_KEY_COLUMN" in line for line in lines)
     assert f"       {tmp_path}/masking_functions.sql" in lines
     assert not any(re.search(r"make apply\b", line) for line in lines)
 
 
 @pytest.mark.parametrize(("mode", "target"), [("full", "apply"), ("governance", "apply-governance")])
-def test_non_champion_full_and_governance_unchanged(tmp_path, mode, target):
-    lines = generate_next_steps(tmp_path, mode, "dev", has_sql=True, champion_flow=False)
+def test_legacy_full_and_governance_keep_validate_then_apply(tmp_path, mode, target):
+    lines = generate_next_steps(tmp_path, mode, "dev", has_sql=True, champion_flow=False, tuning=True)
     assert lines[-1].startswith(f"    4. make {target}   ")
+    assert any("make validate-generated" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("mode", "env_name", "tail"),
+    [
+        ("full", "dev", ["    3. make rehearse ENV=dev   (applies, then proves the masks: ALL EFFECTIVE)"]),
+        ("governance", "dev", ["    3. make rehearse ENV=dev   (applies, then proves the masks: ALL EFFECTIVE)"]),
+        ("full", "prod", ["    3. make release-plan ENV=prod", "    4. make release ENV=prod"]),
+    ],
+)
+def test_deterministic_next_steps_match_walkthrough(tmp_path, mode, env_name, tail):
+    """A deterministic draft follows the walkthrough: commit, make check, then rehearse or release-plan."""
+    lines = generate_next_steps(tmp_path, mode, env_name, has_sql=True, champion_flow=False, tuning=False)
+
+    assert lines[: -len(tail)][-1] == (
+        f"    2. git add envs/ && git commit, then: make check ENV={env_name}   (reads committed files only)"
+    )
+    assert lines[-len(tail):] == tail
+    assert not any("validate-generated" in line for line in lines)
+    assert not any(re.search(r"make apply\b", line) for line in lines)
+    assert not any("TUNING.md" in line for line in lines)
+
+
+def test_deterministic_genie_import_points_to_classification_then_generate():
+    lines = generate_next_steps(Path("/x"), "genie", "dev", has_sql=False, champion_flow=False, tuning=False)
+
+    assert lines == generate_abac.champion_genie_next_steps("dev")
+    assert not any("apply-genie" in line for line in lines)
 
 
 def test_main_wires_champion_flow_into_header_and_next_steps():

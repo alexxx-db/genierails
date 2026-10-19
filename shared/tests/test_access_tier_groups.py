@@ -550,3 +550,39 @@ def test_champion_docs_drop_generate_args_from_generate_commands():
     assert "\nmake generate ENV=dev\n" in readme
     assert "MODE=genie" not in readme
     assert "`make generate ENV=dev MODE=genie`" in import_doc
+
+
+def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
+    """Gaps a live Azure run found: make check, an early commit, verify-access inside rehearse, both agent forms."""
+    readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
+    ref = (SHARED / "examples/dev_to_prod/REFERENCE.md").read_text()
+    flow = readme[readme.index("## The whole flow"):readme.index("## Before you start")]
+    dev = readme[readme.index("## Dev"):readme.index("## Prod")]
+    prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
+
+    # The whole flow: own repo and first commit before check; check before rehearse and release-plan.
+    order = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
+             "make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
+             "make promote-to ENV=prod", "make check ENV=prod", "make release-plan ENV=prod",
+             "make release ENV=prod"]
+    positions = [flow.index(step) for step in order]
+    assert positions == sorted(positions)
+    assert "Data classification" in flow
+
+    # Dev: commit (own repo) comes before generate, check and rehearse.
+    committed = dev[dev.index("**2. Commit it (own repo).**"):]
+    steps = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
+             "**4. Generate.**", "**5. Check.**", "make check ENV=dev", "**6. Rehearse.**"]
+    positions = [committed.index(step) for step in steps]
+    assert positions == sorted(positions)
+    assert "`make rehearse` and `make release-plan` don't run it" in dev
+    assert "`verify-access` as its last gate (`_verify-access-gate`)" in dev
+    assert "**Pass looks like:** `ALL EFFECTIVE`" in dev and "make verify-access ENV=dev" in dev
+    assert "**Agents (preferred):**" in dev and "envs/dev/agents/" in dev
+    assert "**Also accepted:**" in dev and "genie_spaces = [{" in dev
+
+    assert prod.index("make check ENV=prod") < prod.index("make release-plan ENV=prod")
+    assert "make verify-access ENV=prod" in prod
+    assert "not run by `rehearse` or `release-plan`" in ref
+    assert "Does **not** run `make check`" in ref
+    assert "**Preferred:**" in ref and "**Also accepted:**" in ref

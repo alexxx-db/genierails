@@ -1,5 +1,5 @@
 ### EXIT 0
-### OUTPUT 1914
+### OUTPUT 2199
 ============================================================
   ABAC Configuration Generator
   Mode: genie — Genie configs only (no ABAC, no masking SQL)
@@ -36,11 +36,13 @@
 
 ============================================================
   Done!
-  Next steps:
-    1. Review generated files:
-       <TMP>/env/generated/abac.auto.tfvars
-    2. make validate-generated ENV=env   (check your changes anytime)
-    3. make apply-genie ENV=env   (applies workspace layer only)
+  Next steps (the walkthrough's Dev section):
+    1. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on.
+       When the scan finishes, review the detections and exclude any false positives, then turn on
+       auto-tagging. Wait until the class.* tags appear.
+       Prefer a script? make enable-classification ENV=env turns it on (you still review detections in the UI).
+    2. make generate ENV=env
+    3. make rehearse ENV=env   (picks a verification key automatically)
 ============================================================
 
 ### FILE auth.auto.tfvars 152

@@ -149,8 +149,10 @@ def _tracked_env_files(envs: Path) -> list[Path]:
     files = [Path(os.fsdecode(raw)) for raw in listed.split(b"\0") if raw]
     if not files and any(envs.iterdir()):
         raise CheckFailed(f"git tracks no file under {envs} (is envs/ git-ignored?); make check reads only "
-                          "committed env files. Commit envs/ (in your own repo make setup ENV=<env> "
-                          "writes a .gitignore that keeps runtime files out, then git add .gitignore envs/).")
+                          "committed env files. Put the checkout in your own repo and commit envs/ first: "
+                          "see shared/examples/dev_to_prod/README.md (Dev step 2 / Commit it) — "
+                          "rename origin to genierails, add your remote, make setup ENV=<env> writes a "
+                          ".gitignore that keeps runtime files out, then git add .gitignore envs/.")
     return files
 
 

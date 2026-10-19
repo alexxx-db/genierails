@@ -5,21 +5,28 @@ Take a Genie agent you've curated in **dev** and ship it to **prod** with its se
 ## The whole flow
 
 ```bash
+# your own repo first: make check, rehearse receipts and release-plan read committed envs/
+git remote rename origin genierails      # keep GenieRails for upgrades
+git remote add origin <your-repo-url>
+
 # dev
-make setup ENV=dev          # copy the templates; set deployer_principal_id and groups; per agent, its ID and acl_groups
+make setup ENV=dev          # writes the .gitignore that commits envs/; copy the templates; set deployer_principal_id and groups; per agent, its ID and acl_groups
+git add .gitignore envs/ && git commit -m "Govern the first agent in dev" && git push -u origin main
 #   Catalog Explorer: turn on Data classification, review detections, enable auto-tagging
 make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
-make rehearse ENV=dev       # applies in dev and proves the masks work
+git add envs/ && git commit -m "Draft the rules" && git push
+make check ENV=dev          # read-only check of the committed files (rehearse doesn't run it)
+make rehearse ENV=dev       # applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
 
 # prod (same for stg or any env)
-make promote-to ENV=prod    # copies the reviewed rules (set catalog_map first)
+make setup ENV=prod         # set deployer_principal_id, groups and catalog_map
+make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
+git add envs/ && git commit -m "Promote the rules to prod" && git push
+make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't run it)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
-make release ENV=prod      # applies exactly the approved plan, proves the masks
+make release ENV=prod       # applies exactly the approved plan, proves the masks
 make maintain ENV=prod      # run on a schedule
-
-# commit (from your own repo)
-make setup ENV=prod          # writes .gitignore in your repo; then git add .gitignore envs/ and open the first PR
 ```
 
 <a id="prerequisites--gather-required-values"></a>
@@ -55,27 +62,47 @@ Fill in `envs/dev/auth.auto.tfvars` (service principal and workspace). The templ
 deployer_principal_id = "<the dev auth.auto.tfvars databricks_client_id>"
 access_tier_groups = ["payments_ops", "regional_analysts", "viewers"]
 ```
-Each agent has its own file in `envs/dev/agents/`; the file name is the agent's name. In it, set the agent's ID and who may run it:
+**Agents (preferred):** one file per agent in `envs/dev/agents/`; the file name is the agent's name. In it, set the agent's ID and who may run it:
 ```hcl
 genie_space_id = "01ef0000000000000000000000000000"   # Genie UI > agent > Configure > About this agent
 acl_groups     = ["regional_analysts", "viewers"]      # who gets CAN_RUN on the agent; [] means nobody
 ```
+**Also accepted:** the same fields inline in `env.auto.tfvars` as `genie_spaces = [{ name = "...", genie_space_id = "...", acl_groups = [...] }]` (leave `genie_spaces = []` when using agent files). Prefer `agents/` files so agent and governance PRs stay separate; `make split-agent-files` moves an inline list into files later.
 `acl_groups` is required: `make generate` stops while an agent has none. It grants only `CAN_RUN` on the agent. `SELECT` on the agent's tables comes only from `table_readers` in `env.auto.tfvars`, which `make generate` proposes for you (filled with `acl_groups`) for each table nothing covers yet. Every `acl_groups` group must be able to read every table of the agent, so pick them from `access_tier_groups` (only tier groups and `raw_exempt_principals` can be readers); otherwise `generate`, `rehearse` and `release` stop and name the table and group.
 
-<a id="dev-classify"></a>
-**2. Classify (in the UI).** In **Catalog Explorer**, open the dev catalog → **Details** → **Data classification**: turn it on. When the scan finishes (the first one can take up to about a day), review the detections, exclude false positives, and turn on auto-tagging. Then wait until the columns show `class.*` tags such as `class.email_address`: open a table in Catalog Explorer and check its **Columns** tab.
+**2. Commit it (own repo).** `make check` reads only committed env files, a rehearse receipt counts only for a clean checkout, and `make release-plan` needs that commit on your `origin/main`. In a plain GenieRails clone `envs/` is git-ignored, so `make check` stops. Put the checkout in your own repo (create an empty one first) before going on:
+```bash
+git remote rename origin genierails      # keep GenieRails for upgrades
+git remote add origin <your-repo-url>
+make setup ENV=dev                       # origin is your repo now: writes .gitignore (commits envs/, ignores credentials, state and runtime files)
+git add .gitignore envs/
+git status                               # pass looks like: no auth.auto.tfvars, *.tfstate or .genie_* files
+git commit -m "Govern the first agent in dev"
+git push -u origin main
+```
+Commit (and push) again after each step below that changes `envs/`. Later changes go through PRs: [Commit it](#commit-it).
 
-**3. Generate.**
+<a id="dev-classify"></a>
+**3. Classify (in the UI).** In **Catalog Explorer**, open the dev catalog → **Details** → **Data classification**: turn it on. When the scan finishes (the first one can take up to about a day), review the detections, exclude false positives, and turn on auto-tagging. Then wait until the columns show `class.*` tags such as `class.email_address`: open a table in Catalog Explorer and check its **Columns** tab.
+
+**4. Generate.**
 ```bash
 make generate ENV=dev
 ```
-It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes its `table_readers`. Review those and the drafted rules in `envs/dev/generated/`, and edit the rules if you need to. If the tags aren't there yet, it stops and tells you to wait; re-run it later. Re-runs keep whatever is already in `envs/dev/generated/`, including your edits, and only add rules for new columns.
+It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes its `table_readers`. Review those and the drafted rules in `envs/dev/generated/`, and edit the rules if you need to. If the tags aren't there yet, it stops and tells you to wait; re-run it later. Re-runs keep whatever is already in `envs/dev/generated/`, including your edits, and only add rules for new columns. Then commit and push `envs/`.
 
-**4. Rehearse.**
+**5. Check.**
+```bash
+make check ENV=dev
+```
+A read-only check of what git tracks under `envs/`, in a scratch copy: validate, generated files current, validate-generated, the offline coverage check, mask tests and a structural plan. It is the PR check; `make rehearse` and `make release-plan` don't run it. It stops at the first failing step.
+
+**6. Rehearse.**
 ```bash
 make rehearse ENV=dev
 ```
-**Pass looks like:** `ALL EFFECTIVE`: each test tier sees masked values, the authorized tier sees raw ones.
+It applies in dev, then runs `verify-access` as its last gate (`_verify-access-gate`), querying as each test tier.
+**Pass looks like:** `ALL EFFECTIVE`: each test tier sees masked values, the authorized tier sees raw ones. To re-run only that proof later: `make verify-access ENV=dev`.
 
 <a id="phase-2--prod-set-up-and-promote-rules"></a>
 <a id="phase-3--prod-scan-real-data"></a>
@@ -95,19 +122,21 @@ Then:
 make promote-to ENV=prod
 ```
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
+Commit and push the promoted files.
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 
-**3. Release.** Plan, review the manifest, then apply exactly what was approved:
+**3. Check, plan, release.** Check the committed files, plan and review the manifest, then apply exactly what was approved:
 ```bash
+make check ENV=prod
 make release-plan ENV=prod
 make release ENV=prod
 ```
-`make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
-**Pass looks like:** `ALL EFFECTIVE` and "Release complete". Business users can now open the agent and get masked answers.
+`make check ENV=prod` also runs `promote-to CHECK=1`. `make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
+**Pass looks like:** `ALL EFFECTIVE` (from its `verify-access` gate) and "Release complete". Business users can now open the agent and get masked answers. To re-run only that proof later: `make verify-access ENV=prod`.
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
-- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make release-plan ENV=prod` and `make release ENV=prod`.
+- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make check ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make check ENV=prod`, `make release-plan ENV=prod` and `make release ENV=prod`, committing after each step that changes `envs/`.
 - **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Applying a custom mask in governance (`make adopt-custom-mask`) is not on `main` yet. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
 
 Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-gap-found-in-prod).
@@ -120,18 +149,9 @@ make maintain ENV=prod      # schedule it (cron or CI)
 ```
 It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
 
+<a id="commit-it"></a>
 ## Commit it
 
-Put it in your own repo (create an empty one first) and open the first PR. From `aws/` (or `azure/`):
-```bash
-git remote rename origin genierails      # keep GenieRails for upgrades
-git remote add origin <your-repo-url>
-make setup ENV=prod                      # origin is your repo: writes .gitignore (commits envs/, ignores credentials, state and runtime files)
-git push -u origin main
-git switch -c first-agent
-git add .gitignore envs/                 # plus any ../shared/ file a coverage fix changed
-git status                               # pass looks like: no auth.auto.tfvars, *.tfstate or .genie_* files
-git commit -m "Govern the first agent in dev and prod"
-git push -u origin first-agent
-```
-Open a pull request from `first-agent` into `main`. From then on every change goes through a PR: see [Pipelines](../../docs/pipelines.md) to set up CI, and the [agents](../../docs/playbooks/agents.md), [governance](../../docs/playbooks/governance.md) or [one-team](../../docs/playbooks/one-team.md) playbook for day-2 changes.
+[Dev step 2](#phase-0--dev-set-up) puts the checkout in your own repo: the remote rename, `make setup` writing `.gitignore`, and the first `git add .gitignore envs/`. Do it before `make check`, `make rehearse` or `make release-plan`; if you skipped it, run it now from `aws/` (or `azure/`) and commit what you have.
+
+From then on every change goes through a PR into `main`, with `make check` as its check (`make release-plan` plans only a commit on `origin/main`): see [Pipelines](../../docs/pipelines.md) to set up CI, and the [agents](../../docs/playbooks/agents.md), [governance](../../docs/playbooks/governance.md) or [one-team](../../docs/playbooks/one-team.md) playbook for day-2 changes.

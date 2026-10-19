@@ -1,5 +1,5 @@
 ### EXIT 0 0
-### OUTPUT 7074
+### OUTPUT 7060
 ============================================================
   ABAC Configuration Generator
 ============================================================
@@ -61,11 +61,11 @@
 ============================================================
   Done!
   Next steps:
-    1. Review generated files:
+    1. Review the draft:
        <TMP>/env/generated/masking_functions.sql
        <TMP>/env/generated/abac.auto.tfvars
-    2. make validate-generated ENV=env   (check your changes anytime)
-    3. make apply ENV=env   (validates, splits shared account/workspace config, runs terraform apply)
+    2. git add envs/ && git commit, then: make check ENV=env   (reads committed files only)
+    3. make rehearse ENV=env   (applies, then proves the masks: ALL EFFECTIVE)
 ============================================================
 ============================================================
   ABAC Configuration Generator
@@ -129,11 +129,11 @@
 ============================================================
   Done!
   Next steps:
-    1. Review generated files:
+    1. Review the draft:
        <TMP>/env/generated/masking_functions.sql
        <TMP>/env/generated/abac.auto.tfvars
-    2. make validate-generated ENV=env   (check your changes anytime)
-    3. make apply ENV=env   (validates, splits shared account/workspace config, runs terraform apply)
+    2. git add envs/ && git commit, then: make check ENV=env   (reads committed files only)
+    3. make rehearse ENV=env   (applies, then proves the masks: ALL EFFECTIVE)
 ============================================================
 
 ### FILE auth.auto.tfvars 152
