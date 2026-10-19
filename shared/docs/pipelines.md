@@ -248,9 +248,9 @@ committed config against empty state, live tags not re-read). It is safe under
 Applying targets (`apply`, `apply-governance`, `apply-genie`, `apply-account`,
 `rehearse`, `release-plan`, `release`, `maintain`, `enable-classification`,
 `ungovern`, `detach-agent`, `destroy*`, `import`, `migrate-state`,
-`migrate-state-dir`, `policy-abandon`) refuse when they
+`migrate-state-dir`, `policy-abandon`, `policy-rebind`) refuse when they
 detect CI: `CI=true|1|yes`, or `TF_BUILD`, `JENKINS_URL`, `GITLAB_CI`,
-`BUILDKITE` or `CIRCLECI` set. The sole exception is exactly
+`BUILDKITE` or `CIRCLECI` set (`policy-rebind` even with `GENIERAILS_ALLOW_CI_APPLY=1`). The sole exception is exactly
 `make rehearse ENV=dev`, on `<cloud>/envs/dev` itself (not a promote-to
 destination), and only when `envs/dev/remote_state.hcl` configures a locked
 backend (S3 plus DynamoDB or `use_lockfile` on AWS; Azure Storage blob leases on
@@ -376,7 +376,8 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   `enable-classification` (classification config only), `import`,
   `migrate-state`, `rebuild-governed-tables` (state or a local record), and
   `policy-abandon` (drops only a staged change that never switched, or whose
-  switch was rolled back and still is, live). Each
+  switch was rolled back and still is, live). `policy-rebind` refuses a
+  promoted env. Each
   moves a state serial or a committed file, so a manifest planned before it is
   refused.
 

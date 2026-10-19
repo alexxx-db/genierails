@@ -184,7 +184,7 @@ def test_the_runner_reads_a_staged_render_instead_of_the_split_config(tmp_path):
     (staged / "abac.auto.tfvars").write_text("fgac_policies = []\n")
     environ, log = _fake_terraform(tmp_path)
     environ |= {"LAYER_ENV_DIR": str(layer), pg.STAGE_CONFIG_ENV: str(staged)}
-    result = subprocess.run([RUNNER, "data_access", "dev", "plan", "-var=policy_stage=create"],
+    result = subprocess.run([RUNNER, "data_access", "dev", "plan", "-var=sql_warehouse_id=wh"],
                             text=True, capture_output=True, env=environ)
     assert result.returncode == 0, result.stdout + result.stderr
     args = shlex.split(log.read_text().splitlines()[1])
