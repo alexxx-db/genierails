@@ -15,7 +15,7 @@ import pytest
 import generate_abac
 from governance_policies import TAG_KEY, replace_sql_library, sql_library_block
 from sensitivity_source import ClassificationSource
-from tests.test_derive_assignments import MODEL_SURFACES
+from tests.test_derive_assignments import MODEL_FUNCTIONS
 
 SPACE_ID = "01ef7b3c2a4d5e6f"
 AGENT = "Payments Agent"
@@ -121,7 +121,7 @@ def _forbid_model_and_network(monkeypatch):
     def forbidden(*_args, **_kwargs):
         pytest.fail("deterministic generate must never call a model or the network")
 
-    for name in MODEL_SURFACES + ("configure_databricks_env",):
+    for name in MODEL_FUNCTIONS + ("configure_databricks_env",):
         monkeypatch.setattr(generate_abac, name, forbidden, raising=False)
     monkeypatch.setattr(generate_abac, "PROVIDERS", {
         name: {"call": forbidden, "default_model": "unused"} for name in generate_abac.PROVIDERS

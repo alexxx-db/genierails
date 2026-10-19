@@ -8,10 +8,15 @@ calls its own module's X, and the test silently stops testing anything.
 This test fails when a patch on generate_abac targets a name a split module
 defines or calls, or when a patch on a split module targets a name
 generate_abac.py calls. Fix it by patching the module that holds the caller.
+
+It also fails when a test patches, reads or imports a name the module does
+not bind (a patch with raising=False on a missing name silently patches
+nothing; a moved name dropped from the re-exports breaks every test using it).
 """
 
 import ast
 import importlib
+import sys
 from pathlib import Path
 
 from scripts.check_pure_move import SPLIT_MODULES
@@ -53,18 +58,47 @@ def _module_aliases(tree) -> dict[str, str]:
 UNRESOLVED = "?"
 
 
+NOT_A_LOOP = object()
+
+
 def _loop_values(tree, node, name, namespace):
-    """The values a for-loop gives `name` around node, evaluated in namespace."""
+    """The values a for-loop gives `name` around node, evaluated in namespace.
+
+    None when the loop cannot be evaluated; NOT_A_LOOP when no loop binds name.
+    """
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     while node in parents:
         node = parents[node]
         if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == name:
+            if namespace is None:
+                return None
             try:
-                values = list(eval(compile(ast.Expression(node.iter), "<loop>", "eval"), dict(namespace)))
+                return list(eval(compile(ast.Expression(node.iter), "<loop>", "eval"), dict(namespace)))
             except Exception:  # noqa: BLE001 -- unresolvable means fail closed
                 return None
-            return values if all(isinstance(v, str) for v in values) else None
-    return None
+    return NOT_A_LOOP
+
+
+def _patched_modules(tree, node, arg, aliases, namespace):
+    """The watched modules a patch call's first argument can be."""
+    if not isinstance(arg, ast.Name):
+        return []
+    if arg.id in aliases:
+        return [aliases[arg.id]]
+    # `for namespace in (generate_abac, other): monkeypatch.setattr(namespace, ...)`
+    values = _loop_values(tree, node, arg.id, namespace)
+    if values is NOT_A_LOOP:
+        return []
+    if values is None:
+        return [UNRESOLVED]
+    found, pending = [], list(values)
+    while pending:  # look inside tuples too: `for namespace, names in ((generate_abac, ...), ...)`
+        value = pending.pop(0)
+        if isinstance(value, (tuple, list)):
+            pending += value
+        elif getattr(value, "__name__", None) in WATCHED and hasattr(value, "__file__"):
+            found.append(value.__name__)
+    return found
 
 
 def patch_targets(source: str, filename: str = "<test>", namespace=None) -> list[tuple[str, str, str]]:
@@ -85,17 +119,21 @@ def patch_targets(source: str, filename: str = "<test>", namespace=None) -> list
         if isinstance(node, ast.Call):
             name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
             args = node.args
-            if name in PATCH_CALLS and len(args) >= 2 and isinstance(args[0], ast.Name) \
-                    and args[0].id in aliases and isinstance(args[1], ast.Constant) \
-                    and isinstance(args[1].value, str):
-                add(aliases[args[0].id], args[1].value, node)
-            elif name in PATCH_CALLS and len(args) >= 2 and isinstance(args[0], ast.Name) \
-                    and args[0].id in aliases:
-                values = None
-                if isinstance(args[1], ast.Name) and namespace is not None:
-                    values = _loop_values(tree, node, args[1].id, namespace)
-                for value in values or [UNRESOLVED]:
-                    add(aliases[args[0].id], value, node)
+            modules = _patched_modules(tree, node, args[0], aliases, namespace) \
+                if name in PATCH_CALLS and len(args) >= 2 else []
+            if modules:
+                if isinstance(args[1], ast.Constant) and isinstance(args[1].value, str):
+                    values = [args[1].value]
+                else:
+                    values = None
+                    if isinstance(args[1], ast.Name):
+                        values = _loop_values(tree, node, args[1].id, namespace)
+                    if values is NOT_A_LOOP or not values \
+                            or not all(isinstance(v, str) for v in values):
+                        values = [UNRESOLVED]
+                for module in modules:
+                    for value in values:
+                        add(module, value if module != UNRESOLVED else UNRESOLVED, node)
             elif name in STRING_PATCHES and args and isinstance(args[0], ast.Constant) \
                     and isinstance(args[0].value, str) and "." in args[0].value:
                 module, _, attr = args[0].value.partition(".")
@@ -107,6 +145,51 @@ def patch_targets(source: str, filename: str = "<test>", namespace=None) -> list
                         and target.value.id in aliases:
                     add(aliases[target.value.id], target.attr, node)
     return found
+
+
+def name_uses(source: str, filename: str = "<test>") -> list[tuple[str, str, str]]:
+    """(module, attribute, location) for every `module.X` read and `from module import X`."""
+    tree = ast.parse(source)
+    aliases = _module_aliases(tree)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) \
+                and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            found.append((aliases[node.value.id], node.attr, f"{filename}:{node.lineno}"))
+        elif isinstance(node, ast.ImportFrom) and node.module in WATCHED and node.level == 0:
+            found += [(node.module, alias.name, f"{filename}:{node.lineno}") for alias in node.names]
+    return found
+
+
+def _bound(source: str) -> set[str]:
+    """Every name the module binds at top level (also inside top-level if/try/with)."""
+    bound = {"__file__", "__name__", "__doc__", "__dict__", "__spec__", "__loader__", "__package__"}
+    pending = list(ast.parse(source).body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                bound |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        elif isinstance(node, ast.Import):
+            bound |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            bound |= {a.asname or a.name for a in node.names}
+        elif isinstance(node, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                pending += getattr(node, field, [])
+        elif isinstance(node, ast.ExceptHandler):
+            pending += node.body
+    return bound
+
+
+def unresolved(targets, sources: dict[str, str], verb: str = "patches") -> list[str]:
+    """Targets naming an attribute their module does not bind."""
+    bound = {module: _bound(text) for module, text in sources.items()}
+    return [f"{where}: {verb} {module}.{attr}, which {module}.py does not define or import"
+            for module, attr, where in targets
+            if attr != UNRESOLVED and module in bound and attr not in bound[module]]
 
 
 def _names(source: str) -> tuple[set[str], set[str]]:
@@ -140,12 +223,16 @@ def inert_patches(targets, sources: dict[str, str]) -> list[str]:
                     problems.append(f"{where}: patches {SOURCE_MODULE}.{attr}, but {split} calls it")
         elif module in names and attr in names[SOURCE_MODULE][1]:
             problems.append(f"{where}: patches {module}.{attr}, but {SOURCE_MODULE} calls it")
-    return problems
+    return problems + unresolved(targets, sources)
+
+
+def _test_files():
+    return [p for p in sorted(TESTS.rglob("*.py")) if p.name != Path(__file__).name]
 
 
 def _all_test_patches():
     targets = []
-    for path in sorted(TESTS.rglob("*.py")):
+    for path in _test_files():
         source = path.read_text()
         namespace = None
         if "for " in source:  # a loop may pick the patched name; resolve it from the module
@@ -162,6 +249,14 @@ def _sources():
 
 def test_no_patch_targets_a_name_whose_callers_moved():
     assert inert_patches(_all_test_patches(), _sources()) == []
+
+
+def test_every_name_the_tests_read_or_import_from_generate_abac_resolves():
+    uses = []
+    for path in _test_files():
+        uses += name_uses(path.read_text(), path.relative_to(SHARED).as_posix())
+    assert len([u for u in uses if u[0] == SOURCE_MODULE]) > 100
+    assert unresolved(uses, _sources(), verb="uses") == []
 
 
 def test_the_scanner_sees_the_suite_patches():
@@ -202,7 +297,8 @@ def test_x(monkeypatch):
         monkeypatch.setattr(ga, name, None)
 '''
     sources = {
-        SOURCE_MODULE: "from hcl_text import helper\ndef kept():\n    return helper()\n"
+        SOURCE_MODULE: "from hcl_text import helper, LIMIT\ndependency = None\n"
+                         "def kept():\n    return helper()\n"
                          "def main():\n    return kept()\n",
         "hcl_text": "LIMIT = 1\ndef helper():\n    return dependency() + LIMIT\n",
     }
@@ -212,6 +308,37 @@ def test_x(monkeypatch):
         "<test>:9: patches generate_abac.dependency, but hcl_text calls it",
         "<test>:10: patches generate_abac.LIMIT, which moved to hcl_text",
         "<test>:12: patches hcl_text.kept, but generate_abac calls it",
+        "<test>:12: patches hcl_text.kept, which hcl_text.py does not define or import",
         "<test>:15: patches generate_abac.helper, which moved to hcl_text",
         "<test>:17: patches generate_abac with a name this test cannot resolve",
     ])
+
+
+def test_a_patch_or_use_of_a_name_generate_abac_does_not_bind_is_reported():
+    test = '''
+import generate_abac
+from unittest import mock
+from generate_abac import kept, gone_import
+
+def test_x(monkeypatch):
+    mock.patch("generate_abac.does_not_exist")
+    monkeypatch.setattr(generate_abac, "also_missing", None, raising=False)
+    monkeypatch.setattr(generate_abac, "kept", None)
+    for namespace in (generate_abac,):
+        for name in ("kept", "loop_missing"):
+            monkeypatch.setattr(namespace, name, None, raising=False)
+    generate_abac.gone_attr()
+    generate_abac.kept()
+'''
+    sources = {SOURCE_MODULE: "import sys\ndef kept():\n    return sys\n"}
+    namespace = {"generate_abac": type(sys)("generate_abac")}
+    namespace["generate_abac"].__file__ = "generate_abac.py"
+    assert inert_patches(patch_targets(test, namespace=namespace), sources) == [
+        "<test>:7: patches generate_abac.does_not_exist, which generate_abac.py does not define or import",
+        "<test>:8: patches generate_abac.also_missing, which generate_abac.py does not define or import",
+        "<test>:12: patches generate_abac.loop_missing, which generate_abac.py does not define or import",
+    ]
+    assert sorted(unresolved(name_uses(test), sources, verb="uses")) == [
+        "<test>:13: uses generate_abac.gone_attr, which generate_abac.py does not define or import",
+        "<test>:4: uses generate_abac.gone_import, which generate_abac.py does not define or import",
+    ]

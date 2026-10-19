@@ -469,15 +469,19 @@ MODEL_SURFACES = (
     "call_with_retries", "call_databricks", "call_openai", "call_anthropic",
     "build_prompt", "serving_endpoints",
 )
+# serving_endpoints is a WorkspaceClient attribute, not a module-level name:
+# patching it on a module patches nothing.
+MODEL_FUNCTIONS = tuple(name for name in MODEL_SURFACES if name != "serving_endpoints")
 
 
 def _forbid_model_calls(monkeypatch):
     def forbidden(*_args, **_kwargs):
         pytest.fail("assignment refresh must never call a model")
 
-    for namespace in (generate_abac, MODULE):
-        for name in MODEL_SURFACES:
-            monkeypatch.setattr(namespace, name, forbidden, raising=False)
+    for name in MODEL_FUNCTIONS:
+        monkeypatch.setattr(generate_abac, name, forbidden, raising=False)
+    for name in MODEL_SURFACES:
+        monkeypatch.setattr(MODULE, name, forbidden, raising=False)
 
 
 def test_command_has_no_model_call_surface():
