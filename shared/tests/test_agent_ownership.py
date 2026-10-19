@@ -1157,7 +1157,7 @@ def test_agent_config_is_pushed_only_under_releases_lock(tmp_path, monkeypatch):
     manifest = _manifest(tmp_path, prod, api)
     for owner in (None, "maintain", "rehearse", "detach-agent"):
         monkeypatch.setattr(ownership, "_lock_owner", lambda env_dir, owner=owner: owner)
-        with pytest.raises(ownership.AgentError, match="only by make release MANIFEST="):
+        with pytest.raises(ownership.AgentError, match=r"only by make release ENV=prod \(a manifest\)"):
             ownership.sync_manifest(prod, "prod", manifest, api)
     with pytest.raises(ownership.AgentError, match="only from an approved manifest"):
         ownership.sync(prod, "prod", api)

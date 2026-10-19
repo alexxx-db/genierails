@@ -16,7 +16,7 @@ make check ENV=prod
 git add envs/ && git commit            # one PR; after merge the dev pipeline rehearses it
 # on the deployment machine, after rehearse passes on the merge commit:
 make release-plan ENV=prod             # approve the manifest
-make release ENV=prod MANIFEST=<manifest>
+make release ENV=prod                  # releases the approved manifest
 ```
 
 1. **Curate and edit.** Change agent A in the dev UI and governance in

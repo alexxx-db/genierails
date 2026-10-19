@@ -138,6 +138,27 @@ def held_by_ancestor(env_dir: Path) -> str | None:
     return str(held.get("owner") or "?")
 
 
+STAGE_TOKEN_ENV = "GENIERAILS_POLICY_STAGE_TOKEN"
+
+
+def stage_token(env_dir: Path) -> str:
+    """The token that lets terraform_layer.sh take policy_stage and the rebind variables ("" without the lock).
+
+    Derived from the nonce of the env lock an ancestor holds, so only the
+    staged controller's own Terraform calls (always under the env lock) can
+    present it; a caller's -var can't.
+    """
+    if held_by_ancestor(env_dir) is None:
+        return ""
+    held = _read_lock(lock_path(env_dir))
+    return hmac.new(str(held["nonce"]).encode(), b"genierails-policy-stage", "sha256").hexdigest()
+
+
+def valid_stage_token(env_dir: Path, token: str) -> bool:
+    expected = stage_token(env_dir) if token else ""
+    return bool(expected) and hmac.compare_digest(expected, token)
+
+
 def owns_lock(env_dir: Path, pid: int, state_dir: str | None = None) -> bool:
     held = _read_lock(lock_path(env_dir, state_dir))
     return bool(held) and held["pid"] == pid and held["host"] == socket.gethostname()

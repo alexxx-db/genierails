@@ -69,6 +69,16 @@
 
 ### Changed
 
+- **`make release ENV=prod` no longer needs `MANIFEST=`.** `make release-plan`
+  records the manifest it writes as the env's current one (`manifests/CURRENT`
+  in the state dir; a newer `release-plan` supersedes it). A plain `make
+  release` in a deterministic env prints that manifest's path, commit and
+  change summary, then runs the same checks and saved-plan apply as before. It
+  refuses, asking for a fresh `release-plan`, when there is no current
+  manifest or it was already released. `MANIFEST=<path>` still names a manifest
+  explicitly (the pipeline samples keep passing it); an explicit manifest that
+  was superseded or already released now refuses too. Legacy envs are unchanged.
+
 - **`tag_treatments` keys other than `class.<name>`** (for example
   `"sensitivity=confidential"`) are now refused: they were accepted but never
   applied, so the columns stayed unmasked by them. Also refused: remapping a

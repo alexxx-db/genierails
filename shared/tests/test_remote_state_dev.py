@@ -852,13 +852,130 @@ def test_the_runners_variables_come_after_every_caller_argument(tmp_path, fake_t
     env = _hermetic_env(tmp_path, PATH=fake_terraform["PATH"], FAKE_TF_LOG=fake_terraform["FAKE_TF_LOG"],
                         FAKE_TF_STATE=fake_terraform["FAKE_TF_STATE"], LAYER_ENV_DIR=str(dev),
                         ENVS_DIR=str(dev.parent), **extra)
-    proc = subprocess.run([str(RUNNER), "workspace", "dev", "plan", "-var=policy_stage=switch", "-no-color"],
+    proc = subprocess.run([str(RUNNER), "workspace", "dev", "plan", "-var=sql_warehouse_id=wh", "-no-color"],
                           env=env, text=True, capture_output=True)
     assert proc.returncode == 0, proc.stderr  # ordinary caller variables still pass
     plan = [c for c in fake_terraform["log"].read_text().splitlines() if c.startswith("plan ")][-1].split()
     runner_vars = [i for i, a in enumerate(plan) if a.split("=", 2)[1:2] and a.startswith("-var=")
                    and a.split("=", 2)[1] in RUNNER_VARS]
-    caller = [plan.index("-var=policy_stage=switch"), plan.index("-no-color")]
+    caller = [plan.index("-var=sql_warehouse_id=wh"), plan.index("-no-color")]
     assert runner_vars and min(runner_vars) > max(caller), plan
     expected = 4 if layout == "state dir" else 1  # + genie_id_dir (the state dir's records/)
     assert len(runner_vars) == expected, plan
+
+
+# -- the staged policy controller's variables can't be set by a caller -------------------------
+# policy_stage chooses which grants a plan withholds and whether the staged guard applies, and the
+# rebind variables hold grants back; only the controller (under the env lock) sets them.
+
+STAGE_VARS = ("policy_stage", "held_access_grants", "rebind_table_grants")
+STAGE_VALUES = {"policy_stage": '"rebind"', "held_access_grants": '["catalog_access|cat|g"]',
+                "rebind_table_grants": '["cat.sch.t|g"]'}
+
+
+def _stage_env(tmp_path, fake_terraform, layer_dir, dev, **extra):
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    return _hermetic_env(tmp_path, PATH=fake_terraform["PATH"], FAKE_TF_LOG=fake_terraform["FAKE_TF_LOG"],
+                         FAKE_TF_STATE=fake_terraform["FAKE_TF_STATE"], LAYER_ENV_DIR=str(layer_dir),
+                         ENVS_DIR=str(dev.parent), GENIERAILS_STATE_DIR=str(tmp_path / "state"), **extra)
+
+
+@pytest.mark.parametrize("layer", ["workspace", "data_access"])
+@pytest.mark.parametrize("name", STAGE_VARS)
+@pytest.mark.parametrize("form", OVERRIDE_FORMS + ("TF_VAR_", "APPLY_FLAGS"))
+def test_a_caller_cannot_set_the_staged_controllers_variables(tmp_path, fake_terraform, layer, name, form):
+    dev = tmp_path / "aws" / "envs" / "dev"
+    (dev / "data_access").mkdir(parents=True)
+    layer_dir = dev / "data_access" if layer == "data_access" else dev
+    value = STAGE_VALUES[name]
+    raw = value.strip('"') if name == "policy_stage" else value
+    args, extra = ["plan"], {}
+    var_file = tmp_path / "caller.tfvars"
+    var_file.write_text(f"{name} = {value}\n")
+    if form.startswith(("-var=", "--var=")):
+        args.append(form.replace("NAME", name) + raw)
+    elif form == "-var NAME=":
+        args += ["-var", f"{name}={raw}"]
+    elif form == "-var-file=FILE":
+        args.append(f"-var-file={var_file}")
+    elif form == "-var-file FILE":
+        args += ["-var-file", str(var_file)]
+    elif form == "env tfvars":
+        (layer_dir / "abac.auto.tfvars").write_text(f"{name} = {value}\n")
+    elif form == "TF_VAR_":
+        extra[f"TF_VAR_{name}"] = raw
+    elif form == "APPLY_FLAGS":  # make passes APPLY_FLAGS / DESTROY_FLAGS to the runner as arguments
+        args = ["apply", "-auto-approve", f"-var={name}={raw}"]
+    else:
+        extra[form] = f"-var={name}={raw}"
+    env = _stage_env(tmp_path, fake_terraform, layer_dir, dev, **extra)
+    proc = subprocess.run([str(RUNNER), layer, "dev", *args], env=env, text=True, capture_output=True)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert f"sets {name}, which only the staged policy controller sets" in proc.stderr
+    assert fake_terraform["log"].read_text() == ""  # refused before terraform init
+
+
+@pytest.mark.parametrize("command, stage", [("plan", "preview"), ("destroy", "destroy")])
+def test_makes_own_preview_and_destroy_stages_still_pass(tmp_path, fake_terraform, command, stage):
+    dev = tmp_path / "aws" / "envs" / "dev"
+    (dev / "data_access").mkdir(parents=True)
+    env = _stage_env(tmp_path, fake_terraform, dev / "data_access", dev)
+    proc = subprocess.run([str(RUNNER), "data_access", "dev", command, f"-var=policy_stage={stage}"], env=env,
+                          text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    # ... but only with their own command.
+    other = "apply" if command == "plan" else "plan"
+    proc = subprocess.run([str(RUNNER), "data_access", "dev", other, f"-var=policy_stage={stage}"], env=env,
+                          text=True, capture_output=True)
+    assert proc.returncode == 2 and "only the staged policy controller sets" in proc.stderr
+
+
+def test_the_controllers_lock_token_lets_its_variables_pass(tmp_path, fake_terraform, monkeypatch):
+    dev = tmp_path / "aws" / "envs" / "dev"
+    (dev / "data_access").mkdir(parents=True)
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    # The lock records ps's start time, whose format follows the locale; the runner's env has LANG=C.
+    monkeypatch.setenv("LANG", "C")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_TIME", raising=False)
+    ok, message, nonce = environment_lock.acquire(dev, os.getpid(), "policy-rebind")
+    assert ok, message
+    try:
+        monkeypatch.setenv(environment_lock.nonce_var(dev), nonce)
+        token = environment_lock.stage_token(dev)
+        assert token
+        args = ["plan", "-var=policy_stage=rebind", '-var=held_access_grants=["catalog_access|cat|g"]']
+        base = {environment_lock.nonce_var(dev): nonce}
+        for given, rc in ((token, 0), ("0" * len(token), 2), ("", 2)):
+            env = _stage_env(tmp_path, fake_terraform, dev / "data_access", dev,
+                             **base, **{environment_lock.STAGE_TOKEN_ENV: given})
+            proc = subprocess.run([str(RUNNER), "data_access", "dev", *args], env=env, text=True, capture_output=True)
+            assert proc.returncode == rc, (given, proc.stderr)
+        # The token is bound to this lock: without the inherited nonce it is worthless.
+        env = _stage_env(tmp_path, fake_terraform, dev / "data_access", dev, **{environment_lock.STAGE_TOKEN_ENV: token})
+        proc = subprocess.run([str(RUNNER), "data_access", "dev", *args], env=env, text=True, capture_output=True)
+        assert proc.returncode == 2, proc.stderr
+    finally:
+        environment_lock.release_lock(dev, os.getpid())
+
+
+def test_the_controllers_own_terraform_calls_pass_under_its_lock(tmp_path, fake_terraform, monkeypatch):
+    """policy_generations._runner under staged_policy_apply.env_lock: the real runner takes its policy_stage."""
+    from scripts import policy_generations as pg
+    from scripts import staged_policy_apply as spa
+
+    dev = tmp_path / "aws" / "envs" / "dev"
+    (dev / "data_access").mkdir(parents=True)
+    render = pg.stage_config_dir(dev)
+    render.mkdir(parents=True)
+    (render / "abac.auto.tfvars").write_text("fgac_policies = []\n")
+    (tmp_path / "state").mkdir()
+    for key, value in _stage_env(tmp_path, fake_terraform, dev / "data_access", dev).items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(pg.StageError):  # without the lock, refused
+        pg._runner("dev", dev / "data_access", "plan", "-var=policy_stage=rebind", "-var=held_access_grants=[]")
+    assert fake_terraform["log"].read_text() == ""
+    with spa.env_lock(dev, "policy-rebind"):
+        pg._runner("dev", dev / "data_access", "plan", "-var=policy_stage=rebind", "-var=held_access_grants=[]")
+    assert "policy_stage=rebind" in fake_terraform["log"].read_text()

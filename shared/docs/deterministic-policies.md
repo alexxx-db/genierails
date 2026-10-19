@@ -163,6 +163,70 @@ any unfinished transition with its completed phases. Writes are atomic.
   Unity Catalog has no transaction across tags and policies, so a retag
   between step 2 and the apply can't be prevented. Step 4 catches it, and
   the change stays recorded until a check passes.
+- `make policy-rebind ENV=<env>` is the step before abandon when principals
+  of a rolled-back change were deleted and recreated (a sandbox SCIM cleanup,
+  say). Unity Catalog then shows each deleted principal as `unknown` in the
+  policies' `TO`/`EXCEPT` and drops its grants, so abandon's plan would
+  re-point policies and recreate grants, which it refuses. Rebind takes the
+  same eligibility as abandon of a rolled-back switch (the `restored` marker
+  or the pre-marker shape; the last applied stage is still the restore), and
+  the generated config may differ from the unfinished change only by
+  replacing deleted principals with recreated ones: the same policies,
+  conditions, functions and treatment values; in each policy's `TO` and
+  `EXCEPT`, at most one principal swapped for one the env names (a tier
+  group, a `raw_exempt_principals` entry or the committed deployer) that the
+  change never named, the same swap everywhere; and no retained generation's
+  policy naming a principal the config replaced (rebind can re-point those
+  only at principals recreated under the same name). Adding an `EXCEPT` or
+  dropping a `TO` refuses. It re-applies the restore render with the
+  config's principals, under the env lock, in two phases:
+
+  1. **Protection.** Every policy depends on the grants in Terraform, so
+     `-target` can't leave them out. Instead rebind plans the whole render,
+     then saves a plan that holds back every grant it would create
+     (`held_access_grants`). That plan may only update policies' `TO` and
+     `EXCEPT`, redeploy the masking functions (the same SQL hash, with no
+     destroy-time drop: the drop lives in `masking_functions_drop`, which
+     may only be updated in place) and restart the enforcement wait. Its
+     policy updates may not loosen a live mask: a `TO` entry may leave only
+     as a deleted principal (`unknown`) being replaced, an `EXCEPT` entry
+     may be added only in place of a deleted one and only where the
+     verified restore excepted it, and nobody the verified restore masked
+     (the env's tier groups, exempt principals, deployer, and every
+     principal named) may end up unmasked. A treatment tag change, a policy
+     create or delete, or a change to a policy's condition or function
+     refuses before anything is applied.
+     Then the live check (every column on the previous generation's value,
+     the policies with their new principals) and the live agent coverage
+     check (every classified column of the agents' tables masked).
+  2. **Access**, only after both pass: a second saved plan, after the
+     coverage check on the same render, that may create exactly the grants
+     the protect plan held back, nothing else. Terraform's refresh drops a
+     grant a deleted principal lost from state, so the journal keeps the
+     held list for a re-run, bound to a copy of the protect plan that held
+     it back (its sha256, a digest, and the plan's own
+     `held_access_grants`); a record that doesn't match its plan refuses.
+     Then the live check again and verify-access with the previous
+     generation's tier settings.
+
+  Each plan's sha256 is recorded when it is made and re-checked before its
+  apply. A failure after the first apply marks the change
+  `rebind_incomplete` with the next step (`make policy-status` shows it), and
+  abandon refuses until a rebind finishes; re-running rebind re-plans from
+  what is live. Afterwards `make policy-abandon` plans only the change's
+  policy deletes and the restarted wait. Rebind refuses in CI, even with
+  `GENIERAILS_ALLOW_CI_APPLY=1`, and, in this version, on a promoted env
+  (prod): a prod apply comes only from a release-plan manifest, and rebind
+  doesn't make one.
+
+  `policy_stage`, `held_access_grants` and `rebind_table_grants` belong to
+  the staged controller, like the runner's `env_dir` and state-file
+  variables: `scripts/terraform_layer.sh` refuses them from a caller's
+  `-var` (so `APPLY_FLAGS`/`DESTROY_FLAGS` too), `TF_VAR_*`, a var file,
+  the env's tfvars and `TF_CLI_ARGS*`. Only the controller's own Terraform
+  calls pass, with a token derived from the env lock they run under; make's
+  own `-var=policy_stage=preview` (plan) and `=destroy` (destroy) are the
+  exceptions.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
 
@@ -171,8 +235,8 @@ command. A prod release is two-phase (rollout step 9, [pipelines.md](pipelines.m
 `make release-plan` runs the controller's `plan --out-dir`, which saves the
 plan of each remaining apply phase in order (a phase that changes nothing is
 recorded and planning goes on) and stops after the first phase that changes
-something, with the verifications right after it; `make release
-MANIFEST=...` runs `apply-saved`, which applies exactly those saved plans
+something, with the verifications right after it; `make release`
+runs `apply-saved`, which applies exactly those saved plans
 (a saved plan that changes nothing isn't applied) and runs those
 verifications. It refuses when the journal, the generated config or a stage's
 render moved since the plan. A change that replaces policies or moves tiers
