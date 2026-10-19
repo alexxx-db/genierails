@@ -1,0 +1,402 @@
+### EXIT 0
+### OUTPUT 2598
+============================================================
+  ABAC Configuration Generator
+  Mode: genie — Genie configs only (no ABAC, no masking SQL)
+============================================================
+  Loaded environment from: <TMP>/env/env.auto.tfvars
+  Loaded credentials from: <TMP>/env/auth.auto.tfvars
+  Groups:   payments_ops, viewers (--groups CLI)
+  IdP preflight: all 2 referenced group(s) found in the account.
+  Saved --groups to access_tier_groups in <TMP>/env/env.auto.tfvars; later runs can omit --groups.
+
+  Genie agent '01ef7b3c2a4d5e6f' has no uc_tables — querying API...
+
+  Auto-discovered tables from existing Genie agent(s):
+    - dev_fin.payments.customers
+    - dev_fin.payments.payments
+
+  Persisted for automatic UC grants, classification, and masking scope.
+
+  Discovered UC table persistence:
+    added: dev_fin.payments.customers, dev_fin.payments.payments
+    already present: (none)
+    disappeared: (none)
+    wrote: <TMP>/env/data_access/discovered_uc_tables.auto.tfvars
+  Footprint: 2 table(s), 0 explicitly scoped column(s)
+  Provider: databricks
+  Out dir:  <TMP>/env/generated
+  Tables:   dev_fin.payments.customers, dev_fin.payments.payments (from agent footprint)
+
+  Masking UDFs will be deployed to: dev_fin.payments
+  Fetched DDLs saved to: <TMP>/env/ddl/_fetched.sql
+
+  Full LLM response saved to: <TMP>/env/generated/generated_response.md
+  Tuning checklist written to: <TMP>/env/generated/TUNING.md
+  [genie mode] Skipping masking_functions.sql (managed by governance team)
+  [genie mode] Stripped ABAC sections from output (groups, tag_policies, tag_assignments, fgac_policies)
+  [genie mode] Tip: set genie_only = true in env.auto.tfvars for least-privilege SP access (Workspace Admin only)
+  [auto-strip] Removed flat legacy Genie fields from multi-space draft
+  Injected genie_space_configs from Genie API for: Payments Agent
+  abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars
+  NOTE: Genie ACL for 'Payments Agent' not derived yet (this draft has no access policies); the next full `make generate` derives it.
+  Per-agent config: generated/spaces/payments_agent/abac.auto.tfvars
+
+============================================================
+  Done!
+  Next steps:
+    1. Review the tuning checklist:
+       <TMP>/env/generated/TUNING.md
+    2. Review and tune generated files:
+       <TMP>/env/generated/abac.auto.tfvars
+    3. make validate-generated ENV=env   (check your changes anytime)
+    4. make apply-genie ENV=env   (applies workspace layer only)
+============================================================
+
+### FILE auth.auto.tfvars 152
+databricks_workspace_host = "https://example.invalid"
+databricks_client_id = "82bb9d6d-0000-0000-0000-000000000000"
+databricks_client_secret = "secret"
+
+### FILE data_access/discovered_uc_tables.auto.tfvars 332
+# Tool-owned: refreshed by make generate; do not edit manually.
+discovered_uc_tables = [
+  "dev_fin.payments.customers",
+  "dev_fin.payments.payments",
+]
+
+# Table FQN -> Genie agents that expose it.
+discovered_table_agents = {
+  "dev_fin.payments.customers" = ["Payments Agent"]
+  "dev_fin.payments.payments" = ["Payments Agent"]
+}
+
+### FILE ddl/_fetched.sql 315
+-- Table: dev_fin.payments.customers
+CREATE TABLE dev_fin.payments.customers (
+  customer_id BIGINT,
+  email STRING,
+  phone STRING,
+  ssn STRING,
+  date_of_birth DATE
+);
+
+-- Table: dev_fin.payments.payments
+CREATE TABLE dev_fin.payments.payments (
+  payment_id BIGINT,
+  spend_limit DECIMAL(18,2),
+  cvv STRING
+);
+
+### FILE env.auto.tfvars 180
+genie_spaces = [{ genie_space_id = "01ef7b3c2a4d5e6f" }]
+
+# Access-tier groups, most to least privileged (saved by make generate).
+access_tier_groups = ["payments_ops", "viewers"]
+
+### FILE generated/TUNING.md 2978
+# Review & Tune (Before Apply)
+
+This folder contains a **first draft** of:
+- `masking_functions.sql` — masking UDFs + row filter functions
+- `abac.auto.tfvars` — groups, tags, FGAC policies, and Genie agent config
+
+Before you apply, tune for your business roles, security requirements, and Genie accuracy:
+
+## Checklist — Genie Accuracy (review first)
+
+- **Benchmarks**: Each benchmark question must be **unambiguous and self-contained**. The natural-language question and its ground-truth SQL must agree on the exact scope — e.g., "What is the average risk score for **active** customers?" (not "What is the average customer risk score?"). Run benchmarks in the Genie UI after apply to verify accuracy.
+- **SQL filters**: Do the default WHERE clauses match your business definitions? (e.g., "active customers" = `CustomerStatus = 'Active'`, "completed transactions" = `TransactionStatus = 'Completed'`). These filters guide Genie's SQL generation.
+- **SQL measures**: Are the standard metrics correct? (e.g., total revenue = `SUM(Amount)`, average risk = `AVG(RiskScore)`).
+- **SQL expressions**: Are the computed dimensions useful? (e.g., transaction year, age bucket).
+- **Join specs**: Do the join conditions between tables use the correct keys? Incorrect joins cause wrong results across all multi-table queries.
+- **Instructions**: Does the instruction text define business defaults (e.g., "customer" means active by default) and domain conventions (date handling, metric calculations)?
+
+## Checklist — ABAC & Masking
+
+- **Groups and personas**: Do the groups map to real business roles?
+- **Sensitive columns**: Are the right columns tagged (PII/PHI/financial/etc.)?
+- **Masking behavior**: Are you using the right approach (partial, redact, hash) per sensitivity and use case?
+- **Row filters and exceptions**: Are filters too broad/strict? Are exceptions minimal and intentional?
+
+## Checklist — Genie agent Metadata & ACLs
+
+- **Genie title & description**: Does the AI-generated title/description accurately represent the space?
+- **Genie sample questions**: Do the sample questions reflect what business users will ask?
+- **Per-space ACLs (`acl_groups`)**: Each space lists which groups get `CAN_RUN` access. Verify that:
+  - Each space includes all groups that need access
+  - Groups that should NOT see this space are excluded
+  - Set durable per-agent `acl_groups` only on `genie_spaces[]` in `env.auto.tfvars`
+  - Explicit `acl_groups = []` means nobody; omission derives fresh from policies (legacy mode only)
+  - ACL fields in the generated draft are ignored
+- **Validate before apply**: Run validation before `terraform apply`.
+
+## Suggested workflow
+
+1. Review and edit `masking_functions.sql` and `abac.auto.tfvars` in `generated/`.
+2. Validate after each change:
+   ```bash
+   make validate-generated
+   ```
+3. When ready, apply (validates again, promotes shared account + workspace config, then runs terraform):
+   ```bash
+   make apply
+   ```
+
+### FILE generated/abac.auto.tfvars 7174
+# ============================================================================
+# GENERATED GENIE CONFIG (FIRST DRAFT — genie mode)
+# ============================================================================
+# NOTE: ABAC governance (groups, tag policies, tag assignments, masking
+# functions) is owned by the central Data Governance team and is NOT
+# generated here.  Only genie_space_configs is produced in this mode.
+# Tune the following before apply:
+# - genie_space_configs (titles, instructions, sample questions, SQL)
+# Then run: make apply-genie ENV=...
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Groups (business roles)
+# ----------------------------------------------------------------------------
+# Keys are group names. Use these to represent business personas (e.g., Analyst,
+# Researcher, Compliance). These groups are used for workspace onboarding,
+# Databricks One consumer access, data grants, and optional Genie agent ACLs.
+#
+# Docs:
+# - Governed tags / tag policies: https://docs.databricks.com/en/database-objects/tags.html
+# - Unity Catalog ABAC overview: https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac
+# - ABAC policies (masks + filters): https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac/policies
+# - Row filters + column masks: https://docs.databricks.com/en/tables/row-and-column-filters.html
+#
+
+# ----------------------------------------------------------------------------
+# Tag policies (governed tags)
+# ----------------------------------------------------------------------------
+# Each entry defines a governed tag key and the allowed values. You’ll assign
+# these tags to tables/columns below, then reference them in FGAC policies.
+#
+# Docs:
+# - Governed tags / tag policies: https://docs.databricks.com/en/database-objects/tags.html
+# - Unity Catalog ABAC overview: https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac
+# - ABAC policies (masks + filters): https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac/policies
+# - Row filters + column masks: https://docs.databricks.com/en/tables/row-and-column-filters.html
+#
+
+# ----------------------------------------------------------------------------
+# Tag assignments (classify tables/columns)
+# ----------------------------------------------------------------------------
+# Apply governed tags to Unity Catalog objects.
+# - entity_type: "tables" or "columns"
+# - entity_name: fully qualified three-level name
+#   - table:  "catalog.schema.Table"
+#   - column: "catalog.schema.Table.Column"
+# - Table-level tags are optional; use them to scope column masks or row filters
+#   to specific tables, or for governance.
+#
+# Docs:
+# - Governed tags / tag policies: https://docs.databricks.com/en/database-objects/tags.html
+# - Unity Catalog ABAC overview: https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac
+# - ABAC policies (masks + filters): https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac/policies
+# - Row filters + column masks: https://docs.databricks.com/en/tables/row-and-column-filters.html
+#
+
+# ----------------------------------------------------------------------------
+# FGAC policies (who sees what, and how)
+# ----------------------------------------------------------------------------
+# Each entry creates either a COLUMN MASK or ROW FILTER policy.
+#
+# Common fields:
+# - name: logical name for the policy (must be unique)
+# - policy_type: POLICY_TYPE_COLUMN_MASK | POLICY_TYPE_ROW_FILTER
+# - catalog: catalog this policy is scoped to
+# - function_catalog: catalog where the masking UDF lives
+# - function_schema: schema where the masking UDF lives
+# - to_principals: list of group names who receive this policy
+# - except_principals: optional list of groups excluded (break-glass/admin)
+# - comment: human-readable intent (recommended)
+#
+# For COLUMN MASK:
+# - match_condition: ABAC condition, e.g. hasTagValue('phi_level','full_phi')
+# - match_alias: the column alias used by the ABAC engine
+# - function_name: masking UDF name (relative; Terraform prefixes catalog.schema)
+# - when_condition: (optional) scope to specific tagged tables
+#
+# For ROW FILTER:
+# - when_condition: (optional) scope to specific tagged tables
+# - function_name: row filter UDF name (relative; must be zero-argument)
+#
+# Example — column mask (mask SSN for analysts, exempt compliance):
+#   {
+#     name              = "mask_ssn_analysts"
+#     policy_type       = "POLICY_TYPE_COLUMN_MASK"
+#     to_principals     = ["Junior_Analyst", "Senior_Analyst"]
+#     except_principals = ["Compliance_Officer"]
+#     comment           = "Mask SSN showing only last 4 digits"
+#     match_condition   = "hasTagValue('pii_level', 'highly_sensitive')"
+#     match_alias       = "masked_ssn"
+#     function_name     = "mask_ssn"
+#   }
+#
+# Example — row filter (restrict regional staff to their rows):
+#   {
+#     name           = "filter_us_region"
+#     policy_type    = "POLICY_TYPE_ROW_FILTER"
+#     to_principals  = ["US_Region_Staff"]
+#     comment        = "Only show rows where region = US"
+#     when_condition = "hasTagValue('region_scope', 'global')"
+#     function_name  = "filter_by_region_us"
+#   }
+#
+# Docs:
+# - Governed tags / tag policies: https://docs.databricks.com/en/database-objects/tags.html
+# - Unity Catalog ABAC overview: https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac
+# - ABAC policies (masks + filters): https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac/policies
+# - Row filters + column masks: https://docs.databricks.com/en/tables/row-and-column-filters.html
+#
+
+# ----------------------------------------------------------------------------
+# Genie agent configs (per-space semantic configuration)
+# ----------------------------------------------------------------------------
+# Each key is the human-readable space name matching genie_spaces[*].name in
+# env.auto.tfvars. Contains instructions, benchmarks, and SQL measures.
+#
+# ACL ownership: set optional acl_groups on the matching genie_spaces[] entry
+# in env.auto.tfvars. Explicit [] means nobody; omission derives from policies.
+# Any ACL fields in this generated draft are ignored.
+#
+# Docs:
+# - Governed tags / tag policies: https://docs.databricks.com/en/database-objects/tags.html
+# - Unity Catalog ABAC overview: https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac
+# - ABAC policies (masks + filters): https://docs.databricks.com/aws/en/data-governance/unity-catalog/abac/policies
+# - Row filters + column masks: https://docs.databricks.com/en/tables/row-and-column-filters.html
+#
+
+# genie_space_configs parsed verbatim from the existing Genie agent(s).
+# Edit here to manage space config as code; make apply pushes changes back.
+genie_space_configs = {
+  "Payments Agent" = {
+    instructions = "Amounts are in AUD."
+    sample_questions = [
+      "Total payments by month?",
+    ]
+  }
+}
+
+# Tool-owned canonical identity for id-only imported spaces.
+genie_space_id_to_name = {
+  "01ef7b3c2a4d5e6f" = "Payments Agent"
+}
+
+
+### FILE generated/generated_response.md 2687
+```sql
+USE CATALOG dev_fin;
+USE SCHEMA payments;
+
+CREATE OR REPLACE FUNCTION mask_email(email STRING)
+RETURNS STRING
+RETURN CASE WHEN email IS NULL THEN NULL ELSE CONCAT('***@', SPLIT(email, '@')[1]) END;
+
+CREATE OR REPLACE FUNCTION mask_amount_rounded(amount DECIMAL(18,2))
+RETURNS DECIMAL(18,2)
+RETURN ROUND(amount, -2);
+
+CREATE OR REPLACE FUNCTION mask_redact(val STRING)
+RETURNS STRING
+RETURN '[REDACTED]';
+```
+
+```hcl
+# Authentication
+databricks_account_id = "acct"
+uc_tables = ["dev_fin.payments.customers"]
+-- the model's SQL habit
+groups = {
+  "payments_ops" = { description = "Full access" }
+  "viewers" = { description = "Masked" }
+}
+
+tag_policies = [
+  { key = "pii_level", description = "PII", values = ["masked_email", "redacted"] },
+  { key = "financial_sensitivity", description = "Fin", values = [{ name = "rounded_amounts" }] },
+]
+
+tag_assignments = [
+  { entity_type = "columns", entity_name = "dev_fin.payments.customers.email", tag_key = "pii_level", tag_value = "masked_email" },
+  { entity_type = "columns", entity_name = "dev_fin.payments.customers.ssn", tag_key = "pii_level", tag_value = "redacted" },
+  ,
+  { entity_type = "columns", entity_name = "dev_fin.payments.payments.spend_limit", tag_key = "financial_sensitivity", tag_value = "rounded_amounts" },
+]
+
+fgac_policies = [
+  {
+    name = "mask_email"
+    policy_type = "POLICY_TYPE_COLUMN_MASK"
+    catalog = "dev_fin"
+    to_principals = ["viewers"]
+    match_condition = "hasTagValue('pii_level', 'masked_email')"
+    match_alias = "cols"
+    function_name = "mask_email"
+    function_catalog = "dev_fin"
+    function_schema = "payments"
+  }
+  {
+    name = "mask_ssn"
+    policy_type = "POLICY_TYPE_COLUMN_MASK"
+    catalog = "dev_fin"
+    to_principals = ["viewers"]
+    match_condition = "hasTagValue('pii_level', 'redacted')"
+    match_alias = "cols"
+    function_name = "mask_redact"
+    function_catalog = "dev_fin"
+    function_schema = "payments"
+  },
+  {
+    name = "mask_spend_limit"
+    policy_type = "POLICY_TYPE_COLUMN_MASK"
+    catalog = "dev_fin"
+    to_principals = ["viewers"]
+    match_condition = "hasTagValue('financial_sensitivity', 'rounded_amounts')"
+    match_alias = "cols"
+    function_name = "mask_amount_rounded"
+    function_catalog = "dev_fin"
+    function_schema = "payments"
+  },
+]
+
+genie_space_configs = {
+  "Payments Agent" = {
+    title = "Payments Agent"
+    description = "Payments analytics"
+    sample_questions = ["Which customers paid most?"]
+    instructions = "Model instructions."
+    benchmarks = [
+      { question = "How many payments?", sql = "SELECT COUNT(*) FROM dev_fin.payments.payments" },
+    ]
+  }
+}
+
+genie_space_title = "legacy single-space key"
+```
+### FILE generated/genie_space_derived_acl_groups.auto.tfvars 152
+# Tool-owned; resolved from env.auto.tfvars overrides or freshly derived policies.
+genie_space_legacy_mode = false
+genie_space_derived_acl_groups = {
+}
+
+### FILE generated/spaces/payments_agent/abac.auto.tfvars 494
+# ============================================================================
+# Per-space config for: Payments Agent
+# Bootstrapped by full generation. Re-run: make generate SPACE="Payments Agent"
+# to regenerate only this space without touching others.
+# ============================================================================
+
+genie_space_configs = {
+  "Payments Agent" = {
+    instructions = "Amounts are in AUD."
+    sample_questions = [
+      "Total payments by month?",
+    ]
+  }
+}
+

@@ -1,0 +1,412 @@
+### EXIT 0 0
+### OUTPUT 7074
+============================================================
+  ABAC Configuration Generator
+============================================================
+  Loaded environment from: <TMP>/env/env.auto.tfvars
+  Loaded credentials from: <TMP>/env/auth.auto.tfvars
+  Groups:   payments_ops, regional_analysts, viewers (access_tier_groups in <TMP>/env/env.auto.tfvars)
+  IdP preflight: all 3 referenced group(s) found in the account.
+
+  Genie agent '01ef7b3c2a4d5e6f' has no uc_tables — querying API...
+
+  Auto-discovered tables from existing Genie agent(s):
+    - dev_fin.payments.customers
+    - dev_fin.payments.payments
+
+  Persisted for automatic UC grants, classification, and masking scope.
+
+  Discovered UC table persistence:
+    added: dev_fin.payments.customers, dev_fin.payments.payments
+    already present: (none)
+    disappeared: (none)
+    wrote: <TMP>/env/data_access/discovered_uc_tables.auto.tfvars
+  Footprint: 2 table(s), 0 explicitly scoped column(s)
+  Provider: databricks
+  Out dir:  <TMP>/env/generated
+  Tables:   dev_fin.payments.customers, dev_fin.payments.payments (from agent footprint)
+
+  Masking UDFs will be deployed to: dev_fin.payments
+  Fetched DDLs saved to: <TMP>/env/ddl/_fetched.sql
+  Loaded reviewed Genie config from: <TMP>/env/generated/abac.auto.tfvars
+  Injected genie_space_configs from Genie API for: Payments Agent
+  Derived ACL sidecar for 1 Genie agent(s)
+  abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars (deterministic; no model called)
+  Per-agent config: generated/spaces/payments_agent/abac.auto.tfvars
+  Deterministic governance: 4 column(s), 7 polic(y/ies)
+
+  Running validation...
+
+============================================================
+  ABAC Configuration Validation Report
+============================================================
+  [PASS] SQL file: 9 function(s) found — ['filter_anz', 'gr_mask_card_security_code__string__26d4b17e_full', 'gr_mask_date_year__date__7d691823_full', 'gr_mask_date_year__date__7d691823_partial', 'gr_mask_email_partial__string__f86256b2_full', 'gr_mask_email_partial__string__f86256b2_partial', 'gr_mask_ssn__string__8277f91e_full', 'gr_mask_ssn__string__8277f91e_partial', 'mask_email']
+  [PASS] Vars loaded from auth.auto.tfvars
+  [PASS] Vars loaded from env.auto.tfvars
+  [PASS] databricks_client_id: set
+  [PASS] databricks_client_secret: set
+  [PASS] databricks_workspace_host: set
+  [PASS] groups: 3 group(s) defined
+  [PASS] tag_policies: 2 policy/ies, 5 total values
+  [PASS] tag_assignments: 5 assignment(s)
+  [PASS] fgac_policies: 8 policy/ies, 8 unique function(s)
+
+  [WARN] 'databricks_account_id' is empty — fill in before terraform apply
+  [WARN] 'databricks_workspace_id' is empty — fill in before terraform apply
+  [WARN] SQL file defines functions not used by any policy: ['mask_email']. These will be created but won't mask anything.
+------------------------------------------------------------
+  RESULT: PASS  (10 passed, 3 warnings, 0 errors)
+============================================================
+
+============================================================
+  Done!
+  Next steps:
+    1. Review generated files:
+       <TMP>/env/generated/masking_functions.sql
+       <TMP>/env/generated/abac.auto.tfvars
+    2. make validate-generated ENV=env   (check your changes anytime)
+    3. make apply ENV=env   (validates, splits shared account/workspace config, runs terraform apply)
+============================================================
+============================================================
+  ABAC Configuration Generator
+============================================================
+  Loaded environment from: <TMP>/env/env.auto.tfvars
+  Loaded credentials from: <TMP>/env/auth.auto.tfvars
+  Groups:   payments_ops, regional_analysts, viewers (access_tier_groups in <TMP>/env/env.auto.tfvars)
+  IdP preflight: all 3 referenced group(s) found in the account.
+
+  Genie agent '01ef7b3c2a4d5e6f' has no uc_tables — querying API...
+
+  Auto-discovered tables from existing Genie agent(s):
+    - dev_fin.payments.customers
+    - dev_fin.payments.payments
+
+  Persisted for automatic UC grants, classification, and masking scope.
+  Loaded previously discovered UC tables from: <TMP>/env/data_access/discovered_uc_tables.auto.tfvars
+
+  Discovered UC table persistence:
+    added: (none)
+    already present: dev_fin.payments.customers, dev_fin.payments.payments
+    disappeared: (none)
+    unchanged: <TMP>/env/data_access/discovered_uc_tables.auto.tfvars
+  Footprint: 2 table(s), 0 explicitly scoped column(s)
+  Provider: databricks
+  Out dir:  <TMP>/env/generated
+  Tables:   dev_fin.payments.customers, dev_fin.payments.payments (from agent footprint)
+
+  Masking UDFs will be deployed to: dev_fin.payments
+  Fetched DDLs saved to: <TMP>/env/ddl/_fetched.sql
+  Loaded reviewed Genie config from: <TMP>/env/generated/abac.auto.tfvars
+  Injected genie_space_configs from Genie API for: Payments Agent
+  Derived ACL sidecar for 1 Genie agent(s)
+  abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars (deterministic; no model called)
+  Per-agent config: generated/spaces/payments_agent/abac.auto.tfvars
+  Deterministic governance: 4 column(s), 7 polic(y/ies)
+
+  Running validation...
+
+============================================================
+  ABAC Configuration Validation Report
+============================================================
+  [PASS] SQL file: 9 function(s) found — ['filter_anz', 'gr_mask_card_security_code__string__26d4b17e_full', 'gr_mask_date_year__date__7d691823_full', 'gr_mask_date_year__date__7d691823_partial', 'gr_mask_email_partial__string__f86256b2_full', 'gr_mask_email_partial__string__f86256b2_partial', 'gr_mask_ssn__string__8277f91e_full', 'gr_mask_ssn__string__8277f91e_partial', 'mask_email']
+  [PASS] Vars loaded from auth.auto.tfvars
+  [PASS] Vars loaded from env.auto.tfvars
+  [PASS] databricks_client_id: set
+  [PASS] databricks_client_secret: set
+  [PASS] databricks_workspace_host: set
+  [PASS] groups: 3 group(s) defined
+  [PASS] tag_policies: 2 policy/ies, 5 total values
+  [PASS] tag_assignments: 5 assignment(s)
+  [PASS] fgac_policies: 8 policy/ies, 8 unique function(s)
+
+  [WARN] 'databricks_account_id' is empty — fill in before terraform apply
+  [WARN] 'databricks_workspace_id' is empty — fill in before terraform apply
+  [WARN] SQL file defines functions not used by any policy: ['mask_email']. These will be created but won't mask anything.
+------------------------------------------------------------
+  RESULT: PASS  (10 passed, 3 warnings, 0 errors)
+============================================================
+
+============================================================
+  Done!
+  Next steps:
+    1. Review generated files:
+       <TMP>/env/generated/masking_functions.sql
+       <TMP>/env/generated/abac.auto.tfvars
+    2. make validate-generated ENV=env   (check your changes anytime)
+    3. make apply ENV=env   (validates, splits shared account/workspace config, runs terraform apply)
+============================================================
+
+### FILE auth.auto.tfvars 152
+databricks_workspace_host = "https://example.invalid"
+databricks_client_id = "82bb9d6d-0000-0000-0000-000000000000"
+databricks_client_secret = "secret"
+
+### FILE data_access/discovered_uc_tables.auto.tfvars 332
+# Tool-owned: refreshed by make generate; do not edit manually.
+discovered_uc_tables = [
+  "dev_fin.payments.customers",
+  "dev_fin.payments.payments",
+]
+
+# Table FQN -> Genie agents that expose it.
+discovered_table_agents = {
+  "dev_fin.payments.customers" = ["Payments Agent"]
+  "dev_fin.payments.payments" = ["Payments Agent"]
+}
+
+### FILE ddl/_fetched.sql 315
+-- Table: dev_fin.payments.customers
+CREATE TABLE dev_fin.payments.customers (
+  customer_id BIGINT,
+  email STRING,
+  phone STRING,
+  ssn STRING,
+  date_of_birth DATE
+);
+
+-- Table: dev_fin.payments.payments
+CREATE TABLE dev_fin.payments.payments (
+  payment_id BIGINT,
+  spend_limit DECIMAL(18,2),
+  cvv STRING
+);
+
+### FILE env.auto.tfvars 316
+governance_mode = "deterministic"
+deployer_principal_id = "82bb9d6d-0000-0000-0000-000000000000"
+enable_classification = true
+access_tier_groups = ["payments_ops", "regional_analysts", "viewers"]
+genie_spaces = [{ genie_space_id = "01ef7b3c2a4d5e6f", acl_groups = ["payments_ops", "regional_analysts", "viewers"] }]
+
+### FILE generated/abac.auto.tfvars 6405
+tag_policies = [
+  {
+    key = "region"
+    description = "Row scope"
+    values = ["anz"]
+  },
+  {
+    key = "gr_treatment"
+    description = "GenieRails deterministic treatment: <treatment>__<column type>__<generation>."
+    values = ["card_security_code__string__26d4b17e", "date_year__date__7d691823", "email_partial__string__f86256b2", "ssn__string__8277f91e"]
+  }
+]
+tag_assignments = [
+  {
+    entity_type = "tables"
+    entity_name = "dev_fin.payments.customers"
+    tag_key = "region"
+    tag_value = "anz"
+  },
+  {
+    entity_type = "columns"
+    entity_name = "dev_fin.payments.customers.date_of_birth"
+    tag_key = "gr_treatment"
+    tag_value = "date_year__date__7d691823"
+  },
+  {
+    entity_type = "columns"
+    entity_name = "dev_fin.payments.customers.email"
+    tag_key = "gr_treatment"
+    tag_value = "email_partial__string__f86256b2"
+  },
+  {
+    entity_type = "columns"
+    entity_name = "dev_fin.payments.customers.ssn"
+    tag_key = "gr_treatment"
+    tag_value = "ssn__string__8277f91e"
+  },
+  {
+    entity_type = "columns"
+    entity_name = "dev_fin.payments.payments.cvv"
+    tag_key = "gr_treatment"
+    tag_value = "card_security_code__string__26d4b17e"
+  }
+]
+fgac_policies = [
+  {
+    name             = "anz_rows"
+    policy_type      = "POLICY_TYPE_ROW_FILTER"
+    catalog          = "dev_fin"
+    to_principals    = ["regional_analysts"]
+    when_condition   = "hasTagValue('region', 'anz')"
+    function_name    = "filter_anz"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_card_security_code__string__26d4b17e_full"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["account users"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'card_security_code__string__26d4b17e')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_card_security_code__string__26d4b17e_full"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_date_year__date__7d691823_partial"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["regional_analysts"]
+    except_principals = ["payments_ops", "82bb9d6d-0000-0000-0000-000000000000"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'date_year__date__7d691823')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_date_year__date__7d691823_partial"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_date_year__date__7d691823_full"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["account users"]
+    except_principals = ["payments_ops", "regional_analysts", "82bb9d6d-0000-0000-0000-000000000000"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'date_year__date__7d691823')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_date_year__date__7d691823_full"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_email_partial__string__f86256b2_partial"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["regional_analysts"]
+    except_principals = ["payments_ops", "82bb9d6d-0000-0000-0000-000000000000"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'email_partial__string__f86256b2')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_email_partial__string__f86256b2_partial"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_email_partial__string__f86256b2_full"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["account users"]
+    except_principals = ["payments_ops", "regional_analysts", "82bb9d6d-0000-0000-0000-000000000000"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'email_partial__string__f86256b2')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_email_partial__string__f86256b2_full"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_ssn__string__8277f91e_partial"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["regional_analysts"]
+    except_principals = ["payments_ops", "82bb9d6d-0000-0000-0000-000000000000"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'ssn__string__8277f91e')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_ssn__string__8277f91e_partial"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  },
+  {
+    name             = "gr_mask_dev_fin_ssn__string__8277f91e_full"
+    policy_type      = "POLICY_TYPE_COLUMN_MASK"
+    catalog          = "dev_fin"
+    to_principals    = ["account users"]
+    except_principals = ["payments_ops", "regional_analysts", "82bb9d6d-0000-0000-0000-000000000000"]
+    comment          = "GenieRails deterministic governance policy"
+    match_condition  = "hasTagValue('gr_treatment', 'ssn__string__8277f91e')"
+    match_alias      = "masked_col"
+    function_name    = "gr_mask_ssn__string__8277f91e_full"
+    function_catalog = "dev_fin"
+    function_schema  = "payments"
+  }
+]
+
+groups = {
+  payments_ops = {
+    description = "Reviewed tier 1"
+  }
+  regional_analysts = {
+    description = ""
+  }
+  viewers = {
+    description = ""
+  }
+}
+
+# genie_space_configs parsed verbatim from the existing Genie agent(s).
+# Edit here to manage space config as code; make apply pushes changes back.
+genie_space_configs = {
+  "Payments Agent" = {
+    instructions = "Amounts are in AUD."
+    sample_questions = [
+      "Total payments by month?",
+    ]
+  }
+}
+
+# Tool-owned canonical identity for id-only imported spaces.
+genie_space_id_to_name = {
+  "01ef7b3c2a4d5e6f" = "Payments Agent"
+}
+
+### FILE generated/genie_space_derived_acl_groups.auto.tfvars 222
+# Tool-owned; resolved from env.auto.tfvars overrides or freshly derived policies.
+genie_space_legacy_mode = false
+genie_space_derived_acl_groups = {
+  "Payments Agent" = ["payments_ops", "regional_analysts", "viewers"]
+}
+
+### FILE generated/governed_tables.json 72
+{"tables": ["dev_fin.payments.customers", "dev_fin.payments.payments"]}
+
+### FILE generated/masking_functions.sql 1653
+USE CATALOG dev_fin;
+USE SCHEMA payments;
+
+CREATE OR REPLACE FUNCTION mask_email(val STRING)
+RETURNS STRING
+RETURN '***';
+
+CREATE OR REPLACE FUNCTION filter_anz()
+RETURNS BOOLEAN
+RETURN TRUE;
+
+-- === GenieRails deterministic mask library ===
+USE CATALOG dev_fin;
+USE SCHEMA payments;
+
+CREATE OR REPLACE FUNCTION gr_mask_card_security_code__string__26d4b17e_full(value STRING) RETURNS STRING RETURN CAST((CASE WHEN value IS NULL THEN NULL ELSE '[REDACTED]' END) AS STRING);
+
+CREATE OR REPLACE FUNCTION gr_mask_date_year__date__7d691823_partial(value DATE) RETURNS DATE RETURN CAST((CASE WHEN value IS NULL THEN NULL ELSE make_date(year(value), 1, 1) END) AS DATE);
+
+CREATE OR REPLACE FUNCTION gr_mask_date_year__date__7d691823_full(value DATE) RETURNS DATE RETURN CAST(NULL AS DATE);
+
+CREATE OR REPLACE FUNCTION gr_mask_email_partial__string__f86256b2_partial(value STRING) RETURNS STRING RETURN CAST((CASE WHEN value IS NULL THEN NULL WHEN trim(value) NOT RLIKE '^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$' THEN '[REDACTED]' ELSE concat(left(trim(value), 1), '***@', lower(substring_index(trim(value), '@', -1))) END) AS STRING);
+
+CREATE OR REPLACE FUNCTION gr_mask_email_partial__string__f86256b2_full(value STRING) RETURNS STRING RETURN CAST((CASE WHEN value IS NULL THEN NULL ELSE '[REDACTED]' END) AS STRING);
+
+CREATE OR REPLACE FUNCTION gr_mask_ssn__string__8277f91e_partial(value STRING) RETURNS STRING RETURN CAST((CASE WHEN value IS NULL THEN NULL ELSE '[REDACTED]' END) AS STRING);
+
+CREATE OR REPLACE FUNCTION gr_mask_ssn__string__8277f91e_full(value STRING) RETURNS STRING RETURN CAST((CASE WHEN value IS NULL THEN NULL ELSE '[REDACTED]' END) AS STRING);
+
+### FILE generated/spaces/payments_agent/abac.auto.tfvars 494
+# ============================================================================
+# Per-space config for: Payments Agent
+# Bootstrapped by full generation. Re-run: make generate SPACE="Payments Agent"
+# to regenerate only this space without touching others.
+# ============================================================================
+
+genie_space_configs = {
+  "Payments Agent" = {
+    instructions = "Amounts are in AUD."
+    sample_questions = [
+      "Total payments by month?",
+    ]
+  }
+}
+
