@@ -387,3 +387,24 @@ run "plain_plan_still_grants" {
   }
 }
 
+
+# held_access_grants and rebind_table_grants belong to make policy-rebind: in
+# any other plan they are ignored (holding a grant back would revoke it), and
+# the check says so.
+run "rebind_variables_outside_rebind_are_ignored" {
+  command         = plan
+  expect_failures = [check.rebind_grants_only_in_rebind]
+  variables {
+    policy_stage        = ""
+    held_access_grants  = ["terraform_sp_manage_catalog|cat"]
+    rebind_table_grants = ["cat.sch.orders|raw"]
+  }
+}
+
+run "rebind_variables_in_rebind" {
+  command = plan
+  variables {
+    policy_stage       = "rebind"
+    held_access_grants = ["terraform_sp_manage_catalog|cat"]
+  }
+}

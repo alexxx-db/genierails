@@ -533,3 +533,14 @@ def test_unchanged_access_replans_without_changes_after_the_gate_expires(tmp_pat
     # No resource is created, changed, replaced or destroyed (outputs may change:
     # the recorded gate status is now "expired").
     assert not re.search(r"# \S+ (will be|must be)", section), section
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_held_access_grants_leave_only_the_listed_grants_out(tmp_path):
+    """make policy-rebind's protect phase: held grants leave the plan, every other grant and policy stays."""
+    root = shared_copy(tmp_path) / "modules" / "data_access"
+    env = tf_env(tmp_path)
+    tf_init(root, env=env)
+    result = tf(root, "test", "-no-color", "-filter=tests/held_grants.tftest.hcl", env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "3 passed, 0 failed" in result.stdout

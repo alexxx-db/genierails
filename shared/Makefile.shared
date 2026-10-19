@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan apply-account check policy-status policy-abandon
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan apply-account check policy-status policy-abandon policy-rebind
 
 .PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask adopt-custom-mask
 
@@ -267,6 +267,17 @@ _guard-not-ci-apply:
 	if [ "$$is_ci" = "1" ] && [ "$$GENIERAILS_ALLOW_CI_APPLY" != "1" ] && [ "$$allow_dev_rehearse" != "1" ]; then \
 		echo "ERROR: applying targets cannot run in CI (except make rehearse ENV=dev with configured remote state and locking). Prod and account applies stay on the deployment machine." >&2; \
 		echo "Only isolated integration-test workflows may opt out with GENIERAILS_ALLOW_CI_APPLY=1." >&2; \
+		exit 1; \
+	fi
+
+# policy-rebind repairs a live rolled-back change: CI never runs it, and
+# GENIERAILS_ALLOW_CI_APPLY=1 (for throwaway integration workflows) doesn't apply.
+_guard-not-ci-rebind:
+	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
+	case "$$ci_value" in true|1|yes) is_ci=1 ;; *) is_ci= ;; esac; \
+	if [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; then is_ci=1; fi; \
+	if [ "$$is_ci" = 1 ]; then \
+		echo "ERROR: make policy-rebind cannot run in CI, even with GENIERAILS_ALLOW_CI_APPLY=1. Run it on the deployment machine." >&2; \
 		exit 1; \
 	fi
 
@@ -1762,6 +1773,17 @@ policy-status: _guard-workspace-target ## Show the staged policy journal (determ
 # can start a new one. Takes the env lock.
 policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched or was rolled back (deterministic envs)
 	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
+
+# After the principals of a rolled-back change were deleted and recreated
+# (policies then name "unknown" and their grants are gone): re-apply the
+# restore render with the generated config's principals, protection first,
+# then the lost grants, so policy-abandon can drop the change. Dev only (v1).
+policy-rebind: _guard-not-ci-apply _guard-not-ci-rebind _guarded-bootstrap _guard-workspace-target ## Re-point a rolled-back policy change at recreated principals, then restore its lost grants (deterministic dev; then policy-abandon)
+	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); \
+	$(_DEPLOYER_CHECK) "make policy-rebind" || exit 1; \
+	$(_GROUP_CHECK) "make policy-rebind" || exit 1; \
+	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) rebind --env-dir "$(ENV_DIR)" --env-name "$(ENV)" \
+		--verify-access-cmd '$(_STAGED_VERIFY_ACCESS)'
 
 # Read-only dry run of moving a legacy env to deterministic governance (design
 # section 8, scripts/migration.py): what every principal sees on every column

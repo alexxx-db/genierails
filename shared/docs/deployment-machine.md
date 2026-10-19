@@ -107,7 +107,7 @@ One approval per operation, each from a clean checkout of `main`:
 | Forget a detached agent | `make detach-agent ENV=prod SPACE="<agent>"` | HEAD is the last released commit, and that release had the agent with `detached = true` and `acl_groups = []` ([agents](playbooks/agents.md#remove-an-agent)) |
 | Change the account layer | `make account-plan`, approve its manifest, then `make apply-account` | clean checkout at the exact current `origin/main` tip; saved account plan hash, account input hashes, account state and tag-policy replace diff still match; refuses in CI; takes the account lock; writes an account receipt; manifests are single-use; the only command that removes tag-policy values |
 | Migrate a legacy env | `make migrate-plan`, then `release-plan` / `release` per phase | [legacy-migration.md](legacy-migration.md) |
-| Inspect or drop a staged policy change | `make policy-status ENV=prod`, `make policy-abandon ENV=prod` | `policy-abandon` refuses once a column was retagged or a principal moved, unless the switch was rolled back and a live check confirms it |
+| Inspect or drop a staged policy change | `make policy-status ENV=prod`, `make policy-abandon ENV=prod` | `policy-abandon` refuses once a column was retagged or a principal moved, unless the switch was rolled back and a live check confirms it ; `make policy-rebind` (after deleted principals were recreated) runs on dev only and refuses prod |
 
 `bootstrap-sp` and `bootstrap-pipelines` are explicit bootstrap exceptions: they create or authorize service principals and pipeline federation, print repo settings, and do not apply the account Terraform layer or remove tag-policy values.
 
