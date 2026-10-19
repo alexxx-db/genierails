@@ -1770,9 +1770,13 @@ policy-status: _guard-workspace-target ## Show the staged policy journal (determ
 
 # Drops an unfinished staged policy change that never retagged a column or
 # moved a principal (its new policies match no column), so a corrected config
-# can start a new one. Takes the env lock.
+# can start a new one. Takes the env lock. The abandon hook re-runs the
+# coverage check on the abandon render (the previous generation it leaves
+# live), like every other stage: the last check judged another render, so
+# kept SELECT grants would otherwise fail the plan as stale.
 policy-abandon: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target ## Drop an unfinished staged policy change that never switched or was rolled back (deterministic envs)
-	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
+	@$(_GUARD_WORKSPACE_ENV); $(_DRY_RUN_GUARD); \
+	GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) abandon --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
 
 # After the principals of a rolled-back change were deleted and recreated
 # (policies then name "unknown" and their grants are gone): re-apply the
