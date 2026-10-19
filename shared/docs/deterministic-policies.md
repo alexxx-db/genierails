@@ -147,7 +147,15 @@ any unfinished transition with its completed phases. Writes are atomic.
      the one other change allowed. Any other change refuses before anything
      is applied: a treatment tag update (a column retagged to the new value
      since the restore shows up as one), a policy's `TO`, `EXCEPT` or match,
-     a function, a grant, or a create.
+     a function, a grant, or a create. Before planning, it re-runs the
+     coverage check on the abandon render, as every other stage does on its
+     own: removing the change's policies changes the inputs the last check
+     (for example rebind's) judged, so kept business SELECT needs a pass for
+     exactly the set abandon leaves live. A column that render leaves
+     unmasked fails the check, and inputs that change after it (grants,
+     tags, DDL) still fail the plan as stale. A standalone `make
+     coverage-gate` judges the generated config, not this render, so it
+     doesn't stand in.
   2. For a rolled-back switch it then runs the live check (the
      `verify-created`/`verify-switched` check: policies, `TO`/`EXCEPT`
      principals, functions and treatment tags) against the restore. A
