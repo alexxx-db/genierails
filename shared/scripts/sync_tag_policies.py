@@ -7,20 +7,34 @@ This script bypasses Terraform by updating tag policy values directly via
 the Databricks REST API, so Terraform can use ignore_changes = [values] safely.
 
 Modes:
-    add-only  (default) only adds values. If a live value is no longer
-              desired, nothing is written and the run fails, pointing at
-              ``make apply-account``. Deterministic rehearse, release and
-              apply use this: Terraform ignores tag-policy values, so an
-              empty account plan doesn't prove a REST update is safe.
+    add-only  (default) adds missing values and never removes one. Live
+              values this checkout doesn't desire (another repo's, another
+              team's, a legacy env's) are reported as left in place and the
+              sync continues. Deterministic rehearse, release and apply use it.
+              With ``--remove KEY:VALUE`` (repeatable) it also removes exactly
+              the named values, after checking they're unused (below); only
+              ``make apply-account`` passes them, from its approved manifest.
     replace   makes the live values equal the desired ones, removing the
-              rest. Only account-layer applies use it: ``make apply-account``
-              and the legacy account apply (unchanged behaviour).
+              rest without a usage check. Only the legacy account apply (no
+              deterministic env in the checkout) uses it, as before.
 
 In both modes a live deterministic gr_treatment value is kept: only the
 staged retirement removes a generation.
 
+A named removal is refused, and nothing at all is written, when the value
+isn't live, is still desired, is a deterministic generation, or is still in
+use: assigned to any catalog, schema, table, column or volume in
+``system.information_schema`` (every catalog the deployer can read), or
+referenced by an ABAC policy on a visible catalog or schema, or on a table
+that carries the tag key. If that check can't run (no ``--warehouse-id``, a
+failed query or listing), the removal is refused too.
+
+``--dry-run`` reports exactly what the real run would do, refusals and exit
+code included, and writes nothing.
+
 Usage:
-    python3 scripts/sync_tag_policies.py [--mode add-only|replace] [path/to/abac.auto.tfvars]
+    python3 scripts/sync_tag_policies.py [--mode add-only|replace] [--remove KEY:VALUE ...]
+        [--warehouse-id ID] [--dry-run [--json]] [path/to/abac.auto.tfvars]
 """
 import argparse
 import json
@@ -78,89 +92,256 @@ def _str(v):
     return (v[0] if isinstance(v, list) else v or "").strip()
 
 
-APPLY_ACCOUNT_HINT = (
-    "Run 'make account-plan', get its manifest approved, then run 'make apply-account' "
-    "in the approved operations stage to remove them."
+REMOVAL_HINT = (
+    "This sync never removes values. Removing one deletes it from the account tag policy for every "
+    "workspace on the metastore, including tags and ABAC policies outside this repo. If that is intended, "
+    "run 'make account-plan ALLOW_TAG_VALUE_REMOVAL=<key>:<value>,... WAREHOUSE_ID=<id>' (it checks the "
+    "values are unused), get the manifest approved, then 'make apply-account'."
 )
 
 
-def plan_updates(desired_policies, existing, mode):
-    """``(updates, refused)``: per-key values to write, and removals add-only refuses.
+class Refusal(Exception):
+    pass
 
-    ``updates`` is ``[(actual_key, values, added, removed)]``; ``refused`` is
-    ``[(actual_key, values that would be removed)]``.
+
+def parse_removal(text):
+    """``KEY:VALUE`` -> ``(key, value)``; the value may itself contain ':'."""
+    key, sep, value = text.partition(":")
+    if not sep or not key.strip() or not value.strip():
+        raise Refusal(f"--remove {text!r}: expected KEY:VALUE")
+    return key.strip(), value.strip()
+
+
+def _live_key(key, existing):
+    # Exact match first, then suffix match (Terraform appends _<hex> suffix
+    # to tag keys for account-level isolation in parallel test environments).
+    if key in existing:
+        return key
+    return next((db_key for db_key in existing if db_key.startswith(key + "_")), None)
+
+
+def plan_updates(desired_policies, existing, mode, removals=()):
+    """``(updates, left, refused)``.
+
+    ``updates`` is ``[(actual_key, values, added, removed)]``: the full value
+    list to write per key. ``left`` is ``[(actual_key, values)]``: live values
+    add-only leaves in place though this checkout doesn't desire them.
+    ``refused`` is ``[(key, value, reason)]``: named removals that can't run.
     """
-    updates, refused = [], []
+    if removals and mode != "add-only":
+        raise Refusal("--remove is only valid with --mode add-only")
+    updates, left, refused = [], [], []
+    named = {}
+    for key, value in removals:
+        named.setdefault(key, set()).add(value)
+    seen = set()
     for tp in desired_policies:
         key = tp["key"]
         desired_values = set(tp["values"])
-        # Exact match first, then suffix match (Terraform appends _<hex> suffix
-        # to tag keys for account-level isolation in parallel test environments).
-        current_values = existing.get(key)
-        actual_key = key
-        if current_values is None:
-            for db_key, db_vals in existing.items():
-                if db_key == key or db_key.startswith(key + "_"):
-                    current_values = db_vals
-                    actual_key = db_key
-                    break
-
-        if current_values is None:
+        actual_key = _live_key(key, existing)
+        if actual_key is None:
             continue
+        current_values = existing[actual_key]
 
         # A deterministic treatment value stays allowed while a retained policy
         # generation or a not-yet-retagged column may still use it; only the
         # staged retirement removes generations, so this sync never does.
-        desired_values |= retained_deterministic_values(key, current_values)
+        retained = retained_deterministic_values(key, current_values)
         missing = desired_values - current_values
-        removed = current_values - desired_values
-        if mode == "add-only":
-            if removed:
-                refused.append((actual_key, sorted(removed)))
-                continue
-            if not missing:
-                continue
-        updates.append((actual_key, sorted(desired_values), sorted(missing), sorted(removed)))
-    return updates, refused
+        if mode == "replace":
+            desired_values |= retained
+            removed = current_values - desired_values
+            updates.append((actual_key, sorted(desired_values), sorted(missing), sorted(removed)))
+            continue
+        wanted = named.get(key, set()) | named.get(actual_key, set())
+        seen.update(k for k in (key, actual_key) if k in named)
+        remove = set()
+        for value in sorted(wanted):
+            if value in desired_values:
+                refused.append((actual_key, value, "still desired by this checkout's abac.auto.tfvars"))
+            elif value in retained:
+                refused.append((actual_key, value, "a deterministic generation; only the staged retirement removes it"))
+            elif value not in current_values:
+                refused.append((actual_key, value, "not a live value of the tag policy"))
+            else:
+                remove.add(value)
+        foreign = current_values - desired_values - retained - remove
+        if foreign:
+            left.append((actual_key, sorted(foreign)))
+        if missing or remove:
+            values = (current_values | desired_values) - remove
+            updates.append((actual_key, sorted(values), sorted(missing), sorted(remove)))
+    for key in sorted(set(named) - seen):
+        for value in sorted(named[key]):
+            refused.append((key, value, "no tag policy of this checkout has this key live"))
+    return updates, left, refused
 
 
-def update_diff(updates):
-    """Stable JSON shape for the values a replace sync would add/remove."""
-    return [
-        {"key": actual_key, "added": list(added), "removed": list(removed)}
-        for actual_key, _values, added, removed in updates
-        if added or removed
+def update_diff(updates, left=()):
+    """Stable JSON shape: per key, the values a sync would add/remove/leave in place."""
+    entries = {}
+    for actual_key, _values, added, removed in updates:
+        if added or removed:
+            entries[actual_key] = {"key": actual_key, "added": list(added), "removed": list(removed)}
+    for actual_key, values in left:
+        entry = entries.setdefault(actual_key, {"key": actual_key, "added": [], "removed": []})
+        entry["left_in_place"] = list(values)
+    return [entries[k] for k in sorted(entries)]
+
+
+# -- usage check for named removals ----------------------------------------------------
+
+TAG_VIEWS = (
+    ("catalog", "catalog_tags", ("catalog_name",)),
+    ("schema", "schema_tags", ("catalog_name", "schema_name")),
+    ("table", "table_tags", ("catalog_name", "schema_name", "table_name")),
+    ("column", "column_tags", ("catalog_name", "schema_name", "table_name", "column_name")),
+    ("volume", "volume_tags", ("catalog_name", "schema_name", "volume_name")),
+)
+SKIPPED_CATALOGS = ("system",)
+
+
+def _sql_list(values):
+    return ", ".join("'" + str(v).replace("\\", "\\\\").replace("'", "\\'") + "'" for v in sorted(values))
+
+
+def assignment_sql(keys, values):
+    """Every visible assignment of any of ``values`` under any of ``keys``."""
+    parts = [
+        f"SELECT '{kind}' AS kind, concat_ws('.', {', '.join(cols)}) AS securable, tag_name, tag_value "
+        f"FROM system.information_schema.{view} "
+        f"WHERE lower(tag_name) IN ({_sql_list(k.lower() for k in keys)}) AND tag_value IN ({_sql_list(values)})"
+        for kind, view, cols in TAG_VIEWS
     ]
+    return " UNION ALL ".join(parts) + " ORDER BY kind, securable, tag_name, tag_value"
+
+
+def keyed_tables_sql(keys):
+    """Tables that carry any value of ``keys`` (where table-level policies on them are likely)."""
+    where = f"lower(tag_name) IN ({_sql_list(k.lower() for k in keys)})"
+    return (f"SELECT DISTINCT concat_ws('.', catalog_name, schema_name, table_name) AS t "
+            f"FROM system.information_schema.column_tags WHERE {where} UNION "
+            f"SELECT DISTINCT concat_ws('.', catalog_name, schema_name, table_name) AS t "
+            f"FROM system.information_schema.table_tags WHERE {where} ORDER BY t")
+
+
+def _conditions(policy):
+    texts = [str(getattr(policy, "when_condition", "") or "")]
+    for match in getattr(policy, "match_columns", None) or []:
+        texts.append(str(getattr(match, "condition", "") or ""))
+    return [t for t in texts if t]
+
+
+def references(policy, key, value):
+    """Conservative: a condition naming the key and the quoted value references it."""
+    for text in _conditions(policy):
+        if key.lower() in text.lower() and (f"'{value}'" in text or f'"{value}"' in text):
+            return True
+    return False
+
+
+def check_usage(w, warehouse_id, removals):
+    """``(in_use, evidence)`` for ``[(actual_key, value)]``; raise Refusal if it can't tell.
+
+    ``in_use`` maps each used ``(key, value)`` to the places that use it.
+    """
+    if not warehouse_id:
+        raise Refusal("no SQL warehouse to read system.information_schema; set WAREHOUSE_ID=<id>")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts.audit_schema_drift import _run_sql
+
+    keys = sorted({k for k, _ in removals})
+    values = sorted({v for _, v in removals})
+    wanted = set(removals)
+    in_use = {}
+    try:
+        rows = _run_sql(w, warehouse_id, assignment_sql(keys, values))
+    except Exception as exc:
+        raise Refusal(f"could not read tag assignments from system.information_schema ({exc})") from exc
+    for kind, securable, tag_name, tag_value in (tuple(r) for r in rows):
+        for key, value in wanted:
+            if str(tag_name).lower() == key.lower() and tag_value == value:
+                in_use.setdefault((key, value), []).append(f"{kind} {securable}")
+    try:
+        tables = sorted({r[0] for r in _run_sql(w, warehouse_id, keyed_tables_sql(keys)) if r and r[0]})
+    except Exception as exc:
+        raise Refusal(f"could not list tables that carry {keys} ({exc})") from exc
+    securables = []
+    try:
+        catalogs = sorted(c.name for c in w.catalogs.list() if c.name and c.name not in SKIPPED_CATALOGS)
+        for catalog in catalogs:
+            securables.append(("CATALOG", catalog))
+            securables.extend(("SCHEMA", s.full_name or f"{catalog}.{s.name}")
+                              for s in sorted(w.schemas.list(catalog_name=catalog), key=lambda s: s.name or ""))
+    except Exception as exc:
+        raise Refusal(f"could not list catalogs and schemas ({exc})") from exc
+    securables.extend(("TABLE", t) for t in tables)
+    for kind, name in securables:
+        try:
+            policies = list(w.policies.list_policies(kind, name))
+        except Exception as exc:
+            raise Refusal(f"could not list ABAC policies on {kind.lower()} {name} ({exc})") from exc
+        for policy in policies:
+            for key, value in wanted:
+                if references(policy, key, value):
+                    in_use.setdefault((key, value), []).append(
+                        f"ABAC policy {getattr(policy, 'name', '?')} on {kind.lower()} {name}")
+    evidence = {"warehouse_id": warehouse_id, "catalogs": len(catalogs),
+                "policy_securables": len(securables), "tables_with_key": len(tables)}
+    return {k: sorted(v) for k, v in in_use.items()}, evidence
+
+
+def _report(updates, left, refused, dry_run):
+    verb = "[PLAN]" if dry_run else "[SYNC]"
+    for actual_key, values in left:
+        print(f"  [WARN] {actual_key}: {len(values)} live value(s) not desired by this checkout are left "
+              f"in place: {values}")
+    if left:
+        print(f"  {REMOVAL_HINT}")
+    if refused:
+        # Nothing is written: a partial sync would leave the account half-updated.
+        print("  [ERROR] Tag-policy value removal refused; nothing was written:", file=sys.stderr)
+        for key, value, reason in refused:
+            print(f"    - {key}:{value}: {reason}", file=sys.stderr)
+        return
+    if dry_run:
+        for actual_key, _values, missing, removed in updates:
+            changes = [f"would add {missing}"] if missing else []
+            changes += [f"would remove {removed}"] if removed else []
+            print(f"  {verb} {actual_key}: {', '.join(changes) if changes else 'would reassert desired values'}")
+        if not updates:
+            print(f"  {verb} tag policies already in sync")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Sync tag policy values to Databricks.")
     parser.add_argument("--mode", choices=("add-only", "replace"), default="add-only")
-    parser.add_argument("--dry-run", action="store_true", help="plan changes but do not write them")
+    parser.add_argument("--remove", action="append", default=[], metavar="KEY:VALUE",
+                        help="add-only: also remove this live value once it's proven unused (repeatable)")
+    parser.add_argument("--warehouse-id", default="", help="SQL warehouse for the --remove usage check")
+    parser.add_argument("--dry-run", action="store_true", help="report what the run would do; write nothing")
     parser.add_argument("--json", action="store_true", help="with --dry-run, print the add/remove diff as JSON")
     parser.add_argument("tfvars", nargs="?", default=str(WORK_DIR / "abac.auto.tfvars"))
     args = parser.parse_args(argv)
+    try:
+        removals = sorted({parse_removal(item) for raw in args.remove for item in raw.split(",") if item.strip()})
+    except Refusal as exc:
+        print(f"  [ERROR] {exc}", file=sys.stderr)
+        raise SystemExit(1)
     tfvars_path = Path(args.tfvars)
-    if not tfvars_path.exists():
+    desired_policies = []
+    if tfvars_path.exists():
+        import hcl2
+
+        with open(tfvars_path) as f:
+            desired_policies = hcl2.load(f).get("tag_policies", [])
+    if not desired_policies and not removals:
         if args.dry_run and args.json:
             print("[]")
         else:
-            print(f"  [SKIP] {tfvars_path} not found")
+            print(f"  [SKIP] {tfvars_path} not found" if not tfvars_path.exists()
+                  else "  [SKIP] No tag_policies found in config")
         return
-
-    import hcl2
-
-    with open(tfvars_path) as f:
-        config = hcl2.load(f)
-
-    desired_policies = config.get("tag_policies", [])
-    if not desired_policies:
-        if args.dry_run and args.json:
-            print("[]")
-        else:
-            print("  [SKIP] No tag_policies found in config")
-        return
-
     auth_cfg = _load_auth()
 
     # Get auth token via SDK's config.authenticate()
@@ -199,27 +380,35 @@ def main(argv=None):
         print(f"  [ERROR] Could not list tag policies ({list_err})")
         raise SystemExit(1)
 
-    updates, refused = plan_updates(desired_policies, existing, args.mode)
-    if args.dry_run:
-        if args.json:
-            print(json.dumps(update_diff(updates), sort_keys=True))
-        else:
-            for actual_key, _values, missing, removed in updates:
-                changes = []
-                if missing:
-                    changes.append(f"would add {missing}")
-                if removed:
-                    changes.append(f"would remove {removed}")
-                print(f"  [PLAN] {actual_key}: {', '.join(changes) if changes else 'already in sync'}")
-        return
-
-    if refused:
-        # Nothing is written: a partial sync would leave the account half-updated.
-        print("  [ERROR] Tag policy values are live but no longer desired; this sync only adds values:")
-        for actual_key, values in refused:
-            print(f"    - {actual_key}: would remove {values}")
-        print(f"  {APPLY_ACCOUNT_HINT}")
+    try:
+        updates, left, refused = plan_updates(desired_policies, existing, args.mode, removals)
+    except Refusal as exc:
+        print(f"  [ERROR] {exc}", file=sys.stderr)
         raise SystemExit(1)
+    planned = [(k, v) for k, _values, _added, removed in updates for v in removed] if removals else []
+    checks = {}
+    if planned and not refused:
+        try:
+            in_use, checks = check_usage(w, args.warehouse_id or os.environ.get("WAREHOUSE_ID", ""), planned)
+        except Refusal as exc:
+            refused = [(k, v, f"usage unknown: {exc}") for k, v in planned]
+        else:
+            refused = [(k, v, "still in use: " + "; ".join(where)) for (k, v), where in sorted(in_use.items())]
+    if args.dry_run and args.json:
+        if refused:
+            _report([], [], refused, True)
+            raise SystemExit(1)
+        diff = update_diff(updates, left)
+        for entry in diff:
+            if entry["removed"]:
+                entry["removal_check"] = dict(checks)
+        print(json.dumps(diff, sort_keys=True))
+        return
+    _report(updates, left, refused, args.dry_run)
+    if refused:
+        raise SystemExit(1)
+    if args.dry_run:
+        return
 
     updated = 0
     for actual_key, values, missing, removed in updates:

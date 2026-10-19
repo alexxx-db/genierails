@@ -1181,27 +1181,64 @@ def account_input_hashes(env_dir: Path) -> list[dict]:
     return sorted(result, key=lambda item: item["path"])
 
 
-def account_tag_sync_diff(env_dir: Path) -> list[dict]:
+def canonical_removals(text: str | list | tuple) -> list[str]:
+    """``ALLOW_TAG_VALUE_REMOVAL`` as sorted unique ``key:value`` items (deterministic)."""
+    items = text.split(",") if isinstance(text, str) else list(text)
+    result = set()
+    for item in (str(i).strip() for i in items):
+        if not item:
+            continue
+        key, sep, value = item.partition(":")
+        if not sep or not key.strip() or not value.strip():
+            raise Refused(f"ALLOW_TAG_VALUE_REMOVAL item {item!r} is not <key>:<value>")
+        result.add(f"{key.strip()}:{value.strip()}")
+    return sorted(result)
+
+
+def account_tag_sync_diff(env_dir: Path, allowed: list[str] = (), warehouse_id: str = "") -> list[dict]:
+    """What make apply-account's tag sync will do: add missing values, remove only ``allowed``.
+
+    The sync script refuses (and so does this) when an allowed removal is not
+    live, still desired, a deterministic generation, in use, or of unknown use.
+    """
     # Validate and pin the auth endpoint before invoking the REST-oriented tag
     # diff, so a missing routing key is reported by name rather than as JSON.
     account_input_hashes(env_dir)
     script = SHARED / "scripts" / "sync_tag_policies.py"
+    extra = [arg for item in allowed for arg in ("--remove", item)]
+    if allowed:
+        extra += ["--warehouse-id", warehouse_id]
     result = subprocess.run(
-        [sys.executable, str(script), "--mode", "replace", "--dry-run", "--json",
+        [sys.executable, str(script), "--mode", "add-only", "--dry-run", "--json", *extra,
          str(Path(env_dir) / "abac.auto.tfvars")],
         cwd=env_dir, text=True, capture_output=True, check=False,
     )
     if result.returncode:
         message = (result.stderr or result.stdout).strip()
-        raise Refused(f"the account tag-policy replace diff could not be computed"
-                      + (f": {message}" if message else ""))
+        raise Refused(f"the account tag-policy diff could not be computed"
+                      + (f":\n{message}" if message else ""))
     try:
         value = json.loads(result.stdout or "[]")
     except ValueError as exc:
-        raise Refused("the account tag-policy replace diff was not valid JSON") from exc
+        raise Refused("the account tag-policy diff was not valid JSON") from exc
     if not isinstance(value, list):
-        raise Refused("the account tag-policy replace diff was not a JSON list")
+        raise Refused("the account tag-policy diff was not a JSON list")
     return value
+
+
+def tag_sync_changes(diff) -> list[dict]:
+    """The part of a tag diff a manifest approves: per key, values added and removed.
+
+    Values left in place (live, not desired by this checkout) are reported but
+    never written, so another repo adding or retagging its own values doesn't
+    invalidate an approved manifest.
+    """
+    return [{"key": e.get("key"), "added": list(e.get("added") or []), "removed": list(e.get("removed") or [])}
+            for e in diff or [] if e.get("added") or e.get("removed")]
+
+
+def tag_removals(diff) -> list[str]:
+    return sorted(f"{e.get('key')}:{v}" for e in diff or [] for v in e.get("removed") or [])
 
 
 def _plan_summary_data(data: Mapping | None, *, changes: bool) -> dict:
@@ -1237,7 +1274,12 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
         raise Refused("account-plan didn't record the account plan summary")
     tag_sync = _read_json(plan_dir / "tag_sync.json")
     if tag_sync is None or not isinstance(tag_sync.get("diff"), list):
-        raise Refused("account-plan didn't record the account tag-policy replace diff")
+        raise Refused("account-plan didn't record the account tag-policy diff")
+    allowed = canonical_removals(tag_sync.get("allowed") or [])
+    # The live key may carry a Terraform _<hex> suffix, so compare the values.
+    if sorted(r.partition(":")[2] for r in tag_removals(tag_sync["diff"])) != \
+            sorted(a.partition(":")[2] for a in allowed):
+        raise Refused("account-plan's tag diff doesn't remove exactly the values ALLOW_TAG_VALUE_REMOVAL names")
     created = _now()
     manifest_id = f"{created.replace(':', '').replace('.', '').replace('-', '')}-{prov['commit'][:12]}-account"
     final_dir = manifests_dir(cloud_dir_of(env_dir), env) / manifest_id
@@ -1252,6 +1294,11 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
                  "summary": summary},
         "inputs": account_input_hashes(env_dir),
         "tag_sync": tag_sync["diff"],
+        # Approving the manifest approves exactly these removals; apply-account
+        # passes them (and only them) to the sync, which re-checks their usage.
+        "tag_value_removal": {"allowed": allowed, "allowed_arg": ",".join(allowed),
+                              "warehouse_id": str(tag_sync.get("warehouse_id") or "") if allowed else "",
+                              "removed": tag_removals(tag_sync["diff"])},
         "host": socket.gethostname(), "created_at": created,
     }
     _write_once(plan_dir / "manifest.json", manifest)
@@ -1299,7 +1346,7 @@ def select_account_manifest(env_dir: Path, env: str) -> Path:
 
 
 def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remote: str = "origin",
-                           branch: str = "main") -> dict:
+                           branch: str = "main", allow_removal: str = "") -> dict:
     env_dir, manifest_path = Path(env_dir), Path(manifest_path)
     manifest = load_account_manifest(manifest_path, env)
     plan_dir = manifest_path.parent
@@ -1330,13 +1377,25 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
     current_inputs = account_input_hashes(env_dir)
     if current_inputs != manifest.get("inputs"):
         drift.append("the account input file hashes changed since account-plan")
+    removal = manifest.get("tag_value_removal")
+    if not isinstance(removal, dict):
+        drift.append("the manifest records no approved tag-value removals (planned before removals were gated)")
+        removal = {}
+    allowed = list(removal.get("allowed") or [])
+    if allow_removal.strip() and canonical_removals(allow_removal) != allowed:
+        drift.append(f"ALLOW_TAG_VALUE_REMOVAL is set to {canonical_removals(allow_removal)} but the manifest "
+                     f"approved {allowed}; removals are chosen at account-plan, not at apply-account")
     try:
-        current_tag_sync = account_tag_sync_diff(env_dir)
+        current_tag_sync = account_tag_sync_diff(env_dir, allowed, str(removal.get("warehouse_id") or ""))
     except Refused as exc:
         drift.append(str(exc))
     else:
-        if current_tag_sync != manifest.get("tag_sync"):
-            drift.append("the account tag-policy replace diff changed since account-plan")
+        planned, live = tag_sync_changes(manifest.get("tag_sync")), tag_sync_changes(current_tag_sync)
+        if planned != live:
+            drift.append("the account tag-policy diff changed since account-plan: planned removals "
+                         f"{tag_removals(planned)}, additions {sorted(v for e in planned for v in e['added'])}; "
+                         f"live removals now {tag_removals(live)}, additions "
+                         f"{sorted(v for e in live for v in e['added'])}")
     if drift:
         raise Refused(f"make apply-account refused: {manifest_path} no longer matches:\n  - "
                       + "\n  - ".join(drift)
@@ -1350,8 +1409,41 @@ def require_account_lock(env_dir: Path) -> None:
     owner = held_by_ancestor(Path(env_dir))
     if owner == "apply-account":
         return
-    raise Refused("make sync-tags TAG_SYNC_MODE=replace refused: a deterministic env uses the account layer, "
-                  "so replace syncs may run only under the live account lock held by make apply-account.")
+    raise Refused("make sync-tags TAG_SYNC_REMOVE=... refused: a deterministic env uses the account layer, "
+                  "so tag-value removals may run only under the live account lock held by make apply-account, "
+                  "from the removals its approved manifest names.")
+
+
+def account_manifest_summary(manifest_path: Path, manifest: Mapping) -> list[str]:
+    """What an account manifest applies, tag-value removals first and loudest."""
+    plan = manifest.get("plan") or {}
+    counts = (plan.get("summary") or {}).get("resource_changes") or {}
+    diff = manifest.get("tag_sync") or []
+    lines = [f"  Manifest: {manifest_path}",
+             f"  Commit:   {manifest.get('commit')} (planned {manifest.get('created_at')} on {manifest.get('host')})",
+             "  Account plan: " + (", ".join(f"{n} {a}" for a, n in sorted(counts.items()))
+                                   if plan.get("changes") else "no changes")]
+    removed = [(e.get("key"), e.get("removed")) for e in diff if e.get("removed")]
+    if removed:
+        lines.append("  !! TAG VALUES THIS MANIFEST REMOVES (from every workspace on the metastore):")
+        for key, values in removed:
+            lines.append(f"  !!   {key}: {values}")
+        check = next((e.get("removal_check") for e in diff if e.get("removal_check")), None) or {}
+        if check:
+            lines.append(f"  !!   checked unused: no tag assignment in system.information_schema (warehouse "
+                         f"{check.get('warehouse_id')}), no ABAC policy reference on {check.get('policy_securables')} "
+                         f"catalog/schema/table securable(s) in {check.get('catalogs')} catalog(s); re-checked "
+                         "under the account lock before removal")
+    else:
+        lines.append("  Tag values removed: none")
+    for e in diff:
+        if e.get("added"):
+            lines.append(f"  Tag values added: {e.get('key')}: {e.get('added')}")
+    for e in diff:
+        if e.get("left_in_place"):
+            lines.append(f"  Tag values left in place (live, not desired here; never removed): {e.get('key')}: "
+                         f"{len(e['left_in_place'])} value(s) {e['left_in_place']}")
+    return lines
 
 
 def _plan_entry(plan_dir: Path, root: str) -> dict:
@@ -1715,6 +1807,8 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--out", type=Path, required=True)
     cmd = command("account-tag-sync-diff")
     cmd.add_argument("--out", type=Path, required=True)
+    cmd.add_argument("--allow-removal", default="", help="ALLOW_TAG_VALUE_REMOVAL: <key>:<value>,...")
+    cmd.add_argument("--warehouse-id", default="")
     cmd = command("reports")
     cmd.add_argument("--plan-dir", type=Path, required=True)
     cmd.add_argument("--provenance", type=Path, required=True)
@@ -1737,7 +1831,9 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--remote", default="origin")
     cmd.add_argument("--branch", default="main")
     cmd.add_argument("--field", default="", help="print one manifest field (json path a.b) instead")
+    cmd.add_argument("--allow-removal", default="", help="ALLOW_TAG_VALUE_REMOVAL at apply time (must match)")
     command("account-manifest-select")
+    command("account-manifest-summary").add_argument("--manifest", type=Path, required=True)
     cmd = command("account-manifest-info")
     cmd.add_argument("--manifest", type=Path, required=True)
     for name in ("release-receipt", "phase-record"):
@@ -1785,7 +1881,13 @@ def main(argv: list[str] | None = None) -> int:
             args.out.write_text(json.dumps(_plan_summary_data(data, changes=args.changes == "true"),
                                            indent=2, sort_keys=True) + "\n")
         elif args.command == "account-tag-sync-diff":
-            args.out.write_text(json.dumps({"diff": account_tag_sync_diff(args.env_dir)},
+            allowed = canonical_removals(args.allow_removal)
+            if allowed and not args.warehouse_id.strip():
+                raise Refused("ALLOW_TAG_VALUE_REMOVAL needs WAREHOUSE_ID=<id>: the usage check reads "
+                              "system.information_schema through a SQL warehouse")
+            diff = account_tag_sync_diff(args.env_dir, allowed, args.warehouse_id.strip())
+            args.out.write_text(json.dumps({"diff": diff, "allowed": allowed,
+                                            "warehouse_id": args.warehouse_id.strip()},
                                            indent=2, sort_keys=True) + "\n")
         elif args.command == "reports":
             prov = _read_json(args.provenance) or {}
@@ -1829,9 +1931,12 @@ def main(argv: list[str] | None = None) -> int:
                     value = value.get(part) if isinstance(value, dict) else None
                 print(json.dumps(value) if not isinstance(value, str) else value)
                 return 0
-            account_manifest_check(args.env_dir, args.env, args.manifest, remote=args.remote, branch=args.branch)
+            account_manifest_check(args.env_dir, args.env, args.manifest, remote=args.remote, branch=args.branch,
+                                   allow_removal=args.allow_removal)
             print(f"Account manifest {args.manifest}: commit, account state serial, saved plan, "
-                  "account inputs and tag-policy diff match.")
+                  "account inputs and tag-policy diff (approved removals) match.")
+        elif args.command == "account-manifest-summary":
+            print("\n".join(account_manifest_summary(args.manifest, load_account_manifest(args.manifest, args.env))))
         elif args.command == "account-manifest-select":
             path = select_account_manifest(args.env_dir, args.env)
             manifest = load_account_manifest(path, args.env)

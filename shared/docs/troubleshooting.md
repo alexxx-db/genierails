@@ -40,10 +40,10 @@ make import ENV=account      # import account groups + tag policies into module.
 make import                  # import env-scoped governance + workspace-local resources for ENV=dev
 make import ENV=prod         # import env-scoped governance + workspace-local resources for ENV=prod
 
-cd envs/account && ../../scripts/import_existing.sh --groups-only --dry-run
-cd envs/account && ../../scripts/import_existing.sh --tags-only --dry-run   # tag policies live in account
-cd envs/dev/data_access && ../../../scripts/import_existing.sh --fgac-only
-cd envs/dev/data_access && ../../../scripts/import_existing.sh --tag-assignments-only
+cd envs/account && ../../../shared/scripts/import_existing.sh --groups-only --dry-run
+cd envs/account && ../../../shared/scripts/import_existing.sh --tags-only --dry-run   # tag policies live in account
+cd envs/dev/data_access && ../../../../shared/scripts/import_existing.sh --fgac-only
+cd envs/dev/data_access && ../../../../shared/scripts/import_existing.sh --tag-assignments-only
 ```
 
 ### Brownfield workflow
@@ -63,6 +63,42 @@ make apply
 ```
 
 ## Common Issues
+
+### Tag sync warns "live value(s) not desired by this checkout are left in place"
+
+On a shared metastore the account tag policy (for example `gr_treatment`) holds
+values other GenieRails repos, teams or legacy envs use. Rehearse, release,
+apply and `make sync-tags` only add values: they leave those in place, print
+them and continue. Nothing is wrong; don't remove them to silence the warning.
+(Before this was fixed, the add-only sync refused here and failed
+`make rehearse` even when it had nothing to add.)
+
+To remove values that really are retired, name them:
+
+```bash
+make account-plan ALLOW_TAG_VALUE_REMOVAL=gr_treatment:redact WAREHOUSE_ID=<id>
+make apply-account   # after the manifest is approved
+```
+
+This deletes the values from the tag policy for every workspace on the
+metastore. `account-plan` refuses a value that is:
+
+| Message | Meaning / fix |
+|---|---|
+| `still in use: column <c.s.t.col>` (or `table`, `schema`, `catalog`, `volume`) | Something carries the tag value. Retag or untag it first (another team's? leave the value). |
+| `still in use: ABAC policy <name> on <securable>` | A policy condition names the value. Change or drop that policy first. |
+| `usage unknown: ...` / `ALLOW_TAG_VALUE_REMOVAL needs WAREHOUSE_ID` | The check couldn't run (no warehouse, no access to `system.information_schema`, a policy listing failed). Pass a warehouse the deployer can use and grant the read; the removal is never made blind. |
+| `still desired by this checkout's abac.auto.tfvars` | Remove it from `envs/account/abac.auto.tfvars` first. |
+| `a deterministic generation` | Only the staged retirement removes `<treatment>__<type>__<gen>` values. |
+| `not a live value of the tag policy` | Already gone, or a typo. |
+
+`make apply-account` refuses with `the account tag-policy diff changed since
+account-plan` when live values moved after planning (a planned value is no
+longer live, or a value it planned to add already is), and with `removals are
+chosen at account-plan, not at apply-account` when `ALLOW_TAG_VALUE_REMOVAL` is
+set at apply time to a different list. Run `make account-plan` again.
+`make sync-tags TAG_SYNC_MODE=replace` refuses while any env is deterministic.
+
 
 ### "Provider produced inconsistent result after apply" (tag policies)
 

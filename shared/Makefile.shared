@@ -858,11 +858,13 @@ account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/
 	if ! "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" show -json "$$plan_dir/account.tfplan" > "$$show_json"; then rm -f "$$show_json"; rm -rf "$$plan_dir"; echo "account-plan: terraform show failed (above); no manifest was written." >&2; exit 1; fi; \
 	$(_RELEASE_GATE) account-plan-summary --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --show-json "$$show_json" --changes "$$([ $$status -eq 2 ] && echo true || echo false)" --out "$$plan_dir/account.summary.json" || { rm -f "$$show_json"; rm -rf "$$plan_dir"; exit 1; }; \
 	rm -f "$$show_json"; \
-	$(_RELEASE_GATE) account-tag-sync-diff --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --out "$$plan_dir/tag_sync.json" || { rm -rf "$$plan_dir"; exit 1; }; \
+	$(_RELEASE_GATE) account-tag-sync-diff --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" --warehouse-id "$(strip $(WAREHOUSE_ID))" --out "$$plan_dir/tag_sync.json" || { rm -rf "$$plan_dir"; exit 1; }; \
 	manifest="$$($(_RELEASE_GATE) account-manifest-write --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json")" || { rm -rf "$$plan_dir"; exit 1; }; \
 	echo ""; \
 	echo "=== Account plan ==="; \
+	$(_RELEASE_GATE) account-manifest-summary --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --manifest "$$manifest" || exit 1; \
 	echo "  Manifest (immutable): $$manifest"; \
+	echo "  Approving this manifest approves exactly the plan and the tag-value removals above."; \
 	echo "  Review it and its saved plan, get it approved, then run:"; \
 	echo "    make apply-account"
 
@@ -880,16 +882,19 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 _apply-account-locked:
 	@$(_DRY_RUN_GUARD); \
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
-	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
+	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
 	$(call _ENV_LOCK,apply-account); \
-	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
+	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
 	apply_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-plan.XXXXXX")" || exit 1; chmod 700 "$$apply_dir"; \
 	trap '$(_NO_SIGNALS); rm -rf "$$apply_dir"; $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	cp "$$plans/account.tfplan" "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; chmod 400 "$$apply_dir/account.tfplan"; \
 	expected="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plan.sha256)" || { rm -rf "$$apply_dir"; exit 1; }; \
 	actual="$$(shasum -a 256 "$$apply_dir/account.tfplan" | awk '{print $$1}')"; \
 	if [ "$$actual" != "$$expected" ]; then rm -rf "$$apply_dir"; echo "ERROR: the saved account plan changed while it was copied; nothing was applied. Run make account-plan again." >&2; exit 1; fi; \
-	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=replace || { rm -rf "$$apply_dir"; exit 1; }; \
+	$(_RELEASE_GATE) account-manifest-summary --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || { rm -rf "$$apply_dir"; exit 1; }; \
+	removals="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field tag_value_removal.allowed_arg)" || { rm -rf "$$apply_dir"; exit 1; }; \
+	warehouse="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field tag_value_removal.warehouse_id)" || { rm -rf "$$apply_dir"; exit 1; }; \
+	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only TAG_SYNC_REMOVE="$$removals" WAREHOUSE_ID="$$warehouse" || { rm -rf "$$apply_dir"; exit 1; }; \
 	echo "=== Apply saved plan (account) ==="; \
 	LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" apply-plan "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; \
 	rm -rf "$$apply_dir"; \
@@ -1578,10 +1583,14 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		$(MAKE) --no-print-directory _plan-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
 	fi
 
-# add-only never removes a live tag-policy value (it refuses instead, pointing
-# at make apply-account); replace removes values no longer desired. A
-# deterministic ENV, or ENV=account while any env is deterministic, defaults
-# to add-only; anything else keeps replace.
+# add-only never removes a live tag-policy value: values this checkout doesn't
+# desire are reported as left in place. TAG_SYNC_REMOVE=<key>:<value>,... (only
+# make apply-account passes it, from its approved manifest) also removes those
+# values once sync_tag_policies.py proves them unused (WAREHOUSE_ID reads
+# system.information_schema). replace removes every undesired value with no
+# usage check; it's for legacy-only checkouts and refuses while any env is
+# deterministic. A deterministic ENV, or ENV=account while any env is
+# deterministic, defaults to add-only; anything else keeps replace.
 sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG_SYNC_MODE=add-only|replace)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
@@ -1592,9 +1601,13 @@ sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG
 		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$any_det" = 1 ]; then mode=add-only; fi; \
 	fi; \
 	if [ "$$mode" = replace ] && [ "$$any_det" = 1 ]; then \
+		echo "ERROR: make sync-tags TAG_SYNC_MODE=replace refused: a deterministic env uses the account layer, and replace would delete every live tag-policy value this checkout doesn't desire, with no usage check. Remove named values with make account-plan ALLOW_TAG_VALUE_REMOVAL=<key>:<value>,... WAREHOUSE_ID=<id>, then make apply-account." >&2; exit 1; \
+	fi; \
+	if [ -n "$(strip $(TAG_SYNC_REMOVE))" ]; then \
+		if [ "$$mode" != add-only ]; then echo "ERROR: TAG_SYNC_REMOVE needs TAG_SYNC_MODE=add-only." >&2; exit 1; fi; \
 		$(_RELEASE_GATE) account-lock-check --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" || exit 1; \
 	fi; \
-	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
+	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode" $(if $(strip $(TAG_SYNC_REMOVE)),--remove "$(strip $(TAG_SYNC_REMOVE))" --warehouse-id "$(strip $(WAREHOUSE_ID))",)
 
 _sync-tags-add-only-locked:
 	@$(call _ENV_LOCK,tag-sync-add-only); \

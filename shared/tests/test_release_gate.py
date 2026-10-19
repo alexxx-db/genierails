@@ -402,16 +402,19 @@ def _account_plan_dir(repo: Repo, *, changes: bool = True) -> Path:
         "changes": changes, "resource_changes": {"create": 1, "update": 1},
     }))
     (plan_dir / "tag_sync.json").write_text(json.dumps({"diff": [
-        {"key": "gr_treatment", "added": ["new"], "removed": ["old"]},
-    ]}))
+        {"key": "gr_treatment", "added": ["new"], "removed": ["old"], "left_in_place": ["theirs"]},
+    ], "allowed": ["gr_treatment:old"], "warehouse_id": "wh"}))
     return plan_dir
 
 
 @pytest.fixture
 def account_manifest(repo, monkeypatch):
-    monkeypatch.setattr(rg, "account_tag_sync_diff", lambda _env_dir: [
-        {"key": "gr_treatment", "added": ["new"], "removed": ["old"]},
-    ])
+    def diff(_env_dir, allowed=(), warehouse_id=""):
+        # Like the sync: only a named removal (with its warehouse) is removed.
+        named = list(allowed) == ["gr_treatment:old"] and warehouse_id == "wh"
+        return [{"key": "gr_treatment", "added": ["new"], "removed": ["old"] if named else [],
+                 "left_in_place": ["theirs"] if named else ["old", "theirs"]}]
+    monkeypatch.setattr(rg, "account_tag_sync_diff", diff)
     state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({"version": 4, "serial": 5, "lineage": "A", "resources": []}))
@@ -427,7 +430,10 @@ def test_account_plan_writes_one_immutable_manifest(repo, account_manifest):
     assert data["plan"]["sha256"] == rg.sha256_bytes(b"account saved plan")
     assert data["plan"]["summary"]["resource_changes"] == {"create": 1, "update": 1}
     assert {"path": "env.auto.tfvars", "sha256": rg.sha256_file(repo.cloud / "envs" / "account" / "env.auto.tfvars")} in data["inputs"]
-    assert data["tag_sync"] == [{"key": "gr_treatment", "added": ["new"], "removed": ["old"]}]
+    assert data["tag_sync"] == [{"key": "gr_treatment", "added": ["new"], "removed": ["old"],
+                                 "left_in_place": ["theirs"]}]
+    assert data["tag_value_removal"] == {"allowed": ["gr_treatment:old"], "allowed_arg": "gr_treatment:old",
+                                         "warehouse_id": "wh", "removed": ["gr_treatment:old"]}
     for path in [account_manifest.parent, *account_manifest.parent.rglob("*")]:
         assert path.stat().st_mode & 0o077 == 0, path
         if path.is_file():
@@ -520,11 +526,70 @@ def test_account_input_hashes_refuse_an_auth_symlink_outside_envs(tmp_path):
 
 
 def test_account_manifest_refuses_tag_sync_diff_drift(repo, account_manifest, monkeypatch):
-    monkeypatch.setattr(rg, "account_tag_sync_diff", lambda _env_dir: [
-        {"key": "gr_treatment", "added": ["other"], "removed": []},
+    monkeypatch.setattr(rg, "account_tag_sync_diff", lambda *_a: [
+        {"key": "gr_treatment", "added": ["new"], "removed": []},
     ])
-    with pytest.raises(rg.Refused, match="tag-policy replace diff changed"):
+    with pytest.raises(rg.Refused, match=r"planned removals \['gr_treatment:old'\].*live removals now \[\]"):
         rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_ignores_values_left_in_place_changing(repo, account_manifest, monkeypatch):
+    monkeypatch.setattr(rg, "account_tag_sync_diff", lambda *_a: [
+        {"key": "gr_treatment", "added": ["new"], "removed": ["old"], "left_in_place": ["theirs", "more"]},
+    ])
+    rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_refuses_a_different_allow_list_at_apply(repo, account_manifest):
+    with pytest.raises(rg.Refused, match="chosen at account-plan, not at apply-account"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest,
+                                  allow_removal="gr_treatment:old,gr_treatment:theirs")
+    rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest,
+                              allow_removal=" gr_treatment:old ,")
+
+
+def test_account_manifest_without_recorded_removals_is_refused(repo, account_manifest):
+    os.chmod(account_manifest, 0o644)
+    data = json.loads(account_manifest.read_text())
+    del data["tag_value_removal"]
+    account_manifest.write_text(json.dumps(data))
+    with pytest.raises(rg.Refused, match="records no approved tag-value removals"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", account_manifest)
+
+
+def test_account_manifest_write_refuses_removals_nobody_allowed(repo, monkeypatch):
+    state = rg.root_state_paths(repo.cloud / "envs" / "account")["account"]
+    state.parent.mkdir(parents=True)
+    state.write_text(json.dumps({"version": 4, "serial": 5, "lineage": "A", "resources": []}))
+    plan_dir = _account_plan_dir(repo)
+    (plan_dir / "tag_sync.json").write_text(json.dumps({"diff": [
+        {"key": "gr_treatment", "added": [], "removed": ["old"]}], "allowed": [], "warehouse_id": ""}))
+    prov = rg.account_provenance(repo.cloud / "envs" / "account")
+    with pytest.raises(rg.Refused, match="doesn't remove exactly the values ALLOW_TAG_VALUE_REMOVAL names"):
+        rg.account_manifest_write(repo.cloud / "envs" / "account", "account", plan_dir, prov)
+
+
+def test_account_manifest_summary_puts_removals_first_and_loud(repo, account_manifest):
+    lines = rg.account_manifest_summary(account_manifest, json.loads(account_manifest.read_text()))
+    text = "\n".join(lines)
+    assert "!! TAG VALUES THIS MANIFEST REMOVES (from every workspace on the metastore):" in text
+    assert "!!   gr_treatment: ['old']" in text
+    assert "Tag values added: gr_treatment: ['new']" in text
+    assert "left in place (live, not desired here; never removed): gr_treatment: 1 value(s) ['theirs']" in text
+    assert text.index("REMOVES") < text.index("Tag values added")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("", []), ("k:b,k:a, k:a ", ["k:a", "k:b"]), ("k:a:b", ["k:a:b"]),
+])
+def test_canonical_removals_is_sorted_and_deduplicated(text, expected):
+    assert rg.canonical_removals(text) == expected
+
+
+@pytest.mark.parametrize("text", ["novalue", ":v", "k:"])
+def test_canonical_removals_refuses_malformed_items(text):
+    with pytest.raises(rg.Refused, match="is not <key>:<value>"):
+        rg.canonical_removals(text)
 
 
 def test_account_manifest_refuses_already_receipted_manifest(repo, account_manifest):
