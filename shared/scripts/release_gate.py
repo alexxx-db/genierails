@@ -34,7 +34,15 @@ manifest-write / manifest-check
     plan file hashes, the live-snapshot and effective-config digests, the
     kept-name mapping, the reports, and the Genie agent plan (what release
     pushes to each agent, with its overwrite report; scripts/agent_ownership.py). ``make release MANIFEST=<path>`` refuses
-    and asks for a fresh release-plan if any of them changed.
+    and asks for a fresh release-plan if any of them changed, if the manifest
+    was already released, or if a newer release-plan superseded it.
+
+current-manifest / manifest-summary
+    manifest-write records the manifest it wrote as the env's current one
+    (manifests/CURRENT, the manifest id; a newer release-plan replaces it).
+    ``make release ENV=<env>`` with no MANIFEST= releases the current manifest
+    after printing its path, commit and change summary; MANIFEST=<path> is the
+    explicit override pipelines use.
 
 release-receipt / maintain-check
     A finished release writes a receipt (commit, digests, manifest, and each
@@ -81,6 +89,8 @@ from state_layout import root_state_paths, state_json  # noqa: E402
 
 STATE_DIR_ENV = "GENIERAILS_STATE_DIR"
 DEFAULT_STATE = ".genierails-state"
+# manifests/CURRENT: the id of the manifest a plain make release ENV=<env> releases.
+CURRENT_MANIFEST = "CURRENT"
 VERSION = 1
 # Files under envs/<env> that applying commands write: never inputs.
 RUNTIME_FILES = {
@@ -991,6 +1001,106 @@ def manifests_dir(cloud_dir: Path, env: str) -> Path:
     return env_state(cloud_dir, env) / "manifests"
 
 
+def current_pointer(cloud_dir: Path, env: str) -> Path:
+    return manifests_dir(cloud_dir, env) / CURRENT_MANIFEST
+
+
+def current_manifest_id(cloud_dir: Path, env: str) -> str | None:
+    """The id of the manifest the last release-plan wrote; None before any did."""
+    pointer = _read_json(current_pointer(cloud_dir, env))
+    if pointer is None:
+        return None
+    value = pointer.get("id")
+    if not isinstance(value, str) or not value or "/" in value or value.startswith("."):
+        raise Refused(f"{current_pointer(cloud_dir, env)} names no manifest; run make release-plan ENV={env} again")
+    return value
+
+
+def _set_current(cloud_dir: Path, env: str, manifest_id: str, created: str) -> None:
+    """Point the env at its newest manifest (replaced, never appended: it supersedes the previous one)."""
+    pointer = current_pointer(cloud_dir, env)
+    tmp = pointer.with_name(f".{pointer.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"id": manifest_id, "created_at": created}, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, pointer)
+
+
+def released_by(cloud_dir: Path, env: str, manifest_id: str) -> str | None:
+    """The receipt (release or applied phase) that already released this manifest, if any."""
+    for receipt in release_receipts(cloud_dir, env):
+        if (receipt.get("manifest") or {}).get("id") == manifest_id:
+            return receipt["_path"]
+    for record in _receipts(env_state(cloud_dir, env) / "receipts" / "phases"):
+        if record.get("kind") == "release-phase" and record.get("id") == manifest_id:
+            return record["_path"]
+    return None
+
+
+def check_releasable(env_dir: Path, env: str, manifest_path: Path, manifest: Mapping) -> None:
+    """Refuse a manifest that was already released or that a newer release-plan superseded."""
+    cloud_dir = cloud_dir_of(env_dir)
+    receipt = released_by(cloud_dir, env, manifest["id"])
+    if receipt:
+        raise Refused(f"make release refused: {manifest_path} was already released ({receipt}). Nothing was "
+                      f"applied. Run make release-plan ENV={env} for a new manifest, then make release ENV={env}.")
+    current = current_manifest_id(cloud_dir, env)
+    if current is not None and current != manifest["id"]:
+        newer = manifests_dir(cloud_dir, env) / current / "manifest.json"
+        raise Refused(f"make release refused: {manifest_path} was superseded by a newer make release-plan "
+                      f"({newer}). Nothing was applied. Review and release the current one with make release "
+                      f"ENV={env}, or run make release-plan ENV={env} again.")
+
+
+def current_manifest(env_dir: Path, env: str) -> Path:
+    """The env's current manifest for a plain make release; refuses when there is none to release."""
+    cloud_dir = cloud_dir_of(env_dir)
+    current = current_manifest_id(cloud_dir, env)
+    if current is None:
+        raise Refused(f"make release refused: ENV={env} has no current release manifest. Run make release-plan "
+                      f"ENV={env}, get the manifest it writes approved, then make release ENV={env}.")
+    path = manifests_dir(cloud_dir, env) / current / "manifest.json"
+    if not path.is_file():
+        raise Refused(f"make release refused: the current manifest {path} is missing. Run make release-plan "
+                      f"ENV={env} again.")
+    check_releasable(env_dir, env, path, load_manifest(path, env))
+    return path
+
+
+def manifest_summary(manifest_path: Path, manifest: Mapping) -> list[str]:
+    """What a manifest applies, from its own records (printed before a plain make release applies it)."""
+    plans = manifest.get("plans") or {}
+    lines = [f"  Manifest: {manifest_path}",
+             f"  Commit:   {manifest.get('commit')} (planned {manifest.get('created_at')} on {manifest.get('host')})",
+             "  Changes:"]
+    imports = (manifest.get("imports") or {}).get("count") or 0
+    if imports:
+        lines.append(f"    imports:      {imports} recorded import(s)/stale-tag cleanup(s), and nothing else")
+    steps = (plans.get("data_access") or {}).get("steps") or []
+    changing = [str(s.get("phase")) for s in steps if s.get("kind") == "apply" and s.get("changes")]
+    if steps and [s.get("kind") for s in steps] == ["adopt"]:
+        lines.append("    data_access:  adopt the legacy policies (one staged phase)")
+    elif not imports:
+        what = f"saved plan(s) with changes, phase(s) {', '.join(changing)}" if changing else "no changes"
+        lines.append(f"    data_access:  {what}"
+                     + ("" if manifest.get("final") else " (one phase of a staged policy change)"))
+    workspace = plans.get("workspace") or {}
+    lines.append("    workspace:    " + (f"not planned ({workspace['skipped']})" if workspace.get("skipped")
+                                       else "saved plan with changes" if workspace.get("changes") else "no changes"))
+    agents = ((manifest.get("agents") or {}).get("agents") or {}).values()
+    actions = [a.get("action") for a in agents]
+    if actions:
+        lines.append(f"    Genie agents: {actions.count('push')} pushed, {actions.count('delete')} deleted, "
+                     f"{len(actions) - actions.count('push') - actions.count('delete')} not pushed")
+    report = manifest.get("reports") or {}
+    acked = len((report.get("weakening") or {}).get("acknowledged") or []) \
+        + len((report.get("revocations") or {}).get("acknowledged") or [])
+    newly = len((report.get("readers") or {}).get("tables") or [])
+    if acked or newly:
+        lines.append(f"    reviewed:     {acked} acknowledged weakening(s)/revocation(s), "
+                     f"{newly} newly governed table(s)")
+    return lines
+
+
 def new_plan_dir(env_dir: Path, env: str) -> Path:
     """A private dir for release-plan's saved plans.
 
@@ -1328,6 +1438,7 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
     for path in plan_dir.rglob("*"):
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)  # the manifest dir appears complete or not at all
+    _set_current(cloud_dir_of(env_dir), env, manifest_id, created)  # supersedes the previous manifest
     return final_dir / "manifest.json"
 
 
@@ -1397,6 +1508,8 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
     if drift:
         raise Refused(f"make release refused: {manifest_path} no longer matches:\n  - " + "\n  - ".join(drift)
                       + f"\nNothing was applied. Run make release-plan ENV={env} again and approve the new manifest.")
+    # After the drift checks, so a changed manifest is always reported as changed.
+    check_releasable(env_dir, env, manifest_path, manifest)
     return manifest
 
 
@@ -1473,7 +1586,7 @@ def maintain_check(env_dir: Path, env: str) -> dict:
     if last is None:
         raise Refused(f"make maintain refused: {env} has no release receipt yet "
                       f"({release_dir(cloud_dir, env)}). Release it first: make release-plan ENV={env}, "
-                      f"then make release ENV={env} MANIFEST=<manifest>")
+                      f"then make release ENV={env}")
     status = checkout_status(env_dir)
     repo = Path(status["repo"])
     problems = []
@@ -1530,8 +1643,8 @@ def apply_guard(env_dir: Path, env: str, target: str) -> None:
     name = target.split(":")[0]
     layer = f" (the {target.split(':')[1]} layer)" if ":" in target else ""
     if role == PROMOTED:
-        how = (f"changes reach it only through make release-plan ENV={env}, then make release ENV={env} "
-               f"MANIFEST=<the manifest it printed>" + ("; make maintain ENV=" + env + " re-applies governance "
+        how = (f"changes reach it only through make release-plan ENV={env}, then make release ENV={env}"
+               + ("; make maintain ENV=" + env + " re-applies governance "
                                                          "from the released commit" if "maintain" in allowed else ""))
         why = f"ENV={env} is a deterministic env promoted from {source_env(env_dir)}"
     else:
@@ -1629,6 +1742,8 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--manifest", type=Path, required=True)
     for name in ("release-receipt", "phase-record"):
         command(name).add_argument("--manifest", type=Path, required=True)
+    command("current-manifest")
+    command("manifest-summary").add_argument("--manifest", type=Path, required=True)
     command("account-receipt").add_argument("--manifest", type=Path, required=True)
     command("account-lock-check")
     command("any-deterministic-env")
@@ -1703,6 +1818,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Manifest {args.manifest}: commit, state serials, saved plans"
                   + (", effective config and live snapshot" if args.live_snapshot else " and effective config")
                   + " match.")
+        elif args.command == "current-manifest":
+            print(current_manifest(args.env_dir, args.env))
+        elif args.command == "manifest-summary":
+            print("\n".join(manifest_summary(args.manifest, load_manifest(args.manifest, args.env))))
         elif args.command == "account-manifest-check":
             if args.field:
                 value = load_account_manifest(args.manifest, args.env)

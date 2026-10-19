@@ -1,4 +1,4 @@
-"""make wiring of release gating (rollout step 9): rehearse, release-plan, release MANIFEST=, maintain.
+"""make wiring of release gating (rollout step 9): rehearse, release-plan, release (current or MANIFEST=), maintain.
 
 Real make runs the real recipes and release_gate.py against a git checkout
 in tmp_path (tests/test_release_gate.py's Repo). Recursive makes, Terraform
@@ -13,6 +13,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -164,7 +165,8 @@ def _no_lock(repo: Repo, env: str) -> bool:
 def test_plain_release_in_a_deterministic_env_refuses_with_a_pointer_to_release_plan(tmp_path, repo, cloud):
     result = Make(tmp_path, repo, cloud)("release", "prod", stub_make=False)
     assert result.returncode != 0
-    assert "make release-plan ENV=prod" in result.stderr and "MANIFEST=" in result.stderr
+    assert "has no current release manifest. Run make release-plan ENV=prod" in result.stderr
+    assert "MANIFEST=<path> names one explicitly" in result.stderr
     assert _no_lock(repo, "prod")
     assert not rg.release_receipts(repo.cloud, "prod")
 
@@ -225,6 +227,7 @@ def test_release_plan_writes_one_manifest_under_the_lock(make, repo):
     manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
     data = json.loads(manifest.read_text())
     assert data["commit"] == repo.head() and data["live_snapshot"] == "live-1" and data["final"] is True
+    assert "    make release ENV=prod\n" in result.stdout and rg.current_manifest(repo.prod, "prod") == manifest
     assert data["provenance"]["source_env"] == "dev" and data["reports"] == {"ok": True}
     assert _no_lock(repo, "prod")
 
@@ -444,6 +447,98 @@ def test_release_applies_only_the_saved_plans_then_verifies_and_writes_a_receipt
     assert "_verify-access-gate" in make.names()
     receipt = rg.last_release(repo.cloud, "prod")
     assert receipt["commit"] == repo.head() and receipt["manifest"]["path"] == str(manifest)
+    assert "Release the current manifest" not in result.stdout  # an explicit MANIFEST= is unchanged
+
+
+def _applied(make: Make) -> list[list[str]]:
+    return [c for c in make.calls() if c[0] in ("staged", "runner")]
+
+
+def test_plain_release_prints_the_current_manifest_then_applies_it(make, repo):
+    manifest = _planned(make)
+    result = make("_release-manifest", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    summary = out.index("=== Release the current manifest (prod) ===")
+    assert f"  Manifest: {manifest}\n" in out and f"  Commit:   {repo.head()} (planned " in out
+    assert "    data_access:  saved plan(s) with changes, phase(s) grant" in out
+    assert "    workspace:    saved plan with changes" in out
+    # The summary comes before anything is applied, and the checks and apply path are today's.
+    assert summary < out.index("match.") < out.index("=== Apply saved plan (workspace:prod) ===") \
+        < out.index("=== Release complete (prod) ===")
+    staged = [c for c in make.calls() if c[0] == "staged"]
+    assert staged[0][1:2] == ["apply-saved"]
+    assert staged[0][staged[0].index("--plan-dir") + 1] == str(manifest.parent / "data_access")
+    assert [c for c in make.calls() if c[0] == "runner"] == [
+        ["runner", "workspace", "prod", "apply-plan", str(manifest.parent / "workspace.tfplan")]]
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
+
+
+def test_plain_release_through_the_release_target_uses_the_current_manifest(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_release-manifest",))
+    manifest = _planned(make)
+    result = make("release", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"  Manifest: {manifest}\n" in result.stdout
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
+
+
+def test_plain_release_without_a_current_manifest_refuses_and_applies_nothing(make, repo):
+    result = make("_release-manifest", "prod")
+    assert result.returncode != 0
+    assert "has no current release manifest. Run make release-plan ENV=prod" in result.stderr
+    assert "Release the current manifest" not in result.stdout
+    assert _applied(make) == [] and _no_lock(repo, "prod") and not rg.release_receipts(repo.cloud, "prod")
+
+
+def test_plain_release_refuses_a_current_manifest_that_was_already_released(make, repo):
+    manifest = _planned(make)
+    assert make("_release-manifest", "prod").returncode == 0
+    make.reset()
+    for extra in ((), (f"MANIFEST={manifest}",)):
+        result = make("_release-manifest", "prod", *extra)
+        assert result.returncode != 0
+        assert "was already released" in result.stderr and "Run make release-plan ENV=prod" in result.stderr
+        assert _applied(make) == [] and _no_lock(repo, "prod")
+    assert len(rg.release_receipts(repo.cloud, "prod")) == 1
+
+
+def test_plain_release_refuses_a_current_phase_manifest_already_applied(make, repo):
+    _planned(make)
+    make.exit_code("staged", 10)
+    assert make("_release-manifest", "prod").returncode == 0
+    make.reset()
+    result = make("_release-manifest", "prod")
+    assert result.returncode != 0 and "was already released" in result.stderr
+    assert _applied(make) == []
+
+
+def test_a_newer_release_plan_supersedes_the_older_manifest(make, repo):
+    older = _planned(make)
+    time.sleep(1.1)  # manifest ids are per second
+    result = make("release-plan", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    newer = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    assert newer != older
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={older}")
+    assert result.returncode != 0
+    assert "was superseded by a newer make release-plan" in result.stderr and str(newer) in result.stderr
+    assert _applied(make) == [] and _no_lock(repo, "prod")
+    result = make("_release-manifest", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"  Manifest: {newer}\n" in result.stdout
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(newer)
+
+
+def test_plain_release_runs_todays_staleness_checks(make, repo):
+    _planned(make)
+    make.live.write_text("live-2\n")
+    result = make("_release-manifest", "prod")
+    assert result.returncode != 0
+    assert "=== Release the current manifest (prod) ===" in result.stdout
+    assert "live Unity Catalog changed" in result.stderr and "Run make release-plan ENV=prod again" in result.stderr
+    assert _applied(make) == [] and not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
 
 
 @pytest.mark.parametrize("drift", ["commit", "serial", "live", "plan"])

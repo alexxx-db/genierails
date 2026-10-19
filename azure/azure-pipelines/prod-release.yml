@@ -12,12 +12,12 @@
 #   (Approvals check on the "genierails-prod" environment)
 #   make release ENV=prod MANIFEST=<manifest>      applies exactly that manifest
 #
-# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the two-phase
-# release (rollout step 9). Until both exist the operator releases on the
-# deployment machine with make release ENV=prod, at the commit this run names,
-# in that machine's one persistent checkout: v1 keeps Terraform state, the
-# env lock and the Genie ID files under its gitignored envs/, so a re-clone
-# loses them. Move the checkout with
+# REQUIRES PROD REMOTE STATE (deferred; design section 15) before CI can apply
+# prod. Until prod has remote state, the operator releases on the deployment
+# machine with make release ENV=prod, at the commit this run names, in that
+# machine's one persistent checkout: v1 keeps Terraform state, the env lock
+# and the Genie ID files under its gitignored envs/, so a re-clone loses them.
+# Move the checkout with
 # `git fetch && git checkout --force --detach <sha>` (--force drops earlier
 # runs' edits to tracked generated/ and layer files and leaves the ignored
 # state alone), confirm `git status --porcelain` prints nothing, and never
@@ -147,8 +147,10 @@ stages:
               WORKSPACE_ID: $(PROD_DATABRICKS_WORKSPACE_ID)
               HOST: $(PROD_DATABRICKS_WORKSPACE_HOST)
 
-          # TODO(rollout step 9): run the release plan here and publish its
-          # manifest as a pipeline artifact; the release stage applies it.
+          # TODO(deferred, section 15): once prod has remote state, run
+          # release-plan here and publish its manifest. Until then, this CI
+          # stage only re-checks the commit that the deployment machine will
+          # release.
           - script: make check ENV=prod
             displayName: Read-only check of the commit to release
             workingDirectory: azure
@@ -169,7 +171,9 @@ stages:
             deploy:
               steps:
                 # TODO(deferred, section 15): apply the approved manifest here
-                # once prod has remote state with locking.
+                # once prod has remote state with locking. Until then, the
+                # approved handoff is the commit named below, applied from the
+                # deployment machine.
                 - script: |
                     echo "##[warning]Prod release not run in CI (v1); prod remote state is not built yet."
                     echo "Release approved commit $(resources.pipeline.dev.sourceCommit) on the deployment machine (see this pipeline's header)."

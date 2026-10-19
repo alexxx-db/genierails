@@ -65,7 +65,7 @@ make setup ENV=prod                        # set governance_mode, deployer_princ
 make promote-to ENV=prod                   # commit envs/prod/, PR, merge
 #   Catalog Explorer: the same classification review on the prod catalog
 make release-plan ENV=prod                 # on the deployment machine; approve the manifest
-make release ENV=prod MANIFEST=<manifest>
+make release ENV=prod                     # releases the approved manifest
 make maintain ENV=prod                     # on a schedule
 ```
 
@@ -246,7 +246,7 @@ rehearse and release. Read the [CHANGELOG](../../../aws/CHANGELOG.md) first.
 | a mask GenieRails didn't create is on a governed table | remove it; GenieRails supports only governance it generates |
 | prod has a column classified in dev but no `class.*` tag | finish prod's classification review, wait, re-run |
 | a group in `acl_groups` can't read an agent's table | add it to `table_readers`, or the agent's owner drops it |
-| `make check` says generated files differ | run `make generate ENV=dev` (or `make promote-to ENV=prod`) on the latest `main` and commit; never hand-merge generated files |
+| `make check` says generated files differ | run `make generate ENV=dev` (or `make promote-to ENV=prod`) on the latest `main` and commit; never hand-merge generated files. In dev, after a deployer or group change, also run `make promote ENV=dev` before `make check ENV=dev` so the split files are current ([legacy-migration.md](../legacy-migration.md)) |
 
 > **Optional AI helpers (dev only).** They write files under `envs/dev/drafts/`
 > for review, are never run by `generate`, `rehearse`, `release` or `maintain`,

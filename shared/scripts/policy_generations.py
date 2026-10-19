@@ -62,8 +62,11 @@ Stages (every one keeps all retained generations' functions):
 * ``restore``: back to the ``create`` render (old values and principals) after
   a failed tighten or switch; newly governed columns keep their new value.
 * ``retire``: the retire generation's policies leave.
-* ``abandon``: a transition that never switched is dropped: back to the
-  active generation, without the replacement's policies.
+* ``abandon``: a transition that never switched (or whose switch was rolled
+  back) is dropped: back to the active generation, without the replacement's
+  policies. Its plan may only delete those policies; any other change, such
+  as a column retagged since the restore, refuses (``plan_violations``). The
+  controller saves that plan, checks live, and applies exactly it.
 * ``drop-functions``: after ``retire``, drop the functions only the retired
   generation used, once no live policy calls them.
 * ``grant``: last, once every phase above is applied and verified: re-apply
@@ -120,6 +123,8 @@ OUTSIDER = "<anyone outside the tiers>"
 PROTECTED_TYPES = {
     "databricks_policy_info", "databricks_entity_tag_assignment", "terraform_data.masking_functions_drop",
 }
+# Deleting a policy restarts this wait (its trigger hashes the policy map); it changes no access.
+ENFORCEMENT_WAIT = "time_sleep.wait_for_policy_enforcement"
 # Business access is only ever created once the new protection is switched in.
 BUSINESS_GRANTS = {"catalog_access", "schema_access", "table_access"}
 SETTINGS_KEYS = ("access_tier_groups", "raw_exempt_principals", "treatment_versions",
@@ -467,7 +472,10 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
     No stage replaces a policy, a treatment tag or the function drop. Deletes
     are allowed only for the policies and treatment tags the stage itself
     removes (see plan_stage), and business grants are created only once the
-    new protection is switched in.
+    new protection is switched in. ``abandon`` may only delete those policies:
+    any other change (a treatment tag retagged since the restore, a policy's
+    principals or match, a function, a grant, a create) is refused, apart from
+    the enforcement wait that a policy delete restarts.
     """
     problems = []
     for change in plan.get("resource_changes") or []:
@@ -475,6 +483,13 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
         address = str(change.get("address") or "")
         rtype = str(change.get("type") or "")
         key = str(change.get("index") or "")
+        if stage == "abandon" and set(actions) - {"no-op", "read"}:
+            if actions == ["delete"] and rtype == "databricks_policy_info" and key in allowed_policy_deletes:
+                continue
+            if address.endswith(ENFORCEMENT_WAIT):
+                continue
+            problems.append(f"{address}: {'/'.join(actions)} (abandon only deletes the unfinished change's policies)")
+            continue
         if ("create" in actions and rtype == "databricks_grant" and change.get("name") in BUSINESS_GRANTS
                 and stage in ("create", "tighten", "restore", "abandon")):
             problems.append(f"{address}: business access is only granted after the switch")
@@ -547,6 +562,13 @@ def plan_changes(plan: dict) -> bool:
     """Whether a Terraform plan changes any resource."""
     return any(set((c.get("change") or {}).get("actions") or []) - {"no-op", "read"}
                for c in plan.get("resource_changes") or [])
+
+
+def planned_policy_deletes(plan: dict) -> list[str]:
+    """The policies a plan deletes."""
+    return sorted(str(c.get("index") or "") for c in plan.get("resource_changes") or []
+                  if c.get("type") == "databricks_policy_info"
+                  and "delete" in ((c.get("change") or {}).get("actions") or []))
 
 
 def _plan_json(env_name: str, layer_dir: Path, stage: str, plan_file: Path) -> dict:
@@ -644,7 +666,8 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
                 print(f"  - {problem}", file=sys.stderr)
             return 1
         if plan_out:
-            write_json(sidecar_path(plan_file), record | {"changes": plan_changes(plan)})
+            write_json(sidecar_path(plan_file), record | {"changes": plan_changes(plan),
+                                                          "policy_deletes": planned_policy_deletes(plan)})
             print(f"Policy stage {stage}: planned generation {desired['fingerprint']} into {plan_file}"
                   + ("" if plan_changes(plan) else " (no changes)"))
             return 0

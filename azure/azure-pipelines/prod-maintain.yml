@@ -4,17 +4,15 @@
 #
 #   make maintain ENV=prod     at the last released commit
 #
-# REQUIRES PROD REMOTE STATE (deferred; design section 15) and the release
-# receipt (rollout step 9), which names the last released commit. Until both
-# exist the operator runs make maintain ENV=prod on the deployment machine,
-# on its own schedule, at the last released commit, in the same persistent
-# checkout as releases (`git fetch && git checkout --force --detach <sha>`,
-# an empty `git status --porcelain`, never `git clean -x` or a re-clone; see
-# prod-release.yml). The CI guard refuses every applying target here
-# (TF_BUILD is set). Do not set GENIERAILS_ALLOW_CI_APPLY. In v1 this
-# pipeline runs the read-only drift audit, which exits non-zero when
-# sensitive columns are untagged or tag assignments are stale; subscribe the
-# owning team to failed-run notifications.
+# REQUIRES PROD REMOTE STATE (deferred; design section 15). The release
+# receipt names the last released commit; until prod has remote state, the
+# operator runs make maintain ENV=prod on the deployment machine, on its own
+# schedule, at that commit, in the same persistent checkout as releases
+# (`git fetch && git checkout --force --detach <sha>`, an empty
+# `git status --porcelain`, never `git clean -x` or a re-clone; see
+# prod-release.yml). Until then, this pipeline runs only the read-only
+# audit-schema drift alert. The CI guard refuses every applying target here
+# (TF_BUILD is set). Do not set GENIERAILS_ALLOW_CI_APPLY.
 #
 # It uses no environment, so it never takes or waits for the release
 # pipeline's Exclusive Lock on "genierails-prod", and a release waiting
@@ -45,8 +43,6 @@ pool:
   vmImage: ubuntu-latest
 
 steps:
-  # TODO(rollout step 9): check out the last released commit, read from the
-  # release receipt, instead of main.
   - checkout: self
 
   - task: UsePythonVersion@0
