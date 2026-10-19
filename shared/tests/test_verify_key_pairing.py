@@ -133,6 +133,9 @@ def warehouse(monkeypatch):
         def grant_warehouse_use(self, principal):
             pass
 
+        def assert_query_capable(self, principal):
+            pass
+
         def deprovision_principal(self, principal):
             pass
 
@@ -183,6 +186,26 @@ def _admin():
 def _verifier():
     return vea.EffectiveAccessVerifier({"host": "h", "client_id": "c", "client_secret": "s"},
                                        warehouse_id="wh-1")
+
+
+def test_real_workspace_client_is_caught_by_the_no_network_guard(
+    monkeypatch, real_databricks_workspace_client, no_network_io_error,
+):
+    import databricks.sdk as databricks_sdk
+    import databricks.sdk.clock as sdk_clock
+
+    monkeypatch.setattr(databricks_sdk, "WorkspaceClient", real_databricks_workspace_client)
+    clock_calls = {"count": 0}
+
+    def fast_time(_self):
+        clock_calls["count"] += 1
+        return 0.0 if clock_calls["count"] <= 2 else 1000.0
+
+    monkeypatch.setattr(sdk_clock.RealClock, "time", fast_time)
+    monkeypatch.setattr(sdk_clock.RealClock, "sleep", lambda _self, _seconds: None)
+
+    with pytest.raises(no_network_io_error, match="real network I/O is blocked"):
+        databricks_sdk.WorkspaceClient(host="https://h", token="test-token", auth_type="pat")
 
 
 def _check(masked=(JUNIOR,), unmasked=(DEFAULT_ADMIN_TIER,), column="ssn"):
