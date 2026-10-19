@@ -5,12 +5,103 @@ No Databricks connection, LLM call, or Terraform is required.
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import hcl2
 from pathlib import Path
+
+try:
+    import databricks.sdk as _databricks_sdk
+except ImportError:  # pragma: no cover - the verify tests require the SDK.
+    _databricks_sdk = None
+    _REAL_WORKSPACE_CLIENT = None
+else:
+    _REAL_WORKSPACE_CLIENT = _databricks_sdk.WorkspaceClient
+
+
+_VERIFY_NO_NETWORK_MODULES = {
+    "test_verify_effective_access.py",
+    "test_verify_key_autopick.py",
+    "test_verify_key_pairing.py",
+    "test_verify_mask_fixed_points.py",
+}
+
+
+class NoNetworkIOError(BaseException):
+    """Raised when a verify unit test tries to open a real network socket."""
+
+
+class NoNetworkWorkspaceClient:
+    """Databricks SDK stand-in for verify unit tests that use fake warehouses."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.warehouses = SimpleNamespace(list=lambda: [])
+        self.service_principals = SimpleNamespace(patch=lambda *_args, **_kwargs: None)
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            f"unexpected Databricks WorkspaceClient.{name} use in a no-network unit test"
+        )
+
+
+class NoNetworkAccountClient:
+    """Databricks account SDK stand-in for verify unit tests."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            f"unexpected Databricks AccountClient.{name} use in a no-network unit test"
+        )
+
+
+def _is_verify_no_network_test(item) -> bool:
+    return Path(str(item.fspath)).name in _VERIFY_NO_NETWORK_MODULES
+
+
+@pytest.fixture
+def real_databricks_workspace_client():
+    if _REAL_WORKSPACE_CLIENT is None:
+        pytest.skip("databricks-sdk is not installed")
+    return _REAL_WORKSPACE_CLIENT
+
+
+@pytest.fixture
+def no_network_io_error():
+    return NoNetworkIOError
+
+
+@pytest.fixture(autouse=True)
+def _verify_tests_cannot_use_network(request, monkeypatch):
+    """Keep verify unit tests on fake clients and fail fast on real sockets."""
+    if not _is_verify_no_network_test(request.node):
+        return
+
+    def blocked_network(*_args, **_kwargs):
+        raise NoNetworkIOError("real network I/O is blocked in verify unit tests")
+
+    monkeypatch.setattr(socket, "create_connection", blocked_network)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked_network)
+    monkeypatch.setattr(socket.socket, "connect", blocked_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked_network)
+    try:
+        import urllib3.util.connection as urllib3_connection
+    except ImportError:
+        pass
+    else:
+        monkeypatch.setattr(urllib3_connection, "create_connection", blocked_network)
+
+    if _databricks_sdk is not None:
+        monkeypatch.setattr(_databricks_sdk, "WorkspaceClient", NoNetworkWorkspaceClient)
+        monkeypatch.setattr(_databricks_sdk, "AccountClient", NoNetworkAccountClient)
 
 
 def _gnu_make_version(binary: str) -> tuple[int, ...] | None:
