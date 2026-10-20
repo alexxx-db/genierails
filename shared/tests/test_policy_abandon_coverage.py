@@ -246,7 +246,9 @@ def _make(target: str, h, tmp_path: Path, runner: Path, **stubs: str) -> subproc
                 "GATED_RUNNER": str(runner), "DERIVE_LOG": str(tmp_path / "derive.log"),
                 "GIT_CONFIG_GLOBAL": "/dev/null"}
     return subprocess.run(
-        ["make", "--no-print-directory", target, "ENV=dev", f"ENV_DIR={h.env_dir}", f"ROOT_RUNNER={runner}"],
+        ["make", "--no-print-directory", target, "ENV=dev", f"ENV_DIR={h.env_dir}", f"ROOT_RUNNER={runner}",
+         # Next to the test's env, so _prepare-env never links the checkout's envs/account to it.
+         f"ACCOUNT_ENV_DIR={h.env_dir.parent / 'account'}"],
         cwd=ROOT / "aws", text=True, capture_output=True, env=environ, timeout=600)
 
 
