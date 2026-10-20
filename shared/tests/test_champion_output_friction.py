@@ -31,6 +31,7 @@ TEMPLATE = SHARED / "examples/dev_to_prod/env.auto.tfvars.example"
 MAKEFILE = SHARED / "Makefile.shared"
 FILTER = SHARED / "scripts/filter_target_warnings.py"
 TF_CAPTURE = SHARED / "tests/fixtures/terraform_target_apply.txt"  # real Terraform 1.11 -target apply
+USAGE_POLICY_CAPTURE = SHARED / "tests/fixtures/terraform_usage_policy_error.txt"
 REPO = SHARED.parent
 
 sys.path.insert(0, str(SHARED / "scripts"))
@@ -682,7 +683,7 @@ def _boxes(lines):
 
 
 OUTSIDE, (TARGETING, INCOMPLETE) = _boxes(CAPTURE)
-ERROR = ["╷\n", "│ Error: Usage policy ID must not be empty\n", "│ \n", "│   with module.data_access...\n", "╵\n"]
+ERROR = USAGE_POLICY_CAPTURE.read_text().splitlines(keepends=True)
 OTHER_WARNING = ["╷\n", "│ Warning: Deprecated attribute\n", "│ \n", "│ use X instead\n", "╵\n"]
 USAGE_POLICY_ADVICE = (
     "Enable classification in the UI, or create and attach a serverless usage policy: "
@@ -705,8 +706,8 @@ def test_filter_matches_uncolored_and_rewrapped_text():
 
 
 def test_filter_keeps_a_warning_box_with_an_interleaved_error():
-    box = TARGETING[:3] + ["Error: Usage policy ID must not be empty\n"] + TARGETING[3:]
-    assert list(filter_lines(box)) == box + [f"\n{USAGE_POLICY_ADVICE}\n"]
+    box = TARGETING[:3] + ["Error: another failure\n"] + TARGETING[3:]
+    assert list(filter_lines(box)) == box
 
 
 def test_filter_keeps_a_known_title_with_unknown_body():
@@ -753,6 +754,7 @@ def test_filter_script_streams_unbuffered():
     source = FILTER.read_text()
     assert "sys.stdout.flush()" in source
     assert 'python3 -u "$(SHARED_ROOT)/scripts/filter_target_warnings.py"' in MAKEFILE.read_text()
+    assert '--cloud "$(CLOUD)"' in MAKEFILE.read_text()
 
 
 def test_makefile_shared_runs_recipes_in_bash_with_pipefail():
@@ -842,11 +844,13 @@ def test_real_target_hides_target_warnings_and_points_to_catalog_explorer(real_c
 
 
 def test_real_target_surfaces_terraform_errors_and_fails(real_cloud):
-    result = real_cloud(FAKE_TF_STDERR="Error: Usage policy ID must not be empty", FAKE_TF_EXIT="1")
+    result = real_cloud(FAKE_TF_STDERR=USAGE_POLICY_CAPTURE.read_text(), FAKE_TF_EXIT="1")
     out = result.stdout + result.stderr
+    plain_out = re.sub(r"\x1b\[[0-9;]*m", "", out)
 
     assert result.returncode != 0, out
-    assert "Error: Usage policy ID must not be empty" in out
+    assert "Error: failed to create data_classification_catalog_config" in plain_out
+    assert "Usage policy ID must not be empty." in plain_out
     assert USAGE_POLICY_ADVICE in out
     assert "Resource targeting is in effect" not in out
     assert "Classification is enabled" not in out

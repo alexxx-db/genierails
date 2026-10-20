@@ -1,4 +1,3 @@
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,17 +10,18 @@ ADVICE = (
     "Enable classification in the UI, or create and attach a serverless usage policy: "
     "https://docs.databricks.com/aws/en/admin/usage/budget-policies"
 )
+AZURE_ADVICE = (
+    "Enable classification in the UI, or create and attach a serverless usage policy: "
+    "https://learn.microsoft.com/en-us/azure/databricks/admin/usage/budget-policies"
+)
 
 
-def _run_filter(input_text: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+def _run_filter(input_text: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-u", str(FILTER)],
+        [sys.executable, "-u", str(FILTER), *args],
         input=input_text,
         text=True,
         capture_output=True,
-        env=env,
         timeout=30,
     )
 
@@ -47,20 +47,58 @@ def test_unrelated_error_stays_byte_for_byte_without_advice():
     assert result.stderr == ""
 
 
+def test_wrapped_usage_policy_error_gets_advice():
+    error = (
+        "╷\n"
+        "│ Error: failed to create data_classification_catalog_config\n"
+        "│\n"
+        "│ INVALID_PARAMETER_VALUE: Usage policy ID must\n"
+        "│ not be empty.\n"
+        "╵\n"
+    )
+
+    result = _run_filter(error)
+
+    assert result.stdout == error + f"\n{ADVICE}\n"
+
+
+def test_phrase_in_warning_box_gets_no_advice():
+    warning = "╷\n│ Warning: Usage policy ID must not be empty.\n╵\n"
+
+    result = _run_filter(warning)
+
+    assert result.stdout == warning
+    assert ADVICE not in result.stdout
+
+
+def test_phrase_in_hidden_output_gets_no_advice():
+    output = "Apply complete!\n\nOutputs:\nmessage = \"Usage policy ID must not be empty.\"\n"
+
+    result = _run_filter(output)
+
+    assert result.stdout == "Apply complete!\n\n"
+    assert ADVICE not in result.stdout
+
+
+def test_azure_error_gets_azure_documentation_link():
+    captured = USAGE_POLICY_ERROR.read_text()
+
+    result = _run_filter(captured, "--cloud", "azure")
+
+    assert result.stdout == captured + f"\n{AZURE_ADVICE}\n"
+    assert "docs.databricks.com/aws/" not in result.stdout
+
+
 def test_filter_pipeline_preserves_upstream_failure_status():
     command = (
         f"{sys.executable!s} -c 'import sys; "
         f"sys.stdout.write(open(sys.argv[1]).read()); sys.exit(1)' "
         f"'{USAGE_POLICY_ERROR}' | {sys.executable!s} -u '{FILTER}'"
     )
-    env = os.environ.copy()
-    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
-
     result = subprocess.run(
         ["/bin/bash", "-o", "pipefail", "-c", command],
         text=True,
         capture_output=True,
-        env=env,
         timeout=30,
     )
 
