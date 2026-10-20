@@ -6,34 +6,33 @@ values after apply, causing "Provider produced inconsistent result" errors.
 This script bypasses Terraform by updating tag policy values directly via
 the Databricks REST API, so Terraform can use ignore_changes = [values] safely.
 
-Modes:
-    add-only  (default) adds missing values and never removes one. Live
-              values this checkout doesn't desire (another repo's, another
-              team's, a legacy env's) are reported as left in place and the
-              sync continues. Deterministic rehearse, release and apply use it.
-              With ``--remove KEY:VALUE`` (repeatable) it also removes exactly
-              the named values, after checking they're unused (below); only
-              ``make apply-account`` passes them, from its approved manifest.
-    replace   makes the live values equal the desired ones, removing the
-              rest without a usage check. Only the legacy account apply (no
-              deterministic env in the checkout) uses it, as before.
+The sync is add-only, in every governance mode: it adds missing values and
+never removes one. Live values this checkout doesn't desire (another repo's,
+another team's, a legacy env's) are reported as left in place and the sync
+continues. With ``--remove KEY:VALUE`` (repeatable) it also removes exactly
+the named values, after checking they're unused (below); only ``make
+apply-account`` passes them, from its approved manifest. ``--mode replace``
+(remove every undesired value, no usage check) is refused: a tag policy is
+account-wide, so its values may be used outside this checkout.
 
-In both modes a live deterministic gr_treatment value is kept: only the
-staged retirement removes a generation.
+A live deterministic gr_treatment value is never removed: only the staged
+retirement removes a generation.
 
 A named removal is refused, and nothing at all is written, when the value
 isn't live, is still desired, is a deterministic generation, or is still in
 use: assigned to any catalog, schema, table, column or volume in
 ``system.information_schema`` (every catalog the deployer can read), or
-referenced by an ABAC policy on a visible catalog or schema, or on a table
-that carries the tag key. If that check can't run (no ``--warehouse-id``, a
-failed query or listing), the removal is refused too.
+referenced by an ABAC policy on any catalog, schema or table the deployer can
+list (policies attach at every level, and a policy can name a value no
+securable carries yet). If that check can't run or can't see everything (no
+``--warehouse-id``, a failed or truncated query, a listing or policy read that
+fails on any securable), the removal is refused too.
 
 ``--dry-run`` reports exactly what the real run would do, refusals and exit
 code included, and writes nothing.
 
 Usage:
-    python3 scripts/sync_tag_policies.py [--mode add-only|replace] [--remove KEY:VALUE ...]
+    python3 scripts/sync_tag_policies.py [--remove KEY:VALUE ...]
         [--warehouse-id ID] [--dry-run [--json]] [path/to/abac.auto.tfvars]
 """
 import argparse
@@ -92,6 +91,13 @@ def _str(v):
     return (v[0] if isinstance(v, list) else v or "").strip()
 
 
+REPLACE_REFUSED = (
+    "--mode replace is refused: it would delete every live tag-policy value this checkout doesn't desire, "
+    "from the account tag policy for every workspace on the metastore, with no usage check. Remove named "
+    "values with 'make account-plan ALLOW_TAG_VALUE_REMOVAL=<key>:<value>,... WAREHOUSE_ID=<id>', get the "
+    "manifest approved, then 'make apply-account'."
+)
+
 REMOVAL_HINT = (
     "This sync never removes values. Removing one deletes it from the account tag policy for every "
     "workspace on the metastore, including tags and ABAC policies outside this repo. If that is intended, "
@@ -120,7 +126,7 @@ def _live_key(key, existing):
     return next((db_key for db_key in existing if db_key.startswith(key + "_")), None)
 
 
-def plan_updates(desired_policies, existing, mode, removals=()):
+def plan_updates(desired_policies, existing, removals=()):
     """``(updates, left, refused)``.
 
     ``updates`` is ``[(actual_key, values, added, removed)]``: the full value
@@ -128,8 +134,6 @@ def plan_updates(desired_policies, existing, mode, removals=()):
     add-only leaves in place though this checkout doesn't desire them.
     ``refused`` is ``[(key, value, reason)]``: named removals that can't run.
     """
-    if removals and mode != "add-only":
-        raise Refusal("--remove is only valid with --mode add-only")
     updates, left, refused = [], [], []
     named = {}
     for key, value in removals:
@@ -148,11 +152,6 @@ def plan_updates(desired_policies, existing, mode, removals=()):
         # staged retirement removes generations, so this sync never does.
         retained = retained_deterministic_values(key, current_values)
         missing = desired_values - current_values
-        if mode == "replace":
-            desired_values |= retained
-            removed = current_values - desired_values
-            updates.append((actual_key, sorted(desired_values), sorted(missing), sorted(removed)))
-            continue
         wanted = named.get(key, set()) | named.get(actual_key, set())
         seen.update(k for k in (key, actual_key) if k in named)
         remove = set()
@@ -216,13 +215,38 @@ def assignment_sql(keys, values):
     return " UNION ALL ".join(parts) + " ORDER BY kind, securable, tag_name, tag_value"
 
 
-def keyed_tables_sql(keys):
-    """Tables that carry any value of ``keys`` (where table-level policies on them are likely)."""
-    where = f"lower(tag_name) IN ({_sql_list(k.lower() for k in keys)})"
-    return (f"SELECT DISTINCT concat_ws('.', catalog_name, schema_name, table_name) AS t "
-            f"FROM system.information_schema.column_tags WHERE {where} UNION "
-            f"SELECT DISTINCT concat_ws('.', catalog_name, schema_name, table_name) AS t "
-            f"FROM system.information_schema.table_tags WHERE {where} ORDER BY t")
+def policy_securables(w):
+    """``(catalogs, [(type, full_name)])``: every catalog, schema and table the caller can list.
+
+    ABAC policies attach to catalogs, schemas and tables, and a policy can name
+    a value that no securable carries yet, so every one is listed, not only
+    those tagged with the key. Unbound and browse-only catalogs are included:
+    a catalog bound to another workspace still shares the account tag policy.
+    A listing that fails anywhere raises, so the caller refuses.
+    """
+    try:
+        catalogs = sorted(c.name for c in w.catalogs.list(include_browse=True, include_unbound=True)
+                          if c.name and c.name not in SKIPPED_CATALOGS)
+    except Exception as exc:
+        raise Refusal(f"could not list catalogs ({exc})") from exc
+    securables = []
+    for catalog in catalogs:
+        securables.append(("CATALOG", catalog))
+        try:
+            schemas = list(w.schemas.list(catalog_name=catalog, include_browse=True))
+        except Exception as exc:
+            raise Refusal(f"could not list the schemas of catalog {catalog} ({exc})") from exc
+        securables.extend(("SCHEMA", s.full_name or f"{catalog}.{s.name}")
+                          for s in sorted(schemas, key=lambda s: s.name or ""))
+        try:
+            tables = list(w.tables.list_summaries(catalog_name=catalog))
+        except Exception as exc:
+            raise Refusal(f"could not list the tables of catalog {catalog} ({exc})") from exc
+        names = [t.full_name for t in tables]
+        if not all(names):
+            raise Refusal(f"a table of catalog {catalog} was listed without a full name")
+        securables.extend(("TABLE", name) for name in sorted(names))
+    return catalogs, securables
 
 
 def _conditions(policy):
@@ -255,27 +279,14 @@ def check_usage(w, warehouse_id, removals):
     wanted = set(removals)
     in_use = {}
     try:
-        rows = _run_sql(w, warehouse_id, assignment_sql(keys, values))
+        rows = _run_sql(w, warehouse_id, assignment_sql(keys, values), complete=True)
     except Exception as exc:
         raise Refusal(f"could not read tag assignments from system.information_schema ({exc})") from exc
     for kind, securable, tag_name, tag_value in (tuple(r) for r in rows):
         for key, value in wanted:
             if str(tag_name).lower() == key.lower() and tag_value == value:
                 in_use.setdefault((key, value), []).append(f"{kind} {securable}")
-    try:
-        tables = sorted({r[0] for r in _run_sql(w, warehouse_id, keyed_tables_sql(keys)) if r and r[0]})
-    except Exception as exc:
-        raise Refusal(f"could not list tables that carry {keys} ({exc})") from exc
-    securables = []
-    try:
-        catalogs = sorted(c.name for c in w.catalogs.list() if c.name and c.name not in SKIPPED_CATALOGS)
-        for catalog in catalogs:
-            securables.append(("CATALOG", catalog))
-            securables.extend(("SCHEMA", s.full_name or f"{catalog}.{s.name}")
-                              for s in sorted(w.schemas.list(catalog_name=catalog), key=lambda s: s.name or ""))
-    except Exception as exc:
-        raise Refusal(f"could not list catalogs and schemas ({exc})") from exc
-    securables.extend(("TABLE", t) for t in tables)
+    catalogs, securables = policy_securables(w)
     for kind, name in securables:
         try:
             policies = list(w.policies.list_policies(kind, name))
@@ -286,8 +297,8 @@ def check_usage(w, warehouse_id, removals):
                 if references(policy, key, value):
                     in_use.setdefault((key, value), []).append(
                         f"ABAC policy {getattr(policy, 'name', '?')} on {kind.lower()} {name}")
-    evidence = {"warehouse_id": warehouse_id, "catalogs": len(catalogs),
-                "policy_securables": len(securables), "tables_with_key": len(tables)}
+    evidence = {"warehouse_id": warehouse_id, "catalogs": len(catalogs), "policy_securables": len(securables),
+                "tables": sum(kind == "TABLE" for kind, _ in securables)}
     return {k: sorted(v) for k, v in in_use.items()}, evidence
 
 
@@ -315,14 +326,18 @@ def _report(updates, left, refused, dry_run):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Sync tag policy values to Databricks.")
-    parser.add_argument("--mode", choices=("add-only", "replace"), default="add-only")
+    parser.add_argument("--mode", choices=("add-only", "replace"), default="add-only",
+                        help="add-only, the only mode; replace is refused")
     parser.add_argument("--remove", action="append", default=[], metavar="KEY:VALUE",
-                        help="add-only: also remove this live value once it's proven unused (repeatable)")
+                        help="also remove this live value once it's proven unused (repeatable)")
     parser.add_argument("--warehouse-id", default="", help="SQL warehouse for the --remove usage check")
     parser.add_argument("--dry-run", action="store_true", help="report what the run would do; write nothing")
     parser.add_argument("--json", action="store_true", help="with --dry-run, print the add/remove diff as JSON")
     parser.add_argument("tfvars", nargs="?", default=str(WORK_DIR / "abac.auto.tfvars"))
     args = parser.parse_args(argv)
+    if args.mode == "replace":
+        print(f"  [ERROR] {REPLACE_REFUSED}", file=sys.stderr)
+        raise SystemExit(1)
     try:
         removals = sorted({parse_removal(item) for raw in args.remove for item in raw.split(",") if item.strip()})
     except Refusal as exc:
@@ -381,7 +396,7 @@ def main(argv=None):
         raise SystemExit(1)
 
     try:
-        updates, left, refused = plan_updates(desired_policies, existing, args.mode, removals)
+        updates, left, refused = plan_updates(desired_policies, existing, removals)
     except Refusal as exc:
         print(f"  [ERROR] {exc}", file=sys.stderr)
         raise SystemExit(1)

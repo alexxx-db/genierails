@@ -281,9 +281,10 @@ The account tag sync never removes a live deterministic value; the caller runs
 
 The account tag policy (for example `gr_treatment`) is shared by every
 workspace on the metastore, so its live values can include values another
-GenieRails repo, another team or a legacy env still uses. Rehearse, release and
-apply in a deterministic env only **add** values
-(`sync_tag_policies.py --mode add-only`): they add the values this checkout
+GenieRails repo, another team or a legacy env still uses. Every tag sync, in
+every governance mode (rehearse, release, apply, `make sync-tags`, and a
+legacy-only checkout's `make apply ENV=account`), only **adds** values
+(`sync_tag_policies.py` has no replace mode): it adds the values this checkout
 needs and leave every other live value in place, printing them as a warning.
 Terraform ignores the values, so an empty account plan doesn't prove a REST
 update is safe; add-only never writes a removal, so it never needs one.
@@ -303,10 +304,13 @@ make apply-account
 - Each must be unused where the deployer can see: no assignment in
   `system.information_schema.{catalog,schema,table,column,volume}_tags`
   (every catalog the deployer can read, through `WAREHOUSE_ID`), and no ABAC
-  policy whose condition names the key and value on any visible catalog or
-  schema, or on a table that carries the key. A value in use is refused, and so
-  is a value whose use can't be checked (no warehouse, a failed query or
-  listing): no manifest is written.
+  policy whose condition names the key and value on any catalog, schema or
+  table the deployer can list. Every table is read, not only tagged ones: a
+  table policy can name a value no securable carries yet. Unbound and
+  browse-only catalogs are listed too. A value in use is refused, and so is a
+  value whose use can't be checked (no warehouse, a failed or truncated query,
+  a catalog, schema, table or policy listing that fails anywhere): no manifest
+  is written.
 - The manifest records the allowed list, the planned removals and what was
   checked; `account-plan` and `apply-account` print them first. Approving the
   manifest approves exactly those removals.
@@ -316,16 +320,23 @@ make apply-account
   removing. Live values that appear later and aren't named are left in place
   and don't invalidate the manifest.
 
-Limits of the check: it sees only what the deployer can read. Securables in
-catalogs the deployer can't see, and table-level policies on tables that carry
-no value of the key, are not inspected; name a value only when no other team
-depends on it.
+Limits of the check: it sees only what the deployer can list. A securable it
+can't list at all isn't inspected; one it lists but can't read refuses. Name a
+value only when no other team depends on it.
 
-While any env of the checkout (`envs/*/env.auto.tfvars`) is deterministic,
-`make apply ENV=account` routes to `apply-account`, `_apply-account-for-workspace`
-stays add-only even for a legacy env in that mixed checkout,
-`make sync-tags TAG_SYNC_MODE=replace` refuses (it would remove every undesired
-value with no usage check), and `make destroy ENV=account` refuses.
-Legacy-only checkouts keep `replace`, as before.
+Terraform ignores the values, but deleting a tag policy drops all of them, with
+no usage check. So `make account-plan` and a legacy-only checkout's direct
+`make apply ENV=account` refuse a plan that deletes or replaces a
+`databricks_tag_policy`: keep the key in `tag_policies` and remove the values
+you no longer use as above. `wait-tag-policies` never deletes a key it can't
+see; it only creates keys that don't exist.
+
+`make sync-tags TAG_SYNC_MODE=replace` refuses in every checkout (it would
+remove every undesired value with no usage check). While any env of the
+checkout (`envs/*/env.auto.tfvars`) is deterministic, `make apply ENV=account`
+routes to `apply-account` and `make destroy ENV=account` refuses. A legacy-only
+checkout's `make apply ENV=account` still applies the account layer directly,
+but its tag sync is add-only like every other; it removes values through
+`account-plan` and `apply-account` too.
 
 Migrating a legacy env: [legacy-migration.md](legacy-migration.md).

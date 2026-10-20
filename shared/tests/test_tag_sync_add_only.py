@@ -8,7 +8,8 @@ in another) and a Terraform runner that reports an empty plan.
 On a shared metastore the live policy carries values other repos, teams or
 legacy envs use. add-only leaves them in place (a warning, never a refusal);
 only ``make account-plan ALLOW_TAG_VALUE_REMOVAL=...`` then ``make
-apply-account`` removes a value, after checking it is unused.
+apply-account`` removes a value, after checking it is unused. That holds
+for legacy-only checkouts too: there is no replace mode.
 """
 
 import json
@@ -61,8 +62,8 @@ def _usage():
 
 class _Tags:
     def list_tag_policies(self):
-        live = json.load(open(STATE))
-        return [TagPolicy(k, [Value(v) for v in vals]) for k, vals in live.items()]
+        live, hidden = json.load(open(STATE)), _usage().get("invisible", [])
+        return [TagPolicy(k, [Value(v) for v in vals]) for k, vals in live.items() if k not in hidden]
 
     def update_tag_policy(self, tag_key, tag_policy, update_mask):
         live = json.load(open(STATE))
@@ -71,6 +72,22 @@ class _Tags:
         with open(os.environ["FAKE_TAGS_WRITES"], "a") as log:
             log.write(tag_key + "\\n")
 
+    def delete_tag_policy(self, tag_key):
+        live = json.load(open(STATE))
+        live.pop(tag_key, None)
+        json.dump(live, open(STATE, "w"))
+        with open(os.environ["FAKE_TAGS_WRITES"], "a") as log:
+            log.write("delete:" + tag_key + "\\n")
+
+    def create_tag_policy(self, tag_policy):
+        live = json.load(open(STATE))
+        if tag_policy.tag_key in live:
+            raise RuntimeError("ALREADY_EXISTS: " + tag_policy.tag_key)
+        live[tag_policy.tag_key] = [v.name for v in tag_policy.values]
+        json.dump(live, open(STATE, "w"))
+        with open(os.environ["FAKE_TAGS_WRITES"], "a") as log:
+            log.write("create:" + tag_policy.tag_key + "\\n")
+
 class _Sql:
     def execute_statement(self, statement, warehouse_id, wait_timeout=None):
         usage = _usage()
@@ -78,21 +95,34 @@ class _Sql:
             log.write(json.dumps([warehouse_id, statement]) + "\\n")
         if usage.get("fail") == "sql":
             return NS(status=NS(state=StatementState.FAILED, error=NS(message="PERMISSION_DENIED", error_code="403")))
-        if "DISTINCT" in statement:
-            rows = [[t] for t in usage.get("keyed_tables", [])]
-        else:
-            rows = [r for r in usage.get("tag_rows", []) if "'" + r[3] + "'" in statement]
+        rows = [r for r in usage.get("tag_rows", []) if "'" + r[3] + "'" in statement]
         return NS(status=NS(state=StatementState.SUCCEEDED), statement_id="s",
-                  result=NS(data_array=rows, next_chunk_index=None), manifest=NS(total_chunk_count=1))
+                  result=NS(data_array=rows, next_chunk_index=None),
+                  manifest=NS(total_chunk_count=1, truncated=usage.get("fail") == "truncated"))
 
+def _fail(what):
+    if _usage().get("fail") == what:
+        raise RuntimeError("PERMISSION_DENIED: list " + what)
+
+# Only what's asked for comes back: browse-only and unbound catalogs are hidden
+# unless the caller includes them.
 class _Catalogs:
-    def list(self):
-        return [NS(name=c) for c in _usage().get("catalogs", {"main": ["default"]})]
+    def list(self, include_browse=None, include_unbound=None):
+        _fail("catalogs")
+        usage = _usage()
+        hidden = set(usage.get("unbound", []) if not include_unbound else [])
+        return [NS(name=c) for c in usage.get("catalogs", {"main": ["default"]}) if c not in hidden]
 
 class _Schemas:
-    def list(self, catalog_name):
+    def list(self, catalog_name, include_browse=None):
+        _fail("schemas")
         return [NS(name=s, full_name=catalog_name + "." + s)
                 for s in _usage().get("catalogs", {"main": ["default"]})[catalog_name]]
+
+class _Tables:
+    def list_summaries(self, catalog_name, **kwargs):
+        _fail("tables")
+        return [NS(full_name=t) for t in _usage().get("tables", {}).get(catalog_name, [])]
 
 class _Policies:
     def list_policies(self, on_securable_type, on_securable_fullname, include_inherited=None):
@@ -110,6 +140,7 @@ class WorkspaceClient:
         self.statement_execution = _Sql()
         self.catalogs = _Catalogs()
         self.schemas = _Schemas()
+        self.tables = _Tables()
         self.policies = _Policies()
 ''',
 }
@@ -123,7 +154,7 @@ if [ "$3" = plan ]; then
   [ "$wrote_plan" = 1 ] && exit 2 || exit 0
 fi
 if [ "$3" = show ]; then
-  printf '{"resource_changes":[{"change":{"actions":["update"]}}]}\\n'
+  if [ -f "$FAKE_SHOW" ]; then cat "$FAKE_SHOW"; else printf '{"resource_changes":[{"change":{"actions":["update"]}}]}\\n'; fi
   exit 0
 fi
 if [ "$3" = apply ] || [ "$3" = apply-plan ]; then
@@ -179,6 +210,7 @@ class Repo:
             "FAKE_TAGS_STATE": str(self.state), "FAKE_TAGS_WRITES": str(self.writes),
             "FAKE_USAGE": str(self.usage), "FAKE_SQL_LOG": str(self.sql_log),
             "FAKE_LOCK_PATH": str(self.lock), "FAKE_RUNNER_LOG": str(tmp_path / "runner.log"),
+            "FAKE_SHOW": str(tmp_path / "show.json"),
             "GENIERAILS_STATE_DIR": str(self.state_dir), "GIT_CONFIG_GLOBAL": str(gitconfig),
             "GIT_CONFIG_NOSYSTEM": "1",
         }
@@ -403,10 +435,14 @@ def test_an_opt_in_removal_of_an_unused_value_works(tmp_path):
     ({"catalogs": {"other": ["s"]}, "policies": {"CATALOG:other": [{
         "name": "mask_ssn", "match_columns": ["hasTagValue('gr_treatment', 'retired_by_hand')"]}]}},
      "still in use: ABAC policy mask_ssn on catalog other"),
-    ({"catalogs": {"other": ["s"]}, "keyed_tables": ["other.s.t"], "policies": {"TABLE:other.s.t": [{
+    ({"catalogs": {"other": ["s"]}, "tables": {"other": ["other.s.t"]}, "policies": {"TABLE:other.s.t": [{
         "name": "row_f", "when_condition": "hasTagValue('gr_treatment','retired_by_hand')"}]}},
      "still in use: ABAC policy row_f on table other.s.t"),
-], ids=["column-tag", "schema-tag-any-case", "catalog-policy", "table-policy"])
+    ({"catalogs": {"main": ["default"], "bound_elsewhere": ["s"]}, "unbound": ["bound_elsewhere"],
+      "policies": {"SCHEMA:bound_elsewhere.s": [{
+          "name": "mask_s", "match_columns": ["hasTagValue('gr_treatment', 'retired_by_hand')"]}]}},
+     "still in use: ABAC policy mask_s on schema bound_elsewhere.s"),
+], ids=["column-tag", "schema-tag-any-case", "catalog-policy", "table-policy", "unbound-catalog-policy"])
 def test_an_in_use_value_is_refused_and_no_manifest_is_written(tmp_path, usage, why):
     repo = Repo(tmp_path, LIVE)
     repo.use(**usage)
@@ -417,12 +453,48 @@ def test_an_in_use_value_is_refused_and_no_manifest_is_written(tmp_path, usage, 
     assert repo.wrote() == []
 
 
+# Review finding on fc3a8c5: policies were read only on tables that carried the
+# key, so a table-level policy naming a value no securable carries yet was
+# missed and the removal went ahead. Every listed table's policies are read now.
+def test_a_table_policy_on_an_untagged_table_keeps_the_value_in_use(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    repo.use(catalogs={"main": ["default"], "other": ["s"]},
+             tables={"main": ["main.default.a"], "other": ["other.s.t"]},
+             policies={"TABLE:other.s.t": [{"name": "mask_retired", "match_columns": [
+                 "hasTagValue('gr_treatment', 'retired_by_hand')"]}]})
+    plan = repo.account_plan("ALLOW_TAG_VALUE_REMOVAL=gr_treatment:retired_by_hand", "WAREHOUSE_ID=wh")
+    assert plan.returncode != 0
+    assert "gr_treatment:retired_by_hand: still in use: ABAC policy mask_retired on table other.s.t" in plan.stderr
+    assert "Manifest (immutable)" not in plan.stdout
+    # The removal path itself (what apply-account runs) refuses too.
+    result = repo.script("--remove", "gr_treatment:retired_by_hand", "--warehouse-id", "wh")
+    assert result.returncode == 1 and "ABAC policy mask_retired on table other.s.t" in result.stderr
+    assert repo.wrote() == [] and "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+def test_the_usage_check_reads_policies_on_every_listed_securable(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    repo.use(catalogs={"main": ["default"], "other": ["s"]},
+             tables={"main": ["main.default.a"], "other": ["other.s.t", "other.s.u"]})
+    manifest = json.loads(Path(repo.account_manifest(
+        "ALLOW_TAG_VALUE_REMOVAL=gr_treatment:retired_by_hand", "WAREHOUSE_ID=wh")).read_text())
+    assert manifest["tag_sync"][0]["removal_check"] == {
+        "warehouse_id": "wh", "catalogs": 2, "policy_securables": 7, "tables": 3}
+
+
 @pytest.mark.parametrize("usage, extra, why", [
     ({}, (), "ALLOW_TAG_VALUE_REMOVAL needs WAREHOUSE_ID"),
     ({"fail": "sql"}, ("WAREHOUSE_ID=wh",), "usage unknown: could not read tag assignments"),
+    ({"fail": "truncated"}, ("WAREHOUSE_ID=wh",), "usage unknown: could not read tag assignments "
+     "from system.information_schema (SQL result was truncated"),
     ({"fail": "policies"}, ("WAREHOUSE_ID=wh",), "usage unknown: could not list ABAC policies on catalog main"),
-], ids=["no-warehouse", "sql-fails", "policy-listing-fails"])
+    ({"fail": "catalogs"}, ("WAREHOUSE_ID=wh",), "usage unknown: could not list catalogs (PERMISSION_DENIED"),
+    ({"fail": "schemas"}, ("WAREHOUSE_ID=wh",), "usage unknown: could not list the schemas of catalog main"),
+    ({"fail": "tables"}, ("WAREHOUSE_ID=wh",), "usage unknown: could not list the tables of catalog main"),
+], ids=["no-warehouse", "sql-fails", "sql-truncated", "policy-listing-fails", "catalog-listing-fails",
+        "schema-listing-fails", "table-listing-fails"])
 def test_an_unknown_usage_value_is_refused(tmp_path, usage, extra, why):
+    """Every way the check can't see everything refuses; nothing is assumed unused."""
     repo = Repo(tmp_path, LIVE)
     repo.use(**usage)
     result = repo.account_plan("ALLOW_TAG_VALUE_REMOVAL=gr_treatment:retired_by_hand", *extra)
@@ -517,22 +589,103 @@ def test_apply_account_keeps_the_ci_guard(tmp_path):
     assert repo.wrote() == []
 
 
-# (d) Legacy envs are unchanged: their account apply still replaces (it was
-# never add-only), through _apply-account-for-workspace and sync-tags alike.
-@pytest.mark.parametrize("target", ["_apply-account-for-workspace", "sync-tags"])
-def test_legacy_sync_still_replaces(tmp_path, target):
-    repo = Repo(tmp_path, LIVE, mode="legacy")
-    result = repo.make(target)
+# (d) Legacy-only checkouts are add-only too: the tag policy is account-wide,
+# so a legacy checkout on a shared metastore must not delete another repo's
+# values either. On fc3a8c5 their account apply still replaced, removing every
+# undesired value with no plan, approval or usage check.
+@pytest.mark.parametrize("target, env", [("_apply-account-for-workspace", "dev"), ("sync-tags", "dev"),
+                                         ("sync-tags", "account"), ("apply", "account")])
+def test_legacy_sync_is_add_only(tmp_path, target, env):
+    repo = Repo(tmp_path, {"gr_treatment": ["email_partial__string__0a1b2c3d", *FOREIGN]}, mode="legacy")
+    result = repo.make(target, env)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+    assert f"left in place: {FOREIGN}" in result.stdout
+    assert repo.live()["gr_treatment"] == sorted(["email_partial__string__0a1b2c3d", "new_value", *FOREIGN])
 
 
-def test_the_script_defaults_to_add_only(tmp_path):
+@pytest.mark.parametrize("mode", ["legacy", "deterministic"])
+@pytest.mark.parametrize("target, env", [("sync-tags", "dev"), ("sync-tags", "account"), ("apply", "account")])
+def test_tag_sync_mode_replace_is_refused_in_every_mode(tmp_path, mode, target, env):
+    repo = Repo(tmp_path, LIVE, mode=mode)
+    result = repo.make(target, env, "TAG_SYNC_MODE=replace")
+    assert result.returncode != 0
+    if (target, mode) == ("apply", "deterministic"):
+        assert "make account-plan" in result.stderr  # routed to apply-account: no manifest, refused earlier
+    else:
+        assert "TAG_SYNC_MODE=replace refused: the sync is add-only" in result.stderr
+    assert repo.wrote() == [] and repo.applies() == []
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+def test_the_script_is_add_only_and_refuses_replace(tmp_path):
     repo = Repo(tmp_path, LIVE)
     assert repo.script().returncode == 0
     assert "retired_by_hand" in repo.live()["gr_treatment"]
-    assert repo.script("--mode", "replace").returncode == 0
-    assert "retired_by_hand" not in repo.live()["gr_treatment"]
+    result = repo.script("--mode", "replace")
+    assert result.returncode == 1 and "--mode replace is refused" in result.stderr
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+# A legacy-only checkout removes a value the one way a deterministic one does:
+# account-plan names it and checks it unused; the approved manifest applies it.
+def test_a_legacy_checkout_removes_a_value_only_through_account_plan_and_apply_account(tmp_path):
+    repo = Repo(tmp_path, LIVE, mode="legacy")
+    manifest = repo.account_manifest("ALLOW_TAG_VALUE_REMOVAL=gr_treatment:retired_by_hand", "WAREHOUSE_ID=wh")
+    result = repo.make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "removed ['retired_by_hand']" in result.stdout
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+
+
+def test_a_legacy_checkout_cannot_remove_a_value_outside_the_account_lock(tmp_path):
+    repo = Repo(tmp_path, LIVE, mode="legacy")
+    result = repo.make("sync-tags", "account", "TAG_SYNC_REMOVE=gr_treatment:retired_by_hand", "WAREHOUSE_ID=wh")
+    assert result.returncode != 0
+    assert "tag-value removals may run only under the live account lock" in result.stderr
+    assert repo.wrote() == [] and "retired_by_hand" in repo.live()["gr_treatment"]
+
+
+# Terraform ignores a tag policy's values, but deleting the policy drops them all:
+# neither the legacy account apply nor account-plan may do that.
+TAG_POLICY_DELETE = {"resource_changes": [{
+    "address": 'module.account.databricks_tag_policy.policies["row_scope"]', "type": "databricks_tag_policy",
+    "change": {"actions": ["delete"], "before": {"tag_key": "row_scope"}}}]}
+
+
+@pytest.mark.parametrize("actions", [["delete"], ["delete", "create"]], ids=["delete", "replace"])
+def test_a_legacy_account_apply_refuses_a_plan_that_deletes_a_tag_policy(tmp_path, actions):
+    repo = Repo(tmp_path, LIVE, mode="legacy")
+    change = json.loads(json.dumps(TAG_POLICY_DELETE))
+    change["resource_changes"][0]["change"]["actions"] = actions
+    (tmp_path / "show.json").write_text(json.dumps(change))
+    result = repo.make("apply", "account")
+    assert result.returncode != 0
+    assert "the account plan deletes tag policy ['row_scope']" in result.stderr
+    assert repo.applies() == []
+
+
+def test_account_plan_refuses_a_plan_that_deletes_a_tag_policy(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    (tmp_path / "show.json").write_text(json.dumps(TAG_POLICY_DELETE))
+    result = repo.account_plan()
+    assert result.returncode != 0
+    assert "the account plan deletes tag policy ['row_scope']" in result.stderr
+    assert "Manifest (immutable)" not in result.stdout
+
+
+# wait-tag-policies used to delete a key it couldn't see and recreate it with
+# only this checkout's values, dropping every other value of the key.
+def test_wait_tag_policies_never_deletes_an_invisible_key(tmp_path):
+    repo = Repo(tmp_path, {"gr_treatment": ["email_partial__string__0a1b2c3d", "new_value", *FOREIGN]})
+    repo.use(invisible=["gr_treatment"])
+    code = ("import runpy, sys, time; time.sleep = lambda s: None; "
+            "sys.argv = ['w', '--timeout-seconds', '1', '--poll-seconds', '1']; "
+            f"runpy.run_path({str(SHARED / 'scripts' / 'wait_for_tag_policies.py')!r}, run_name='__main__')")
+    result = subprocess.run([sys.executable, "-c", code], cwd=repo.account, env=repo.env,
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not [w for w in repo.wrote() if w.startswith("delete:")]
+    assert repo.live()["gr_treatment"] == sorted(["email_partial__string__0a1b2c3d", "new_value", *FOREIGN])
 
 
 # apply-account holds the account lock for the whole account apply.
@@ -577,28 +730,19 @@ def test_apply_env_account_with_a_deterministic_env_does_not_bypass_the_manifest
     assert not repo.lock.exists()
 
 
-def test_legacy_apply_env_account_is_unchanged(tmp_path):
+def test_legacy_apply_env_account_applies_directly_and_removes_nothing(tmp_path):
     repo = Repo(tmp_path, LIVE, mode="legacy")
     result = repo.make("apply", "account")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "through make apply-account" not in result.stdout
     assert repo.applies() == ["apply unlocked"]
-    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value", "retired_by_hand"]
 
 
 def test_standalone_sync_tags_env_account_with_a_deterministic_env_is_add_only(tmp_path):
     repo = Repo(tmp_path, LIVE)
     result = repo.make("sync-tags", "account")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "retired_by_hand" in repo.live()["gr_treatment"]
-
-
-def test_standalone_sync_tags_replace_with_a_deterministic_env_is_refused(tmp_path):
-    repo = Repo(tmp_path, LIVE)
-    result = repo.make("sync-tags", "account", "TAG_SYNC_MODE=replace")
-    assert result.returncode != 0
-    assert "replace would delete every live tag-policy value this checkout doesn't desire" in result.stderr
-    assert repo.wrote() == []
     assert "retired_by_hand" in repo.live()["gr_treatment"]
 
 
@@ -632,18 +776,16 @@ def test_destroy_env_account_refuses_when_any_env_is_deterministic(tmp_path):
     assert repo.applies() == []
 
 
-@pytest.mark.parametrize("target", ["destroy", "_destroy-layer", "sync-tags"])
+@pytest.mark.parametrize("target", ["destroy", "_destroy-layer"])
 def test_account_mutation_guards_fail_closed_on_malformed_workspace_config(tmp_path, target):
     live = {"gr_treatment": ["email_partial__string__0a1b2c3d", "retired_by_hand"]}
     repo = Repo(tmp_path, live)
     (repo.dev / "env.auto.tfvars").write_text('governance_mode = "deterministic" ]]\n')
     if target == "destroy":
         result = repo.make("destroy", "account")
-    elif target == "_destroy-layer":
+    else:
         result = repo.make("_destroy-layer", "account", "LAYER=account", "TARGET_ENV=account",
                            f"LAYER_ENV_DIR={repo.account}")
-    else:
-        result = repo.make("sync-tags", "account", "TAG_SYNC_MODE=replace")
     assert result.returncode != 0
     assert "cannot determine whether deterministic governance is in use" in result.stderr
     assert repo.applies() == [] and repo.wrote() == []

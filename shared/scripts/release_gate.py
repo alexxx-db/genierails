@@ -1241,6 +1241,29 @@ def tag_removals(diff) -> list[str]:
     return sorted(f"{e.get('key')}:{v}" for e in diff or [] for v in e.get("removed") or [])
 
 
+def require_no_tag_policy_deletes(data: Mapping | None) -> None:
+    """Refuse an account plan that deletes (or replaces) a tag policy.
+
+    Terraform ignores a tag policy's values, but deleting the policy drops every
+    value of its key for every workspace on the metastore, with none of the
+    usage checks a named removal gets. Unreadable plan JSON refuses too.
+    """
+    if data is None:
+        raise Refused("the account plan could not be read as terraform show -json output; nothing was applied")
+    keys = sorted(
+        str(((item.get("change") or {}).get("before") or {}).get("tag_key") or item.get("address"))
+        for item in data.get("resource_changes") or []
+        if item.get("type") == "databricks_tag_policy" and "delete" in ((item.get("change") or {}).get("actions") or [])
+    )
+    if keys:
+        raise Refused(
+            f"the account plan deletes tag polic{'y' if len(keys) == 1 else 'ies'} {keys}: that removes every value "
+            "of the key from every workspace on the metastore, with no usage check, so it is refused and nothing "
+            "was applied. Keep the key in tag_policies; remove values you no longer use with make account-plan "
+            "ALLOW_TAG_VALUE_REMOVAL=<key>:<value>,... WAREHOUSE_ID=<id> (each is checked unused) and make "
+            "apply-account.")
+
+
 def _plan_summary_data(data: Mapping | None, *, changes: bool) -> dict:
     summary = {"changes": bool(changes)}
     if data is None:
@@ -1409,9 +1432,8 @@ def require_account_lock(env_dir: Path) -> None:
     owner = held_by_ancestor(Path(env_dir))
     if owner == "apply-account":
         return
-    raise Refused("make sync-tags TAG_SYNC_REMOVE=... refused: a deterministic env uses the account layer, "
-                  "so tag-value removals may run only under the live account lock held by make apply-account, "
-                  "from the removals its approved manifest names.")
+    raise Refused("make sync-tags TAG_SYNC_REMOVE=... refused: tag-value removals may run only under the "
+                  "live account lock held by make apply-account, from the removals its approved manifest names.")
 
 
 def account_manifest_summary(manifest_path: Path, manifest: Mapping) -> list[str]:
@@ -1805,6 +1827,7 @@ def main(argv: list[str] | None = None) -> int:
     cmd.add_argument("--show-json", type=Path, required=True)
     cmd.add_argument("--changes", choices=("true", "false"), required=True)
     cmd.add_argument("--out", type=Path, required=True)
+    command("tag-policy-delete-guard").add_argument("--show-json", type=Path, required=True)
     cmd = command("account-tag-sync-diff")
     cmd.add_argument("--out", type=Path, required=True)
     cmd.add_argument("--allow-removal", default="", help="ALLOW_TAG_VALUE_REMOVAL: <key>:<value>,...")
@@ -1878,8 +1901,11 @@ def main(argv: list[str] | None = None) -> int:
             data = _read_json(args.show_json)
             if data is None:
                 raise Refused(f"{args.show_json} is not valid terraform show -json output")
+            require_no_tag_policy_deletes(data)
             args.out.write_text(json.dumps(_plan_summary_data(data, changes=args.changes == "true"),
                                            indent=2, sort_keys=True) + "\n")
+        elif args.command == "tag-policy-delete-guard":
+            require_no_tag_policy_deletes(_read_json(args.show_json))
         elif args.command == "account-tag-sync-diff":
             allowed = canonical_removals(args.allow_removal)
             if allowed and not args.warehouse_id.strip():

@@ -87,7 +87,7 @@ metastore. `account-plan` refuses a value that is:
 |---|---|
 | `still in use: column <c.s.t.col>` (or `table`, `schema`, `catalog`, `volume`) | Something carries the tag value. Retag or untag it first (another team's? leave the value). |
 | `still in use: ABAC policy <name> on <securable>` | A policy condition names the value. Change or drop that policy first. |
-| `usage unknown: ...` / `ALLOW_TAG_VALUE_REMOVAL needs WAREHOUSE_ID` | The check couldn't run (no warehouse, no access to `system.information_schema`, a policy listing failed). Pass a warehouse the deployer can use and grant the read; the removal is never made blind. |
+| `usage unknown: ...` / `ALLOW_TAG_VALUE_REMOVAL needs WAREHOUSE_ID` | The check couldn't run or couldn't see everything (no warehouse, no access to `system.information_schema`, a truncated result, a catalog, schema, table or policy listing that failed, for example on a catalog bound to another workspace). Pass a warehouse the deployer can use and grant the read (or run from a workspace that can read the named catalog); the removal is never made blind. |
 | `still desired by this checkout's abac.auto.tfvars` | Remove it from `envs/account/abac.auto.tfvars` first. |
 | `a deterministic generation` | Only the staged retirement removes `<treatment>__<type>__<gen>` values. |
 | `not a live value of the tag policy` | Already gone, or a typo. |
@@ -97,7 +97,10 @@ account-plan` when live values moved after planning (a planned value is no
 longer live, or a value it planned to add already is), and with `removals are
 chosen at account-plan, not at apply-account` when `ALLOW_TAG_VALUE_REMOVAL` is
 set at apply time to a different list. Run `make account-plan` again.
-`make sync-tags TAG_SYNC_MODE=replace` refuses while any env is deterministic.
+`make sync-tags TAG_SYNC_MODE=replace` refuses in every checkout, legacy-only
+included: the sync is add-only. `the account plan deletes tag policy [...]`
+(from `account-plan` or a legacy `make apply ENV=account`) means the plan would
+drop a whole key with every value; keep the key in `tag_policies`.
 
 
 ### "Provider produced inconsistent result after apply" (tag policies)
