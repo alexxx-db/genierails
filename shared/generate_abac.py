@@ -349,14 +349,19 @@ def _load_tfvars(path: Path, label: str, *, strict: bool = False) -> dict:
             print(f"  Loaded {label} from: {path}")
         return cfg
     except Exception as e:
-        # Auth files can embed secrets; never echo parser text (it may contain
-        # credential fragments from a malformed secret value).
-        detail = "not valid HCL" if path.name == "auth.auto.tfvars" or label == "credentials" else str(e)
-        message = f"Failed to parse {label} file {path}: {detail}"
-        if strict:
-            raise ValueError(message) from (None if detail == "not valid HCL" else e)
-        print(f"  WARNING: {message}")
-        return {}
+        if path.name != "auth.auto.tfvars" and label != "credentials":
+            message = f"Failed to parse {label} file {path}: {e}"
+            if strict:
+                raise ValueError(message) from e
+            print(f"  WARNING: {message}")
+            return {}
+    # Auth files: raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    message = f"Failed to parse {label} file {path}: not valid HCL"
+    if strict:
+        raise ValueError(message) from None
+    print(f"  WARNING: {message}")
+    return {}
 
 
 def load_auth_config(

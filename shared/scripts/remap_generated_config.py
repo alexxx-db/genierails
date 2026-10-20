@@ -163,7 +163,10 @@ def live_policy_lister(
             try:
                 auth = hcl2.loads(auth_path.read_text())
             except Exception:
-                # Parser text can echo credential fragments; never surface it.
+                auth = None
+            if auth is None:
+                # Raised outside the handler with no parser text, which can echo a
+                # malformed secret (also via __context__).
                 raise RuntimeError(f"{auth_path} is not valid HCL") from None
             client = WorkspaceClient(config=Config(
                 host=auth["databricks_workspace_host"],

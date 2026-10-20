@@ -859,8 +859,16 @@ class CommandRunner:
 def read_tfvars(path: Path) -> dict[str, str]:
     if not path.is_file():
         raise RuntimeError(f"missing authentication file: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise RuntimeError(f"{path} is not valid UTF-8") from None
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         m = re.match(r'^\s*([A-Za-z_][\w]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$', line)
         if m:
             values[m.group(1)] = bytes(m.group(2), "utf-8").decode("unicode_escape")

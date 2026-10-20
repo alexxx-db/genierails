@@ -85,7 +85,7 @@ for _path in (SHARED, SHARED / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from state_layout import root_state_paths, state_json  # noqa: E402
+from state_layout import data_access_subdir, root_state_paths, state_json  # noqa: E402
 
 STATE_DIR_ENV = "GENIERAILS_STATE_DIR"
 DEFAULT_STATE = ".genierails-state"
@@ -107,27 +107,15 @@ STATE_SUFFIXES = (".tfstate", ".tfstate.backup", ".tfplan")
 PROMOTE_OWNED = ("abac.auto.tfvars", "masking_functions.sql", "expected_classification.json")
 CODE_ROOTS = ("shared",)
 CODE_SKIP = ("shared/docs/", "shared/tests/")
+# Terraform layer names (state_json layers, manifest keys), not directories:
+# the data_access layer's directory is data_access_subdir().
+ROOTS = ("account", "data_access", "workspace")
 ACCOUNT_ENV = "account"
 
 
-def data_access_subdir() -> str:
-    """Matches Makefile.shared ``DATA_ACCESS_SUBDIR`` (exported into the recipe env)."""
-    return os.environ.get("DATA_ACCESS_SUBDIR") or "data_access"
-
-
 def runtime_dirs() -> set[str]:
+    """Env subdirectories that are runtime, not inputs: the data_access layer's."""
     return {data_access_subdir()}
-
-
-def roots() -> tuple[str, ...]:
-    return ("account", data_access_subdir(), "workspace")
-
-
-# Module-level aliases for callers/tests that still read the old names; they
-# reflect the default subdir. Prefer data_access_subdir() / roots() / runtime_dirs()
-# when an override must take effect after import.
-RUNTIME_DIRS = {"data_access"}
-ROOTS = ("account", "data_access", "workspace")
 
 
 class Refused(RuntimeError):
@@ -1169,8 +1157,10 @@ def _account_auth_endpoint_hash(env_dir: Path) -> dict | None:
     try:
         values = _load_hcl(resolved)
     except Exception:
-        # Parser text can echo credential fragments from a malformed secret;
-        # never surface it.
+        values = None
+    if values is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
         raise Refused(f"account auth endpoint is not pinned: {auth} is not valid HCL") from None
     endpoint = {name: values.get(name) for name in ACCOUNT_AUTH_ENDPOINT_KEYS}
     endpoint["databricks_account_host"] = (

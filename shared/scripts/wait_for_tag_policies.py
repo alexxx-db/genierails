@@ -44,7 +44,10 @@ def _load_auth() -> dict:
     try:
         cfg = _load_hcl(auth_path)
     except Exception:
-        # Parser text can echo credential fragments; never surface it.
+        cfg = None
+    if cfg is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
         raise SystemExit(f"ERROR: {auth_path} is not valid HCL") from None
     mapping = {
         "databricks_workspace_host": "DATABRICKS_HOST",

@@ -175,7 +175,10 @@ def main() -> int:
         try:
             auth = hcl2.load(args.auth_file.open())
         except Exception:
-            # Parser text can echo credential fragments; never surface it.
+            auth = None
+        if auth is None:
+            # Raised outside the handler with no parser text, which can echo a
+            # malformed secret (also via __context__).
             raise SystemExit(f"ERROR: {args.auth_file} is not valid HCL") from None
         env = hcl2.load(args.env_file.open())
         w = WorkspaceClient(

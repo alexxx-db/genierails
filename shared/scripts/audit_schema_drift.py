@@ -78,10 +78,13 @@ def _load_hcl(path: Path) -> dict:
         with path.open() as f:
             value = hcl2.load(f)
     except Exception as exc:
-        # Auth files can embed secrets; never echo parser text.
-        if path.name == "auth.auto.tfvars":
-            raise RuntimeError(f"cannot parse {path}: not valid HCL") from None
-        raise RuntimeError(f"cannot parse {path}: {exc}") from exc
+        if path.name != "auth.auto.tfvars":
+            raise RuntimeError(f"cannot parse {path}: {exc}") from exc
+        value = None
+    if value is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise RuntimeError(f"cannot parse {path}: not valid HCL") from None
     if not isinstance(value, dict):
         raise RuntimeError(f"cannot parse {path}: expected top-level object")
     return value

@@ -1504,7 +1504,10 @@ def load_auth(auth_file: Path) -> dict[str, str]:
         with open(auth_file) as f:
             auth = hcl2.load(f)
     except Exception:
-        # Parser text can echo credential fragments; never surface it.
+        auth = None
+    if auth is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
         raise ValueError(f"{auth_file} is not valid HCL") from None
     return {
         "host": _as_str(auth.get("databricks_workspace_host")),

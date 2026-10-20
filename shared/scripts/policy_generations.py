@@ -169,10 +169,11 @@ def _load(path: Path) -> dict:
     try:
         return hcl2.loads(path.read_text())
     except Exception:
-        if path.name == "auth.auto.tfvars":
-            # Parser text can echo credential fragments; never surface it.
-            raise RuntimeError(f"{path} is not valid HCL") from None
-        raise
+        if path.name != "auth.auto.tfvars":
+            raise
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise RuntimeError(f"{path} is not valid HCL") from None
 
 
 def desired_generation(env_dir: Path) -> dict:

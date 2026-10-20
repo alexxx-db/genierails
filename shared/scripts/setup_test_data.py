@@ -598,7 +598,10 @@ def _load_auth(auth_file: Path) -> dict:
         with open(auth_file) as f:
             cfg = hcl2.load(f)
     except Exception:
-        # Parser text can echo credential fragments; never surface it.
+        cfg = None
+    if cfg is None:
+        # Reported outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
         print(f"ERROR: {auth_file} is not valid HCL")
         sys.exit(1)
 
