@@ -257,5 +257,6 @@ def test_cross_env_promote_points_to_release_not_apply():
     block = makefile[makefile.index("=== Promote complete:"):]
     block = block[:block.index("trap - EXIT")]
 
-    assert "make release ENV=$(DEST_ENV)" in block
+    # release-steps prints release-plan and release after a same-commit source rehearsal, or a legacy release.
+    assert '$(_RELEASE_STEPS) --env-dir "$$dest_env_dir" --env "$(DEST_ENV)"' in block
     assert "make apply ENV=$(DEST_ENV)" not in block

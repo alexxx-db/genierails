@@ -564,6 +564,18 @@ def _derive_live_desired(env_dir: Path, out_dir: Path) -> Path:
     return out_dir / "abac.auto.tfvars"
 
 
+def cutover_next(env_dir: Path, env: str) -> str:
+    """How a ready cutover proceeds: a rehearse env rehearses; a promoted env (promote_from set,
+    or prod) needs its source env rehearsed on the merge commit before release-plan."""
+    from scripts.coverage_fix import promote_source
+
+    source = promote_source(env_dir) or ("dev" if env == "prod" else "")
+    if not source:
+        return f"merge, then make rehearse ENV={env}"
+    return (f"merge, then make rehearse ENV={source} on the merge commit, then make release-plan ENV={env} "
+            f"and make release ENV={env} (one manifest and approval per phase)")
+
+
 def report(env_dir: Path, env: str, *, desired_abac: Path | None = None) -> tuple[list[str], dict]:
     """(printed lines, JSON report) of the dry run; never changes anything."""
     env_dir = Path(env_dir)
@@ -674,8 +686,7 @@ def report(env_dir: Path, env: str, *, desired_abac: Path | None = None) -> tupl
     if needed:
         lines += ["", f"To accept, add to envs/{env}/ack.txt (reviewed, code-owned):"] + [f"  {k}" for k in needed]
     ok = result["ok"] and not result["stale"]
-    lines += ["", "Result: " + ("the cutover may proceed: merge, then make rehearse ENV=dev, or make release-plan "
-                                f"ENV={env} for a promoted env (one manifest and approval per phase)." if ok else
+    lines += ["", "Result: " + (f"the cutover may proceed: {cutover_next(env_dir, env)}." if ok else
                                 "refused (above); nothing was changed.")]
     data |= {
         "ok": ok, "ready": True, "problems": result["problems"], "stale_acknowledgements": result["stale"],

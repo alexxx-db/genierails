@@ -31,7 +31,8 @@ make release ENV=prod                  # releases the approved manifest
 5. **Merge.** The dev pipeline (or the operator, until dev has remote state)
    runs `make rehearse ENV=dev` on the merge commit. **Pass looks like:**
    `ALL EFFECTIVE`.
-6. **Release.** On the [deployment machine](../deployment-machine.md#release-prod).
+6. **Release.** On the [deployment machine](../deployment-machine.md#release-prod):
+   `make release-plan ENV=prod`, approve the manifest, `make release ENV=prod`.
    **Pass looks like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
    If A now uses a new table, its masks are applied before anyone gets access.
 
@@ -57,9 +58,9 @@ the new `main`. Both ways reach prod through the same stages.
 | You want to | Do this |
 |---|---|
 | Add an agent | its `agents/` file, `make generate ENV=dev`, review the proposed `table_readers`; [details](agents.md#add-an-agent) |
-| Give another group an agent in prod | edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`, and `table_readers` if needed; PR, release |
-| Remove an agent | `acl_groups = []` and `detached = true`, release, then `make detach-agent`; [details](agents.md#remove-an-agent) |
-| Remove a table from an agent | remove it in the dev UI, capture, generate, promote, release; masks stay |
+| Give another group an agent in prod | edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`, and `table_readers` if needed; PR, merge, rehearse dev on the merge commit, `release-plan`, `release` |
+| Remove an agent | `acl_groups = []` and `detached = true`; PR, merge, rehearse dev on the merge commit, `release-plan`, `release`, then `make detach-agent`; [details](agents.md#remove-an-agent) |
+| Remove a table from an agent | remove it in the dev UI, capture, generate, promote; PR, merge, rehearse dev on the merge commit, `release-plan`, `release`; masks stay |
 | Change who can read a table | edit `table_readers`, in dev and promote, or in prod directly; [details](governance.md#who-can-read-a-table) |
 | Change a mask | `treatment_versions` or `column_overrides`; [details](governance.md#change-a-mask) |
 | Map a new class | `make scaffold-treatments ENV=dev TREATMENT=<name>`; [details](governance.md#map-a-new-class) |

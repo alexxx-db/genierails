@@ -46,6 +46,7 @@ from scripts.coverage_fix import (  # noqa: E402
     env_column_types,
     fitting_treatments,
     promote_source,
+    promoted_release_steps,
     rerun_command,
     treatment_input_type,
     types_compatible,
@@ -467,7 +468,8 @@ def _print_deterministic(result: dict, env_name: str) -> None:
     source = promote_source(result["env_dir"])
     if target != result["env_dir"]:
         print(f"Next: commit {rel}, then make generate ENV={target.name}, make rehearse ENV={target.name}, "
-              f"make promote-to ENV={env_name} (it carries tag_treatments), {rerun_command(env_name, True)}")
+              f"make promote-to ENV={env_name} (it carries tag_treatments), then "
+              f"{promoted_release_steps(env_name, target.name)}")
     else:
         print(f"Next: make generate ENV={env_name}, then {rerun_command(env_name, bool(source))}; "
               f"commit {rel} and envs/{env_name}/generated/")

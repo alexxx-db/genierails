@@ -169,13 +169,24 @@ def live_classified_columns(env_dir: Path, timeout_seconds: int = 120) -> set[st
     return value
 
 
+def _release_steps(env_dir: Path) -> str:
+    """What follows promote-to here (scripts/coverage_fix.py, for the env's mode)."""
+    shared = str(Path(__file__).resolve().parents[1])
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    from scripts.coverage_fix import release_steps
+
+    return release_steps(env_dir.name, env_dir)
+
+
 def _check(env_dir: Path, mode: str, ack: str, timeout_seconds: int) -> int:
     manifest = env_dir / "generated" / "expected_classification.json"
     if not manifest.is_file():
         if mode == "deterministic":
             print(
                 "ERROR: deterministic release requires generated/expected_classification.json; "
-                "run make promote-to from the reviewed source environment.",
+                f"run make promote-to ENV={env_dir.name} from the reviewed source environment, then "
+                f"{_release_steps(env_dir)}.",
                 file=sys.stderr,
             )
             return 1

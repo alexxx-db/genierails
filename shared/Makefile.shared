@@ -531,7 +531,7 @@ ungovern: _guard-not-ci-apply ## Remove governance (treatment tags, masks) from 
 	$(_STICKY) ungovern --env-dir "$(ENV_DIR)" --table "$(TABLE)" --commit >/dev/null || exit 1; \
 	if [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" = promoted ]; then \
 		echo "ungovern: removed $(TABLE) from $(_SETUP_ENV_REL)/generated; ENV=$(ENV) is promoted, so nothing was applied."; \
-		echo "  Commit it in a PR; after rehearse, make release-plan ENV=$(ENV) and make release ENV=$(ENV) apply the removal."; \
+		echo "  Commit it in a PR, then $$($(_RELEASE_STEPS) --env-dir "$(ENV_DIR)" --env "$(ENV)") to apply the removal."; \
 		exit 0; \
 	fi; \
 	if ! GENIERAILS_UNGOVERN_TABLE="$(TABLE)" $(MAKE) --no-print-directory apply-governance ENV="$(ENV)" APPLY_FLAGS=; then \
@@ -919,7 +919,11 @@ override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FL
 
 rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (verify-access picks and proves a row-pairing key per masked table; VERIFY_KEY_COLUMN optionally overrides)
 	@if [ "$(ENV)" = "prod" ]; then \
-		echo "rehearse: ENV=prod is not allowed; use make release ENV=prod" >&2; \
+		if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+			echo "rehearse: ENV=prod is not allowed; rehearse its source env, then make release-plan ENV=prod and make release ENV=prod" >&2; \
+		else \
+			echo "rehearse: ENV=prod is not allowed; use make release ENV=prod" >&2; \
+		fi; \
 		exit 1; \
 	fi; \
 	$(_DRY_RUN_GUARD); \
@@ -963,6 +967,11 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 # maintain have audit-rulebook write its script's own exit code (1 = drift,
 # 2 = error) to a file they name. They also export GENIERAILS_RERUN_TARGET so a
 # coverage gap's fix message ends with the command that stopped.
+# The drift hint after audit-rulebook: the full promote -> same-commit rehearse ->
+# release-plan -> release sequence in deterministic envs, the direct re-run in legacy.
+override _DRIFT_HINT = python3 "$(SHARED_ROOT)/scripts/coverage_fix.py" drift-hint --env-dir "$(ENV_DIR)" --env "$(ENV)"
+# What follows promote-to, for the env's mode (add --env-dir/--env/--source).
+override _RELEASE_STEPS = python3 "$(SHARED_ROOT)/scripts/coverage_fix.py" release-steps
 override _RUN_AUDIT_RULEBOOK = audit_rc_file="$$(mktemp)"; \
 	GENIERAILS_AUDIT_RC_FILE="$$audit_rc_file" $(MAKE) audit-rulebook ENV="$(ENV)"; audit_rc=$$?; \
 	if [ $$audit_rc -ne 0 ] && [ -s "$$audit_rc_file" ]; then audit_rc="$$(cat "$$audit_rc_file")"; fi; \
@@ -1048,7 +1057,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	if [ $$audit_rc -ne 0 ]; then \
 		if [ $$audit_rc -eq 1 ]; then \
 			echo "release: audit-rulebook reported drift (output above); no new or wider business access was applied." >&2; \
-			echo "  For class.* tags, follow 'How to fix' above; otherwise fix the rule in dev, make rehearse, make promote-to ENV=$(ENV), then re-run make release ENV=$(ENV)." >&2; \
+			$(_DRIFT_HINT) --target release >&2; \
 		else \
 			echo "release: audit-rulebook failed (error, not drift); no new or wider business access was applied." >&2; \
 			echo "  Review the error output above, then re-run make release ENV=$(ENV)." >&2; \
@@ -1132,6 +1141,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	$(_RUN_AUDIT_RULEBOOK); \
 	if [ $$audit_rc -ne 0 ]; then \
 		echo "release-plan: audit-rulebook $$([ $$audit_rc -eq 1 ] && echo reported drift || echo failed) (output above); no manifest was written." >&2; \
+		if [ $$audit_rc -eq 1 ]; then $(_DRIFT_HINT) --target release-plan >&2; fi; \
 		exit $$audit_rc; \
 	fi; \
 	plan_dir="$$($(_RELEASE_GATE) plan-dir --env-dir "$(ENV_DIR)" --env "$(ENV)")" || exit 1; \
@@ -1342,7 +1352,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 	if [ $$audit_rc -ne 0 ]; then \
 		if [ $$audit_rc -eq 1 ]; then \
 			echo "maintain: audit-rulebook reported drift (output above); governance was not applied." >&2; \
-			echo "  For class.* tags, follow 'How to fix' above; otherwise fix the rule in dev, make rehearse, make promote-to ENV=$(ENV), then re-run make maintain ENV=$(ENV)." >&2; \
+			$(_DRIFT_HINT) --target maintain >&2; \
 		else \
 			echo "maintain: audit-rulebook failed (error, not drift); governance was not applied." >&2; \
 			echo "  Review the error output above, then re-run make maintain ENV=$(ENV)." >&2; \
@@ -1417,7 +1427,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		echo "  Then: in Catalog Explorer, open the $(DEST_ENV) catalog > Details tab > Data classification and turn it on."; \
 		echo "        When the scan finishes, review detections, exclude false positives, enable auto-tagging,"; \
 		echo "        and wait for class.* tags,"; \
-		echo "        and run make release ENV=$(DEST_ENV) (the walkthrough's Prod section)"; \
+		echo "        then $$($(_RELEASE_STEPS) --env-dir "$$dest_env_dir" --env "$(DEST_ENV)" --source "$(SOURCE_ENV)") (the walkthrough's Prod section)"; \
 		$(_PROMOTION_TXN_COMMIT); \
 	else \
 		if [ "$(SOURCE_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(SOURCE_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \

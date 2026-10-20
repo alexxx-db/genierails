@@ -191,7 +191,20 @@ def main() -> int:
     if args.command == "access-summary":
         print("\n".join(access_summary(args.env_dir)))
         return 0
+    from scripts.coverage_fix import _deterministic, promote_source
+
     env_file = args.env_dir / "env.auto.tfvars"
+    if _deterministic(args.env_dir):
+        # A promoted deterministic env refuses make apply; every change is a manifest release.
+        source = promote_source(args.env_dir) or "dev"
+        after = (f"make rehearse ENV={source} on the merge commit, make release-plan ENV={args.env} "
+                 f"and make release ENV={args.env}")
+        print(f"release: {args.reason}.\n  Business access (table SELECT / Genie CAN_RUN) for {args.env} may be PARTLY APPLIED;\n"
+              f"  Terraform granted only what passed the coverage check. To withdraw access, remove the groups\n"
+              f"  (or set acl_groups = []) in {env_file} in a PR, then after merge: {after}.\n"
+              f"  Otherwise fix the cause (a change merges the same way), then make release-plan ENV={args.env} "
+              f"and make release ENV={args.env}.", file=sys.stderr)
+        return 0
     print(f"release: {args.reason}.\n  Business access (table SELECT / Genie CAN_RUN) for {args.env} may be PARTLY APPLIED;\n"
           f"  Terraform granted only what passed the coverage check. To withdraw access, remove the groups\n"
           f"  (or set acl_groups = []) in {env_file}, then run: make apply ENV={args.env}\n"

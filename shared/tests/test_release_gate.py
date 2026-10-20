@@ -298,8 +298,10 @@ def test_provenance_refuses_a_fingerprint_mismatch(repo):
 def test_provenance_refuses_a_prod_generated_digest_mismatch(repo, monkeypatch):
     monkeypatch.setattr(rg, "promoted_digest", lambda *a: ("what-promote-to-produces-now", ""))
     rehearse(repo)
-    with pytest.raises(rg.Refused, match="stale promotion"):
+    with pytest.raises(rg.Refused, match="stale promotion") as refused:
         rg.provenance(repo.prod, "prod")
+    assert ("open a PR, then make rehearse ENV=dev on its merge commit and re-run make release-plan ENV=prod"
+            in str(refused.value))
 
 
 def test_provenance_refuses_a_receipt_without_a_digest_for_the_env(repo, monkeypatch):

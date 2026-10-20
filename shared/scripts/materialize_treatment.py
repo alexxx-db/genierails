@@ -251,12 +251,9 @@ def source_env_dir(envs_dir: Path, env: str, env_dir: Path) -> Path:
 def release_steps(env_dir: Path | None, source: str, dest: str) -> str:
     """What follows promote-to: a deterministic release-plan needs the promotion on
     origin/main with a source rehearsal of that same commit; a legacy env just releases."""
-    from scripts.coverage_fix import _deterministic
+    from scripts.coverage_fix import release_steps as steps
 
-    if env_dir is not None and _deterministic(env_dir):
-        return (f"commit and push envs/{dest}/ to origin/main, make rehearse ENV={source} again on "
-                f"that commit, make release-plan ENV={dest} and make release ENV={dest}")
-    return f"make release ENV={dest}"
+    return steps(dest, env_dir, source) if env_dir is not None else f"make release ENV={dest}"
 
 
 def promoted_to(env_dir: Path, env: str) -> list[str]:

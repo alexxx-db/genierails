@@ -284,6 +284,31 @@ def fix_lines(
     return lines
 
 
+def promoted_release_steps(env_name: str, source: str) -> str:
+    """What follows promote-to in a deterministic env: release-plan plans only a commit on
+    origin/main that has a passing rehearsal of the source env at that same commit."""
+    return (f"commit and push envs/{env_name}/ to origin/main (or merge its PR), make rehearse ENV={source} "
+            f"on that commit, make release-plan ENV={env_name} and make release ENV={env_name}")
+
+
+def release_steps(env_name: str, env_dir: Path, source: str = "") -> str:
+    """What follows promote-to, for this env's mode: the deterministic sequence, or a legacy release."""
+    if _deterministic(env_dir):
+        return promoted_release_steps(env_name, source or promote_source(env_dir) or "dev")
+    return f"make release ENV={env_name}"
+
+
+def drift_hint(env_name: str, env_dir: Path, target: str) -> str:
+    """The audit-rulebook drift hint for release, release-plan and maintain, for this env's mode."""
+    prefix = "  For class.* tags, follow 'How to fix' above; otherwise "
+    if _deterministic(env_dir):
+        source = promote_source(env_dir) or "dev"
+        return (f"{prefix}fix the rule in {source}, make rehearse ENV={source}, make promote-to "
+                f"ENV={env_name}, then {promoted_release_steps(env_name, source)}.")
+    return (f"{prefix}fix the rule in dev, make rehearse, make promote-to ENV={env_name}, "
+            f"then re-run make {target} ENV={env_name}.")
+
+
 def _deterministic(env_dir: Path) -> bool:
     path = env_dir / "env.auto.tfvars"
     try:
@@ -304,9 +329,7 @@ def deterministic_fix_lines(env_name: str, env_dir: Path, source: str, rerun: st
     if owner != env_name:
         lines.append(f"       then commit envs/{owner}/env.auto.tfvars, make rehearse ENV={owner}, "
                      f"make promote-to ENV={env_name}")
-        # release-plan needs HEAD on origin/main and a source rehearsal of that same commit.
-        lines.append(f"       then commit and push envs/{env_name}/, make rehearse ENV={owner} "
-                     f"again on that commit, {rerun}")
+        lines.append(f"       then {promoted_release_steps(env_name, owner)}")
     else:
         lines.append(f"       then make generate ENV={env_name} and {rerun}; commit envs/{env_name}/")
     return lines
@@ -322,11 +345,9 @@ def materialize_lines(env_name: str, env_dir: Path, treatments: list[str]) -> li
             f"    make materialize-treatment ENV={source or env_name} TREATMENT={treatment}"
         )
     if source and _deterministic(env_dir):
-        # release-plan needs HEAD on origin/main and a source rehearsal of that same commit.
         lines.append(f"    then commit envs/{source}/generated/, make rehearse ENV={source}, "
                      f"make promote-to ENV={env_name}")
-        lines.append(f"    then commit and push envs/{env_name}/, make rehearse ENV={source} "
-                     f"again on that commit, {rerun}")
+        lines.append(f"    then {promoted_release_steps(env_name, source)}")
     elif source:
         lines.append(
             f"    then make rehearse ENV={source}, make promote-to ENV={env_name}, {rerun}; "
@@ -335,3 +356,28 @@ def materialize_lines(env_name: str, env_dir: Path, treatments: list[str]) -> li
     else:
         lines.append(f"    then {rerun}; commit envs/{env_name}/generated/")
     return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    hint = sub.add_parser("drift-hint", help="print the audit-rulebook drift hint for this env")
+    hint.add_argument("--env-dir", type=Path, required=True)
+    hint.add_argument("--env", required=True)
+    hint.add_argument("--target", required=True)
+    steps = sub.add_parser("release-steps", help="print what follows promote-to for this env's mode")
+    steps.add_argument("--env-dir", type=Path, required=True)
+    steps.add_argument("--env", required=True)
+    steps.add_argument("--source", default="", help="the env it is promoted from (default: its promote_from)")
+    args = parser.parse_args(argv)
+    if args.command == "release-steps":
+        print(release_steps(args.env, args.env_dir, args.source))
+    else:
+        print(drift_hint(args.env, args.env_dir, args.target))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
