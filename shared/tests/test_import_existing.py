@@ -460,3 +460,23 @@ def test_account_group_import_runs_only_when_groups_are_managed(tmp_path, manage
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert ('databricks_group.groups["tier_a"]' in result.stdout) is imports
+
+
+def test_run_by_hand_the_runner_gets_envs_dir_from_the_env_dir(tmp_path):
+    """make exports ENVS_DIR; by hand terraform_layer.sh would default to shared/envs (the wrong state)."""
+    envs = tmp_path / "azure" / "envs"
+    data_access = envs / "dev" / "data_access"
+    data_access.mkdir(parents=True)
+    (envs / "dev" / "env.auto.tfvars").write_text('sql_warehouse_id = "wh"\n')
+    (data_access / "abac.auto.tfvars").write_text(STALE_TREATMENT)
+    fake = fake_uc.install(tmp_path, LIVE)
+    log = tmp_path / "envs_dir.log"
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text(f'#!/bin/sh\necho "$ENVS_DIR" >> {log}\nexec "{fake["TERRAFORM_RUNNER"]}" "$@"\n')
+    wrapper.chmod(0o755)
+    environ = {k: v for k, v in os.environ.items() if k != "ENVS_DIR"} | fake | {"TERRAFORM_RUNNER": str(wrapper)}
+    result = subprocess.run(["bash", SCRIPT, "--tag-assignments-only"], cwd=data_access, env=environ,
+                            text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    seen = set(log.read_text().split())
+    assert seen == {str(envs)}, seen
