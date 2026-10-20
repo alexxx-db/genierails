@@ -16,8 +16,15 @@ import hcl2
 
 
 def _load_hcl(path: Path) -> dict[str, Any]:
-    with path.open() as handle:
-        return hcl2.load(handle)
+    try:
+        with path.open() as handle:
+            return hcl2.load(handle)
+    except Exception:
+        if path.name != "auth.auto.tfvars":
+            raise
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise ValueError(f"{path} is not valid HCL") from None
 
 
 def classified_columns(config: Mapping[str, Any]) -> dict[str, list[str]]:

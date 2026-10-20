@@ -868,13 +868,11 @@ def _resolve_warehouse_id(auth_file: Path, warehouse_id: str) -> str:
     if warehouse_id:
         return warehouse_id
     try:
-        import hcl2 as _hcl2
         from databricks.sdk import WorkspaceClient as _WC
 
         def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-        with open(auth_file) as f:
-            auth = _hcl2.load(f)
+        auth = _read_auth(auth_file)
         host          = _s(auth.get("databricks_workspace_host", ""))
         client_id     = _s(auth.get("databricks_client_id", ""))
         client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -1393,13 +1391,11 @@ def _force_delete_tag_policies(*envs: str) -> None:
         if not auth_file.exists():
             continue
         try:
-            import hcl2 as _hcl2
             from databricks.sdk import WorkspaceClient as _WC
 
             def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-            with open(auth_file) as f:
-                auth = _hcl2.load(f)
+            auth = _read_auth(auth_file)
             host          = _s(auth.get("databricks_workspace_host", ""))
             client_id     = _s(auth.get("databricks_client_id", ""))
             client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -1512,14 +1508,12 @@ def _wait_for_tag_policy_deletion(*envs: str, max_wait: int = 180, poll_interval
         if not auth_file.exists():
             continue
         try:
-            import hcl2 as _hcl2
             from databricks.sdk import WorkspaceClient as _WC
             import ssl as _ssl, urllib.request as _urq, json as _json
 
             def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-            with open(auth_file) as f:
-                auth = _hcl2.load(f)
+            auth = _read_auth(auth_file)
             host          = _s(auth.get("databricks_workspace_host", ""))
             client_id     = _s(auth.get("databricks_client_id", ""))
             client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -1601,13 +1595,11 @@ def _force_delete_fgac_policies(*envs: str, all_catalogs: bool = False) -> None:
         if not auth_file.exists():
             continue
         try:
-            import hcl2 as _hcl2
             from databricks.sdk import WorkspaceClient as _WC
 
             def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-            with open(auth_file) as f:
-                auth = _hcl2.load(f)
+            auth = _read_auth(auth_file)
             host          = _s(auth.get("databricks_workspace_host", ""))
             client_id     = _s(auth.get("databricks_client_id", ""))
             client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -1719,13 +1711,11 @@ def _force_delete_tag_assignments(*envs: str) -> None:
         if not auth_file.exists():
             continue
         try:
-            import hcl2 as _hcl2
             from databricks.sdk import WorkspaceClient as _WC
 
             def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-            with open(auth_file) as f:
-                auth = _hcl2.load(f)
+            auth = _read_auth(auth_file)
             host          = _s(auth.get("databricks_workspace_host", ""))
             client_id     = _s(auth.get("databricks_client_id", ""))
             client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -1898,13 +1888,11 @@ def _drop_test_catalogs(*envs: str) -> None:
         if not auth_file.exists():
             continue
         try:
-            import hcl2 as _hcl2
             from databricks.sdk import WorkspaceClient as _WC
 
             def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-            with open(auth_file) as f:
-                auth = _hcl2.load(f)
+            auth = _read_auth(auth_file)
             host          = _s(auth.get("databricks_workspace_host", ""))
             client_id     = _s(auth.get("databricks_client_id", ""))
             client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -1975,13 +1963,11 @@ def _count_fgac_policies(*envs: str) -> int:
         if not auth_file.exists():
             continue
         try:
-            import hcl2 as _hcl2
             from databricks.sdk import WorkspaceClient as _WC
 
             def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-            with open(auth_file) as f:
-                auth = _hcl2.load(f)
+            auth = _read_auth(auth_file)
             host          = _s(auth.get("databricks_workspace_host", ""))
             client_id     = _s(auth.get("databricks_client_id", ""))
             client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -3054,12 +3040,26 @@ def _ensure_packages() -> None:
               "databricks-sdk", "python-hcl2>=7.3.1,<8"])
 
 
+def _read_auth(auth_file: Path) -> dict:
+    """auth.auto.tfvars as a dict; a RuntimeError naming only the path when it isn't valid HCL."""
+    import hcl2
+    try:
+        with open(auth_file) as f:
+            return hcl2.load(f)
+    except Exception:
+        pass
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise RuntimeError(f"{auth_file} is not valid HCL") from None
+
+
 def _load_auth_cfg(auth_file: Path) -> dict:
     """Load databricks credentials from auth.auto.tfvars."""
     _ensure_packages()
-    import hcl2
-    with open(auth_file) as f:
-        return hcl2.load(f)
+    try:
+        return _read_auth(auth_file)
+    except RuntimeError as exc:
+        raise SystemExit(f"ERROR: {exc}") from None
 
 
 def _configure_sdk_env(cfg: dict) -> None:
@@ -4194,14 +4194,12 @@ def _unset_column_tags(
     This handles suffixed tag keys in parallel mode (e.g. pii_level_abc123)
     by reading the real tag names rather than guessing base names.
     """
-    import hcl2 as _hcl2
     from databricks.sdk import WorkspaceClient as _WC
     from databricks.sdk.service.sql import StatementState
 
     def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-    with open(auth_file) as f:
-        auth = _hcl2.load(f)
+    auth = _read_auth(auth_file)
     host          = _s(auth.get("databricks_workspace_host", ""))
     client_id     = _s(auth.get("databricks_client_id", ""))
     client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -4251,14 +4249,12 @@ def _unset_column_tags(
 
 def _sdk_run_sql(auth_file: Path, sql: str, warehouse_id: str = "") -> None:
     """Execute a single SQL statement via the Databricks SDK."""
-    import hcl2 as _hcl2
     from databricks.sdk import WorkspaceClient as _WC
     from databricks.sdk.service.sql import StatementState
 
     def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-    with open(auth_file) as f:
-        auth = _hcl2.load(f)
+    auth = _read_auth(auth_file)
     host          = _s(auth.get("databricks_workspace_host", ""))
     client_id     = _s(auth.get("databricks_client_id", ""))
     client_secret = _s(auth.get("databricks_client_secret", ""))
@@ -6283,6 +6279,8 @@ def _champion_phase(number: int, title: str) -> None:
 
 def _load_tfvars(path: Path) -> dict:
     _ensure_packages()
+    if Path(path).name == "auth.auto.tfvars":
+        return _read_auth(path)
     import hcl2
     with open(path) as handle:
         return hcl2.load(handle)
@@ -6820,7 +6818,6 @@ def _preflight_fgac_quota_check(auth_file: Path) -> None:
     support ticket instructions needed to fix it.
     """
     try:
-        import hcl2 as _hcl2
         import json as _pf_json
         import ssl as _pf_ssl
         import urllib.request as _pf_urq
@@ -6833,8 +6830,7 @@ def _preflight_fgac_quota_check(auth_file: Path) -> None:
 
         def _s(v): return (v[0] if isinstance(v, list) else (v or "")).strip()
 
-        with open(auth_file) as f:
-            auth = _hcl2.load(f)
+        auth = _read_auth(auth_file)
         host          = _s(auth.get("databricks_workspace_host", ""))
         client_id     = _s(auth.get("databricks_client_id", ""))
         client_secret = _s(auth.get("databricks_client_secret", ""))

@@ -178,7 +178,16 @@ class StageError(RuntimeError):
 
 def _load(path: Path) -> dict:
     import hcl2
-    return hcl2.loads(path.read_text()) if path.is_file() else {}
+    if not path.is_file():
+        return {}
+    try:
+        return hcl2.loads(path.read_text())
+    except Exception:
+        if path.name != "auth.auto.tfvars":
+            raise
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise RuntimeError(f"{path} is not valid HCL") from None
 
 
 def desired_generation(env_dir: Path) -> dict:

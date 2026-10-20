@@ -211,6 +211,20 @@ def _yellow(s: str) -> str:
     return f"\033[33m{s}\033[0m"
 
 
+def _load_auth(auth_file: Path) -> dict:
+    """auth.auto.tfvars as a dict; exits naming only the path when it isn't valid HCL."""
+    import hcl2
+
+    try:
+        with open(auth_file) as f:
+            return hcl2.load(f)
+    except Exception:
+        pass
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise SystemExit(f"ERROR: {auth_file} is not valid HCL") from None
+
+
 def _load_env_file(path: Path) -> dict[str, str]:
     """Parse a KEY=VALUE env file (ignoring comments and blank lines)."""
     cfg: dict[str, str] = {}
@@ -426,11 +440,9 @@ uc_tables = [
 
 def _create_tables_via_sdk(dev_state: dict) -> str:
     """Create tables directly via Databricks SDK. Returns warehouse ID."""
-    import hcl2 as _hcl2
 
     auth_file = Path(dev_state.get("test_envs_dir", "")) / "dev" / "auth.auto.tfvars"
-    with open(auth_file) as f:
-        cfg = _hcl2.load(f)
+    cfg = _load_auth(auth_file)
 
     _s = lambda v: (v[0] if isinstance(v, list) else (v or "")).strip()
     host = _s(cfg.get("databricks_workspace_host", ""))
@@ -604,14 +616,12 @@ def _create_prod_workspace(cfg: dict, cloud: str, metastore_id: str, dev_state: 
 
 def _create_prod_catalog_via_sdk(dev_state: dict) -> None:
     """Create prod catalog in the shared metastore (via dev workspace client)."""
-    import hcl2 as _hcl2
 
     auth_file = Path(dev_state.get("test_envs_dir", "")) / "dev" / "auth.auto.tfvars"
     if not Path(auth_file).exists():
         print(f"  {_yellow('WARN')} Auth file not found: {auth_file}")
         return
-    with open(auth_file) as f:
-        cfg = _hcl2.load(f)
+    cfg = _load_auth(auth_file)
 
     _s = lambda v: (v[0] if isinstance(v, list) else (v or "")).strip()
     host = _s(cfg.get("databricks_workspace_host", ""))
@@ -658,13 +668,11 @@ def _create_prod_catalog_via_sdk(dev_state: dict) -> None:
 
 def _create_genie_space(dev_state: dict) -> str:
     """Create a Genie Space pointing at dev bank tables via REST API directly."""
-    import hcl2 as _hcl2
     import urllib.request
     import urllib.error
 
     auth_file = Path(dev_state.get("test_envs_dir", "")) / "dev" / "auth.auto.tfvars"
-    with open(auth_file) as f:
-        cfg = _hcl2.load(f)
+    cfg = _load_auth(auth_file)
 
     _s = lambda v: (v[0] if isinstance(v, list) else (v or "")).strip()
     host = _s(cfg.get("databricks_workspace_host", "")).rstrip("/")

@@ -198,7 +198,13 @@ def load_auth(env_dir: Path) -> dict:
     import hcl2
 
     with open(env_dir / "auth.auto.tfvars") as f:
-        return hcl2.load(f)
+        try:
+            return hcl2.load(f)
+        except Exception:
+            pass
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise ValueError(f"{env_dir / 'auth.auto.tfvars'} is not valid HCL") from None
 
 
 def get_status(auth: dict, agent_id: str) -> str:

@@ -11,7 +11,9 @@ def auth_configured(path: Path) -> bool:
     try:
         with path.open() as handle:
             config = hcl2.load(handle)
-    except (OSError, ValueError):
+    except Exception:
+        # Malformed HCL (and OS errors): treat as not configured. Never let
+        # parser text (which can echo credential fragments) propagate.
         return False
 
     def configured(name: str) -> bool:

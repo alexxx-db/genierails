@@ -85,7 +85,7 @@ def test_real_layout_loads_current_credentials(tmp_path, monkeypatch):
     "auth_text, expected",
     [
         (None, "credentials file not found"),
-        ("databricks_client_id = \n", "could not parse"),
+        ("databricks_client_id = \n", "is not valid HCL"),
         (AUTH_TEXT.replace('databricks_client_secret = "current-secret"\n', ""),
          "no value for databricks_client_secret"),
         (AUTH_TEXT.replace('"current-secret"', '""'), "no value for databricks_client_secret"),

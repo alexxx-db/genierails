@@ -24,7 +24,7 @@
      migration record, a policy journal moving from it and a snapshot that
      matches its fingerprint, the mismatch fails as before.
   5. Ask Terraform for the fingerprint again and write the result to
-     envs/<env>/data_access/.coverage_gate.json.
+     envs/<env>/$DATA_ACCESS_SUBDIR/.coverage_gate.json (data_access by default).
 
 modules/data_access plans business SELECT only while that file records a pass
 for the fingerprint Terraform computes at plan time AND a live refresh no
@@ -64,7 +64,6 @@ import hcl2
 SHARED_ROOT = Path(__file__).resolve().parent.parent
 RUNNER = SHARED_ROOT / "scripts" / "terraform_layer.sh"
 VALIDATOR = SHARED_ROOT / "validate_abac.py"
-DATA_ACCESS_SUBDIR = "data_access"
 GATE_FILENAME = ".coverage_gate.json"
 CAN_RUN_FILENAME = ".can_run_check.json"
 AGENT_COVERAGE_FILENAME = ".agent_coverage.json"  # scripts/agent_coverage.py
@@ -137,13 +136,24 @@ def _run_bounded(command: list[str], *, label: str, **kwargs) -> subprocess.Comp
         signal.signal(signal.SIGTERM, previous_sigterm)
 
 
+def data_access_subdir() -> str:
+    """The data_access layer's directory under envs/<env>/: Makefile.shared's
+    ``DATA_ACCESS_SUBDIR`` (exported into recipes). The Terraform layer is
+    still named ``data_access``."""
+    return os.environ.get("DATA_ACCESS_SUBDIR") or "data_access"
+
+
 def _load_tfvars(path: Path) -> dict:
     if not path.is_file():
         return {}
     try:
         return hcl2.loads(path.read_text())
     except Exception as exc:
-        raise GateError(f"cannot parse {path}: {exc}") from exc
+        if path.name != "auth.auto.tfvars":
+            raise GateError(f"cannot parse {path}: {exc}") from exc
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise GateError(f"{path} is not valid HCL") from None
 
 
 RETIRED_FLAG = "business_access_enabled"
@@ -198,7 +208,7 @@ def needs_derive(env_dir: Path, apply_flags: str) -> tuple[str, str | None]:
     """
     env = _load_tfvars(env_dir / "env.auto.tfvars")
     generated = (env_dir / "generated" / "abac.auto.tfvars").is_file()
-    if not generated and not (env_dir / DATA_ACCESS_SUBDIR / "abac.auto.tfvars").is_file():
+    if not generated and not (env_dir / data_access_subdir() / "abac.auto.tfvars").is_file():
         return "none", None
     if env.get("enable_classification") is not True:
         return "ddl", "enable_classification is false; tags come from make generate, so only the DDL is re-read"
@@ -405,7 +415,7 @@ def _layer_state(layer_dir: Path, layer: str | None = None) -> dict | None:
         sys.path.insert(0, str(SHARED_ROOT))
     from scripts.state_layout import state_json
     layer_dir = Path(layer_dir)
-    resolved_layer = layer or ("data_access" if layer_dir.name == DATA_ACCESS_SUBDIR else "workspace")
+    resolved_layer = layer or ("data_access" if layer_dir.name == data_access_subdir() else "workspace")
     env_dir = layer_dir.parent if resolved_layer == "data_access" else layer_dir
     try:
         return state_json(env_dir, env_dir.name, resolved_layer)
@@ -594,7 +604,7 @@ def can_run_check(env_dir: Path, env_name: str, runner: Path, apply_flags: str) 
 def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbose: bool,
              config_dir: Path | None = None, staged: dict | None = None) -> int:
     """Gate the data_access config: the split one, or a staged phase's render in ``config_dir``."""
-    layer_dir = env_dir / DATA_ACCESS_SUBDIR
+    layer_dir = env_dir / data_access_subdir()
     tfvars = (config_dir or layer_dir) / "abac.auto.tfvars"
     gate_path = layer_dir / GATE_FILENAME
     if not tfvars.is_file():
@@ -744,7 +754,7 @@ def skip_key(layer: str, layer_dir: Path) -> str:
             return "noskip"
     if withheld_access(layer, layer_dir):
         return "noskip"
-    outputs = (_layer_state(layer_dir / DATA_ACCESS_SUBDIR, "data_access") or {}).get("outputs", {})
+    outputs = (_layer_state(layer_dir / data_access_subdir(), "data_access") or {}).get("outputs", {})
     key = "data_access " + hashlib.sha256(json.dumps(
         [outputs.get("coverage_gate"), outputs.get("table_grant_resource_keys")], sort_keys=True,
     ).encode()).hexdigest()
@@ -764,7 +774,7 @@ def skip_key(layer: str, layer_dir: Path) -> str:
 
 def invalidate(env_dir: Path, reason: str) -> None:
     """Mark the recorded result failed (a live refresh is starting or failed)."""
-    path = env_dir / DATA_ACCESS_SUBDIR / GATE_FILENAME
+    path = env_dir / data_access_subdir() / GATE_FILENAME
     if not path.exists():
         (env_dir / REFRESH_RELPATH).unlink(missing_ok=True)
         return

@@ -85,7 +85,7 @@ for _path in (SHARED, SHARED / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from state_layout import root_state_paths, state_json  # noqa: E402
+from state_layout import data_access_subdir, root_state_paths, state_json  # noqa: E402
 
 STATE_DIR_ENV = "GENIERAILS_STATE_DIR"
 DEFAULT_STATE = ".genierails-state"
@@ -98,7 +98,6 @@ RUNTIME_FILES = {
     "discovered_uc_tables.auto.tfvars", "ddl/_fetched.sql",
     "generated/genie_space_derived_acl_groups.auto.tfvars",
 }
-RUNTIME_DIRS = {"data_access"}
 # AI-helper drafts (scripts/ai_helpers.py) are committed for review but are not
 # inputs: nothing that applies reads them, so they never change a fingerprint.
 DRAFTS_DIR = "drafts"
@@ -108,8 +107,15 @@ STATE_SUFFIXES = (".tfstate", ".tfstate.backup", ".tfplan")
 PROMOTE_OWNED = ("abac.auto.tfvars", "masking_functions.sql", "expected_classification.json")
 CODE_ROOTS = ("shared",)
 CODE_SKIP = ("shared/docs/", "shared/tests/")
+# Terraform layer names (state_json layers, manifest keys), not directories:
+# the data_access layer's directory is data_access_subdir().
 ROOTS = ("account", "data_access", "workspace")
 ACCOUNT_ENV = "account"
+
+
+def runtime_dirs() -> set[str]:
+    """Env subdirectories that are runtime, not inputs: the data_access layer's."""
+    return {data_access_subdir()}
 
 
 class Refused(RuntimeError):
@@ -147,8 +153,9 @@ def deterministic(env_dir: Path) -> bool:
 def any_deterministic_env(account_env_dir: Path) -> bool:
     """Fail-closed scan of workspace envs sharing an account layer."""
     envs_dir = Path(account_env_dir).resolve().parent
+    reserved = {ACCOUNT_ENV, data_access_subdir()}
     for path in sorted(envs_dir.glob("*/env.auto.tfvars")):
-        if path.parent.name in {ACCOUNT_ENV, "data_access"}:
+        if path.parent.name in reserved:
             continue
         try:
             config = _load_hcl(path)
@@ -298,7 +305,7 @@ def code_files(repo: Path, cloud_dir: Path) -> list[Path]:
 
 def _is_input(rel: Path) -> bool:
     parts = rel.parts
-    if not parts or parts[0] in RUNTIME_DIRS or parts[0] == DRAFTS_DIR or str(rel) in RUNTIME_FILES:
+    if not parts or parts[0] in runtime_dirs() or parts[0] == DRAFTS_DIR or str(rel) in RUNTIME_FILES:
         return False
     return not any(part.startswith(".") or part.endswith(STATE_SUFFIXES) or part == "__pycache__"
                    for part in parts)
@@ -348,7 +355,7 @@ def promotion_targets(cloud_dir: Path, source: str) -> list[str]:
     envs = Path(cloud_dir) / "envs"
     for env_file in sorted(envs.glob("*/env.auto.tfvars")):
         name = env_file.parent.name
-        if name in ("account", "data_access", source):
+        if name in (ACCOUNT_ENV, data_access_subdir(), source):
             continue
         promote_from = str(_load_hcl(env_file).get("promote_from") or ("dev" if name == "prod" else ""))
         if promote_from == source:
@@ -921,7 +928,8 @@ def _databricks_reader_source(env_dir: Path, warehouse_id: str):
         from reader_inventory import DatabricksSource
         from scripts.audit_schema_drift import _get_sdk_client
 
-        return DatabricksSource(warehouse_id, client=_get_sdk_client(Path(env_dir) / "data_access"))
+        return DatabricksSource(
+            warehouse_id, client=_get_sdk_client(Path(env_dir) / data_access_subdir()))
     return build
 
 
@@ -930,7 +938,8 @@ def _databricks_reader_source(env_dir: Path, warehouse_id: str):
 def live_policies(env_dir: Path, catalogs: Iterable[str], lister=None) -> dict[str, list[str]]:
     from remap_generated_config import live_policy_lister
 
-    lister = lister or live_policy_lister(Path(env_dir) / "data_access" / "auth.auto.tfvars")
+    lister = lister or live_policy_lister(
+        Path(env_dir) / data_access_subdir() / "auth.auto.tfvars")
     out = {}
     for catalog in sorted(set(catalogs)):
         names = lister(catalog)
@@ -1145,7 +1154,14 @@ def _account_auth_endpoint_hash(env_dir: Path) -> dict | None:
         raise Refused(f"account auth endpoint is not pinned: {auth} resolves outside {envs_dir}") from exc
     if not resolved.is_file():
         raise Refused(f"account auth endpoint is not pinned: {auth} does not resolve to a file")
-    values = _load_hcl(resolved)
+    try:
+        values = _load_hcl(resolved)
+    except Exception:
+        values = None
+    if values is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise Refused(f"account auth endpoint is not pinned: {auth} is not valid HCL") from None
     endpoint = {name: values.get(name) for name in ACCOUNT_AUTH_ENDPOINT_KEYS}
     endpoint["databricks_account_host"] = (
         endpoint["databricks_account_host"] or DEFAULT_DATABRICKS_ACCOUNT_HOST

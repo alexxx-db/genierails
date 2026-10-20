@@ -38,7 +38,13 @@ def _load_hcl(path: Path) -> dict:
     try:
         value = hcl2.loads(path.read_text())
     except Exception as exc:
-        raise DeployerIdentityError(f"cannot parse {path}: {exc}") from exc
+        if path.name != "auth.auto.tfvars":
+            raise DeployerIdentityError(f"cannot parse {path}: {exc}") from exc
+        value = None
+    if value is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise DeployerIdentityError(f"{path} is not valid HCL") from None
     return value if isinstance(value, dict) else {}
 
 

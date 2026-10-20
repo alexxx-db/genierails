@@ -383,13 +383,17 @@ def load_credentials(auth_file: str, host: str) -> None:
 
     if not os.path.isfile(auth_file):
         fail(f"credentials file not found: {auth_file}")
-    try:
-        import hcl2
+    import hcl2
 
+    try:
         with open(auth_file) as f:
             auth = hcl2.load(f)
-    except Exception as exc:
-        fail(f"could not parse {auth_file} ({type(exc).__name__})")
+    except Exception:
+        auth = None
+    if auth is None:
+        # Reported outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        fail(f"{auth_file} is not valid HCL")
     values = {key: str(auth.get(key) or "").strip() for key in AUTH_KEYS}
     for key, value in values.items():
         if not value:

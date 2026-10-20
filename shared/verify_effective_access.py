@@ -1500,8 +1500,15 @@ def load_auth(auth_file: Path) -> dict[str, str]:
     """Parse an auth.auto.tfvars file into host/client_id/client_secret."""
     import hcl2  # local import: only needed for the live path
 
-    with open(auth_file) as f:
-        auth = hcl2.load(f)
+    try:
+        with open(auth_file) as f:
+            auth = hcl2.load(f)
+    except Exception:
+        auth = None
+    if auth is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise ValueError(f"{auth_file} is not valid HCL") from None
     return {
         "host": _as_str(auth.get("databricks_workspace_host")),
         "client_id": _as_str(auth.get("databricks_client_id")),
