@@ -60,7 +60,7 @@ So "expose last" isn't a policy you hope holds — there is simply no new or wid
 | `make audit-rulebook ENV=<e>` | 4/5 | Drift check — tags with no covering rule |
 | `make audit-schema ENV=<e>` | 5 | Untagged-column audit (also the first step of `make maintain`) |
 | `make generate-delta ENV=<e>` | — | [Legacy] model-based incremental tag assignments; the champion flow uses `make maintain` instead |
-| `make evidence ENV=<e>` | 4 | Compliance evidence record (`GENIERAILS_EVIDENCE_INTEGRATION=1` + `WAREHOUSE_ID`) |
+| `make evidence ENV=<e>` | 4 | Compliance evidence record; `GENIERAILS_EVIDENCE_INTEGRATION=1` reads live state through the env's warehouse, resolved automatically (`WAREHOUSE_ID=<id>` optional) |
 
 Successful validation reports are compact by default. Add `VERBOSE=1` to a
 `make` command to restore the full PASS reports and informational detail;
@@ -133,7 +133,7 @@ What each walkthrough step does, for when you need more than the [walkthrough](R
 - The Agent ID is also in the agent's URL (`…/genie/rooms/<id>`).
 - Tiers: e.g. `payments_ops` sees raw values, `regional_analysts` sees region-scoped masked data, `viewers` sees every sensitive column masked. Each agent's tables are `SELECT`-granted only to the tiers allowed to run that agent (a table shared by several agents gets the union). See [architecture](../../docs/architecture.md).
 - **Who may run an agent is its `acl_groups`**. **Preferred:** its agent file (`envs/<env>/agents/<agent>.auto.tfvars`). **Also accepted:** the same fields inline in `env.auto.tfvars` as `genie_spaces = [{ ... }]` (leave that list empty when using agent files). It is required: a missing value stops `make generate`, and `[]` means nobody. It grants only Genie `CAN_RUN`; `SELECT` comes only from `table_readers`, and every `acl_groups` group must be able to read the agent's tables through it. New access still waits for a passing coverage check. (Legacy envs only: an agent without `acl_groups` gets each configured group a policy names plus every tier listed above it.)
-- `access_tier_groups` is read by every `make generate`. The first promote copies it to prod; later promotes keep prod's value. The first `promote-to` also seeds `envs/prod/agents/<agent>.auto.tfvars` with dev's `acl_groups`; later promotions keep prod's. To change prod tiers, edit `envs/prod/env.auto.tfvars` in a PR; to change who may run a prod agent, edit its `acl_groups` in `envs/prod/agents/`. GenieRails uses your groups by exact name and never creates them. (CLI alternative: leave it `[]` and pass `GENERATE_ARGS='--groups "a,b,c"'` once; that run saves it. A later `--groups` that differs applies to that run only.)
+- `access_tier_groups` is read by every `make generate`. In a deterministic env every promote copies dev's tiers to prod through `group_map`; in a legacy env the first promote copies them and later promotes keep prod's value. The first `promote-to` also seeds `envs/prod/agents/<agent>.auto.tfvars` with dev's `acl_groups`; later promotions keep prod's. To change prod tiers, edit dev's tiers (or prod's `group_map`) and promote in a deterministic env, `envs/prod/env.auto.tfvars` in a legacy one, in a PR; to change who may run a prod agent, edit its `acl_groups` in `envs/prod/agents/`. GenieRails uses your groups by exact name and never creates them. (CLI alternative: leave it `[]` and pass `GENERATE_ARGS='--groups "a,b,c"'` once; that run saves it. A later `--groups` that differs applies to that run only.)
 - `sql_warehouse_id` on an agent's `genie_spaces` entry (file or inline) picks its warehouse; leave it `""` to auto-create one. Agents can share the environment-level warehouse.
 
 **Classification**
@@ -149,7 +149,7 @@ What each walkthrough step does, for when you need more than the [walkthrough](R
 **`make rehearse ENV=dev`**
 - Runs live derive → validate-generated → coverage-gate → apply → verify-access (`_verify-access-gate`), stopping at the first failure. Does **not** run `make check` (run that on committed files first; see the walkthrough).
 - `verify-access` creates a test service principal per tier, gives each temporary `CAN_USE` on the warehouse, and checks a bounded sample of rows: unprivileged tiers must see masked values, the authorized tier raw ones. Pass prints `ALL EFFECTIVE`. Standalone: `make verify-access ENV=dev`.
-- To pair rows across tiers it picks a key per masked table (single-column primary key, else an untagged id-like column such as `customer_id`), proves it unique, non-null and unmasked, and saves the proven keys as `verify_key_columns` after a pass. [Details and overrides](../../docs/effective-access-verification.md#how-genierails-picks-the-row-pairing-key).
+- To pair rows across tiers it picks a key per masked table (single-column primary key, else an untagged id-like column such as `customer_id`), proves it unique, non-null and unmasked, and saves the proven keys as `verify_key_columns` after a pass (a deterministic env prints them for you to commit instead). [Details and overrides](../../docs/effective-access-verification.md#how-genierails-picks-the-row-pairing-key).
 - Dev keeps business access after rehearse; the masks protect the data either way.
 
 **`make promote-to ENV=prod`**
@@ -167,7 +167,7 @@ What each walkthrough step does, for when you need more than the [walkthrough](R
 - Drift or an audit error stops it before the apply: existing access stays, and no new or wider `SELECT` or Genie run access is granted.
 - If it fails after it started applying, only access that passed the coverage check can be applied; follow the printed steps.
 - To withdraw access, remove the groups (or set `acl_groups = []`) and run `make apply ENV=prod`. `business_access_enabled` is retired; setting it to `false` revokes nothing.
-- Evidence: `make evidence ENV=prod` writes a config-based report to `envs/prod/generated/evidence/`. For a live, signed snapshot: `GENIERAILS_EVIDENCE_INTEGRATION=1 GENIERAILS_EVIDENCE_APPROVED_BY="<you>" make evidence ENV=prod WAREHOUSE_ID=<id>`.
+- Evidence (walkthrough Prod step 4, after the release): `GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod` writes a live snapshot to `envs/prod/generated/evidence/`; add `GENIERAILS_EVIDENCE_APPROVED_BY="<you>"` to sign it. The warehouse is resolved from prod's config or applied workspace (`WAREHOUSE_ID=<id>` only pins one). Without the variable it writes a config-only report. Archive it and remove the folder before `make maintain` or the next `release-plan`: both need a clean checkout ([evidence report](../../docs/evidence-report.md)).
 
 **`make maintain ENV=prod`**
 - Runs audit-schema → derive-assignments → coverage-gate → validate-generated → audit-rulebook → apply-governance. It audits before applying, keeps `SELECT` for already-covered tables, never widens access past a passing check, and never changes the Genie agent.
