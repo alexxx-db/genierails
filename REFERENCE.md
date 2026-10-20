@@ -244,7 +244,7 @@ Off by default. See [scheduled governance](shared/docs/scheduled-governance.md) 
 | Setting | Type | Default | Meaning |
 |---|---|---|---|
 | `enable_scheduled_governance` | bool | `false` | Create a scheduled job that runs the read-only governance checks. |
-| `scheduled_governance_mode` | string | `"check"` | `check` (read-only audits) or `legacy` (the old audit, generate-delta, coverage flow). |
+| `scheduled_governance_mode` | string | `"check"` | `check` (read-only audits) or `legacy` (audit, generate-delta, then `validate_abac.py --coverage-gate` against the generated or split config; never apply). |
 | `scheduled_governance_env` | string | `"prod"` | The env the job checks. |
 | `scheduled_governance_cloud` | string | `"aws"` | `aws` or `azure`: the cloud dir holding that env. |
 | `scheduled_governance_catalog` | string | `""` | Legacy mode only: the catalog for generate-delta. |

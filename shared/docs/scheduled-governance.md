@@ -59,7 +59,10 @@ After the move, the job's ID and URL outputs come from the data_access root
 
 Set `scheduled_governance_mode = "legacy"` to retain the explicit legacy
 `audit -> generate-delta -> coverage` flow. Its model-based delta step may
-rewrite files in the ephemeral checkout but never applies them. The runner also
+rewrite files in the ephemeral checkout but never applies them. The coverage
+step runs `validate_abac.py --coverage-gate` with the generated config when
+present, otherwise the split `data_access` config, and passes the target env
+name for actionable failure guidance. The runner also
 retains `--step all|audit|delta|coverage` for existing callers;
 `--auth-file` and `--catalog` are legacy-only.
 

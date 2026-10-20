@@ -180,11 +180,13 @@ def test_coverage_no_config_fails_loudly(tmp_path, capsys):
     assert "no ABAC config to validate" in capsys.readouterr().err
 
 
-def test_coverage_falls_back_to_data_access_layer(tmp_path, monkeypatch):
-    # No generated/ config, but a split data_access/ config exists.
-    da = tmp_path / "data_access"
-    da.mkdir()
-    (da / "abac.auto.tfvars").write_text("tag_assignments = [\n]\n")
+@pytest.mark.parametrize("layer", ["generated", "data_access"])
+def test_coverage_invokes_gate_with_selected_config_and_env_name(tmp_path, monkeypatch, layer):
+    env_dir = tmp_path / "prod"
+    selected = env_dir / layer
+    selected.mkdir(parents=True)
+    config = selected / "abac.auto.tfvars"
+    config.write_text("tag_assignments = [\n]\n")
     calls = {}
 
     def fake_run(cmd, cwd):
@@ -192,8 +194,33 @@ def test_coverage_falls_back_to_data_access_layer(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(rsg, "_run", fake_run)
-    assert rsg._coverage(tmp_path) == 0
-    assert str(da / "abac.auto.tfvars") in calls["cmd"]
+    assert rsg._coverage(env_dir) == 0
+    assert calls["cmd"] == [
+        sys.executable,
+        str(rsg.SHARED_ROOT / "validate_abac.py"),
+        "--coverage-gate",
+        str(config),
+        "--env-name",
+        "prod",
+    ]
+
+
+def test_coverage_prefers_generated_config_over_split_config(tmp_path, monkeypatch):
+    env_dir = tmp_path / "prod"
+    for layer in ("generated", "data_access"):
+        (env_dir / layer).mkdir(parents=True)
+        (env_dir / layer / "abac.auto.tfvars").write_text("tag_assignments = [\n]\n")
+    calls = {}
+
+    def fake_run(cmd, cwd):
+        calls["cmd"] = cmd
+        return 0
+
+    monkeypatch.setattr(rsg, "_run", fake_run)
+
+    assert rsg._coverage(env_dir) == 0
+    assert str(env_dir / "generated" / "abac.auto.tfvars") in calls["cmd"]
+    assert str(env_dir / "data_access" / "abac.auto.tfvars") not in calls["cmd"]
 
 
 def test_audit_invokes_existing_script(tmp_path, monkeypatch):
@@ -235,6 +262,7 @@ def test_default_check_runs_both_audits_never_delta(tmp_path, monkeypatch):
     monkeypatch.setattr(rsg, "_audit", lambda ed: ran.append("audit") or 0)
     monkeypatch.setattr(rsg, "_rulebook", lambda ed: ran.append("rulebook") or 0)
     monkeypatch.setattr(rsg, "_delta", lambda *args: pytest.fail("default called delta"))
+    monkeypatch.setattr(rsg, "_coverage", lambda *args: pytest.fail("default called coverage"))
     monkeypatch.setattr(sys, "argv", ["prog", "--env-dir", str(env_dir)])
     assert rsg.main() == 0
     assert ran == ["audit", "rulebook"]
@@ -338,8 +366,10 @@ def test_coverage_includes_masking_sql_when_present(tmp_path, monkeypatch):
     rsg._coverage(tmp_path)
     cmd = calls["cmd"]
     assert cmd[1].endswith("validate_abac.py")
-    assert str(gen / "abac.auto.tfvars") in cmd
-    assert str(gen / "masking_functions.sql") in cmd
+    assert cmd == [sys.executable, str(rsg.SHARED_ROOT / "validate_abac.py"),
+                   "--coverage-gate", str(gen / "abac.auto.tfvars"),
+                   str(gen / "masking_functions.sql"),
+                   "--env-name", tmp_path.name]
 
 
 def test_step_all_runs_all_three_steps(tmp_path, monkeypatch):
