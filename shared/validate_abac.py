@@ -1439,7 +1439,8 @@ def validate_auth(cfg: dict, result: ValidationResult, tfvars_path: Path):
                         auth_cfg[k] = v
                 result.ok(f"Vars loaded from {found.name}")
             except Exception as e:
-                result.warn(f"Could not parse {found}: {e}")
+                # Never echo parser text for auth files: it can quote a malformed secret.
+                result.warn(f"Could not parse {found}: {'not valid HCL' if fname == 'auth.auto.tfvars' else e}")
 
     for key in required:
         val = auth_cfg.get(key, "")

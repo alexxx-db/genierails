@@ -334,7 +334,7 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   operation equivalent: `account-plan` refuses unless the checkout is clean and
   exactly current `origin/main`, saves one account plan and immutable manifest,
   and changes nothing live. The manifest records the saved plan hash, account
-  input hashes and the replace-mode tag-policy diff. `apply-account` chooses
+  input hashes and the tag-policy diff (additions and approved removals). `apply-account` chooses
   the single unreceipted manifest for `HEAD` (or accepts `MANIFEST=<path>` as an
   explicit override) and refuses in CI, from a dirty checkout, from any commit
   other than the manifest commit and the exact current `origin/main` tip, if

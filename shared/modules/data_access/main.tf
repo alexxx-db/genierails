@@ -483,9 +483,9 @@ resource "databricks_sql_endpoint" "warehouse" {
 # No secret goes into these triggers: state keeps them, and a destroy-time
 # provisioner can only read state, so a rotated secret would linger there and
 # break --drop. The script loads the current SP credentials from auth_file.
-# Every other input still forces a replacement, which only re-runs CREATE OR
-# REPLACE: the drop lives in masking_functions_drop, so changing the SQL never
-# drops a function the live policies use.
+# Only what changes the deployed functions forces a replacement, which only
+# re-runs CREATE OR REPLACE: the drop lives in masking_functions_drop, so
+# changing the SQL never drops a function the live policies use.
 data "external" "normalized_masking_sql" {
   program = ["python3", "${path.module}/normalize_masking_sql.py"]
   query = {
@@ -493,23 +493,48 @@ data "external" "normalized_masking_sql" {
   }
 }
 
+locals {
+  # Checkout paths in state, relative where they can be: the script to the
+  # project root (path.module/../.., the shared/ the run uses, a prepared
+  # root's copy included), the SQL and auth files to masking_paths_base (the
+  # env dir). A path outside its anchor, or with no base, stays as given.
+  masking_project_root = "${abspath("${path.module}/../..")}/"
+  masking_paths_base   = var.masking_paths_base == "" ? "" : "${abspath(var.masking_paths_base)}/"
+  masking_drop_script = (startswith(abspath(var.deploy_masking_script), local.masking_project_root)
+  ? trimprefix(abspath(var.deploy_masking_script), local.masking_project_root) : var.deploy_masking_script)
+  masking_drop_files = {
+    for key, path in { sql_file = var.masking_sql_file, auth_file = var.auth_file } :
+    key => (local.masking_paths_base != "" && startswith(abspath(path), local.masking_paths_base)
+    ? trimprefix(abspath(path), local.masking_paths_base) : path)
+  }
+}
+
 resource "terraform_data" "masking_functions" {
   triggers_replace = {
     # Format 3 hashes the exact execution context and blocks used by the shared
-    # deployer parser. Upgrading state from #94 may cause one more drop-free
-    # CREATE OR REPLACE run. Thereafter only execution-context or executable
-    # definition changes replace this resource; safe function reordering does not.
+    # deployer parser. Only the deployed definitions (sql_hash) and where they go
+    # replace this resource: never the checkout's paths, so a plan from another
+    # clone, CI runner or moved repo changes nothing. Upgrading state that still
+    # records sql_file, script and auth_file here runs one drop-free CREATE OR
+    # REPLACE of the same functions (the guards and the plan note call it a
+    # re-key); safe function reordering never replaces it.
     sql_hash     = data.external.normalized_masking_sql.result.hash
-    sql_file     = var.masking_sql_file
-    script       = var.deploy_masking_script
-    auth_file    = var.auth_file
     warehouse_id = local.effective_warehouse_id
     host         = var.databricks_workspace_host
     client_id    = var.databricks_client_id
   }
 
+  # The arguments go in as environment variables the shell expands quoted, so
+  # a checkout path with spaces or shell characters reaches the script intact.
   provisioner "local-exec" {
-    command = "python3 ${self.triggers_replace.script} --sql-file ${self.triggers_replace.sql_file} --warehouse-id ${self.triggers_replace.warehouse_id} --auth-file ${self.triggers_replace.auth_file} --host ${self.triggers_replace.host}"
+    command = "python3 \"$MASKING_SCRIPT\" --sql-file \"$MASKING_SQL_FILE\" --warehouse-id \"$MASKING_WAREHOUSE_ID\" --auth-file \"$MASKING_AUTH_FILE\" --host \"$MASKING_HOST\""
+    environment = {
+      MASKING_SCRIPT       = var.deploy_masking_script
+      MASKING_SQL_FILE     = var.masking_sql_file
+      MASKING_WAREHOUSE_ID = self.triggers_replace.warehouse_id
+      MASKING_AUTH_FILE    = var.auth_file
+      MASKING_HOST         = self.triggers_replace.host
+    }
   }
 
   depends_on = [
@@ -523,18 +548,50 @@ resource "terraform_data" "masking_functions" {
 # Drops the functions when the layer is destroyed, after the policies and
 # masking_functions are gone. Its settings are input, not triggers, so a
 # change updates it in place: nothing but a real destroy runs the drop.
+# A destroy-time provisioner reads only state, so the paths it records are
+# relative (local.masking_drop_*) and resolved when the destroy runs: the
+# script under this run's path.module/../.., the SQL and auth files under
+# GENIERAILS_MASKING_BASE_DIR, which terraform_layer.sh exports as the env
+# dir. A destroy from another checkout drops the functions with that
+# checkout's files; without the variable the drop refuses rather than guess.
+# sql_hash records which functions these are: the drop hashes the SQL it
+# resolved and refuses, before it connects, when that is another env's (a
+# wrong GENIERAILS_MASKING_BASE_DIR) or the file changed since the last apply.
+# All state from before this (absolute paths, no hash) refuses to drop,
+# whether its paths still exist or not, until an apply from this checkout
+# re-keys the drop (relative paths and sql_hash): a reused or replaced
+# checkout may hold another env's SQL at those paths. An absolute path
+# recorded with sql_hash that is gone is found by its place under the old
+# shared/ (the old script's dir) or the env dir, and the hash then checked.
 resource "terraform_data" "masking_functions_drop" {
   input = {
-    sql_file     = var.masking_sql_file
-    script       = var.deploy_masking_script
-    auth_file    = var.auth_file
+    sql_file     = local.masking_drop_files.sql_file
+    script       = local.masking_drop_script
+    auth_file    = local.masking_drop_files.auth_file
+    sql_hash     = data.external.normalized_masking_sql.result.hash
     warehouse_id = local.effective_warehouse_id
     host         = var.databricks_workspace_host
   }
 
   provisioner "local-exec" {
     when    = destroy
-    command = "python3 ${self.input.script} --sql-file ${self.input.sql_file} --warehouse-id ${self.input.warehouse_id} --auth-file ${self.input.auth_file} --host ${self.input.host} --drop"
+    command = "python3 \"$MASKING_SCRIPT\" --sql-file \"$MASKING_SQL_FILE\" --warehouse-id \"$MASKING_WAREHOUSE_ID\" --auth-file \"$MASKING_AUTH_FILE\" --host \"$MASKING_HOST\" --drop --expect-sql-hash \"$MASKING_SQL_HASH\" --relocate-from \"$MASKING_RELOCATE_FROM\" --base-dir \"$${GENIERAILS_MASKING_BASE_DIR:-}\""
+    environment = {
+      # A recorded deploy_masking_functions.py, relative or an older state's
+      # absolute path, runs from this checkout; it understands these flags.
+      MASKING_SCRIPT = (!startswith(self.input.script, "/") ? "${abspath("${path.module}/../..")}/${self.input.script}"
+        : basename(self.input.script) == "deploy_masking_functions.py"
+      ? "${abspath("${path.module}/../..")}/deploy_masking_functions.py" : self.input.script)
+      MASKING_SQL_FILE     = self.input.sql_file
+      MASKING_WAREHOUSE_ID = self.input.warehouse_id
+      MASKING_AUTH_FILE    = self.input.auth_file
+      MASKING_HOST         = self.input.host
+      MASKING_SQL_HASH     = try(self.input.sql_hash, "")
+      # The shared/ an absolute path was recorded under, for the deployer to
+      # find a moved file at the same place under this checkout's.
+      MASKING_RELOCATE_FROM = (startswith(self.input.script, "/") && basename(self.input.script) == "deploy_masking_functions.py"
+      ? dirname(self.input.script) : "")
+    }
   }
 
   depends_on = [

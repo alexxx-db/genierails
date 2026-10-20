@@ -42,6 +42,11 @@ else
 fi
 # The env dir (envs/<env>): data_access is one level below it.
 if [ "$LAYER" = "data_access" ]; then ENV_ROOT="$(dirname "$MODULE_DIR")"; else ENV_ROOT="$MODULE_DIR"; fi
+# terraform_layer.sh finds the layer's env dir as $ENVS_DIR/<env>[/data_access]
+# (or $ENVS_DIR/account), defaulting to shared/envs. make exports <cloud>/envs;
+# run by hand, the env dir's parent is that same dir, so derive it.
+ENVS_DIR="${ENVS_DIR:-$(dirname "$ENV_ROOT")}"
+export ENVS_DIR
 
 DRY_RUN=false
 SKIP_TREATMENT_TAGS=""

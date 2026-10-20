@@ -152,6 +152,20 @@ BUSINESS_GRANTS = {"catalog_access", "schema_access", "table_access"}
 ACCESS_GRANTS = BUSINESS_GRANTS | {"terraform_sp_manage_catalog"}
 MASKING_FUNCTIONS = "terraform_data.masking_functions"
 FUNCTION_DROP = "terraform_data.masking_functions_drop"
+# What a masking_functions replace deploys and where (its triggers since the
+# paths left them); a replace that keeps all four only re-keys it.
+DEPLOY_TRIGGERS = ("sql_hash", "warehouse_id", "host", "client_id")
+# Checkout paths, which older states recorded in masking_functions' triggers
+# and masking_functions_drop's input (as absolute paths).
+# (relative_base only appeared in unreleased state; it is dropped again.)
+PATH_KEYS = frozenset({"sql_file", "script", "auth_file", "relative_base"})
+DROP_TARGET = ("warehouse_id", "host")
+# Which functions masking_functions_drop drops: older states lack it, and
+# recording it the first time changes no target.
+DROP_IDENTITY = "sql_hash"
+REKEY_NOTE = ("terraform_data.masking_functions is replaced only to stop recording checkout paths "
+              "(sql_file, script, auth_file): the SQL, warehouse, host and client are unchanged, so it "
+              "re-runs CREATE OR REPLACE of the same functions and drops nothing. This happens once.")
 # What a rebind may change on a mask policy; everything else must be planned unchanged.
 REBIND_POLICY_FIELDS = ("to_principals", "except_principals")
 POLICY_BINDING = ("name", "on_securable_type", "on_securable_fullname", "policy_type", "for_securable_type",
@@ -167,7 +181,16 @@ class StageError(RuntimeError):
 
 def _load(path: Path) -> dict:
     import hcl2
-    return hcl2.loads(path.read_text()) if path.is_file() else {}
+    if not path.is_file():
+        return {}
+    try:
+        return hcl2.loads(path.read_text())
+    except Exception:
+        if path.name != "auth.auto.tfvars":
+            raise
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise RuntimeError(f"{path} is not valid HCL") from None
 
 
 def desired_generation(env_dir: Path) -> dict:
@@ -502,13 +525,14 @@ def split_assignment_problems(env_dir: Path) -> list[str]:
     coverage check and the stage's plan judge different assignments.
     """
     from scripts.runtime_overlay import effective
+    from scripts.state_layout import data_access_subdir
 
     def others(path: Path) -> set[str]:
         return {"|".join(str(item.get(f, "")) for f in ("entity_type", "entity_name", "tag_key", "tag_value"))
                 for item in _load(path).get("tag_assignments") or []
                 if not (item.get("entity_type") == "columns" and item.get("tag_key") == TAG_KEY)}
 
-    split = others(Path(env_dir) / "data_access" / "abac.auto.tfvars")
+    split = others(Path(env_dir) / data_access_subdir() / "abac.auto.tfvars")
     generated = others(effective(Path(env_dir), "abac.auto.tfvars"))
     return ([f"{key} is in the generated config only" for key in sorted(generated - split)]
             + [f"{key} is in the split data_access config only" for key in sorted(split - generated)])
@@ -524,7 +548,8 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
     new protection is switched in. ``abandon`` may only delete those policies:
     any other change (a treatment tag retagged since the restore, a policy's
     principals or match, a function, a grant, a create) is refused, apart from
-    the enforcement wait that a policy delete restarts.
+    the enforcement wait that a policy delete restarts and a path-only re-key
+    of the masking functions (``masking_rekey``).
     """
     problems = []
     for change in plan.get("resource_changes") or []:
@@ -536,6 +561,8 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
             if actions == ["delete"] and rtype == "databricks_policy_info" and key in allowed_policy_deletes:
                 continue
             if address.endswith(ENFORCEMENT_WAIT):
+                continue
+            if masking_rekey(change):  # the one-time move of the paths out of state
                 continue
             problems.append(f"{address}: {'/'.join(actions)} (abandon only deletes the unfinished change's policies)")
             continue
@@ -730,6 +757,8 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
             for problem in problems:
                 print(f"  - {problem}", file=sys.stderr)
             return 1
+        for note in rekey_notes(plan):
+            print(f"Policy stage {stage}: {note}")
         if plan_out:
             write_json(sidecar_path(plan_file), record | {"changes": plan_changes(plan),
                                                           "policy_deletes": planned_policy_deletes(plan)})
@@ -973,10 +1002,55 @@ def coverage_loss_problems(plan: dict, recorded: list[dict], mapping: dict[str, 
     return problems
 
 
-def _trigger(values: dict | None, field: str):
-    value = (values or {}).get("triggers_replace")
+def _values(values: dict | None, field: str) -> dict:
+    value = (values or {}).get(field)
     value = value.get("value", value) if isinstance(value, dict) and "type" in value else value
-    return (value or {}).get(field) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _trigger(values: dict | None, field: str):
+    return _values(values, "triggers_replace").get(field)
+
+
+def _path_only(before: dict, after: dict, kept: tuple[str, ...]) -> bool:
+    """Every key in ``kept`` is set and unchanged, and every other change is a checkout path."""
+    if not all(before.get(k) and before.get(k) == after.get(k) for k in kept):
+        return False
+    return all(before.get(k) == after.get(k) for k in before.keys() | after.keys() if k not in PATH_KEYS)
+
+
+def masking_rekey(change: dict) -> bool:
+    """Whether a planned change only moves checkout paths out of the masking resources' state.
+
+    masking_functions once recorded sql_file, script and auth_file in its
+    triggers, so every checkout planned a replace, and the first plan without
+    them replaces it once more. A replace that keeps sql_hash, warehouse_id,
+    host and client_id re-runs CREATE OR REPLACE of the same functions on the
+    same warehouse, and (with no destroy-time provisioner on masking_functions:
+    redeploy_drops_functions) drops nothing. masking_functions_drop's input
+    moving from absolute to relative paths (and first recording sql_hash) is an
+    in-place update that keeps the warehouse and host. Anything else, including any delete of
+    masking_functions_drop (the destroy that drops the functions), is not.
+    """
+    address = str(change.get("address") or "")
+    body = change.get("change") or {}
+    actions = sorted(body.get("actions") or [])
+    before, after = body.get("before"), body.get("after")
+    if address.endswith(MASKING_FUNCTIONS) and actions == ["create", "delete"]:
+        return (_path_only(_values(before, "triggers_replace"), _values(after, "triggers_replace"),
+                           DEPLOY_TRIGGERS) and not redeploy_drops_functions())
+    if address.endswith(FUNCTION_DROP) and actions == ["update"]:
+        before, after = _values(before, "input"), _values(after, "input")
+        if DROP_IDENTITY not in before:
+            after = {k: v for k, v in after.items() if k != DROP_IDENTITY}
+        return _path_only(before, after, DROP_TARGET)
+    return False
+
+
+def rekey_notes(plan: dict) -> list[str]:
+    """The note for a plan that re-keys the masking functions (masking_rekey), else none."""
+    return [REKEY_NOTE] if any(masking_rekey(c) and str(c.get("address") or "").endswith(MASKING_FUNCTIONS)
+                               for c in plan.get("resource_changes") or []) else []
 
 
 def redeploy_drops_functions(module_main: Path = SHARED / "modules" / "data_access" / "main.tf") -> bool:
@@ -1178,6 +1252,8 @@ def rebind(env_dir: Path, environ: dict, stage: str) -> int:
     print(f"Policy stage {stage}: planned into {plan_file}" + ("" if summary else " (no changes)"))
     for line in summary:
         print(f"  {line}")
+    for note in rekey_notes(plan):
+        print(f"Policy stage {stage}: {note}")
     if held:
         print(f"  held back until the access phase: {len(held)} grant(s)")
     return 0
@@ -1214,6 +1290,14 @@ def _resolve_warehouse(env_dir: Path, environ: dict) -> str:
     if result.returncode or not result.stdout.strip():
         raise StageError("drop-functions: no SQL warehouse resolved; set WAREHOUSE_ID or sql_warehouse_id")
     return result.stdout.strip().splitlines()[-1]
+
+
+def masking_sql_hash(sql: str) -> str:
+    """The normalized hash masking_functions_drop records for this SQL (normalize_masking_sql.py)."""
+    import hashlib
+
+    from modules.data_access.normalize_masking_sql import normalized_definitions
+    return hashlib.sha256(normalized_definitions(sql).encode()).hexdigest()
 
 
 def drop_functions(env_dir: Path, environ: dict, *, live_users=None, run=subprocess.run) -> int:
@@ -1257,9 +1341,12 @@ def drop_functions(env_dir: Path, environ: dict, *, live_users=None, run=subproc
         handle.write(sql)
         sql_file = handle.name
     try:
+        # The deployer drops only SQL whose identity it is told: this is the
+        # hash of what the generations above say to drop.
         result = run([sys.executable, str(DEPLOY_FUNCTIONS), "--sql-file", sql_file, "--warehouse-id", warehouse,
                       "--auth-file", str(layer / "auth.auto.tfvars"),
-                      "--host", str(auth.get("databricks_workspace_host") or ""), "--drop"], check=False)
+                      "--host", str(auth.get("databricks_workspace_host") or ""), "--drop",
+                      "--expect-sql-hash", masking_sql_hash(sql)], check=False)
     finally:
         os.unlink(sql_file)
     if result.returncode:

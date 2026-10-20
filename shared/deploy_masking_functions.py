@@ -8,7 +8,20 @@ never from Terraform state, so a rotated secret is always current.
 Usage:
   python3 deploy_masking_functions.py --sql-file masking_functions.sql \
       --warehouse-id <id> --auth-file auth.auto.tfvars --host <workspace-url>
-  python3 deploy_masking_functions.py ... --drop
+  python3 deploy_masking_functions.py ... --drop --expect-sql-hash <sql_hash>
+  python3 deploy_masking_functions.py ... --drop --expect-sql-hash <sql_hash> --base-dir <env-dir>
+
+terraform_data.masking_functions_drop records --sql-file and --auth-file
+relative to the env dir, so its destroy-time drop passes --base-dir (the
+GENIERAILS_MASKING_BASE_DIR terraform_layer.sh exports) and runs from any
+checkout. Absolute paths are used as given while they exist; one recorded
+under a checkout that is gone is looked up at the same place under this
+shared/ (--relocate-from names the old one) or the env dir.
+--expect-sql-hash is the normalized SQL hash the last apply recorded: the
+drop hashes the SQL it resolved and refuses, before it connects, on a
+mismatch (another env's SQL, or a file changed since the apply). A drop
+without one (all state from before it was recorded, whether its paths still
+exist or not) refuses until an apply from this checkout re-keys it.
 """
 
 import argparse
@@ -370,13 +383,17 @@ def load_credentials(auth_file: str, host: str) -> None:
 
     if not os.path.isfile(auth_file):
         fail(f"credentials file not found: {auth_file}")
-    try:
-        import hcl2
+    import hcl2
 
+    try:
         with open(auth_file) as f:
             auth = hcl2.load(f)
-    except Exception as exc:
-        fail(f"could not parse {auth_file} ({type(exc).__name__})")
+    except Exception:
+        auth = None
+    if auth is None:
+        # Reported outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        fail(f"{auth_file} is not valid HCL")
     values = {key: str(auth.get(key) or "").strip() for key in AUTH_KEYS}
     for key, value in values.items():
         if not value:
@@ -390,6 +407,112 @@ def load_credentials(auth_file: str, host: str) -> None:
     os.environ["DATABRICKS_HOST"] = file_host
     os.environ["DATABRICKS_CLIENT_ID"] = values["databricks_client_id"]
     os.environ["DATABRICKS_CLIENT_SECRET"] = values["databricks_client_secret"]
+
+
+def _refuse(problem: str) -> None:
+    print(f"ERROR: {problem}; nothing was dropped.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _under(path: str, base: str, resolve=os.path.realpath) -> bool:
+    """Whether path is under base, symlinks resolved (abspath for a path that is gone)."""
+    path, base = resolve(path), resolve(base)
+    return os.path.commonpath([path, base]) == base
+
+
+def _relocated(path: str, args):
+    """Where a recorded absolute path that is gone sits in this checkout, if it can be told.
+
+    Older states recorded the files under the checkout that applied them. The
+    same file is at the same place under this script's shared/ (when it was
+    under the old one, --relocate-from) or, by its last two parts
+    (data_access/<file>), under the env dir when the dir above those is named
+    like it (the env). A place counts only if, symlinks resolved, it is still
+    under the dir it was found in and under --base-dir when one is given.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if args.relocate_from and _under(path, args.relocate_from, os.path.abspath):
+        candidates.append((os.path.join(here, os.path.relpath(path, args.relocate_from)), here))
+    parts = os.path.normpath(path).split(os.sep)
+    if args.base_dir and len(parts) > 3 and parts[-3] == os.path.basename(os.path.normpath(args.base_dir)):
+        candidates.append((os.path.join(args.base_dir, *parts[-2:]), args.base_dir))
+    for candidate, anchor in candidates:
+        if (os.path.isfile(candidate) and _under(candidate, anchor)
+                and (not args.base_dir or _under(candidate, args.base_dir))):
+            return candidate
+    return None
+
+
+def _refuse_unidentified(sql_file: str) -> None:
+    _refuse(
+        "masking_functions_drop records no sql_hash (state from an earlier version), so the "
+        f"drop can't tell whether {sql_file} is the SQL it deployed: a reused or replaced "
+        "checkout may hold another env's at that path. Run make apply once from this checkout "
+        "(it re-keys masking_functions_drop to relative paths and records sql_hash, dropping "
+        "nothing; see docs/deterministic-policies.md), then make destroy"
+    )
+
+
+def resolve_paths(args) -> None:
+    """Resolve --sql-file/--auth-file for this checkout, or exit.
+
+    A drop needs the --expect-sql-hash the last apply recorded, which is what
+    tells this env's SQL from another's: all legacy state, which has none,
+    refuses, whether its absolute paths still exist or not. Relative paths
+    resolve against --base-dir (given but empty refuses). An absolute path
+    that is gone is relocated (_relocated) or refuses.
+    """
+    base_dir = getattr(args, "base_dir", None)
+    if getattr(args, "drop", False) and not getattr(args, "expect_sql_hash", ""):
+        _refuse_unidentified(args.sql_file)
+    for key in ("sql_file", "auth_file"):
+        path = getattr(args, key)
+        if not os.path.isabs(path):
+            if base_dir is None:
+                continue
+            if not base_dir:
+                _refuse(
+                    f"masking_functions_drop records {path} relative to the env dir, but "
+                    "GENIERAILS_MASKING_BASE_DIR is unset, so the drop can't find it. Run the "
+                    "destroy through terraform_layer.sh (make destroy), which sets it"
+                )
+            setattr(args, key, os.path.join(base_dir, path))
+        elif not os.path.exists(path) and getattr(args, "drop", False):
+            moved = _relocated(path, args)
+            if moved is None:
+                _refuse(
+                    f"masking_functions_drop records {path}, which no longer exists, and "
+                    "this checkout has no file at the same place"
+                    + (f" under {base_dir}" if base_dir else "")
+                    + ". Restore that checkout, or re-run make apply from this one to record "
+                    "its paths, then destroy"
+                )
+            print(f"  {path} is gone; using {moved} from this checkout.")
+            setattr(args, key, moved)
+
+
+def verify_sql_identity(sql_file: str, expected: str) -> None:
+    """Refuse unless sql_file hashes to the normalized hash the last apply recorded (none refuses)."""
+    if not expected:
+        _refuse_unidentified(sql_file)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "data_access"))
+    import hashlib
+
+    from normalize_masking_sql import normalized_definitions
+
+    try:
+        with open(sql_file) as f:
+            actual = hashlib.sha256(normalized_definitions(f.read()).encode()).hexdigest()
+    except Exception as exc:
+        _refuse(f"could not hash {sql_file} ({type(exc).__name__}: {exc})")
+    if actual != expected:
+        _refuse(
+            f"{sql_file} is not the SQL the last apply deployed (sql_hash {actual}, state "
+            f"records {expected}): it is another env's, or it changed since that apply. "
+            "Point GENIERAILS_MASKING_BASE_DIR at this env's dir (make destroy sets it), "
+            "or restore the SQL, then destroy"
+        )
 
 
 def main():
@@ -425,7 +548,28 @@ def main():
         required=True,
         help="Workspace URL the functions belong to; must match --auth-file",
     )
+    parser.add_argument(
+        "--base-dir",
+        default=None,
+        help="Directory relative --sql-file and --auth-file are resolved "
+        "against (the env dir); given but empty, relative paths refuse",
+    )
+    parser.add_argument(
+        "--expect-sql-hash",
+        default="",
+        help="With --drop: the normalized SQL hash state records; a "
+        "--sql-file that hashes otherwise refuses before connecting",
+    )
+    parser.add_argument(
+        "--relocate-from",
+        default="",
+        help="With --drop: the shared/ dir older state recorded absolute "
+        "paths under, to find them in this checkout when they are gone",
+    )
     args = parser.parse_args()
+    resolve_paths(args)
+    if args.drop:
+        verify_sql_identity(args.sql_file, args.expect_sql_hash)
     load_credentials(args.auth_file, args.host)
 
     if args.drop:

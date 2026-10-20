@@ -41,7 +41,14 @@ def _load_auth() -> dict:
     auth_path = WORK_DIR / "auth.auto.tfvars"
     if not auth_path.exists():
         return {}
-    cfg = _load_hcl(auth_path)
+    try:
+        cfg = _load_hcl(auth_path)
+    except Exception:
+        cfg = None
+    if cfg is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise SystemExit(f"ERROR: {auth_path} is not valid HCL") from None
     mapping = {
         "databricks_workspace_host": "DATABRICKS_HOST",
         "databricks_client_id": "DATABRICKS_CLIENT_ID",
@@ -244,24 +251,20 @@ def main() -> int:
 
             time.sleep(max(args.poll_seconds, 1))
 
-        # Timed out — if we have recreate attempts left, delete + recreate invisible keys
+        # Timed out: create keys still not visible, if attempts remain. Never
+        # delete one first: a key invisible to list may exist in the backend,
+        # and deleting it drops every value (other repos' included) for every
+        # workspace on the metastore. A create of an existing key just fails.
         if recreate_cycle < max_recreate_attempts and missing_keys:
             print(
                 f"  [RECREATE] {len(missing_keys)} tag policy key(s) not visible after"
-                f" {args.timeout_seconds}s — deleting and recreating (attempt"
+                f" {args.timeout_seconds}s — creating any that don't exist (attempt"
                 f" {recreate_cycle + 1}/{max_recreate_attempts})"
             )
             for key in missing_keys:
                 policy_cfg = desired.get(key)
                 if not policy_cfg:
                     continue
-                # Delete if it exists (may be invisible to list but present in backend)
-                try:
-                    w.tag_policies.delete_tag_policy(tag_key=key)
-                    print(f"    Deleted: {key}")
-                except Exception:
-                    pass  # may not exist
-                # Recreate with desired values
                 try:
                     from databricks.sdk.service.tags import TagPolicy, Value
                     w.tag_policies.create_tag_policy(
@@ -270,10 +273,10 @@ def main() -> int:
                             values=[Value(name=v) for v in policy_cfg],
                         )
                     )
-                    print(f"    Recreated: {key} with {len(policy_cfg)} value(s)")
+                    print(f"    Created: {key} with {len(policy_cfg)} value(s)")
                 except Exception as exc:
-                    print(f"    [WARN] Could not recreate {key}: {exc}")
-            print(f"  Waiting for recreated policies to become visible...")
+                    print(f"    [WARN] Could not create {key} (it may already exist): {exc}")
+            print("  Waiting for the policies to become visible...")
             time.sleep(10)  # brief settle before re-polling
             continue
 

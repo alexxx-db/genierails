@@ -187,7 +187,8 @@ any unfinished transition with its completed phases. Writes are atomic.
      generation without the change's policies). That plan may only delete
      the policies the unfinished generation created, as the journal's
      generations record them; the enforcement wait those deletes restart is
-     the one other change allowed. Any other change refuses before anything
+     the one other change allowed, besides the one-time masking re-key
+     (below). Any other change refuses before anything
      is applied: a treatment tag update (a column retagged to the new value
      since the restore shows up as one), a policy's `TO`, `EXCEPT` or match,
      a function, a grant, or a create. Before planning, it re-runs the
@@ -315,6 +316,66 @@ columns, and leaves live protection as it is:
 How to un-govern such columns, or supersede the change, is an open design
 decision.
 
+### Masking functions and checkout paths
+
+`terraform_data.masking_functions` is replaced, which re-runs `CREATE OR
+REPLACE FUNCTION` and drops nothing, only when what it deploys changes: the
+normalized SQL hash, the warehouse, the workspace host or the deployer's
+client ID. It records no file paths, so a plan from another checkout of the
+same state (a teammate's clone, a CI runner, a moved repo,
+`GENIERAILS_STATE_DIR`) changes nothing. Edits to
+`deploy_masking_functions.py` itself don't replace it either; they apply on
+the next SQL change.
+
+`terraform_data.masking_functions_drop`, whose destroy-time provisioner drops
+the functions, records its SQL and auth files relative to the env dir and its
+script relative to `shared/`. The destroy resolves them in the checkout that
+runs it: the script under that run's module, the files under
+`GENIERAILS_MASKING_BASE_DIR`, which `scripts/terraform_layer.sh` exports (the
+env dir). A raw `terraform destroy` without that variable fails before
+dropping anything rather than guess; run it through `make destroy`. Only a
+real destroy drops the functions; a path change is never even an update.
+
+The drop also records the normalized SQL hash. Before connecting, the
+destroy hashes the SQL it found and refuses if the hash differs: that SQL
+belongs to another env (a wrong `GENIERAILS_MASKING_BASE_DIR`) or has
+changed since the last apply. Restore the SQL, or apply it, then destroy.
+All state from an earlier version records absolute paths and no hash, so
+its destroy refuses before it loads credentials or connects
+(`masking_functions_drop records no sql_hash ...`). It refuses whether those
+paths still exist or not: a reused or replaced checkout can hold another
+env's SQL at the same path. Run `make apply` once from the current checkout,
+then `make destroy`. That apply is the re-key below. It records relative
+paths and the hash, and it drops nothing.
+
+**Once, after upgrading**, state written by an earlier version still records
+absolute paths, so the first data_access plan shows:
+
+```
+# module.data_access.terraform_data.masking_functions must be replaced
+      ~ triggers_replace = {
+          - auth_file    = "/old/checkout/.../auth.auto.tfvars"
+          - script       = "/old/checkout/shared/deploy_masking_functions.py"
+          - sql_file     = "/old/checkout/.../masking_functions.sql"
+            # (4 unchanged attributes hidden)
+        }
+# module.data_access.terraform_data.masking_functions_drop will be updated in-place
+# module.data_access.time_sleep.wait_for_policy_enforcement must be replaced
+```
+
+followed by `Note: this replacement only stops recording checkout paths`. That
+is a re-key: the same functions are redeployed on the same warehouse and
+nothing is dropped. It is safe to apply, including in prod. The staged
+controller treats it as one: abandon allows it (`masking_rekey` in
+`scripts/policy_generations.py`) and every stage prints `Policy stage <stage>:
+terraform_data.masking_functions is replaced only to stop recording checkout
+paths ...`. Rebind already allows a redeploy with the same SQL hash. It is
+only a re-key when `sql_hash`, `warehouse_id`, `host` and `client_id` are all
+recorded and unchanged and the only other changes are the path keys. The
+drop's update must keep its warehouse and host, and no stage may delete or
+replace `masking_functions_drop`. Anything else is refused as before. After
+that one apply, plans from any checkout show no masking change.
+
 In `rehearse`, `apply` and `maintain` these phases run inside the applying
 command. A prod release is two-phase (rollout step 9, [pipelines.md](pipelines.md#release-gating-deterministic-envs)):
 `make release-plan` runs the controller's `plan --out-dir`, which saves the
@@ -351,18 +412,64 @@ The account tag sync never removes a live deterministic value; the caller runs
 
 ## Tag-policy values
 
-Rehearse, release and apply in a deterministic env only **add** tag-policy
-values (`sync_tag_policies.py --mode add-only`). Terraform ignores the values,
-so an empty account plan doesn't prove the REST update is safe: when a live
-value is no longer desired, the sync writes nothing, lists the values it would
-remove and fails, pointing at the account operation. Only
-`make apply-account` (CI guard, approved single-use account manifest, account
-lock) runs `--mode replace`, which removes them. While any env of the checkout
-(`envs/*/env.auto.tfvars`) is deterministic, `make apply ENV=account` routes
-to that same manifest-gated operation, `_apply-account-for-workspace` stays
-add-only even for a legacy env in that mixed checkout, explicit
-`make sync-tags ENV=account TAG_SYNC_MODE=replace` refuses without the live
-account-lock nonce, and `make destroy ENV=account` refuses. Legacy-only
-checkouts keep `replace`, as before.
+The account tag policy (for example `gr_treatment`) is shared by every
+workspace on the metastore, so its live values can include values another
+GenieRails repo, another team or a legacy env still uses. Every tag sync, in
+every governance mode (rehearse, release, apply, `make sync-tags`, and a
+legacy-only checkout's `make apply ENV=account`), only **adds** values
+(`sync_tag_policies.py` has no replace mode): it adds the values this checkout
+needs and leave every other live value in place, printing them as a warning.
+Terraform ignores the values, so an empty account plan doesn't prove a REST
+update is safe; add-only never writes a removal, so it never needs one.
+
+Removing a value is a separate, approved account operation:
+
+```bash
+make account-plan ALLOW_TAG_VALUE_REMOVAL=gr_treatment:redact,gr_treatment:ssn_last4 WAREHOUSE_ID=<id>
+# review the printed summary ("!! TAG VALUES THIS MANIFEST REMOVES ...") and approve the manifest
+make apply-account
+```
+
+- Only values named in `ALLOW_TAG_VALUE_REMOVAL` (`<key>:<value>`, comma
+  separated; sorted and deduplicated) are removed. Each must be live, no longer
+  desired by the account `abac.auto.tfvars`, and not a deterministic
+  generation (the staged retirement removes those).
+- Each must be unused where the deployer can see: no assignment in
+  `system.information_schema.{catalog,schema,table,column,volume}_tags`
+  (every catalog the deployer can read, through `WAREHOUSE_ID`), and no ABAC
+  policy whose condition names the key and value on any catalog, schema or
+  table the deployer can list. Every table is read, not only tagged ones: a
+  table policy can name a value no securable carries yet. Unbound and
+  browse-only catalogs are listed too. A value in use is refused, and so is a
+  value whose use can't be checked (no warehouse, a failed or truncated query,
+  a catalog, schema, table or policy listing that fails anywhere): no manifest
+  is written.
+- The manifest records the allowed list, the planned removals and what was
+  checked; `account-plan` and `apply-account` print them first. Approving the
+  manifest approves exactly those removals.
+- `apply-account` recomputes the diff and refuses if the planned additions or
+  removals no longer match live, or if `ALLOW_TAG_VALUE_REMOVAL` is set to a
+  different list. Under the account lock it re-checks usage just before
+  removing. Live values that appear later and aren't named are left in place
+  and don't invalidate the manifest.
+
+Limits of the check: it sees only what the deployer can list. A securable it
+can't list at all isn't inspected; one it lists but can't read refuses. Name a
+value only when no other team depends on it.
+
+Terraform ignores the values, but deleting a tag policy drops all of them, with
+no usage check. So `make account-plan` and a legacy-only checkout's direct
+`make apply ENV=account` refuse a plan that deletes or replaces a
+`databricks_tag_policy`: keep the key in `tag_policies` and remove the values
+you no longer use as above. `wait-tag-policies` never deletes a key it can't
+see; it only creates keys that don't exist.
+
+`make sync-tags TAG_SYNC_MODE=replace` refuses in every checkout (it would
+remove every undesired value with no usage check). While any env of the
+checkout (`envs/*/env.auto.tfvars`) is deterministic, `make apply ENV=account`
+routes to `apply-account` and `make destroy ENV=account` refuses. A legacy-only
+checkout's `make apply ENV=account` still applies the account layer directly,
+but its tag sync is add-only like every other; it removes values through
+`account-plan` and `apply-account` too.
 
 Migrating a legacy env: [legacy-migration.md](legacy-migration.md).

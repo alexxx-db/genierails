@@ -31,6 +31,7 @@ override _DRY_RUN_GUARD = if [ -n "$(_MAKE_DRY_RUN)" ]; then exit 0; fi
 
 ACCOUNT_ENV := account
 DATA_ACCESS_SUBDIR := data_access
+export DATA_ACCESS_SUBDIR
 DEFAULT_ENV := dev
 ENV ?= $(DEFAULT_ENV)
 SOURCE_ENV ?= $(ENV)
@@ -183,22 +184,38 @@ _prepare-env:
 			mkdir -p "$$env_dir/ddl" "$$env_dir/generated"; \
 			gov_dir="$$env_dir/$(DATA_ACCESS_SUBDIR)"; \
 			mkdir -p "$$gov_dir"; \
-			if [ ! -e "$$gov_dir/auth.auto.tfvars" ]; then ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars"; fi; \
-			if [ ! -e "$$gov_dir/env.auto.tfvars" ]; then ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars"; fi; \
+			if [ -L "$$gov_dir/auth.auto.tfvars" ] && [ ! -e "$$gov_dir/auth.auto.tfvars" ]; then \
+				echo "ERROR: $$gov_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+			fi; \
+			if [ ! -e "$$gov_dir/auth.auto.tfvars" ] && [ ! -L "$$gov_dir/auth.auto.tfvars" ]; then \
+				ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars"; \
+			fi; \
+			if [ -L "$$gov_dir/env.auto.tfvars" ] && [ ! -e "$$gov_dir/env.auto.tfvars" ]; then \
+				echo "ERROR: $$gov_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+			fi; \
+			if [ ! -e "$$gov_dir/env.auto.tfvars" ] && [ ! -L "$$gov_dir/env.auto.tfvars" ]; then \
+				ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars"; \
+			fi; \
 		fi; \
 		if [ -n "$$owned" ]; then \
 			rm -f "$$env_dir"/*.tf; \
 			rm -f "$$env_dir"/*.py "$$env_dir"/ABAC_PROMPT.md; \
 			rm -rf "$$env_dir/scripts"; \
 		fi; \
-		if [ ! -e "$$env_dir/auth.auto.tfvars" ]; then \
+		if [ -L "$$env_dir/auth.auto.tfvars" ] && [ ! -e "$$env_dir/auth.auto.tfvars" ]; then \
+			echo "ERROR: $$env_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+		fi; \
+		if [ ! -e "$$env_dir/auth.auto.tfvars" ] && [ ! -L "$$env_dir/auth.auto.tfvars" ]; then \
 			if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
 				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars"; \
 			else \
 				cp "$(SHARED_ROOT)/auth.auto.tfvars.example" "$$env_dir/auth.auto.tfvars"; \
 			fi; \
 		fi; \
-		if [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
+		if [ -L "$$env_dir/env.auto.tfvars" ] && [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
+			echo "ERROR: $$env_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
+		fi; \
+		if [ ! -e "$$env_dir/env.auto.tfvars" ] && [ ! -L "$$env_dir/env.auto.tfvars" ]; then \
 			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars"; \
 			if [ "$$env_name" = "$(ACCOUNT_ENV)" ] || [ "$${_SEED_PROMOTION_SETTINGS:-1}" = 0 ]; then \
 				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars"; \
@@ -839,7 +856,7 @@ _apply-account-for-workspace:
 	if [ "$$mode" = deterministic ] || [ "$$any_det" = 1 ]; then \
 		$(MAKE) --no-print-directory _guard-account-plan-empty ENV="$(ENV)" && $(MAKE) --no-print-directory _sync-tags-add-only-locked ENV="$(ACCOUNT_ENV)" ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	else \
-		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" TAG_SYNC_MODE=replace; \
+		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	fi
 
 account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/main HEAD -> immutable account manifest to approve
@@ -858,11 +875,13 @@ account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/
 	if ! "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" show -json "$$plan_dir/account.tfplan" > "$$show_json"; then rm -f "$$show_json"; rm -rf "$$plan_dir"; echo "account-plan: terraform show failed (above); no manifest was written." >&2; exit 1; fi; \
 	$(_RELEASE_GATE) account-plan-summary --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --show-json "$$show_json" --changes "$$([ $$status -eq 2 ] && echo true || echo false)" --out "$$plan_dir/account.summary.json" || { rm -f "$$show_json"; rm -rf "$$plan_dir"; exit 1; }; \
 	rm -f "$$show_json"; \
-	$(_RELEASE_GATE) account-tag-sync-diff --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --out "$$plan_dir/tag_sync.json" || { rm -rf "$$plan_dir"; exit 1; }; \
+	$(_RELEASE_GATE) account-tag-sync-diff --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" --warehouse-id "$(strip $(WAREHOUSE_ID))" --out "$$plan_dir/tag_sync.json" || { rm -rf "$$plan_dir"; exit 1; }; \
 	manifest="$$($(_RELEASE_GATE) account-manifest-write --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --plan-dir "$$plan_dir" --provenance "$$plan_dir/provenance.json")" || { rm -rf "$$plan_dir"; exit 1; }; \
 	echo ""; \
 	echo "=== Account plan ==="; \
+	$(_RELEASE_GATE) account-manifest-summary --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --manifest "$$manifest" || exit 1; \
 	echo "  Manifest (immutable): $$manifest"; \
+	echo "  Approving this manifest approves exactly the plan and the tag-value removals above."; \
 	echo "  Review it and its saved plan, get it approved, then run:"; \
 	echo "    make apply-account"
 
@@ -880,16 +899,19 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 _apply-account-locked:
 	@$(_DRY_RUN_GUARD); \
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
-	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
+	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
 	$(call _ENV_LOCK,apply-account); \
-	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" || exit 1; \
+	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
 	apply_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-plan.XXXXXX")" || exit 1; chmod 700 "$$apply_dir"; \
 	trap '$(_NO_SIGNALS); rm -rf "$$apply_dir"; $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	cp "$$plans/account.tfplan" "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; chmod 400 "$$apply_dir/account.tfplan"; \
 	expected="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plan.sha256)" || { rm -rf "$$apply_dir"; exit 1; }; \
 	actual="$$(shasum -a 256 "$$apply_dir/account.tfplan" | awk '{print $$1}')"; \
 	if [ "$$actual" != "$$expected" ]; then rm -rf "$$apply_dir"; echo "ERROR: the saved account plan changed while it was copied; nothing was applied. Run make account-plan again." >&2; exit 1; fi; \
-	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=replace || { rm -rf "$$apply_dir"; exit 1; }; \
+	$(_RELEASE_GATE) account-manifest-summary --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || { rm -rf "$$apply_dir"; exit 1; }; \
+	removals="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field tag_value_removal.allowed_arg)" || { rm -rf "$$apply_dir"; exit 1; }; \
+	warehouse="$$($(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field tag_value_removal.warehouse_id)" || { rm -rf "$$apply_dir"; exit 1; }; \
+	$(MAKE) --no-print-directory sync-tags TAG_SYNC_REMOVE="$$removals" WAREHOUSE_ID="$$warehouse" || { rm -rf "$$apply_dir"; exit 1; }; \
 	echo "=== Apply saved plan (account) ==="; \
 	LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" apply-plan "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; \
 	rm -rf "$$apply_dir"; \
@@ -1578,27 +1600,27 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		$(MAKE) --no-print-directory _plan-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
 	fi
 
-# add-only never removes a live tag-policy value (it refuses instead, pointing
-# at make apply-account); replace removes values no longer desired. A
-# deterministic ENV, or ENV=account while any env is deterministic, defaults
-# to add-only; anything else keeps replace.
-sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (TAG_SYNC_MODE=add-only|replace)
+# The sync is add-only in every governance mode, legacy included: it never
+# removes a live tag-policy value (the policy is account-wide, so another repo,
+# team or legacy env may use it); values this checkout doesn't desire are
+# reported as left in place. TAG_SYNC_REMOVE=<key>:<value>,... (only make
+# apply-account passes it, from its approved manifest, under the account lock)
+# also removes those values once sync_tag_policies.py proves them unused
+# (WAREHOUSE_ID reads system.information_schema). TAG_SYNC_MODE=replace is refused.
+sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (add-only; removals: account-plan, apply-account)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
-	@mode="$(TAG_SYNC_MODE)"; any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; \
-	if [ -z "$$mode" ]; then \
-		mode=replace; \
-		if [ -f "$(ENV_DIR)/env.auto.tfvars" ]; then env_mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || { echo "ERROR: cannot determine governance mode from $(ENV_DIR)/env.auto.tfvars" >&2; exit 1; }; [ "$$env_mode" != deterministic ] || mode=add-only; fi; \
-		if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] && [ "$$any_det" = 1 ]; then mode=add-only; fi; \
+	@if [ -n "$(strip $(TAG_SYNC_MODE))" ] && [ "$(strip $(TAG_SYNC_MODE))" != add-only ]; then \
+		echo "ERROR: make sync-tags TAG_SYNC_MODE=$(strip $(TAG_SYNC_MODE)) refused: the sync is add-only. replace would delete every live tag-policy value this checkout doesn't desire, for every workspace on the metastore, with no usage check. Remove named values with make account-plan ALLOW_TAG_VALUE_REMOVAL=<key>:<value>,... WAREHOUSE_ID=<id>, get the manifest approved, then make apply-account." >&2; exit 1; \
 	fi; \
-	if [ "$$mode" = replace ] && [ "$$any_det" = 1 ]; then \
+	if [ -n "$(strip $(TAG_SYNC_REMOVE))" ]; then \
 		$(_RELEASE_GATE) account-lock-check --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" || exit 1; \
 	fi; \
-	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" --mode "$$mode"
+	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" $(if $(strip $(TAG_SYNC_REMOVE)),--remove "$(strip $(TAG_SYNC_REMOVE))" --warehouse-id "$(strip $(WAREHOUSE_ID))",)
 
 _sync-tags-add-only-locked:
 	@$(call _ENV_LOCK,tag-sync-add-only); \
-	$(MAKE) --no-print-directory sync-tags TAG_SYNC_MODE=add-only
+	$(MAKE) --no-print-directory sync-tags
 
 wait-tag-policies: _bootstrap ## Wait until account tag policies are visible to downstream FGAC APIs
 	@$(MAKE) --no-print-directory _guard-account-config
@@ -1695,6 +1717,13 @@ _apply-layer: _guard-not-ci-apply
 				fi; \
 			fi; \
 		done; \
+	elif [ "$$layer" = "account" ]; then \
+		account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"; trap 'rm -rf "$$account_plan_dir"' EXIT; \
+		plan_rc=0; LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" plan -input=false -detailed-exitcode -parallelism=1 -out="$$account_plan_dir/account.tfplan" || plan_rc=$$?; \
+		if [ $$plan_rc -ne 0 ] && [ $$plan_rc -ne 2 ]; then echo "ERROR: account plan failed (above); nothing was applied." >&2; exit 1; fi; \
+		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" show -json "$$account_plan_dir/account.tfplan" > "$$account_plan_dir/account.json"; \
+		$(_RELEASE_GATE) tag-policy-delete-guard --env-dir "$$env_dir" --env "$$target_env" --show-json "$$account_plan_dir/account.json"; \
+		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" apply-plan -parallelism=1 "$$account_plan_dir/account.tfplan"; \
 	elif [ "$$staged" = 1 ]; then \
 		GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) run --env-dir "$$(dirname "$$env_dir")" --env-name "$$target_env" $(_STAGED_SPEC_FLAGS) \
 			--verify-access-cmd '$(_STAGED_VERIFY_ACCESS)'; \
@@ -2456,10 +2485,16 @@ migrate-root-to-env: _prepare-env ## Move existing root working files into envs/
 		echo "Moved $$(basename "$$path")"; \
 		found=1; \
 	done; \
-	if [ ! -f "$(ENV_DIR)/auth.auto.tfvars" ]; then \
+	if [ -L "$(ENV_DIR)/auth.auto.tfvars" ] && [ ! -e "$(ENV_DIR)/auth.auto.tfvars" ]; then \
+		echo "ERROR: $(ENV_DIR)/auth.auto.tfvars is a dangling symlink; fix or remove it before migrating."; exit 1; \
+	fi; \
+	if [ ! -e "$(ENV_DIR)/auth.auto.tfvars" ] && [ ! -L "$(ENV_DIR)/auth.auto.tfvars" ]; then \
 		cp "$(SHARED_ROOT)/auth.auto.tfvars.example" "$(ENV_DIR)/auth.auto.tfvars"; \
 	fi; \
-	if [ ! -f "$(ENV_DIR)/env.auto.tfvars" ]; then \
+	if [ -L "$(ENV_DIR)/env.auto.tfvars" ] && [ ! -e "$(ENV_DIR)/env.auto.tfvars" ]; then \
+		echo "ERROR: $(ENV_DIR)/env.auto.tfvars is a dangling symlink; fix or remove it before migrating."; exit 1; \
+	fi; \
+	if [ ! -e "$(ENV_DIR)/env.auto.tfvars" ] && [ ! -L "$(ENV_DIR)/env.auto.tfvars" ]; then \
 		cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$(ENV_DIR)/env.auto.tfvars"; \
 	fi; \
 	if [ "$$found" -eq 0 ]; then \

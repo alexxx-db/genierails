@@ -78,7 +78,13 @@ def _load_hcl(path: Path) -> dict:
         with path.open() as f:
             value = hcl2.load(f)
     except Exception as exc:
-        raise RuntimeError(f"cannot parse {path}: {exc}") from exc
+        if path.name != "auth.auto.tfvars":
+            raise RuntimeError(f"cannot parse {path}: {exc}") from exc
+        value = None
+    if value is None:
+        # Raised outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        raise RuntimeError(f"cannot parse {path}: not valid HCL") from None
     if not isinstance(value, dict):
         raise RuntimeError(f"cannot parse {path}: expected top-level object")
     return value
@@ -198,7 +204,8 @@ def _get_warehouse_id(env_dir: Path, w) -> str:
     return ""
 
 
-def _run_sql(w, warehouse_id: str, sql: str) -> list[list[str]]:
+def _run_sql(w, warehouse_id: str, sql: str, *, complete: bool = False) -> list[list[str]]:
+    """Every result row. With ``complete``, a truncated result raises instead of returning a prefix."""
     from databricks.sdk.service.sql import StatementState
     r = w.statement_execution.execute_statement(
         statement=sql, warehouse_id=warehouse_id, wait_timeout="50s",
@@ -213,6 +220,8 @@ def _run_sql(w, warehouse_id: str, sql: str) -> list[list[str]]:
         code = getattr(err, "error_code", None) if err else None
         code_suffix = f" [{code}]" if code else ""
         raise RuntimeError(f"SQL failed ({state or 'UNKNOWN'}){code_suffix}: {msg}")
+    if complete and getattr(getattr(r, "manifest", None), "truncated", False):
+        raise RuntimeError("SQL result was truncated; not every row was returned")
     rows = list(getattr(r.result, "data_array", None) or [])
     next_chunk = getattr(r.result, "next_chunk_index", None) if r.result else None
     if next_chunk is not None:

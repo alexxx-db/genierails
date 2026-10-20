@@ -21,6 +21,7 @@ import deploy_masking_functions as dmf
 from tests.terraform_helpers import skip_if_providers_unavailable as _skip_if_providers_unavailable  # noqa: E402
 from tests.terraform_helpers import tf as _tf  # noqa: E402
 import generate_abac
+from scripts import policy_generations as pg  # noqa: E402
 
 SHARED = Path(__file__).parents[1]
 MODULE_TF = SHARED / "modules/data_access/main.tf"
@@ -84,7 +85,7 @@ def test_real_layout_loads_current_credentials(tmp_path, monkeypatch):
     "auth_text, expected",
     [
         (None, "credentials file not found"),
-        ("databricks_client_id = \n", "could not parse"),
+        ("databricks_client_id = \n", "is not valid HCL"),
         (AUTH_TEXT.replace('databricks_client_secret = "current-secret"\n', ""),
          "no value for databricks_client_secret"),
         (AUTH_TEXT.replace('"current-secret"', '""'), "no value for databricks_client_secret"),
@@ -127,8 +128,10 @@ def test_main_requires_auth_file_and_loads_it_before_any_statement(
     seen = {}
     monkeypatch.setattr(dmf, "deploy", lambda *a: seen.setdefault("secret", os.environ["DATABRICKS_CLIENT_SECRET"]))
     monkeypatch.setattr(dmf, "drop", lambda *a: seen.setdefault("secret", os.environ["DATABRICKS_CLIENT_SECRET"]))
-    base = ["deploy_masking_functions.py", "--sql-file", str(env_dir / "masking_functions.sql"),
-            "--warehouse-id", "wh"] + (["--drop"] if drop else [])
+    sql_file = env_dir / "masking_functions.sql"
+    # A drop runs only with the sql_hash state records (test_masking_checkout_paths.py).
+    base = ["deploy_masking_functions.py", "--sql-file", str(sql_file), "--warehouse-id", "wh"] + (
+        ["--drop", "--expect-sql-hash", pg.masking_sql_hash(sql_file.read_text())] if drop else [])
 
     monkeypatch.setattr(sys, "argv", base)
     with pytest.raises(SystemExit):
@@ -148,10 +151,12 @@ def test_masking_resource_keeps_no_secret_and_ignores_nothing():
     block = _resource_block(MODULE_TF.read_text(), 'resource "terraform_data" "masking_functions" {')
     triggers = re.search(r"triggers_replace = \{(.*?)\n  \}", block, re.S).group(1)
     keys = set(re.findall(r"^\s*(\w+)\s*=", triggers, re.M))
-    assert keys == {"sql_hash", "sql_file", "script", "auth_file", "warehouse_id", "host", "client_id"}
+    # What is deployed and where; never a checkout path (test_masking_checkout_paths.py).
+    assert keys == {"sql_hash", "warehouse_id", "host", "client_id"}
     assert "secret" not in block
     assert "ignore_changes" not in block
-    assert block.count("--auth-file ${self.triggers_replace.auth_file}") == 1
+    assert block.count('--auth-file \\"$MASKING_AUTH_FILE\\"') == 1
+    assert "MASKING_AUTH_FILE    = var.auth_file" in block
     # Replacing it (any SQL change) must never drop the functions live policies use.
     assert "when    = destroy" not in block and "--drop" not in block
 
@@ -161,7 +166,8 @@ def test_functions_are_dropped_only_by_a_resource_that_never_replaces():
     assert "triggers_replace" not in block and "filemd5" not in block
     assert "secret" not in block
     assert block.count("--drop") == 1 and "when    = destroy" in block
-    assert "--auth-file ${self.input.auth_file}" in block
+    assert '--auth-file \\"$MASKING_AUTH_FILE\\"' in block
+    assert "MASKING_AUTH_FILE    = self.input.auth_file" in block
     deploy = _resource_block(MODULE_TF.read_text(), 'resource "terraform_data" "masking_functions" {')
     assert "terraform_data.masking_functions_drop" in deploy  # destroyed after the deploy
 
@@ -230,6 +236,10 @@ def _masking_root(tf: str) -> str:
         for header in ('resource "terraform_data" "masking_functions" {',
                        'resource "terraform_data" "masking_functions_drop" {')
         if header in tf)  # the drop resource only exists from PR #76 on
+    # From the checkout-path fix on, the drop records relative paths computed here.
+    paths = re.search(r"\nlocals \{\n(?:  #[^\n]*\n)*  masking_project_root.*?\n\}\n", tf, re.S)
+    if paths:
+        blocks = paths.group(0) + 'variable "masking_paths_base" {\n  default = ""\n}\n' + blocks
     removed = re.search(r"removed \{.*?\n\}\n", tf, re.S).group(0)
     return (
         'terraform {\n  required_providers {\n'

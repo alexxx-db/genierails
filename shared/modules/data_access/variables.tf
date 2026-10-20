@@ -252,6 +252,12 @@ variable "auth_file" {
   description = "Path to the layer's auth.auto.tfvars; deploy_masking_functions.py reads the current SP credentials from it."
 }
 
+variable "masking_paths_base" {
+  type        = string
+  default     = ""
+  description = "The env dir masking_functions_drop records masking_sql_file and auth_file relative to (terraform_layer.sh exports it as GENIERAILS_MASKING_BASE_DIR for the destroy-time drop). Empty records them as given."
+}
+
 variable "held_access_grants" {
   type        = list(string)
   default     = []

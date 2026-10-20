@@ -584,6 +584,22 @@ def test_split_assignment_problems_ignores_treatment_tags(harness):
     assert pg.split_assignment_problems(harness.env_dir) == []
 
 
+
+def test_split_assignment_problems_reads_the_split_from_data_access_subdir(harness, monkeypatch):
+    """The split lives in envs/<env>/$DATA_ACCESS_SUBDIR (#200), not always data_access/."""
+    write_env(harness.env_dir)
+    _with_table_tag(effective(harness.env_dir, "abac.auto.tfvars"), "finance")
+    moved = harness.env_dir / "gov_layer" / "abac.auto.tfvars"
+    moved.parent.mkdir()
+    moved.write_text((harness.env_dir / "data_access" / "abac.auto.tfvars").read_text())
+    _with_table_tag(moved, "hr")
+    _with_table_tag(harness.env_dir / "data_access" / "abac.auto.tfvars", "finance")
+    assert pg.split_assignment_problems(harness.env_dir) == []
+    monkeypatch.setenv("DATA_ACCESS_SUBDIR", "gov_layer")
+    assert pg.split_assignment_problems(harness.env_dir) == [
+        "tables|cat.sch.t|domain|finance is in the generated config only",
+        "tables|cat.sch.t|domain|hr is in the split data_access config only"]
+
 # -- (10) out-of-band retags still refuse, with the check on -----------------------------------
 def test_rebind_refuses_a_column_retagged_live_with_the_check_on(harness, tmp_path, monkeypatch, capfd):
     old, failed, _, _ = deleted_and_recreated(harness, tmp_path, monkeypatch)

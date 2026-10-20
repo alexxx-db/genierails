@@ -624,6 +624,8 @@ module "data_access" {
   masking_sql_file                         = var.masking_sql_file != "" ? var.masking_sql_file : "${var.env_dir}/masking_functions.sql"
   deploy_masking_script                    = "${local.project_root}/deploy_masking_functions.py"
   auth_file                                = "${var.env_dir}/auth.auto.tfvars"
+  # terraform_layer.sh exports the same dir as GENIERAILS_MASKING_BASE_DIR.
+  masking_paths_base = dirname(var.env_dir)
 }
 
 # A raw terraform run that withholds new grants still applies; say so.

@@ -594,8 +594,16 @@ def _load_auth(auth_file: Path) -> dict:
         print("  Run from your cloud wrapper directory (genie/aws/ or genie/azure/), or pass --auth-file <path>.")
         sys.exit(1)
 
-    with open(auth_file) as f:
-        cfg = hcl2.load(f)
+    try:
+        with open(auth_file) as f:
+            cfg = hcl2.load(f)
+    except Exception:
+        cfg = None
+    if cfg is None:
+        # Reported outside the handler with no parser text, which can echo a
+        # malformed secret (also via __context__).
+        print(f"ERROR: {auth_file} is not valid HCL")
+        sys.exit(1)
 
     env_file = auth_file.parent / "env.auto.tfvars"
     if env_file.exists():

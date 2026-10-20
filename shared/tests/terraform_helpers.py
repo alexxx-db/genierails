@@ -37,6 +37,15 @@ if [ -n "${GENIE_STUB_LOG:-}" ]; then
 fi
 exit 0
 """
+# State written before masking_functions stopped recording checkout paths
+# replans once with this re-key (docs/deterministic-policies.md): the
+# functions redeployed with only path triggers removed, their drop and the
+# policy-enforcement wait updated in place. is_masking_rekey checks the diff.
+MASKING_REKEY = {
+    ("terraform_data.masking_functions", "must be replaced"),
+    ("terraform_data.masking_functions_drop", "will be updated in-place"),
+    ("time_sleep.wait_for_policy_enforcement", "will be updated in-place"),
+}
 _IGNORED = {".terraform", ".tmp", ".terraform.lock.hcl", "__pycache__", ".pytest_cache"}
 
 
@@ -109,3 +118,11 @@ def tf_init(cwd: Path, *args: str, env: dict) -> subprocess.CompletedProcess:
     init = tf(cwd, "init", "-backend=false", "-input=false", *args, env=env)
     skip_if_providers_unavailable(init)
     return init
+
+
+def is_masking_rekey(plan_output: str) -> bool:
+    """Whether every masking_functions change in Terraform's plan output is a checkout path."""
+    import sys
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from masking_replace_note import is_rekey
+    return is_rekey(plan_output.splitlines())

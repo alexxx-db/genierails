@@ -78,7 +78,11 @@ def _load_hcl(path: Path) -> dict:
         with path.open() as handle:
             return hcl2.load(handle)
     except Exception as exc:  # hcl2 raises lark errors
-        raise AgentFileError(f"{path}: not valid HCL ({exc})") from exc
+        if path.name != "auth.auto.tfvars":
+            raise AgentFileError(f"{path}: not valid HCL ({exc})") from exc
+    # Raised outside the handler with no parser text, which can echo a
+    # malformed secret (also via __context__).
+    raise AgentFileError(f"{path} is not valid HCL") from None
 
 
 def check_key(key: str) -> str:

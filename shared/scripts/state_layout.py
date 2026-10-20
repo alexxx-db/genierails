@@ -109,6 +109,13 @@ def remote_configured(env_dir: Path) -> bool:
     return config_path(env_dir).is_file()
 
 
+def data_access_subdir() -> str:
+    """The data_access layer's directory under envs/<env>/: Makefile.shared's
+    ``DATA_ACCESS_SUBDIR`` (exported into recipes). The Terraform layer is
+    still named ``data_access``."""
+    return os.environ.get("DATA_ACCESS_SUBDIR") or "data_access"
+
+
 def owner_dir(env_dir: Path, layer: str) -> Path:
     """The env dir whose config and state a layer uses (envs/account for the account layer)."""
     env_dir = Path(env_dir)
@@ -137,7 +144,7 @@ def legacy_state_path(env_dir: Path, layer: str) -> Path:
     """Where the in-checkout layout keeps a layer's state file."""
     env_dir = Path(env_dir)
     if layer == "data_access":
-        return env_dir / "data_access" / "terraform.tfstate"
+        return env_dir / data_access_subdir() / "terraform.tfstate"
     return env_dir / "terraform.tfstate"
 
 
@@ -376,7 +383,7 @@ def prepare_root(env_dir: Path, env: str, layer: str, source: Path) -> Path:
 
 def _pull(owner: Path, env: str, layer: str) -> dict | None:
     runner = Path(__file__).with_name("terraform_layer.sh")
-    layer_env_dir = owner / "data_access" if layer == "data_access" else owner
+    layer_env_dir = owner / data_access_subdir() if layer == "data_access" else owner
     result = subprocess.run(
         [str(runner), layer, env, "state-pull"], text=True, capture_output=True, check=False,
         env=os.environ | {"LAYER_ENV_DIR": str(layer_env_dir), "ENVS_DIR": str(owner.parent)},
@@ -598,7 +605,7 @@ def _migrations(env_dir: Path, env: str, target: Path) -> list[tuple[Path, Path]
     for name in ("terraform.tfstate", "terraform.tfstate.backup"):
         moves.append((env_dir / name, target / "layers" / layer / name))
         if env != "account":
-            moves.append((env_dir / "data_access" / name, target / "layers" / "data_access" / name))
+            moves.append((env_dir / data_access_subdir() / name, target / "layers" / "data_access" / name))
     records = cloud_dir(env_dir) / IN_CHECKOUT_STATE / env
     if records.is_dir():
         for source in sorted(records.rglob("*")):
@@ -717,7 +724,7 @@ def migrate(env_dir: Path, env: str) -> int:
         for source, destination in operations:
             print(f"{_move_file(source, destination)}: {source} -> {destination}")
         _remove_empty_record_dirs(env_dir)
-        for cache in (env_dir / ".terraform", env_dir / "data_access" / ".terraform"):
+        for cache in (env_dir / ".terraform", env_dir / data_access_subdir() / ".terraform"):
             shutil.rmtree(cache, ignore_errors=True)
         print(f"State-dir migration complete: {len(operations)} file(s) moved to {target}; config and "
               f"auth files were untouched. {env_dir / MOVED_MARKER} now refuses runs without {STATE_DIR_ENV}.")

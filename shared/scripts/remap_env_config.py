@@ -309,7 +309,15 @@ def main():
         os.path.join(source_env_dir, "..", "auth.auto.tfvars"),
     ]:
         if os.path.exists(auth_path):
-            auth_cfg = hcl2.load(open(auth_path))
+            try:
+                auth_cfg = hcl2.load(open(auth_path))
+            except Exception:
+                auth_cfg = None
+            if auth_cfg is None:
+                # Reported outside the handler with no parser text, which can echo a
+                # malformed secret (also via __context__).
+                print(f"ERROR: {auth_path} is not valid HCL; nothing was written.")
+                sys.exit(1)
             break
 
     # Resolve canonical names before matching discovered table attribution.
