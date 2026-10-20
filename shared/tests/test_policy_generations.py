@@ -379,7 +379,10 @@ def test_drop_functions_drops_only_functions_no_kept_generation_defines(tmp_path
     calls = []
 
     def run(argv, check=False):
-        calls.append(Path(argv[argv.index("--sql-file") + 1]).read_text())
+        sql = Path(argv[argv.index("--sql-file") + 1]).read_text()
+        # The deployer refuses a drop with no identity; this one is the SQL's own hash.
+        assert "--drop" in argv and argv[argv.index("--expect-sql-hash") + 1] == pg.masking_sql_hash(sql)
+        calls.append(sql)
         return type("R", (), {"returncode": 0})()
 
     environ = _environ(env_dir, gen["fingerprint"]) | {"GENIERAILS_RETIRE_FINGERPRINT": retired["fingerprint"],

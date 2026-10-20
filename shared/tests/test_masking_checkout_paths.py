@@ -303,8 +303,11 @@ def test_a_wrong_but_populated_base_dir_refuses_before_it_connects(tmp_path):
     assert _calls(log)[-1]["sql_file"] == str(layer.env_dir / "masking_functions.sql")
 
 
-def _legacy_state(tmp_path: Path) -> tuple[Layer, Path]:
-    """State the pre-fix module applied from checkout A (absolute paths, no sql_hash), then A is gone."""
+def _legacy_state(tmp_path: Path, new_checkout: str = "checkout-b") -> tuple[Layer, Path]:
+    """State the pre-fix module applied from checkout A (absolute paths, no sql_hash), then A is gone.
+
+    ``new_checkout="checkout-a"`` puts a fresh checkout back at A's path, so the recorded paths exist.
+    """
     state, log = tmp_path / "state" / "terraform.tfstate", tmp_path / "masking.log"
     state.parent.mkdir()
     old = Layer(tmp_path, checkout(tmp_path, "checkout-a", PRE_FIX, root=ROOT.replace(NO_PATHS_BASE, "")),
@@ -312,7 +315,7 @@ def _legacy_state(tmp_path: Path) -> tuple[Layer, Path]:
     old.apply()
     shutil.rmtree(old.root.parents[2])
     log.unlink()
-    return Layer(tmp_path, checkout(tmp_path, "checkout-b", real_deployer=True), state, log), log
+    return Layer(tmp_path, checkout(tmp_path, new_checkout, real_deployer=True), state, log), log
 
 
 def test_a_direct_destroy_of_unmigrated_state_refuses_until_an_apply_records_its_identity(tmp_path):
@@ -321,11 +324,14 @@ def test_a_direct_destroy_of_unmigrated_state_refuses_until_an_apply_records_its
     result = new.run("destroy", "-auto-approve")
     output = result.stdout + result.stderr
     assert result.returncode != 0
-    assert "which no longer exists, and no sql_hash" in output and "Run make apply once" in output
+    assert "records no sql_hash" in output and "Run make apply once" in output
     assert "nothing was dropped" in output
     assert _calls(log) == []
-    # The apply the message asks for re-keys the drop; the destroy then drops this checkout's.
+    # The apply the message asks for re-keys the drop, running only CREATE OR REPLACE (no drop);
+    # the destroy then drops this checkout's.
     new.apply()
+    assert _calls(log) == [{"step": "auth", "auth_file": str(new.env_dir / "auth.auto.tfvars")},
+                           {"step": "deploy", "sql_file": str(new.env_dir / "masking_functions.sql")}]
     log.unlink()
     result = new.run("destroy", "-auto-approve")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -342,6 +348,18 @@ def test_a_direct_destroy_of_unmigrated_state_never_drops_another_checkouts_dev(
     assert result.returncode != 0
     assert "no sql_hash" in output and "nothing was dropped" in output
     assert _calls(log) == []  # no credentials loaded, wrongcat.sch's functions untouched
+
+
+def test_a_direct_destroy_of_legacy_state_refuses_even_where_its_paths_still_exist(tmp_path):
+    """Review r3 B1: A's path is reused by a checkout whose dev SQL is another catalog's."""
+    new, log = _legacy_state(tmp_path, new_checkout="checkout-a")
+    write_env(new.env_dir, SQL.replace("cat.sch", "wrongcat.sch"))
+    result = new.run("destroy", "-auto-approve")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "records no sql_hash" in output and "nothing was dropped" in output
+    assert "is gone" not in output  # the recorded paths exist; they are refused all the same
+    assert _calls(log) == []
 
 
 def test_the_runner_exports_the_base_dir_the_root_records_against():
@@ -370,7 +388,8 @@ def _resolve(sql_file, auth_file, base_dir, expect_sql_hash="h", relocate_from="
 def test_relative_paths_resolve_against_the_base_dir_and_absolute_ones_stay(tmp_path):
     assert _resolve("data_access/m.sql", "data_access/auth", str(tmp_path)) == (
         str(tmp_path / "data_access/m.sql"), str(tmp_path / "data_access/auth"))
-    # State from before the fix records absolute paths: used as they are while they exist.
+    # Absolute paths recorded with a sql_hash (a SQL file outside the env dir, e.g.
+    # GENIERAILS_LAYER_CONFIG_DIR) are used as they are while they exist; the hash is checked next.
     old = tmp_path / "old"
     write_env(old, SQL)
     paths = (str(old / "masking_functions.sql"), str(old / "auth.auto.tfvars"))
@@ -431,11 +450,26 @@ def test_the_identity_check_passes_this_envs_sql_and_refuses_any_other(tmp_path,
     sql.write_text(SQL)
     recorded = hashlib.sha256(normalized_definitions(SQL).encode()).hexdigest()
     _dmf().verify_sql_identity(str(sql), recorded)
-    _dmf().verify_sql_identity(str(sql), "")  # older state records none
+    assert pg.masking_sql_hash(SQL) == recorded  # what the staged drop-functions passes
     sql.write_text(SQL.replace("cat.sch", "other.sch"))
     with pytest.raises(SystemExit):
         _dmf().verify_sql_identity(str(sql), recorded)
     assert "is not the SQL the last apply deployed" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        _dmf().verify_sql_identity(str(sql), "")  # older state records none: no identity, no drop
+    assert "records no sql_hash" in capsys.readouterr().err
+
+
+def test_legacy_absolute_paths_that_exist_refuse_without_a_recorded_hash(tmp_path, capsys):
+    """Review r3 B1: the path existing says nothing about whose SQL is at it now."""
+    old = tmp_path / "envs" / "dev" / "data_access"
+    write_env(old, SQL.replace("cat.sch", "wrongcat.sch"))
+    paths = (str(old / "masking_functions.sql"), str(old / "auth.auto.tfvars"))
+    for base in (str(old.parent), ""):
+        with pytest.raises(SystemExit):
+            _resolve(*paths, base, expect_sql_hash="")
+    assert "records no sql_hash" in capsys.readouterr().err
+    assert _resolve(*paths, str(old.parent)) == paths  # with a recorded hash (checked next), as given
 
 
 # -- the one-time re-key of existing state -------------------------------------------------

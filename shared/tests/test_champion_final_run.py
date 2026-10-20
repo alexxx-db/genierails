@@ -21,6 +21,7 @@ import deploy_masking_functions as dmf
 from tests.terraform_helpers import skip_if_providers_unavailable as _skip_if_providers_unavailable  # noqa: E402
 from tests.terraform_helpers import tf as _tf  # noqa: E402
 import generate_abac
+from scripts import policy_generations as pg  # noqa: E402
 
 SHARED = Path(__file__).parents[1]
 MODULE_TF = SHARED / "modules/data_access/main.tf"
@@ -127,8 +128,10 @@ def test_main_requires_auth_file_and_loads_it_before_any_statement(
     seen = {}
     monkeypatch.setattr(dmf, "deploy", lambda *a: seen.setdefault("secret", os.environ["DATABRICKS_CLIENT_SECRET"]))
     monkeypatch.setattr(dmf, "drop", lambda *a: seen.setdefault("secret", os.environ["DATABRICKS_CLIENT_SECRET"]))
-    base = ["deploy_masking_functions.py", "--sql-file", str(env_dir / "masking_functions.sql"),
-            "--warehouse-id", "wh"] + (["--drop"] if drop else [])
+    sql_file = env_dir / "masking_functions.sql"
+    # A drop runs only with the sql_hash state records (test_masking_checkout_paths.py).
+    base = ["deploy_masking_functions.py", "--sql-file", str(sql_file), "--warehouse-id", "wh"] + (
+        ["--drop", "--expect-sql-hash", pg.masking_sql_hash(sql_file.read_text())] if drop else [])
 
     monkeypatch.setattr(sys, "argv", base)
     with pytest.raises(SystemExit):

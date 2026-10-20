@@ -8,20 +8,20 @@ never from Terraform state, so a rotated secret is always current.
 Usage:
   python3 deploy_masking_functions.py --sql-file masking_functions.sql \
       --warehouse-id <id> --auth-file auth.auto.tfvars --host <workspace-url>
-  python3 deploy_masking_functions.py ... --drop
-  python3 deploy_masking_functions.py ... --drop --base-dir <env-dir>
+  python3 deploy_masking_functions.py ... --drop --expect-sql-hash <sql_hash>
+  python3 deploy_masking_functions.py ... --drop --expect-sql-hash <sql_hash> --base-dir <env-dir>
 
 terraform_data.masking_functions_drop records --sql-file and --auth-file
 relative to the env dir, so its destroy-time drop passes --base-dir (the
 GENIERAILS_MASKING_BASE_DIR terraform_layer.sh exports) and runs from any
 checkout. Absolute paths are used as given while they exist; one recorded
 under a checkout that is gone is looked up at the same place under this
-shared/ (--relocate-from names the old one) or the env dir, but only when
-state records the sql_hash that identifies it. Older state without one
-refuses until an apply from this checkout re-keys it.
+shared/ (--relocate-from names the old one) or the env dir.
 --expect-sql-hash is the normalized SQL hash the last apply recorded: the
 drop hashes the SQL it resolved and refuses, before it connects, on a
-mismatch (another env's SQL, or a file changed since the apply).
+mismatch (another env's SQL, or a file changed since the apply). A drop
+without one (all state from before it was recorded, whether its paths still
+exist or not) refuses until an apply from this checkout re-keys it.
 """
 
 import argparse
@@ -440,17 +440,28 @@ def _relocated(path: str, args):
     return None
 
 
+def _refuse_unidentified(sql_file: str) -> None:
+    _refuse(
+        "masking_functions_drop records no sql_hash (state from an earlier version), so the "
+        f"drop can't tell whether {sql_file} is the SQL it deployed: a reused or replaced "
+        "checkout may hold another env's at that path. Run make apply once from this checkout "
+        "(it re-keys masking_functions_drop to relative paths and records sql_hash, dropping "
+        "nothing; see docs/deterministic-policies.md), then make destroy"
+    )
+
+
 def resolve_paths(args) -> None:
     """Resolve --sql-file/--auth-file for this checkout, or exit.
 
-    Relative paths resolve against --base-dir (given but empty refuses), and
-    only with a recorded --expect-sql-hash, which is what tells this env's
-    SQL from another's there. An absolute path that is gone is relocated
-    (_relocated) only with a recorded --expect-sql-hash, for the same reason:
-    another checkout's file at the same place may be another env's SQL.
-    Otherwise it refuses.
+    A drop needs the --expect-sql-hash the last apply recorded, which is what
+    tells this env's SQL from another's: all legacy state, which has none,
+    refuses, whether its absolute paths still exist or not. Relative paths
+    resolve against --base-dir (given but empty refuses). An absolute path
+    that is gone is relocated (_relocated) or refuses.
     """
     base_dir = getattr(args, "base_dir", None)
+    if getattr(args, "drop", False) and not getattr(args, "expect_sql_hash", ""):
+        _refuse_unidentified(args.sql_file)
     for key in ("sql_file", "auth_file"):
         path = getattr(args, key)
         if not os.path.isabs(path):
@@ -462,22 +473,8 @@ def resolve_paths(args) -> None:
                     "GENIERAILS_MASKING_BASE_DIR is unset, so the drop can't find it. Run the "
                     "destroy through terraform_layer.sh (make destroy), which sets it"
                 )
-            if not getattr(args, "expect_sql_hash", ""):
-                _refuse(
-                    f"masking_functions_drop records {path} relative to the env dir but no "
-                    "sql_hash, so the drop can't tell this env's SQL from another's under "
-                    f"{base_dir}. Re-run make apply from this checkout to record it, then destroy"
-                )
             setattr(args, key, os.path.join(base_dir, path))
         elif not os.path.exists(path) and getattr(args, "drop", False):
-            if not getattr(args, "expect_sql_hash", ""):
-                _refuse(
-                    f"masking_functions_drop records {path}, which no longer exists, and no "
-                    "sql_hash, so the drop can't tell whether a file in its place in this "
-                    "checkout is the SQL it deployed. Run make apply once from this checkout "
-                    "(it re-keys masking_functions_drop to relative paths and records "
-                    "sql_hash; see docs/deterministic-policies.md), then destroy"
-                )
             moved = _relocated(path, args)
             if moved is None:
                 _refuse(
@@ -492,9 +489,9 @@ def resolve_paths(args) -> None:
 
 
 def verify_sql_identity(sql_file: str, expected: str) -> None:
-    """Refuse unless sql_file hashes to the normalized hash the last apply recorded."""
+    """Refuse unless sql_file hashes to the normalized hash the last apply recorded (none refuses)."""
     if not expected:
-        return
+        _refuse_unidentified(sql_file)
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules", "data_access"))
     import hashlib
 

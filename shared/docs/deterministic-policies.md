@@ -268,13 +268,13 @@ The drop also records the normalized SQL hash. Before connecting, the
 destroy hashes the SQL it found and refuses if the hash differs: that SQL
 belongs to another env (a wrong `GENIERAILS_MASKING_BASE_DIR`) or has
 changed since the last apply. Restore the SQL, or apply it, then destroy.
-State from an earlier version records absolute paths and no hash. While
-those files exist, the destroy uses them as before. Once the old checkout is
-gone, the destroy refuses (`... which no longer exists, and no sql_hash`)
-rather than drop with whatever file is now in its place, which could be
-another env's SQL. Run `make apply` once from the current checkout. It does
-the re-key below, which records relative paths and the hash. Then run
-`make destroy`.
+All state from an earlier version records absolute paths and no hash, so
+its destroy refuses before it loads credentials or connects
+(`masking_functions_drop records no sql_hash ...`). It refuses whether those
+paths still exist or not: a reused or replaced checkout can hold another
+env's SQL at the same path. Run `make apply` once from the current checkout,
+then `make destroy`. That apply is the re-key below. It records relative
+paths and the hash, and it drops nothing.
 
 **Once, after upgrading**, state written by an earlier version still records
 absolute paths, so the first data_access plan shows:

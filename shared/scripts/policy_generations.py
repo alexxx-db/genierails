@@ -1251,6 +1251,14 @@ def _resolve_warehouse(env_dir: Path, environ: dict) -> str:
     return result.stdout.strip().splitlines()[-1]
 
 
+def masking_sql_hash(sql: str) -> str:
+    """The normalized hash masking_functions_drop records for this SQL (normalize_masking_sql.py)."""
+    import hashlib
+
+    from modules.data_access.normalize_masking_sql import normalized_definitions
+    return hashlib.sha256(normalized_definitions(sql).encode()).hexdigest()
+
+
 def drop_functions(env_dir: Path, environ: dict, *, live_users=None, run=subprocess.run) -> int:
     """Drop the retired generation's functions once no live policy calls them."""
     desired = desired_generation(env_dir)
@@ -1292,9 +1300,12 @@ def drop_functions(env_dir: Path, environ: dict, *, live_users=None, run=subproc
         handle.write(sql)
         sql_file = handle.name
     try:
+        # The deployer drops only SQL whose identity it is told: this is the
+        # hash of what the generations above say to drop.
         result = run([sys.executable, str(DEPLOY_FUNCTIONS), "--sql-file", sql_file, "--warehouse-id", warehouse,
                       "--auth-file", str(layer / "auth.auto.tfvars"),
-                      "--host", str(auth.get("databricks_workspace_host") or ""), "--drop"], check=False)
+                      "--host", str(auth.get("databricks_workspace_host") or ""), "--drop",
+                      "--expect-sql-hash", masking_sql_hash(sql)], check=False)
     finally:
         os.unlink(sql_file)
     if result.returncode:
