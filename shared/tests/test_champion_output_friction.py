@@ -684,12 +684,16 @@ def _boxes(lines):
 OUTSIDE, (TARGETING, INCOMPLETE) = _boxes(CAPTURE)
 ERROR = ["╷\n", "│ Error: Usage policy ID must not be empty\n", "│ \n", "│   with module.data_access...\n", "╵\n"]
 OTHER_WARNING = ["╷\n", "│ Warning: Deprecated attribute\n", "│ \n", "│ use X instead\n", "╵\n"]
+USAGE_POLICY_ADVICE = (
+    "Enable classification in the UI, or create and attach a serverless usage policy: "
+    "https://docs.databricks.com/aws/en/admin/usage/budget-policies"
+)
 
 
 def test_filter_drops_only_the_real_target_warnings():
     out = "".join(filter_lines(CAPTURE + OTHER_WARNING + ERROR))
 
-    assert out == "".join(OUTSIDE + OTHER_WARNING + ERROR)
+    assert out == "".join(OUTSIDE + OTHER_WARNING + ERROR) + f"\n{USAGE_POLICY_ADVICE}\n"
     assert "Apply complete! Resources: 1 added" in out
 
 
@@ -702,7 +706,7 @@ def test_filter_matches_uncolored_and_rewrapped_text():
 
 def test_filter_keeps_a_warning_box_with_an_interleaved_error():
     box = TARGETING[:3] + ["Error: Usage policy ID must not be empty\n"] + TARGETING[3:]
-    assert list(filter_lines(box)) == box
+    assert list(filter_lines(box)) == box + [f"\n{USAGE_POLICY_ADVICE}\n"]
 
 
 def test_filter_keeps_a_known_title_with_unknown_body():
@@ -843,6 +847,7 @@ def test_real_target_surfaces_terraform_errors_and_fails(real_cloud):
 
     assert result.returncode != 0, out
     assert "Error: Usage policy ID must not be empty" in out
+    assert USAGE_POLICY_ADVICE in out
     assert "Resource targeting is in effect" not in out
     assert "Classification is enabled" not in out
 

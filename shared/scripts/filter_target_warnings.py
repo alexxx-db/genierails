@@ -8,7 +8,8 @@ first-time users. A diagnostic box is dropped only when its COMPLETE content
 is one of those two warnings (compared with colour codes, box glyphs and line
 wrapping removed). Any other box, including one with an error interleaved
 into it from merged stderr, is emitted verbatim, as is every line outside a
-box and an unterminated box at EOF.
+box and an unterminated box at EOF. The known AWS missing-usage-policy error
+also gets a short remediation hint after its unmodified diagnostic.
 
 Usage: terraform ... 2>&1 | python3 -u filter_target_warnings.py
 """
@@ -43,6 +44,11 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _OPEN = "╷"
 _CLOSE = "╵"
 _BAR = "│"
+_USAGE_POLICY_ERROR = "Usage policy ID must not be empty"
+_USAGE_POLICY_ADVICE = (
+    "Enable classification in the UI, or create and attach a serverless usage policy: "
+    "https://docs.databricks.com/aws/en/admin/usage/budget-policies"
+)
 
 
 def _plain(line: str) -> str:
@@ -64,7 +70,10 @@ def filter_lines(lines: Iterable[str], hide_outputs: bool = False) -> Iterator[s
     """Yield lines minus benign target warnings and, optionally, final outputs."""
     block: list[str] | None = None
     in_outputs = False
+    missing_usage_policy = False
     for line in lines:
+        if _USAGE_POLICY_ERROR in _plain(line):
+            missing_usage_policy = True
         if hide_outputs and _plain(line) == "Outputs:":
             in_outputs = True
             continue
@@ -84,6 +93,8 @@ def filter_lines(lines: Iterable[str], hide_outputs: bool = False) -> Iterator[s
             block = None
     if block:  # unterminated box at EOF: never swallow it
         yield from block
+    if missing_usage_policy:
+        yield f"\n{_USAGE_POLICY_ADVICE}\n"
 
 
 def main() -> int:
