@@ -108,9 +108,11 @@ a render whose tags differ from the refresh only when all of these hold:
 - the render is exactly the refreshed config with every treatment tag at the
   value the active generation recorded (after an attempted switch, except
   for abandon, newly governed columns keep their new value);
-- the journal moves from that generation to the generated config's (abandon
-  may drop a change the config moved on from; a rebind needs the config to
-  be the change with only recreated principals);
+- the journal moves from that generation to the generated config's (for
+  abandon the config may have moved on, but abandon itself refuses first
+  when its treatment values are neither the change's nor that generation's;
+  a rebind needs the config to be the change with only recreated
+  principals);
 - the generation's snapshot still hashes to its fingerprint.
 
 A legacy active generation also needs its adopted migration record
@@ -171,11 +173,15 @@ any unfinished transition with its completed phases. Writes are atomic.
   re-splits the result into `data_access/` (`promote`, as `make plan`
   does). A failed refresh stops abandon before it plans anything. The render
   takes its non-treatment tag assignments from the split, while the refresh
-  records the generated config's, so abandon refuses before it plans when
-  the two differ and names the entries (run `make promote ENV=<env>`).
-  Abandon keeps the previous generation's values, so it also works when
-  live `class.*` tags changed after the change started: a newly classified
-  column stays as it is live until the next change tags it.
+  records the generated config's. The re-split normally makes them agree, so
+  a split edited or left stale before abandon is reconciled, not refused;
+  abandon refuses before it plans, naming the entries, only when they still
+  differ after the re-split (or when `staged_policy_apply.py abandon` runs
+  without make's re-split). Abandon also refuses before it plans when the
+  generated config's treatment values are neither the change's nor the
+  previous generation's (live `class.*` tags changed after the change
+  started, or its treatment settings were edited), naming the columns: see
+  [Changes that can't be dropped](#changes-that-cant-be-dropped).
 
   1. It saves a refreshed plan of the abandon render (the previous
      generation without the change's policies). That plan may only delete
@@ -227,8 +233,8 @@ any unfinished transition with its completed phases. Writes are atomic.
   config's principals, under the env lock, in two phases. Like abandon, it
   first re-reads live tags and DDL under the lock for the access phase's
   coverage check and re-splits them; a failed refresh stops rebind before it
-  plans anything, and so does a split whose non-treatment assignments differ
-  from the generated config's. A generated config whose treatment values
+  plans anything, and so does a split whose non-treatment assignments still
+  differ from the generated config's after that re-split. A generated config whose treatment values
   differ from the change's (live `class.*` tags changed since it started,
   or its treatment settings were edited) refuses before any plan and names
   the columns.
@@ -296,15 +302,15 @@ columns, and leaves live protection as it is:
   with the generated config on that generation. If principals it names were
   deleted and recreated under new IDs, the config can't be that generation
   again, and no command can finish or drop the change yet.
-- **Live `class.*` tags changed after the change started.** Resume refuses
-  ("N column(s) have another treatment in the generated config than in
-  generation ..."), because the config is no longer the change. A change
-  that never switched, or whose switch was rolled back with no kept
-  columns, can be dropped with `make policy-abandon`. A rebind refuses with
-  the same column list: put those columns' `class.*` tags back as they were
-  when the change started, then re-run it. If the change's principals were
-  also deleted, abandon refuses too, and putting the tags back is the only
-  way out.
+- **Live `class.*` tags changed after the change started** (or its
+  treatment settings were edited). Resume refuses ("N column(s) have another
+  treatment in the generated config than in generation ..."), because the
+  config is no longer the change. Abandon refuses too ("this change can't
+  be abandoned: N column(s) ..."), unless the generated config's treatment
+  values are back on the previous generation's, and so does a rebind. Each
+  names the columns. The way out is to put those columns' `class.*` tags
+  (or the treatment settings) back as they were when the change started,
+  then resume it, or abandon or rebind it as before.
 
 How to un-govern such columns, or supersede the change, is an open design
 decision.

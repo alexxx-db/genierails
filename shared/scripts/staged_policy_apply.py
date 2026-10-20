@@ -812,6 +812,18 @@ class Controller:
                 raise Refused(f"make policy-rebind of run {t['run_id']} didn't finish "
                               f"({t['rebind_incomplete']['reason']}). {t['rebind_incomplete']['next']}")
             self._refuse_split_drift("policy-abandon")
+            moved = self._drifted_treatments(t, pg.desired_generation(self.env_dir))
+            if moved:
+                raise Refused(
+                    f"this change can't be abandoned: {len(moved)} column(s) have another treatment in the generated "
+                    f"config than in the unfinished change {t['to']} ({', '.join(moved[:10])}), and the config isn't "
+                    f"back on generation {t['from'] or 'none'}'s values either: their live class.* tags changed "
+                    "since the change started, or its treatment settings were edited. Abandon only drops the "
+                    "change's policies, so nothing was applied. Next: put those columns' class.* tags (or the "
+                    "treatment settings) back as they were when the change started, then re-run make "
+                    f"policy-abandon ENV={self.env_name}, or re-run the command that started it (commit "
+                    f"{t['commit'] or '?'}) to resume it. See 'Changes that can't be dropped' in "
+                    "shared/docs/deterministic-policies.md.")
             switched = t["switch_attempted"]
             if switched:
                 reason = self._restore_unproven(t)
@@ -1169,9 +1181,11 @@ class Controller:
 
     def _unfinished_message(self, t: dict, desired: dict) -> str:
         options = [f"re-run the same command at commit {t['commit'] or '?'} (generation {t['to']}) to resume it"]
-        if not t["switch_attempted"]:
+        # With drifted treatment values abandon refuses too; the drift note below says what to put back.
+        drifted = self._drifted_treatments(t, desired)
+        if not drifted and not t["switch_attempted"]:
             options.append(f"or drop it with make policy-abandon ENV={self.env_name}")
-        elif (t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t):
+        elif not drifted and ((t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t)):
             options.append(f"or drop it with make policy-abandon ENV={self.env_name} (the switch was rolled "
                            "back; abandon re-checks live protection first). If principals it names were deleted "
                            f"and recreated, run make policy-rebind ENV={self.env_name} first")
@@ -1179,6 +1193,11 @@ class Controller:
         drift = (f"\n{len(moved)} column(s) have another treatment in the generated config than in generation "
                  f"{t['to']} ({', '.join(moved[:10])}): their live class.* tags changed since the change started, or "
                  "its treatment settings were edited. Resuming needs them back as they were." if moved else "")
+        if drifted:
+            drift += (" make policy-abandon refuses too while the generated config is on neither the change's "
+                      f"treatment values nor generation {t['from'] or 'none'}'s. Next: put those columns' class.* "
+                      "tags (or the treatment settings) back as they were when the change started, then resume "
+                      f"it or run make policy-abandon ENV={self.env_name}.")
         return (self.describe_transition(t) + f"\nThe generated config is now generation {desired['fingerprint']}. "
                 "A new policy change can't start until this one is finished: " + "; ".join(options) + "." + drift)
 
@@ -1190,6 +1209,17 @@ class Controller:
             return []
         want, have = dict(desired.get("tags") or {}), dict(changed.get("tags") or {})
         return sorted(c for c in want.keys() | have.keys() if want.get(c) != have.get(c))
+
+    def _drifted_treatments(self, t: dict, desired: dict) -> list[str]:
+        """_moved_treatments, unless the generated config is back on the treatment values the change started from."""
+        moved = self._moved_treatments(t, desired)
+        if not moved:
+            return []
+        try:
+            previous = (self._snapshot(t["from"]) or {}) if t["from"] else {}
+        except pg.StageError:
+            return moved
+        return [] if dict(previous.get("tags") or {}) == dict(desired.get("tags") or {}) else moved
 
     def _refuse_split_drift(self, command: str) -> None:
         """Refuse before any plan when the split's non-treatment assignments aren't the generated config's."""

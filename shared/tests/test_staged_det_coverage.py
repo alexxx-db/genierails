@@ -504,10 +504,9 @@ def test_rebind_of_a_restore_that_kept_a_newly_governed_column_refuses_naming_it
     assert old["tags"].keys() == {"cat.sch.t.email"}
 
 
-def test_resume_after_class_drift_names_the_drifted_columns_and_abandon_is_the_way_out(harness, tmp_path,
-                                                                                    monkeypatch, capfd):
-    """S4: a column is classified after B started. Resume refuses, naming it; abandon now passes the
-    check (it keeps A's values, and the drifted column stays as it is live: untagged) and drops B."""
+def test_resume_and_abandon_after_class_drift_refuse_naming_the_drifted_columns(harness, tmp_path, monkeypatch):
+    """S4: a column is classified after B started. Resume and abandon both refuse before any plan, naming
+    it and the way out (put the class.* tags back); nothing is planned, applied or recorded."""
     old = released(harness, deployer=OLD_SP)
     gate_on(harness, tmp_path, monkeypatch)
     new = change(harness, old, versions=RETAG)
@@ -516,23 +515,34 @@ def test_resume_after_class_drift_names_the_drifted_columns_and_abandon_is_the_w
     drifted = write_env(harness.env_dir, versions=RETAG, deployer=OLD_SP, columns=("email", "phone"))
     _promoted(harness, old, new, drifted)
     _refresh(harness.env_dir)
-    before = (harness.journal(), live_state(harness.env_dir))
+    gate_file = harness.env_dir / "data_access" / cg.GATE_FILENAME
+    before = (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes())
     harness.calls.clear()
     with pytest.raises(spa.Refused) as refused:
         harness.apply()
     message = str(refused.value)
     assert "1 column(s) have another treatment in the generated config than in generation" in message
     assert "(cat.sch.t.phone)" in message and "live class.* tags changed" in message
-    assert "make policy-abandon ENV=dev" in message
-    assert harness.calls == [] and (harness.journal(), live_state(harness.env_dir)) == before
+    assert "make policy-abandon refuses too" in message and "or drop it with make policy-abandon" not in message
+    assert "put those columns' class.* tags (or the treatment settings) back as they were when the change " \
+           "started, then resume it or run make policy-abandon ENV=dev" in message
+    assert harness.calls == []
+    assert (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes()) == before
 
-    capfd.readouterr()
-    assert harness.controller().abandon() == 0
-    out = "".join(capfd.readouterr())
-    assert "1 column(s) the live refresh governs stay untagged in this phase, which opens no access " \
-           "(cat.sch.t.phone)" in out
-    assert harness.journal()["transition"] is None and harness.journal()["active"] == old["fingerprint"]
-    assert live_tags(live_state(harness.env_dir)) == old["tags"]
+    with pytest.raises(spa.Refused) as refused:
+        harness.controller().abandon()
+    message = str(refused.value)
+    assert f"this change can't be abandoned: 1 column(s) have another treatment in the generated config than " \
+           f"in the unfinished change {new['fingerprint']} (cat.sch.t.phone)" in message
+    assert "live class.* tags changed" in message and "nothing was applied" in message
+    assert "put those columns' class.* tags (or the treatment settings) back as they were when the change " \
+           "started, then re-run make policy-abandon ENV=dev" in message
+    assert "Changes that can't be dropped" in message
+    # No plan, no apply, no gate re-run: the journal, the live state and the check's result are as before.
+    assert harness.calls == []
+    assert (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes()) == before
+    assert harness.journal()["transition"]["to"] == new["fingerprint"]
+    assert not (pg.ledger_dir(harness.env_dir) / "abandon").exists()
 
 
 # -- (9) the split's non-treatment assignments vs the generated config's ------------------------
