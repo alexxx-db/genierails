@@ -64,7 +64,7 @@ treating a failed lookup as a legitimate removal.
 <details>
 <summary><strong>Step 3 — Continue through dev-to-prod</strong></summary>
 
-Continue at [Dev step 2 of the dev-to-prod walkthrough](../examples/dev_to_prod/README.md#dev-classify). The remaining workflow is unchanged: classify, generate, rehearse, promote, and release (which re-derives in production and exposes last).
+Continue at [Dev step 2 of the dev-to-prod walkthrough](../examples/dev_to_prod/README.md#dev-classify). The remaining workflow is unchanged: classify, generate, rehearse, promote, then merge the promotion, rehearse the source env (`promote_from`, dev by default) on that commit, `release-plan` and `release` (which re-derives in production and exposes last).
 
 For an imported agent:
 

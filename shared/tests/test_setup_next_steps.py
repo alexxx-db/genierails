@@ -151,13 +151,15 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "envs/prod/auth.auto.tfvars",
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
-        "  5. Run: make release-plan ENV=prod",
+        "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=dev",
+        "     make release-plan ENV=prod   (checks the commit was rehearsed",
         "Get that manifest approved, then: make release ENV=prod\n",
         "make maintain ENV=prod",
     ]
     positions = [out.index(step) for step in order]
     assert positions == sorted(positions)
-    assert "make rehearse" not in out
+    # release-plan needs a dev rehearsal of the promotion commit; prod itself never rehearses.
+    assert "make rehearse ENV=prod" not in out
     assert "make generate" not in out
     assert "deployer_principal_id" in out
     assert "VERIFY_KEY_COLUMN" not in out
@@ -180,6 +182,23 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
     assert "enable_auto_tagging" not in hcl2.loads(env_text)
     assert 'promote_from = "dev"' in env_text
     assert 'catalog_map  = { "<dev_catalog>" = "<prod_catalog>" }' in env_text
+
+
+def test_setup_prod_rehearses_its_promote_from_source_before_release_plan(tmp_path):
+    """release-plan needs a same-commit receipt from promote_from's env, not always dev."""
+    assert _make("aws", tmp_path, "setup", "ENV=prod").returncode == 0
+    env_file = tmp_path / "aws" / "envs" / "prod" / "env.auto.tfvars"
+    text = env_file.read_text()
+    assert 'promote_from = "dev"' in text
+    env_file.write_text(text.replace('promote_from = "dev"', 'promote_from = "stg"'))
+
+    result = _make("aws", tmp_path, "setup", "ENV=prod")
+
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=stg" in out
+    assert "make rehearse ENV=dev" not in out
+    assert out.index("make rehearse ENV=stg") < out.index("make release-plan ENV=prod")
 
 
 @pytest.mark.parametrize("cloud", CLOUDS)
@@ -238,5 +257,6 @@ def test_cross_env_promote_points_to_release_not_apply():
     block = makefile[makefile.index("=== Promote complete:"):]
     block = block[:block.index("trap - EXIT")]
 
-    assert "make release ENV=$(DEST_ENV)" in block
+    # release-steps prints release-plan and release after a same-commit source rehearsal, or a legacy release.
+    assert '$(_RELEASE_STEPS) --env-dir "$$dest_env_dir" --env "$(DEST_ENV)"' in block
     assert "make apply ENV=$(DEST_ENV)" not in block

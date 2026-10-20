@@ -20,7 +20,9 @@ git add envs/dev/ && git commit           # PR; after merge the dev pipeline reh
 # prod
 make promote-to ENV=prod       # the promotion PR shows only mask and policy changes
 make check ENV=prod
-git add envs/prod/ && git commit          # PR; after merge and rehearse, the operator releases
+git add envs/prod/ && git commit          # PR; after merge, rehearse dev on the merge commit
+make release-plan ENV=prod     # on the deployment machine; approve the manifest
+make release ENV=prod          # releases the approved manifest
 ```
 
 A governance change applies to every table and agent that uses it, and changes
@@ -64,6 +66,7 @@ make rehearse ENV=dev                      # the dev pipeline, or the operator
 make setup ENV=prod                        # set governance_mode, deployer_principal_id, catalog_map
 make promote-to ENV=prod                   # commit envs/prod/, PR, merge
 #   Catalog Explorer: the same classification review on the prod catalog
+make rehearse ENV=dev                      # again, on the promotion's merge commit (release-plan needs it)
 make release-plan ENV=prod                 # on the deployment machine; approve the manifest
 make release ENV=prod                     # releases the approved manifest
 make maintain ENV=prod                     # on a schedule
@@ -82,8 +85,10 @@ make maintain ENV=prod                     # on a schedule
 2. **Classify** dev in Catalog Explorer, as in the [walkthrough](../../examples/dev_to_prod/README.md#dev-classify).
 3. **Generate, check, PR, rehearse.** **Pass looks like:** `ALL EFFECTIVE`.
 4. **Prod.** Set `governance_mode`, prod's `deployer_principal_id` and
-   `catalog_map = { "dev_finance" = "prod_finance" }`, promote, classify prod,
-   then release. **Pass looks like:** `ALL EFFECTIVE` and
+   `catalog_map = { "dev_finance" = "prod_finance" }`, promote, classify prod;
+   then merge the promotion, rehearse the source env (`promote_from`, dev by
+   default) on its merge commit, `release-plan` and `release`. **Pass looks
+   like:** `ALL EFFECTIVE` and
    `=== Release complete (prod) ===`.
 
 GenieRails creates nothing in the workspace layer: no group assignment,
@@ -119,7 +124,9 @@ make scaffold-treatments ENV=dev TREATMENT=identifier   # any mask-library treat
 It writes `"class.<name>" = "<treatment>"` to `tag_treatments` in
 `envs/dev/env.auto.tfvars` for every unmapped class it finds. Run with
 `ENV=prod` when prod's release stopped on the class: it writes the env prod is
-promoted from. Then generate, check, PR, rehearse, `promote-to`, release.
+promoted from. Then generate, check, PR, rehearse, `promote-to`, merge to
+`origin/main`, rehearse the source env (`promote_from`, dev by default) again
+on that commit, `release-plan`, `release`.
 Refused: a class the library already maps (use `column_overrides`), a value that
 isn't a library treatment, and keys other than `class.*`
 ([tag_treatments](../../REFERENCE.md#customer-classes-tag_treatments)).
@@ -234,7 +241,8 @@ An upgrade is a governance change. Merge the new GenieRails release into your
 repo in a PR (`shared/` is governance-owned), run `make generate ENV=dev` and
 `make check ENV=dev`. If `make check ENV=prod` fails because prod's promoted
 output changed, run `make promote-to ENV=prod` in the same PR. Then merge,
-rehearse and release. Read the [CHANGELOG](../../../aws/CHANGELOG.md) first.
+rehearse the source env (`promote_from`, dev by default) on the merged commit,
+`release-plan` and `release`. Read the [CHANGELOG](../../../aws/CHANGELOG.md) first.
 
 ## If it stops
 

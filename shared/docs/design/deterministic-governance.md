@@ -264,7 +264,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 3. `make generate ENV=dev`: imports the agents, derives governance, and proposes `table_readers` for the agents' tables. Review and commit.
 4. `make rehearse ENV=dev`.
 5. Set `catalog_map`; `make promote-to ENV=prod`; classify prod in the UI.
-6. Approve and merge the promotion PR; once rehearse passes on that commit, the operator runs `make release ENV=prod`.
+6. Approve and merge the promotion PR; once rehearse passes on that commit, the operator runs `make release-plan ENV=prod`, gets the manifest approved, and runs `make release ENV=prod`.
 7. `make maintain ENV=prod` on a schedule.
 
 **Governance-only flow (no agents):** the same commands with `uc_tables` set and no agents. GenieRails creates no agent. It grants `SELECT` only if `table_readers` is set; otherwise masks apply to whoever already has access, after the reader check (section 6).
@@ -273,17 +273,17 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 
 | Scenario | What happens |
 |---|---|
-| Promote A while B has unfinished dev edits | Capture A, merge, rehearse, promote, release. Prod B gets its last captured version unchanged. |
+| Promote A while B has unfinished dev edits | Capture A, merge, rehearse, promote; merge the promotion, rehearse the source env on its merge commit, `release-plan`, `release`. Prod B gets its last captured version unchanged. |
 | A adds a table | Capture records it; governance derives its masks; the promotion PR shows both; prod applies masks, then A's access. |
 | A and B share a table | Masks are shared and unchanged; only A changes. |
-| Mask change while B is mid-curation | Governance change; rehearse, promote, release. B's config is untouched in dev and prod. |
+| Mask change while B is mid-curation | Governance change; rehearse, promote, merge, rehearse the source env on the merge commit, `release-plan`, `release`. B's config is untouched in dev and prod. |
 | New sensitive column in prod | `maintain` applies the library mask, or the fail-safe redaction if unmapped. |
-| Grant another group access to A in prod | Add the group to A's `acl_groups` in `envs/prod/agents/A.auto.tfvars` and, if it can't already read A's tables, to `table_readers`; PR, release. |
+| Grant another group access to A in prod | Add the group to A's `acl_groups` in `envs/prod/agents/A.auto.tfvars` and, if it can't already read A's tables, to `table_readers`; PR, merge, rehearse the source env on the merge commit, `release-plan`, `release` (a no-op rehearse that writes a receipt). |
 | Remove agent A | A PR sets `acl_groups = []` and `detached = true` and is released (`CAN_RUN` revoked); then `make detach-agent`; then a governance PR adds `<env>:detached-agent:<key>`, removes only its capture, and keeps detached settings with a no-destroy plan. Revival removes that ack line. Table access and masks unchanged. |
-| Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, release. Additions are checked as widening. |
-| Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR, rehearse and release apply the removal. |
+| Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, merge, rehearse the source env on the merge commit, `release-plan`, `release`. Additions are checked as widening. |
+| Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR applies the removal: merge, rehearse on the merge commit, and in a promoted env `release-plan` and `release`. |
 | Roll back | One revert PR covering the source change and its promotion, with `prod:rollback:<commit>` acknowledged; normal stages; masks switch back in place. |
-| Upgrade GenieRails | A governance change: upgrade, rehearse, promote, release. |
+| Upgrade GenieRails | A governance change: upgrade, rehearse, promote, merge, rehearse the source env on the merge commit, `release-plan`, `release`. |
 | Several teams | Per-agent files with code owners; a central team owns governance files. |
 
 ## 13. What a user learns

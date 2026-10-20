@@ -229,6 +229,22 @@ def test_provenance_refuses_a_stale_receipt(repo):
         rg.provenance(repo.prod, "prod")
 
 
+def test_the_promotion_commit_needs_its_own_dev_rehearse_which_reuses_the_apply(repo):
+    """Walkthrough Prod step 3: rehearse dev on the promotion commit before release-plan."""
+    first = rehearse(repo)
+    promoted = repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"},
+                           message="Promote the rules to prod")
+    with pytest.raises(rg.Refused, match=f"no passing rehearsal of {promoted[:12]}"):
+        rg.provenance(repo.prod, "prod")
+    # Only envs/prod changed: dev isn't applied again, the receipt records the new promote-to digest.
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "reused"
+    receipt = rg.passing_receipt(repo.cloud, "dev", promoted)
+    assert receipt["applied"] is False and receipt["reused_from"] == first["commit"]
+    assert receipt["targets"]["prod"]["digest"] == rg.generated_digest(repo.prod / "generated")
+    assert receipt["targets"]["prod"]["digest"] != first["targets"]["prod"]["digest"]
+    assert rg.provenance(repo.prod, "prod")["commit"] == promoted
+
+
 def test_provenance_refuses_a_failed_rehearsal(repo):
     rehearse(repo, "failed")
     with pytest.raises(rg.Refused, match="no passing rehearsal of"):
@@ -282,8 +298,10 @@ def test_provenance_refuses_a_fingerprint_mismatch(repo):
 def test_provenance_refuses_a_prod_generated_digest_mismatch(repo, monkeypatch):
     monkeypatch.setattr(rg, "promoted_digest", lambda *a: ("what-promote-to-produces-now", ""))
     rehearse(repo)
-    with pytest.raises(rg.Refused, match="stale promotion"):
+    with pytest.raises(rg.Refused, match="stale promotion") as refused:
         rg.provenance(repo.prod, "prod")
+    assert ("open a PR, then make rehearse ENV=dev on its merge commit and re-run make release-plan ENV=prod"
+            in str(refused.value))
 
 
 def test_provenance_refuses_a_receipt_without_a_digest_for_the_env(repo, monkeypatch):

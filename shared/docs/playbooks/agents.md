@@ -17,7 +17,9 @@ git add envs/dev/ && git commit        # open a PR; after merge the dev pipeline
 # prod
 make promote-to ENV=prod               # carries the capture to envs/prod/agents/
 make check ENV=prod
-git add envs/prod/ && git commit       # the promotion PR; after merge and rehearse, the operator releases
+git add envs/prod/ && git commit       # the promotion PR; after merge, rehearse dev on the merge commit
+make release-plan ENV=prod             # on the deployment machine; approve the manifest
+make release ENV=prod                  # releases the approved manifest
 ```
 
 ## Before you start
@@ -78,7 +80,8 @@ keeps its last captured version.
    ack line in a governance-reviewed PR.
 2. **Check and open the promotion PR.** `make check ENV=prod`; commit
    `envs/prod/`. It can carry the dev change too, in one PR.
-3. **Merge.** After the dev rehearsal passes on the merge commit, the operator
+3. **Merge.** After the rehearsal of the source env (`promote_from`, dev by
+   default) passes on the merge commit, the operator
    runs `make release-plan ENV=prod`, gets the manifest approved, and runs
    `make release ENV=prod` ([deployment machine](../deployment-machine.md#release-prod)).
    **Pass looks like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
@@ -92,7 +95,8 @@ or changes its ID, so conversations stay. Never edit a prod agent in the UI.
 Edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`: prod owns it and
 `promote-to` never overwrites it. If a new group can't read the agent's tables,
 governance adds it to `table_readers` in the same PR. Then PR, merge, rehearse
-(a no-op that writes a receipt) and release.
+the source env (`promote_from`, dev by default) on the merged commit (a no-op
+that writes a receipt), `release-plan` and `release`.
 
 ## Remove an agent
 
@@ -102,7 +106,7 @@ The agent and its conversations stay; only `CAN_RUN` goes.
 # 1. PR: in envs/prod/agents/<agent>.auto.tfvars (and the same in envs/dev/agents/)
 #      acl_groups = []
 #      detached   = true
-#    merge, rehearse, release  ->  CAN_RUN revoked
+#    merge, rehearse dev on the merge commit, release-plan, release  ->  CAN_RUN revoked
 # 2. the operator, at that released commit:
 make detach-agent ENV=prod SPACE="<agent>"   # forgets it from Terraform state; deletes nothing
 ```

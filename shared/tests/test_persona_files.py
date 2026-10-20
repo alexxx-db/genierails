@@ -501,6 +501,11 @@ def test_scaffold_in_a_promoted_env_writes_the_env_it_is_promoted_from(tmp_path)
     assert hcl2.loads((dev / "env.auto.tfvars").read_text())["tag_treatments"] == {"class.loyalty_id": "redact"}
     assert (prod / "env.auto.tfvars").read_bytes() == prod_before, "promote-to owns prod's copy"
     assert "make promote-to ENV=prod (it carries tag_treatments)" in result.stdout
+    # release-plan needs the promotion on origin/main and a dev rehearsal of that same commit.
+    after = result.stdout[result.stdout.index("make promote-to ENV=prod (it carries"):]
+    steps = ["commit and push envs/prod/", "make rehearse ENV=dev on that commit", "make release-plan ENV=prod",
+             "make release ENV=prod"]
+    assert [after.index(step) for step in steps] == sorted(after.index(step) for step in steps)
 
 
 @pytest.mark.parametrize("treatment, message", [
@@ -542,7 +547,31 @@ def test_the_coverage_gap_fix_points_deterministic_envs_at_tag_treatments(tmp_pa
     assert "envs/dev/env.auto.tfvars; shared/ is product code" in text
     assert "make scaffold-treatments ENV=prod TREATMENT=<mask-library treatment>" in text
     assert "make promote-to ENV=prod" in text
+    # The promotion is a new commit: push it and rehearse dev on it before release-plan.
+    after_promote = text[text.index("make promote-to ENV=prod"):]
+    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
     assert "shared/treatment_config.json" not in text
+
+
+def test_the_missing_mask_fix_rehearses_the_promotion_commit_before_release_plan(tmp_path):
+    _scaffold_env(tmp_path, "dev", DEV_ENV)
+    prod = _scaffold_env(tmp_path, "prod", PROD_ENV)
+    text = "\n".join(coverage_fix.materialize_lines("prod", prod, ["generic_partial"]))
+    after_promote = text[text.index("make promote-to ENV=prod"):]
+    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
+
+
+def test_materialize_in_a_deterministic_prod_points_at_release_plan_after_the_promotion_rehearse(tmp_path):
+    from scripts import materialize_treatment
+
+    _scaffold_env(tmp_path, "dev", DEV_ENV)
+    prod = _scaffold_env(tmp_path, "prod", PROD_ENV)
+    with pytest.raises(ValueError) as refused:
+        materialize_treatment.source_env_dir(tmp_path / "envs", "prod", prod)
+    after_promote = str(refused.value)[str(refused.value).index("make promote-to ENV=prod"):]
+    steps = ["commit and push envs/prod/", "make rehearse ENV=dev", "make release-plan ENV=prod", "make release ENV=prod"]
+    assert [after_promote.index(step) for step in steps] == sorted(after_promote.index(step) for step in steps)
+    assert materialize_treatment.release_steps(tmp_path / "legacy", "dev", "prod") == "make release ENV=prod"
 
 
 # ── The legacy layout: unchanged, or moved by make split-agent-files ────────

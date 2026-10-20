@@ -1102,11 +1102,14 @@ def detach(env_dir: Path, env: str, name: str, runner: Path, *, commit: str | No
         _run(runner, env_dir, env, "state-rm", address)
         print(f"  forgot {address}")
     print(f"Detached {name}: {len(addresses)} state address(es) removed; the agent and its conversations stay.")
+    from scripts.coverage_fix import release_steps
+
     key = agent["key"]
     print(f"  Next: a governance-reviewed PR that adds {env}:detached-agent:{key} to ack.txt, "
           f"removes only agents/{name}.space.json, and keeps detached agents/{name}.auto.tfvars — "
-          f"then runs make promote-to ENV={env} and commits governed_tables.json; its plan must show no "
-          "destroy. To revive later, remove that ack.txt line in a governance PR.")
+          f"then runs make promote-to ENV={env} and commits governed_tables.json. Then "
+          f"{release_steps(env, env_dir)}; its plan must show no destroy. "
+          "To revive later, remove that ack.txt line in a governance PR.")
     return addresses
 
 

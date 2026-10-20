@@ -482,7 +482,11 @@ def test_check_of_untracked_envs_is_refused(repo, tmp_path):
     _commit(repo, "envs ignored, as in the GenieRails repo itself")
     result = _make(repo, tmp_path, "check", "ENV=dev")
     assert result.returncode != 0
-    assert "(is envs/ git-ignored?); make check reads only committed env files" in result.stderr
+    err = result.stderr
+    assert "(is envs/ git-ignored?); make check reads only committed env files" in err
+    assert "shared/examples/dev_to_prod/README.md" in err
+    assert "Dev step 2 / Commit it" in err
+    assert "git add .gitignore envs/" in err
 
 
 def test_check_prod_runs_promote_check(promoted, tmp_path):

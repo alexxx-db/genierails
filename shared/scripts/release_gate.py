@@ -589,8 +589,8 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
                             f"({target.get('error', f'{env} was not a promotion target then')})")
         elif target["digest"] != committed:
             problems.append(f"envs/{env}/generated doesn't match what promote-to produces from this commit "
-                            f"(stale promotion): run make promote-to ENV={env}, open a PR, then rehearse "
-                            "its merge commit")
+                            f"(stale promotion): run make promote-to ENV={env}, open a PR, then make rehearse "
+                            f"ENV={source} on its merge commit and re-run make release-plan ENV={env}")
     last = last_release(cloud_dir, env)
     rollback = None
     if last and last.get("commit") and last["commit"] != commit:

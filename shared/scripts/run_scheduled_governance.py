@@ -163,8 +163,8 @@ def _check(env_dir: Path) -> int:
                   "classification / auto-tagging or tag them in UC; maintain "
                   "never LLM-tags columns.", file=sys.stderr)
         if rulebook_rc == 1:
-            print(f"For rulebook gaps, add the rule in dev, re-promote, then "
-                  f"run `make release ENV={env}`.", file=sys.stderr)
+            print(f"For rulebook gaps, add the rule in {_source_env(env_dir)}, re-promote, then "
+                  f"{_release_steps(env, env_dir)}.", file=sys.stderr)
     if errors:
         return errors[0]
     return rulebook_rc or audit_rc
@@ -208,6 +208,24 @@ def _coverage(env_dir: Path) -> int:
           f"(looked for generated/abac.auto.tfvars and data_access/abac.auto.tfvars).",
           file=sys.stderr)
     return 1
+
+
+def _release_steps(env: str, env_dir: Path) -> str:
+    """What follows a re-promotion, for the env's mode (scripts/coverage_fix.py)."""
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from scripts.coverage_fix import release_steps
+
+    return release_steps(env, env_dir)
+
+
+def _source_env(env_dir: Path) -> str:
+    """The env a rule change starts in: this env's promote_from, else dev."""
+    if str(SHARED_ROOT) not in sys.path:
+        sys.path.insert(0, str(SHARED_ROOT))
+    from scripts.coverage_fix import promote_source
+
+    return promote_source(env_dir) or "dev"
 
 
 def main() -> int:

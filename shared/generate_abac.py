@@ -8632,6 +8632,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 out_dir.resolve(), args.mode, WORK_DIR.name,
                 has_sql=bool(sql_block), champion_flow=champion_flow,
                 tuning=not deterministic_mode,
+                source_env=str(auth_cfg.get("promote_from") or "dev"),
             ):
                 print(line)
     print("=" * 60)
@@ -8639,49 +8640,62 @@ Before you apply, tune for your business roles, security requirements, and Genie
 
 def generate_next_steps(
     out_dir: Path, mode: str, env_name: str, *, has_sql: bool, champion_flow: bool,
-    tuning: bool = True,
+    tuning: bool = True, source_env: str = "dev",
 ) -> list[str]:
     """Next steps printed after a full (non --space, non --promote) generate.
 
     ``tuning`` is false for a deterministic draft, which has no TUNING.md.
+    ``source_env`` is the env a deterministic prod is promoted from (its promote_from).
+    Deterministic and walkthrough envs follow the walkthrough; legacy envs keep
+    validate-generated then apply / apply-governance / apply-genie.
     """
-    if champion_flow and mode == "genie":
+    if mode == "genie" and (champion_flow or not tuning):
         return champion_genie_next_steps(env_name)
-    if champion_flow and mode == "full":
-        # In the walkthrough's Dev section, rehearse already runs validate-generated +
-        # apply. Prod never rehearses (the Makefile refuses); it releases.
-        next_cmd = (
-            f"make release ENV={env_name}" if env_name == "prod"
-            else f"make rehearse ENV={env_name}"
-        )
+    if champion_flow or not tuning:
+        # make check reads only committed env files, and a rehearse or
+        # release-plan needs a clean checkout. Rehearse already runs
+        # validate-generated + apply; prod never rehearses (the Makefile
+        # refuses). A deterministic prod releases the manifest release-plan wrote,
+        # and release-plan plans only a commit on origin/main with a passing
+        # rehearsal of the source env at that same commit.
         lines = ["  Next steps:", "    1. Review the draft:"]
         if has_sql:
             lines.append(f"       {out_dir}/masking_functions.sql")
-        lines += [f"       {out_dir}/abac.auto.tfvars", f"    2. {next_cmd}"]
+        lines += [
+            f"       {out_dir}/abac.auto.tfvars",
+            f"    2. git add envs/ && git commit, then: make check ENV={env_name}   (reads committed files only)",
+        ]
+        if env_name != "prod":
+            lines.append(f"    3. make rehearse ENV={env_name}   (applies, then proves the masks: ALL EFFECTIVE)")
+        elif tuning:
+            lines.append(f"    3. make release ENV={env_name}")
+        else:
+            lines += [
+                "    3. git push (or merge the PR) so the commit is on origin/main; on that commit:",
+                f"       make rehearse ENV={source_env}   (release-plan needs a rehearsal of this exact commit)",
+                f"    4. make release-plan ENV={env_name}",
+                f"    5. make release ENV={env_name}",
+            ]
         return lines
     env_suffix = f" ENV={env_name}" if env_name != "dev" else ""
-    if tuning:
-        lines = [
-            "  Next steps:",
-            "    1. Review the tuning checklist:",
-            f"       {out_dir}/TUNING.md",
-            "    2. Review and tune generated files:",
-        ]
-    else:
-        lines = ["  Next steps:", "    1. Review generated files:"]
+    lines = [
+        "  Next steps:",
+        "    1. Review the tuning checklist:",
+        f"       {out_dir}/TUNING.md",
+        "    2. Review and tune generated files:",
+    ]
     if has_sql:
         lines.append(f"       {out_dir}/masking_functions.sql")
-    step = 3 if tuning else 2
     lines += [
         f"       {out_dir}/abac.auto.tfvars",
-        f"    {step}. make validate-generated{env_suffix}   (check your changes anytime)",
+        f"    3. make validate-generated{env_suffix}   (check your changes anytime)",
     ]
     if mode == "governance":
-        lines.append(f"    {step + 1}. make apply-governance{env_suffix}   (applies account + data_access layers only)")
+        lines.append(f"    4. make apply-governance{env_suffix}   (applies account + data_access layers only)")
     elif mode == "genie":
-        lines.append(f"    {step + 1}. make apply-genie{env_suffix}   (applies workspace layer only)")
+        lines.append(f"    4. make apply-genie{env_suffix}   (applies workspace layer only)")
     else:
-        lines.append(f"    {step + 1}. make apply{env_suffix}   (validates, splits shared account/workspace config, runs terraform apply)")
+        lines.append(f"    4. make apply{env_suffix}   (validates, splits shared account/workspace config, runs terraform apply)")
     return lines
 
 

@@ -550,3 +550,67 @@ def test_champion_docs_drop_generate_args_from_generate_commands():
     assert "\nmake generate ENV=dev\n" in readme
     assert "MODE=genie" not in readme
     assert "`make generate ENV=dev MODE=genie`" in import_doc
+
+
+def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
+    """Gaps a live Azure run found: make check, an early commit, verify-access inside rehearse, both agent forms."""
+    readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
+    ref = (SHARED / "examples/dev_to_prod/REFERENCE.md").read_text()
+    flow = readme[readme.index("## The whole flow"):readme.index("## Before you start")]
+    dev = readme[readme.index("## Dev"):readme.index("## Prod")]
+    prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
+
+    # The whole flow: own repo and first commit before check; check before rehearse and release-plan.
+    order = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
+             "make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
+             "make promote-to ENV=prod", "make check ENV=prod", "make release-plan ENV=prod",
+             "make release ENV=prod"]
+    positions = [flow.index(step) for step in order]
+    assert positions == sorted(positions)
+    assert "Data classification" in flow
+
+    # Dev: commit (own repo) comes before generate, check and rehearse.
+    committed = dev[dev.index("**2. Commit it (own repo).**"):]
+    steps = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
+             "**4. Generate.**", "**5. Check.**", "make check ENV=dev", "**6. Rehearse.**"]
+    positions = [committed.index(step) for step in steps]
+    assert positions == sorted(positions)
+    assert "`make rehearse` and `make release-plan` don't run it" in dev
+    assert "`verify-access` as its last gate (`_verify-access-gate`)" in dev
+    assert "**Pass looks like:** `ALL EFFECTIVE`" in dev and "make verify-access ENV=dev" in dev
+    assert "**Agents (preferred):**" in dev and "envs/dev/agents/" in dev
+    assert "**Also accepted:**" in dev and "genie_spaces = [{" in dev
+
+    assert prod.index("make check ENV=prod") < prod.index("make release-plan ENV=prod")
+    assert "make verify-access ENV=prod" in prod
+    assert "not run by `rehearse` or `release-plan`" in ref
+    assert "Does **not** run `make check`" in ref
+    assert "**Preferred:**" in ref and "**Also accepted:**" in ref
+
+
+def test_champion_walkthrough_rehearses_dev_on_the_promotion_commit():
+    """release-plan needs a passing dev rehearsal of HEAD; the promotion commit is newer than dev step 6's."""
+    readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
+    gate = (SHARED / "scripts/release_gate.py").read_text()
+    flow = readme[readme.index("## The whole flow"):readme.index("## Before you start")]
+    prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
+    gap = prod[prod.index("**Reuse an existing mask**"):prod.index("**A new kind of mask**")]
+
+    # The whole flow: promote, commit and push, then rehearse dev again before release-plan.
+    promoted = flow.index('git commit -m "Promote the rules to prod" && git push')
+    assert flow.index("make promote-to ENV=prod") < promoted
+    assert promoted < flow.index("make rehearse ENV=dev", promoted) < flow.index("make release-plan ENV=prod")
+
+    # Prod: push the promoted files, then rehearse dev on that commit, then plan.
+    steps = ["Commit and push the promoted files to `main`", "**3. Check, rehearse, plan, release.**",
+             "make check ENV=prod", "make rehearse ENV=dev", "make release-plan ENV=prod", "make release ENV=prod"]
+    positions = [prod.index(step) for step in steps]
+    assert positions == sorted(positions)
+    # What the user sees, in release_gate.py's own words.
+    for quoted in ("no passing rehearsal of", "without re-applying"):
+        assert quoted in gate and quoted in prod
+
+    # A coverage-gap fix commits a new promotion too: rehearse dev again before release-plan.
+    after_promote = gap[gap.index("`make promote-to ENV=prod`"):]
+    assert after_promote.index("`make rehearse ENV=dev`") < after_promote.index("`make release-plan ENV=prod`")
+

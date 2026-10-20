@@ -804,6 +804,20 @@ def test_detach_removes_exactly_the_agents_addresses(tmp_path, detach_lock):
     assert all("destroy" not in c and "apply" not in c for c in calls)
 
 
+def test_detach_next_steps_release_the_removal_after_a_source_rehearsal(tmp_path, detach_lock, capsys,
+                                                                        monkeypatch):
+    prod, head = _released_detached(tmp_path)
+    # The printed steps follow env.auto.tfvars; the receipt lookup stays the legacy one tested above.
+    monkeypatch.setattr(ownership, "deterministic", lambda env_dir: False)
+    (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\npromote_from = "stg"\n')
+    runner, _ = _runner(tmp_path)
+    ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
+    out = " ".join(capsys.readouterr().out.split())
+    steps = ["make promote-to ENV=prod", "commit and push envs/prod/", "make rehearse ENV=stg on that commit",
+             "make release-plan ENV=prod", "make release ENV=prod", "its plan must show no destroy"]
+    assert [out.index(step) for step in steps] == sorted(out.index(step) for step in steps), out
+
+
 def test_detach_refuses_unless_the_detached_change_is_the_released_head(tmp_path, detach_lock):
     runner, log = _runner(tmp_path)
     attached = _prod(tmp_path / "a")

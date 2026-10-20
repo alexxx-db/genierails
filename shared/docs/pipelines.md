@@ -313,7 +313,8 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
   dev. When the fingerprint matches an earlier passing receipt, as for a
   prod-only PR, rehearse writes a receipt without re-applying.
 - **`make release-plan ENV=prod`** refuses unless HEAD has a passing receipt
-  from a clean checkout, the checkout is still clean, HEAD is on freshly
+  of prod's source env (`promote_from`, dev by default) from a clean
+  checkout, the checkout is still clean, HEAD is on freshly
   fetched `origin/main`, the fingerprint and the committed
   `envs/prod/generated` digest match the receipt, and HEAD isn't older than
   the last release. Then, under the prod lock, it re-derives prod from live
