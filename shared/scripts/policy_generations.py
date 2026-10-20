@@ -154,8 +154,12 @@ FUNCTION_DROP = "terraform_data.masking_functions_drop"
 DEPLOY_TRIGGERS = ("sql_hash", "warehouse_id", "host", "client_id")
 # Checkout paths, which older states recorded in masking_functions' triggers
 # and masking_functions_drop's input (as absolute paths).
+# (relative_base only appeared in unreleased state; it is dropped again.)
 PATH_KEYS = frozenset({"sql_file", "script", "auth_file", "relative_base"})
 DROP_TARGET = ("warehouse_id", "host")
+# Which functions masking_functions_drop drops: older states lack it, and
+# recording it the first time changes no target.
+DROP_IDENTITY = "sql_hash"
 REKEY_NOTE = ("terraform_data.masking_functions is replaced only to stop recording checkout paths "
               "(sql_file, script, auth_file): the SQL, warehouse, host and client are unchanged, so it "
               "re-runs CREATE OR REPLACE of the same functions and drops nothing. This happens once.")
@@ -980,8 +984,8 @@ def masking_rekey(change: dict) -> bool:
     host and client_id re-runs CREATE OR REPLACE of the same functions on the
     same warehouse, and (with no destroy-time provisioner on masking_functions:
     redeploy_drops_functions) drops nothing. masking_functions_drop's input
-    moving from absolute to relative paths is an in-place update that keeps the
-    warehouse and host. Anything else, including any delete of
+    moving from absolute to relative paths (and first recording sql_hash) is an
+    in-place update that keeps the warehouse and host. Anything else, including any delete of
     masking_functions_drop (the destroy that drops the functions), is not.
     """
     address = str(change.get("address") or "")
@@ -992,7 +996,10 @@ def masking_rekey(change: dict) -> bool:
         return (_path_only(_values(before, "triggers_replace"), _values(after, "triggers_replace"),
                            DEPLOY_TRIGGERS) and not redeploy_drops_functions())
     if address.endswith(FUNCTION_DROP) and actions == ["update"]:
-        return _path_only(_values(before, "input"), _values(after, "input"), DROP_TARGET)
+        before, after = _values(before, "input"), _values(after, "input")
+        if DROP_IDENTITY not in before:
+            after = {k: v for k, v in after.items() if k != DROP_IDENTITY}
+        return _path_only(before, after, DROP_TARGET)
     return False
 
 

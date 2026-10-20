@@ -36,6 +36,21 @@ STUB = """import json, os, sys
 with open(os.environ["MASKING_STUB_LOG"], "a") as log:
     log.write(json.dumps({"script": os.path.abspath(__file__), "argv": sys.argv[1:]}) + "\\n")
 """
+# The real deployer (copied beside it, so its shared/ is the checkout's), with
+# only the credential load and the statements stubbed: it logs what it resolved.
+HARNESS = """import importlib.util, json, os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location("dmf", os.path.join(here, "_deployer.py"))
+dmf = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dmf)
+def log(**entry):
+    with open(os.environ["MASKING_STUB_LOG"], "a") as f:
+        f.write(json.dumps(entry) + "\\n")
+dmf.load_credentials = lambda auth_file, host: log(step="auth", auth_file=auth_file)
+dmf.drop = lambda sql_file, warehouse_id: log(step="drop", sql_file=sql_file)
+dmf.deploy = lambda sql_file, warehouse_id: log(step="deploy", sql_file=sql_file)
+dmf.main()
+"""
 # Stand-ins for what the cut blocks reference outside themselves.
 SUPPORT = """
 terraform {
@@ -118,8 +133,12 @@ def masking_blocks(source: Path) -> str:
                                        "${path.module}/normalize_masking_sql.py")
 
 
-def checkout(tmp_path: Path, name: str, module_source: Path = MODULE, *, root: str = ROOT) -> Path:
-    """A checkout: shared/{deploy stub, SQL helpers, modules/data_access, roots/data_access, envs/dev}."""
+def checkout(tmp_path: Path, name: str, module_source: Path = MODULE, *, root: str = ROOT,
+             real_deployer: bool = False) -> Path:
+    """A checkout: shared/{deploy stub, SQL helpers, modules/data_access, roots/data_access, envs/dev}.
+
+    ``real_deployer`` runs the real deploy_masking_functions.py behind HARNESS.
+    """
     shared = tmp_path / name / "shared"
     module = shared / "modules" / "data_access"
     module.mkdir(parents=True)
@@ -127,15 +146,22 @@ def checkout(tmp_path: Path, name: str, module_source: Path = MODULE, *, root: s
     shutil.copy(SHARED / "modules" / "data_access" / "normalize_masking_sql.py", module)
     for helper in ("sql_tokenizer.py", "masking_sql_blocks.py"):
         shutil.copy(SHARED / helper, shared / helper)
-    (shared / "deploy_masking_functions.py").write_text(STUB)
+    (shared / "deploy_masking_functions.py").write_text(HARNESS if real_deployer else STUB)
+    if real_deployer:
+        shutil.copy(SHARED / "deploy_masking_functions.py", shared / "_deployer.py")
     roots = shared / "roots" / "data_access"
     roots.mkdir(parents=True)
     (roots / "main.tf").write_text(root)
     env = shared / "envs" / "dev" / "data_access"
     env.mkdir(parents=True)
-    (env / "masking_functions.sql").write_text(SQL)
-    (env / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://example.invalid"\n')
+    write_env(env, SQL)
     return shared
+
+
+def write_env(env: Path, sql: str) -> None:
+    env.mkdir(parents=True, exist_ok=True)
+    (env / "masking_functions.sql").write_text(sql)
+    (env / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://example.invalid"\n')
 
 
 class Layer:
@@ -196,8 +222,10 @@ def test_a_plan_from_another_checkout_still_redeploys_a_changed_sql_or_warehouse
     a, b, _ = two_checkouts
     a.apply()
     (b.env_dir / "masking_functions.sql").write_text(SQL.replace("'***'", "'####'"))
+    # The drop records the new sql_hash in place; only a destroy runs it.
     assert _changes(b.plan_json(tmp_path)) == {"module.data_access.terraform_data.masking_functions":
-                                               ["delete", "create"]}
+                                               ["delete", "create"],
+                                               "module.data_access.terraform_data.masking_functions_drop": ["update"]}
     (b.env_dir / "masking_functions.sql").write_text(SQL)
     result = b.run("plan", "-detailed-exitcode", "-var=sql_warehouse_id=other")
     assert result.returncode == 2 and "terraform_data.masking_functions must be replaced" in result.stdout
@@ -220,6 +248,7 @@ def test_a_destroy_from_another_checkout_drops_with_that_checkouts_files(two_che
         recorded = argv[argv.index(flag) + 1]
         assert recorded == f"data_access/{name}"
         assert (Path(base) / recorded).is_file()
+    assert argv[argv.index("--expect-sql-hash") + 1]  # the identity the drop checks
 
 
 def test_a_destroy_without_the_base_dir_refuses_instead_of_guessing(two_checkouts, tmp_path):
@@ -235,6 +264,78 @@ def test_a_destroy_without_the_base_dir_refuses_instead_of_guessing(two_checkout
     assert "nothing was dropped" in result.stdout + result.stderr
 
 
+def _harness_layer(tmp_path: Path, name: str, **kwargs) -> tuple[Layer, Path]:
+    state, log = tmp_path / "state" / "terraform.tfstate", tmp_path / "masking.log"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    return Layer(tmp_path, checkout(tmp_path, name, real_deployer=True, **kwargs), state, log), log
+
+
+def test_a_checkout_path_with_spaces_deploys_and_drops(tmp_path):
+    """Every argument reaches the deployer whole (review B1: the path split at the space)."""
+    layer, log = _harness_layer(tmp_path / "rv199 space", "checkout $(x) 'q'")
+    layer.apply()
+    assert _calls(log) == [{"step": "auth", "auth_file": str(layer.env_dir / "auth.auto.tfvars")},
+                           {"step": "deploy", "sql_file": str(layer.env_dir / "masking_functions.sql")}]
+    log.unlink()
+    result = layer.run("destroy", "-auto-approve")
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The SQL hashes to what state records, so the drop goes ahead with this checkout's files.
+    assert _calls(log) == [{"step": "auth", "auth_file": str(layer.env_dir / "auth.auto.tfvars")},
+                           {"step": "drop", "sql_file": str(layer.env_dir / "masking_functions.sql")}]
+
+
+def test_a_wrong_but_populated_base_dir_refuses_before_it_connects(tmp_path):
+    """GENIERAILS_MASKING_BASE_DIR naming another env (review B2): its SQL is not what state deployed."""
+    layer, log = _harness_layer(tmp_path, "checkout-a")
+    layer.apply()
+    other = layer.env_dir.parents[1] / "prod"
+    write_env(other / "data_access", SQL.replace("cat.sch", "prodcat.sch"))
+    log.unlink()
+    result = layer.run("destroy", "-auto-approve", env=layer.env | {"GENIERAILS_MASKING_BASE_DIR": str(other)})
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "is not the SQL the last apply deployed" in output and "nothing was dropped" in output
+    assert _calls(log) == []  # no credentials loaded, nothing dropped
+    # The drop is still in state; the right base dir then drops this env's functions.
+    result = layer.run("destroy", "-auto-approve")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [c["step"] for c in _calls(log)] == ["auth", "drop"]
+    assert _calls(log)[-1]["sql_file"] == str(layer.env_dir / "masking_functions.sql")
+
+
+def _legacy_state(tmp_path: Path) -> tuple[Layer, Path]:
+    """State the pre-fix module applied from checkout A (absolute paths, no sql_hash), then A is gone."""
+    state, log = tmp_path / "state" / "terraform.tfstate", tmp_path / "masking.log"
+    state.parent.mkdir()
+    old = Layer(tmp_path, checkout(tmp_path, "checkout-a", PRE_FIX, root=ROOT.replace(NO_PATHS_BASE, "")),
+                state, log)
+    old.apply()
+    shutil.rmtree(old.root.parents[2])
+    log.unlink()
+    return Layer(tmp_path, checkout(tmp_path, "checkout-b", real_deployer=True), state, log), log
+
+
+def test_a_direct_destroy_of_unmigrated_state_drops_from_the_new_checkout(tmp_path):
+    """Review B3: the old checkout's script and files are gone; this checkout's are found in their place."""
+    new, log = _legacy_state(tmp_path)
+    result = new.run("destroy", "-auto-approve")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _calls(log) == [{"step": "auth", "auth_file": str(new.env_dir / "auth.auto.tfvars")},
+                           {"step": "drop", "sql_file": str(new.env_dir / "masking_functions.sql")}]
+    assert "is gone; using" in result.stdout
+
+
+def test_a_direct_destroy_of_unmigrated_state_refuses_when_nothing_is_in_its_place(tmp_path):
+    new, log = _legacy_state(tmp_path)
+    # Not the SQL: the destroy's refresh of its hash already fails without it.
+    (new.env_dir / "auth.auto.tfvars").unlink()
+    result = new.run("destroy", "-auto-approve")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "which no longer exists" in output and "nothing was dropped" in output
+    assert _calls(log) == []
+
+
 def test_the_runner_exports_the_base_dir_the_root_records_against():
     runner = (SHARED / "scripts" / "terraform_layer.sh").read_text()
     assert 'GENIERAILS_MASKING_BASE_DIR="$(dirname "$ENV_DIR")"' in runner
@@ -244,22 +345,67 @@ def test_the_runner_exports_the_base_dir_the_root_records_against():
 
 
 # -- the deployer's path resolution --------------------------------------------------------
-def _resolve(*argv: str):
+def _dmf():
     sys.path.insert(0, str(SHARED))
     import deploy_masking_functions as dmf
-    parsed = __import__("argparse").Namespace(**dict(zip(("sql_file", "auth_file", "base_dir"), argv)))
-    dmf.resolve_paths(parsed)
+    return dmf
+
+
+def _resolve(sql_file, auth_file, base_dir, expect_sql_hash="h", relocate_from="", drop=True):
+    parsed = __import__("argparse").Namespace(sql_file=sql_file, auth_file=auth_file, base_dir=base_dir,
+                                              expect_sql_hash=expect_sql_hash, relocate_from=relocate_from,
+                                              drop=drop)
+    _dmf().resolve_paths(parsed)
     return parsed.sql_file, parsed.auth_file
 
 
 def test_relative_paths_resolve_against_the_base_dir_and_absolute_ones_stay(tmp_path):
     assert _resolve("data_access/m.sql", "data_access/auth", str(tmp_path)) == (
         str(tmp_path / "data_access/m.sql"), str(tmp_path / "data_access/auth"))
-    # State from before the fix records absolute paths: used as they are.
-    assert _resolve("/old/m.sql", "/old/auth", str(tmp_path)) == ("/old/m.sql", "/old/auth")
+    # State from before the fix records absolute paths: used as they are while they exist.
+    old = tmp_path / "old"
+    write_env(old, SQL)
+    paths = (str(old / "masking_functions.sql"), str(old / "auth.auto.tfvars"))
+    assert _resolve(*paths, str(tmp_path)) == paths
     assert _resolve("m.sql", "auth", None) == ("m.sql", "auth")  # no --base-dir: as before
     with pytest.raises(SystemExit):
         _resolve("data_access/m.sql", "data_access/auth", "")
+    # Relative paths without a recorded sql_hash can't tell this env's SQL from another's.
+    with pytest.raises(SystemExit):
+        _resolve("data_access/m.sql", "data_access/auth", str(tmp_path), expect_sql_hash="")
+
+
+def test_a_gone_absolute_path_relocates_only_to_the_same_place_or_refuses(tmp_path, capsys):
+    """Under the env dir; under this shared/ (--relocate-from) is the destroy tests' case."""
+    gone = "/gone/checkout/shared"
+    # By its last two parts under the env dir, when the dir above them is named like the env.
+    env = tmp_path / "envs" / "dev"
+    write_env(env / "data_access", SQL)
+    assert _resolve(f"{gone}/envs/dev/data_access/masking_functions.sql",
+                    f"{gone}/envs/dev/data_access/auth.auto.tfvars", str(env)) == (
+        str(env / "data_access/masking_functions.sql"), str(env / "data_access/auth.auto.tfvars"))
+    # Another env's dir (the env name differs) or nothing there: refuse.
+    for base in (tmp_path / "envs" / "prod", tmp_path / "nowhere" / "dev"):
+        write_env(tmp_path / "envs" / "prod" / "data_access", SQL)
+        with pytest.raises(SystemExit):
+            _resolve(f"{gone}/envs/dev/data_access/masking_functions.sql",
+                     f"{gone}/envs/dev/data_access/auth.auto.tfvars", str(base))
+    assert "nothing was dropped" in capsys.readouterr().err
+
+
+def test_the_identity_check_passes_this_envs_sql_and_refuses_any_other(tmp_path, capsys):
+    import hashlib
+    sys.path.insert(0, str(SHARED / "modules" / "data_access"))
+    from normalize_masking_sql import normalized_definitions
+    sql = tmp_path / "m.sql"
+    sql.write_text(SQL)
+    recorded = hashlib.sha256(normalized_definitions(SQL).encode()).hexdigest()
+    _dmf().verify_sql_identity(str(sql), recorded)
+    _dmf().verify_sql_identity(str(sql), "")  # older state records none
+    sql.write_text(SQL.replace("cat.sch", "other.sch"))
+    with pytest.raises(SystemExit):
+        _dmf().verify_sql_identity(str(sql), recorded)
+    assert "is not the SQL the last apply deployed" in capsys.readouterr().err
 
 
 # -- the one-time re-key of existing state -------------------------------------------------
@@ -316,6 +462,17 @@ def test_abandon_refuses_a_drop_update_that_moves_its_target(upgraded_plan, key)
     plan, _ = upgraded_plan
     changed = _with(plan, "masking_functions_drop", lambda c: c["after"]["input"].__setitem__(key, "changed"))
     assert pg.plan_violations(changed, "abandon") == [
+        "module.data_access.terraform_data.masking_functions_drop: update "
+        "(abandon only deletes the unfinished change's policies)"]
+
+
+def test_the_rekey_records_the_drops_sql_hash_but_abandon_refuses_changing_it(upgraded_plan):
+    plan, _ = upgraded_plan
+    drop = next(c for c in plan["resource_changes"] if c["address"].endswith("masking_functions_drop"))
+    assert "sql_hash" not in drop["change"]["before"]["input"] and drop["change"]["after"]["input"]["sql_hash"]
+    recorded = _with(plan, "masking_functions_drop",
+                     lambda c: c["before"]["input"].__setitem__("sql_hash", "deployed-before"))
+    assert pg.plan_violations(recorded, "abandon") == [
         "module.data_access.terraform_data.masking_functions_drop: update "
         "(abandon only deletes the unfinished change's policies)"]
 

@@ -524,8 +524,17 @@ resource "terraform_data" "masking_functions" {
     client_id    = var.databricks_client_id
   }
 
+  # The arguments go in as environment variables the shell expands quoted, so
+  # a checkout path with spaces or shell characters reaches the script intact.
   provisioner "local-exec" {
-    command = "python3 ${var.deploy_masking_script} --sql-file ${var.masking_sql_file} --warehouse-id ${self.triggers_replace.warehouse_id} --auth-file ${var.auth_file} --host ${self.triggers_replace.host}"
+    command = "python3 \"$MASKING_SCRIPT\" --sql-file \"$MASKING_SQL_FILE\" --warehouse-id \"$MASKING_WAREHOUSE_ID\" --auth-file \"$MASKING_AUTH_FILE\" --host \"$MASKING_HOST\""
+    environment = {
+      MASKING_SCRIPT       = var.deploy_masking_script
+      MASKING_SQL_FILE     = var.masking_sql_file
+      MASKING_WAREHOUSE_ID = self.triggers_replace.warehouse_id
+      MASKING_AUTH_FILE    = var.auth_file
+      MASKING_HOST         = self.triggers_replace.host
+    }
   }
 
   depends_on = [
@@ -545,20 +554,41 @@ resource "terraform_data" "masking_functions" {
 # GENIERAILS_MASKING_BASE_DIR, which terraform_layer.sh exports as the env
 # dir. A destroy from another checkout drops the functions with that
 # checkout's files; without the variable the drop refuses rather than guess.
-# State from before this recorded absolute paths, which are used as they are.
+# sql_hash records which functions these are: the drop hashes the SQL it
+# resolved and refuses, before it connects, when that is another env's (a
+# wrong GENIERAILS_MASKING_BASE_DIR) or the file changed since the last apply.
+# State from before this recorded absolute paths and no hash: the drop runs
+# this checkout's script, and a path that is gone is found by its place under
+# the old shared/ (the old script's dir) or the env dir, or the drop refuses.
 resource "terraform_data" "masking_functions_drop" {
   input = {
-    sql_file      = local.masking_drop_files.sql_file
-    script        = local.masking_drop_script
-    auth_file     = local.masking_drop_files.auth_file
-    relative_base = local.masking_paths_base != ""
-    warehouse_id  = local.effective_warehouse_id
-    host          = var.databricks_workspace_host
+    sql_file     = local.masking_drop_files.sql_file
+    script       = local.masking_drop_script
+    auth_file    = local.masking_drop_files.auth_file
+    sql_hash     = data.external.normalized_masking_sql.result.hash
+    warehouse_id = local.effective_warehouse_id
+    host         = var.databricks_workspace_host
   }
 
   provisioner "local-exec" {
     when    = destroy
-    command = "python3 ${startswith(self.input.script, "/") ? self.input.script : "${path.module}/../../${self.input.script}"} --sql-file ${self.input.sql_file} --warehouse-id ${self.input.warehouse_id} --auth-file ${self.input.auth_file} --host ${self.input.host} --drop${try(self.input.relative_base, false) ? " --base-dir \"$${GENIERAILS_MASKING_BASE_DIR:-}\"" : ""}"
+    command = "python3 \"$MASKING_SCRIPT\" --sql-file \"$MASKING_SQL_FILE\" --warehouse-id \"$MASKING_WAREHOUSE_ID\" --auth-file \"$MASKING_AUTH_FILE\" --host \"$MASKING_HOST\" --drop --expect-sql-hash \"$MASKING_SQL_HASH\" --relocate-from \"$MASKING_RELOCATE_FROM\" --base-dir \"$${GENIERAILS_MASKING_BASE_DIR:-}\""
+    environment = {
+      # A recorded deploy_masking_functions.py, relative or an older state's
+      # absolute path, runs from this checkout; it understands these flags.
+      MASKING_SCRIPT = (!startswith(self.input.script, "/") ? "${abspath("${path.module}/../..")}/${self.input.script}"
+        : basename(self.input.script) == "deploy_masking_functions.py"
+      ? "${abspath("${path.module}/../..")}/deploy_masking_functions.py" : self.input.script)
+      MASKING_SQL_FILE     = self.input.sql_file
+      MASKING_WAREHOUSE_ID = self.input.warehouse_id
+      MASKING_AUTH_FILE    = self.input.auth_file
+      MASKING_HOST         = self.input.host
+      MASKING_SQL_HASH     = try(self.input.sql_hash, "")
+      # The shared/ an absolute path was recorded under, for the deployer to
+      # find a moved file at the same place under this checkout's.
+      MASKING_RELOCATE_FROM = (startswith(self.input.script, "/") && basename(self.input.script) == "deploy_masking_functions.py"
+      ? dirname(self.input.script) : "")
+    }
   }
 
   depends_on = [

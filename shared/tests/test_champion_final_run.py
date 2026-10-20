@@ -152,7 +152,8 @@ def test_masking_resource_keeps_no_secret_and_ignores_nothing():
     assert keys == {"sql_hash", "warehouse_id", "host", "client_id"}
     assert "secret" not in block
     assert "ignore_changes" not in block
-    assert block.count("--auth-file ${var.auth_file}") == 1
+    assert block.count('--auth-file \\"$MASKING_AUTH_FILE\\"') == 1
+    assert "MASKING_AUTH_FILE    = var.auth_file" in block
     # Replacing it (any SQL change) must never drop the functions live policies use.
     assert "when    = destroy" not in block and "--drop" not in block
 
@@ -162,7 +163,8 @@ def test_functions_are_dropped_only_by_a_resource_that_never_replaces():
     assert "triggers_replace" not in block and "filemd5" not in block
     assert "secret" not in block
     assert block.count("--drop") == 1 and "when    = destroy" in block
-    assert "--auth-file ${self.input.auth_file}" in block
+    assert '--auth-file \\"$MASKING_AUTH_FILE\\"' in block
+    assert "MASKING_AUTH_FILE    = self.input.auth_file" in block
     deploy = _resource_block(MODULE_TF.read_text(), 'resource "terraform_data" "masking_functions" {')
     assert "terraform_data.masking_functions_drop" in deploy  # destroyed after the deploy
 
