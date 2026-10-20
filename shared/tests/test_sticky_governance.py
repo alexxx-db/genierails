@@ -17,7 +17,8 @@ from governance_policies import base_treatment
 from sensitivity_source import ClassificationSource
 from scripts import sticky_governance as sticky
 from scripts.sticky_governance import GovernedTablesError, check_layout, load_governed_tables, main, ungovern
-from tests.terraform_helpers import shared_copy, skip_if_providers_unavailable, tf, tf_env, tf_init
+from tests.terraform_helpers import (MASKING_REKEY, is_masking_rekey, shared_copy, skip_if_providers_unavailable, tf,
+                                     tf_env, tf_init)
 
 SHARED = Path(__file__).parents[1]
 SCRIPT = SHARED / "scripts/derive_assignments.py"
@@ -618,7 +619,7 @@ def test_treatment_retag_waits_for_functions_and_policies_and_grants_wait_for_it
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
-def test_legacy_env_applied_with_the_old_module_replans_with_no_changes(tmp_path):
+def test_legacy_env_applied_with_the_old_module_replans_with_only_the_masking_rekey(tmp_path):
     root = shared_copy(tmp_path) / "modules" / "data_access"
     env = tf_env(tmp_path)
     tf_init(root, env=env)
@@ -626,5 +627,6 @@ def test_legacy_env_applied_with_the_old_module_replans_with_no_changes(tmp_path
     assert result.returncode == 0, result.stdout + result.stderr
     replan = result.stdout[result.stdout.index('run "legacy_replan_with_new_module"'):]
     assert replan.split("\n", 1)[0].endswith("pass")
-    assert "No changes. Your infrastructure matches the configuration." in replan
-    assert not re.search(r"# \S+ (will be|must be)", replan), replan
+    # No tag or policy change; the old module's checkout paths re-key the masking functions once.
+    assert set(re.findall(r"# (\S+) (will be \S+(?: in-place)?|must be replaced)", replan)) == MASKING_REKEY, replan
+    assert is_masking_rekey(replan), replan
