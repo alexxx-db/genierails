@@ -372,7 +372,7 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
     """
     if str(SHARED_ROOT) not in sys.path:
         sys.path.insert(0, str(SHARED_ROOT))
-    from governance_policies import TAG_KEY, model_fingerprint
+    from governance_policies import TAG_KEY
     from scripts import policy_generations as pg
     from scripts import staged_policy_apply as spa
     from scripts.runtime_overlay import effective
@@ -413,18 +413,11 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
                             f"principals moved: {'; '.join(problems[:3])}")
     elif stage != "abandon" and transition.get("to") != target:
         raise GateError(f"the policy journal records no transition from {old_fingerprint} to {target}")
-    try:
-        old_tags = dict(snapshot["tags"])
-        recorded = {"fgac_policies": snapshot["fgac_policies"], "tag_assignments": [
-            {"entity_type": "columns", "entity_name": column, "tag_key": TAG_KEY, "tag_value": value}
-            for column, value in old_tags.items()]}
-        intact = model_fingerprint(recorded, snapshot["functions_sql"]) == old_fingerprint
-    except (KeyError, TypeError, ValueError, AttributeError):
-        intact = False
-    if not intact:
+    if not pg.snapshot_intact(snapshot, old_fingerprint):
         raise GateError(f"the snapshot of {old_fingerprint} doesn't match its fingerprint (edited since it was "
                         "recorded)")
 
+    old_tags = dict(snapshot["tags"])
     desired = list(_load_tfvars(effective(env_dir, "abac.auto.tfvars")).get("tag_assignments") or [])
     tags = dict(old_tags)
     if keep_new_tags and stage != "abandon":

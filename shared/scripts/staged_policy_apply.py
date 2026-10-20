@@ -812,7 +812,18 @@ class Controller:
                 raise Refused(f"make policy-rebind of run {t['run_id']} didn't finish "
                               f"({t['rebind_incomplete']['reason']}). {t['rebind_incomplete']['next']}")
             self._refuse_split_drift("policy-abandon")
-            moved = self._drifted_treatments(t, pg.desired_generation(self.env_dir))
+            desired = pg.desired_generation(self.env_dir)
+            if self._moved_treatments(t, desired):
+                # The drift allowance below trusts the previous generation's recorded tags.
+                problem = self._previous_snapshot_problem(t)
+                if problem:
+                    raise Refused(
+                        f"this change can't be abandoned: the generated config's treatment values differ from the "
+                        f"unfinished change {t['to']}, and {problem}, so whether the config is back on that "
+                        "generation's values can't be checked. Nothing was applied. Next: restore the snapshot "
+                        f"from where the env's records are kept (git history or GENIERAILS_STATE_DIR), then re-run "
+                        f"make policy-abandon ENV={self.env_name}.")
+            moved = self._drifted_treatments(t, desired)
             if moved:
                 raise Refused(
                     f"this change can't be abandoned: {len(moved)} column(s) have another treatment in the generated "
@@ -1215,11 +1226,23 @@ class Controller:
         moved = self._moved_treatments(t, desired)
         if not moved:
             return []
-        try:
-            previous = (self._snapshot(t["from"]) or {}) if t["from"] else {}
-        except pg.StageError:
+        if self._previous_snapshot_problem(t):
             return moved
+        previous = (self._snapshot(t["from"]) or {}) if t["from"] else {}
         return [] if dict(previous.get("tags") or {}) == dict(desired.get("tags") or {}) else moved
+
+    def _previous_snapshot_problem(self, t: dict) -> str:
+        """Why the snapshot of the generation the change started from can't be trusted, or ""."""
+        if not t["from"]:
+            return ""
+        try:
+            snapshot = self._snapshot(t["from"])
+        except (pg.StageError, OSError, ValueError) as exc:
+            return f"the snapshot of generation {t['from']} can't be read ({exc})"
+        if not pg.snapshot_intact(snapshot, t["from"]):
+            return (f"the snapshot of generation {t['from']} ({pg.ledger_dir(self.env_dir) / (t['from'] + '.json')}) "
+                    "doesn't match its fingerprint (edited since it was recorded)")
+        return ""
 
     def _refuse_split_drift(self, command: str) -> None:
         """Refuse before any plan when the split's non-treatment assignments aren't the generated config's."""

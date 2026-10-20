@@ -308,7 +308,10 @@ columns, and leaves live protection as it is:
   treatment in the generated config than in generation ..."), because the
   config is no longer the change. Abandon refuses too ("this change can't
   be abandoned: N column(s) ..."), unless the generated config's treatment
-  values are back on the previous generation's, and so does a rebind. Each
+  values are back on the previous generation's. That exception trusts the
+  previous generation's snapshot only while it still hashes to its
+  fingerprint; an edited or unreadable snapshot refuses before any plan.
+  A rebind refuses too. Each
   names the columns. The way out is to put those columns' `class.*` tags
   (or the treatment settings) back as they were when the change started,
   then resume it, or abandon or rebind it as before.

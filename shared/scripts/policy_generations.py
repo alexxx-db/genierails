@@ -269,6 +269,27 @@ def load_snapshot(env_dir: Path, fingerprint: str) -> dict | None:
     return json.loads(path.read_text())
 
 
+def snapshot_intact(snapshot: dict | None, fingerprint: str) -> bool:
+    """Whether a generation's snapshot still hashes to its fingerprint (not edited since it was recorded).
+
+    A legacy generation hashes its masks and treatment tags
+    (migration.legacy_fingerprint); a deterministic one its policies,
+    treatment tags and function SQL (model_fingerprint).
+    """
+    from scripts import migration
+
+    try:
+        tags = dict(snapshot["tags"])
+        if fingerprint.startswith(migration.LEGACY_PREFIX):
+            return migration.legacy_fingerprint(snapshot["fgac_policies"], tags) == fingerprint
+        recorded = {"fgac_policies": snapshot["fgac_policies"], "tag_assignments": [
+            {"entity_type": "columns", "entity_name": column, "tag_key": TAG_KEY, "tag_value": value}
+            for column, value in tags.items()]}
+        return model_fingerprint(recorded, snapshot["functions_sql"]) == fingerprint
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
 def _statements(block: str) -> list[tuple[str, str, str]]:
     out, catalog, schema = [], "", ""
     for raw in (block or "").split(";\n"):

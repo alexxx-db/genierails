@@ -547,6 +547,40 @@ def test_resume_and_abandon_after_class_drift_refuse_naming_the_drifted_columns(
     assert not (pg.ledger_dir(harness.env_dir) / "abandon").exists()
 
 
+
+def test_abandon_after_class_drift_refuses_a_previous_snapshot_edited_to_match_the_drift(harness, tmp_path,
+                                                                                          monkeypatch):
+    """The drift allowance (config back on the previous generation's values) trusts that generation's
+    recorded tags only while its snapshot still hashes to its fingerprint; an edited one refuses before any plan."""
+    old = released(harness, deployer=OLD_SP)
+    gate_on(harness, tmp_path, monkeypatch)
+    new = change(harness, old, versions=RETAG)
+    harness.fail_verify = {"create"}
+    assert harness.apply() == 1
+    drifted = write_env(harness.env_dir, versions=RETAG, deployer=OLD_SP, columns=("email", "phone"))
+    _promoted(harness, old, new, drifted)
+    _refresh(harness.env_dir)
+    snapshot_file = pg.ledger_dir(harness.env_dir) / f"{old['fingerprint']}.json"
+    snapshot = json.loads(snapshot_file.read_text())
+    snapshot["tags"] = dict(pg.desired_generation(harness.env_dir)["tags"])
+    snapshot_file.write_text(json.dumps(snapshot))
+    assert not pg.snapshot_intact(snapshot, old["fingerprint"])
+    gate_file = harness.env_dir / "data_access" / cg.GATE_FILENAME
+    before = (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes(), snapshot_file.read_bytes())
+    harness.calls.clear()
+    with pytest.raises(spa.Refused) as refused:
+        harness.controller().abandon()
+    message = str(refused.value)
+    assert f"this change can't be abandoned: the generated config's treatment values differ from the unfinished " \
+           f"change {new['fingerprint']}, and the snapshot of generation {old['fingerprint']}" in message
+    assert "doesn't match its fingerprint (edited since it was recorded)" in message
+    assert "Nothing was applied" in message and "re-run make policy-abandon ENV=dev" in message
+    assert harness.calls == []
+    assert (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes(),
+            snapshot_file.read_bytes()) == before
+    assert not (pg.ledger_dir(harness.env_dir) / "abandon").exists()
+
+
 # -- (9) the split's non-treatment assignments vs the generated config's ------------------------
 def _with_table_tag(path: Path, value: str) -> None:
     text = path.read_text()
