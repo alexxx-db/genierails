@@ -243,9 +243,20 @@ def source_env_dir(envs_dir: Path, env: str, env_dir: Path) -> Path:
             + (f" (its promote_from is {source})" if source else "")
             + f". Run it in the env {env} is promoted from: make materialize-treatment "
             f"ENV={from_env} TREATMENT=<t>, then make rehearse ENV={from_env}, "
-            f"make promote-to ENV={env} and make release ENV={env}"
+            f"make promote-to ENV={env}, {release_steps(path, from_env, env)}"
         )
     return path
+
+
+def release_steps(env_dir: Path | None, source: str, dest: str) -> str:
+    """What follows promote-to: a deterministic release-plan needs the promotion on
+    origin/main with a source rehearsal of that same commit; a legacy env just releases."""
+    from scripts.coverage_fix import _deterministic
+
+    if env_dir is not None and _deterministic(env_dir):
+        return (f"commit and push envs/{dest}/ to origin/main, make rehearse ENV={source} again on "
+                f"that commit, make release-plan ENV={dest} and make release ENV={dest}")
+    return f"make release ENV={dest}"
 
 
 def promoted_to(env_dir: Path, env: str) -> list[str]:
@@ -315,8 +326,14 @@ def main(argv: list[str] | None = None) -> int:
         changed.append(f"envs/{env}/generated/abac.auto.tfvars")
     if result["functions"]:
         changed.append(f"envs/{env}/generated/masking_functions.sql")
-    print(f"Next: make rehearse ENV={env}, make promote-to ENV={dest}, make release ENV={dest}."
-          + (f" Commit {', '.join(changed)}." if changed else ""))
+    from scripts.coverage_fix import _deterministic
+
+    commit = f" Commit {', '.join(changed)}." if changed else ""
+    if args.env_dir is not None and _deterministic(args.env_dir):
+        print(f"Next:{commit} Then make rehearse ENV={env}, make promote-to ENV={dest}, "
+              f"{release_steps(args.env_dir, env, dest)}.")
+    else:
+        print(f"Next: make rehearse ENV={env}, make promote-to ENV={dest}, make release ENV={dest}.{commit}")
     return 0
 
 

@@ -321,7 +321,13 @@ def materialize_lines(env_name: str, env_dir: Path, treatments: list[str]) -> li
         lines.append(
             f"    make materialize-treatment ENV={source or env_name} TREATMENT={treatment}"
         )
-    if source:
+    if source and _deterministic(env_dir):
+        # release-plan needs HEAD on origin/main and a source rehearsal of that same commit.
+        lines.append(f"    then commit envs/{source}/generated/, make rehearse ENV={source}, "
+                     f"make promote-to ENV={env_name}")
+        lines.append(f"    then commit and push envs/{env_name}/, make rehearse ENV={source} "
+                     f"again on that commit, {rerun}")
+    elif source:
         lines.append(
             f"    then make rehearse ENV={source}, make promote-to ENV={env_name}, {rerun}; "
             f"commit envs/{source}/generated/"

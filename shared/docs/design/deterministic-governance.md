@@ -264,7 +264,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 3. `make generate ENV=dev`: imports the agents, derives governance, and proposes `table_readers` for the agents' tables. Review and commit.
 4. `make rehearse ENV=dev`.
 5. Set `catalog_map`; `make promote-to ENV=prod`; classify prod in the UI.
-6. Approve and merge the promotion PR; once rehearse passes on that commit, the operator runs `make release ENV=prod`.
+6. Approve and merge the promotion PR; once rehearse passes on that commit, the operator runs `make release-plan ENV=prod`, gets the manifest approved, and runs `make release ENV=prod`.
 7. `make maintain ENV=prod` on a schedule.
 
 **Governance-only flow (no agents):** the same commands with `uc_tables` set and no agents. GenieRails creates no agent. It grants `SELECT` only if `table_readers` is set; otherwise masks apply to whoever already has access, after the reader check (section 6).

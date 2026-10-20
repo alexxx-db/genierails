@@ -184,6 +184,23 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
     assert 'catalog_map  = { "<dev_catalog>" = "<prod_catalog>" }' in env_text
 
 
+def test_setup_prod_rehearses_its_promote_from_source_before_release_plan(tmp_path):
+    """release-plan needs a same-commit receipt from promote_from's env, not always dev."""
+    assert _make("aws", tmp_path, "setup", "ENV=prod").returncode == 0
+    env_file = tmp_path / "aws" / "envs" / "prod" / "env.auto.tfvars"
+    text = env_file.read_text()
+    assert 'promote_from = "dev"' in text
+    env_file.write_text(text.replace('promote_from = "dev"', 'promote_from = "stg"'))
+
+    result = _make("aws", tmp_path, "setup", "ENV=prod")
+
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=stg" in out
+    assert "make rehearse ENV=dev" not in out
+    assert out.index("make rehearse ENV=stg") < out.index("make release-plan ENV=prod")
+
+
 @pytest.mark.parametrize("cloud", CLOUDS)
 def test_setup_non_default_env_seeds_promotion_settings(cloud, tmp_path):
     result = _make(cloud, tmp_path, "setup", "ENV=stg")

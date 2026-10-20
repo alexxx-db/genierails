@@ -548,6 +548,27 @@ def test_the_coverage_gap_fix_points_deterministic_envs_at_tag_treatments(tmp_pa
     assert "shared/treatment_config.json" not in text
 
 
+def test_the_missing_mask_fix_rehearses_the_promotion_commit_before_release_plan(tmp_path):
+    _scaffold_env(tmp_path, "dev", DEV_ENV)
+    prod = _scaffold_env(tmp_path, "prod", PROD_ENV)
+    text = "\n".join(coverage_fix.materialize_lines("prod", prod, ["generic_partial"]))
+    after_promote = text[text.index("make promote-to ENV=prod"):]
+    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
+
+
+def test_materialize_in_a_deterministic_prod_points_at_release_plan_after_the_promotion_rehearse(tmp_path):
+    from scripts import materialize_treatment
+
+    _scaffold_env(tmp_path, "dev", DEV_ENV)
+    prod = _scaffold_env(tmp_path, "prod", PROD_ENV)
+    with pytest.raises(ValueError) as refused:
+        materialize_treatment.source_env_dir(tmp_path / "envs", "prod", prod)
+    after_promote = str(refused.value)[str(refused.value).index("make promote-to ENV=prod"):]
+    steps = ["commit and push envs/prod/", "make rehearse ENV=dev", "make release-plan ENV=prod", "make release ENV=prod"]
+    assert [after_promote.index(step) for step in steps] == sorted(after_promote.index(step) for step in steps)
+    assert materialize_treatment.release_steps(tmp_path / "legacy", "dev", "prod") == "make release ENV=prod"
+
+
 # ── The legacy layout: unchanged, or moved by make split-agent-files ────────
 
 LEGACY_DEV = f'''governance_mode = "deterministic"

@@ -173,7 +173,7 @@ What each walkthrough step does, for when you need more than the [walkthrough](R
 - Runs audit-schema → derive-assignments → coverage-gate → validate-generated → audit-rulebook → apply-governance. It audits before applying, keeps `SELECT` for already-covered tables, never widens access past a passing check, and never changes the Genie agent.
 - When inputs are unchanged the apply is skipped, so it doesn't repair grants revoked outside Terraform.
 - Stops at `audit-schema`: a sensitive-looking column has no `class.*` tag. Review it in Catalog Explorer, then re-run.
-- Stops at `coverage-gate` or `audit-rulebook`: add the rule in dev, rehearse, `promote-to`, `release` (see "Fixing a coverage gap" below).
+- Stops at `coverage-gate` or `audit-rulebook`: add the rule in dev, rehearse, `promote-to`, then commit and push to `origin/main`, `make rehearse ENV=dev` on that commit, `make release-plan ENV=prod`, `make release ENV=prod` (legacy envs have no `release-plan`: `promote-to`, then `make release ENV=prod`; see "Fixing a coverage gap" below).
 
 <a id="fixing-a-coverage-gap-found-in-prod"></a>
 **Fixing a coverage gap found in prod**
@@ -182,7 +182,7 @@ What each walkthrough step does, for when you need more than the [walkthrough](R
 - New kind of mask: `make scaffold-treatments ENV=prod` adds a `<class>_redacted` treatment with a full-redaction `REVIEW` stub to `shared/treatment_config.json` and `shared/tag_vocabulary_registry.json`. It also writes a prod preview, which the next `promote-to` replaces. Review the stub.
 - Deterministic envs (`governance_mode = "deterministic"`) never change `shared/` for a customer class: `make scaffold-treatments ENV=prod TREATMENT=<mask-library treatment>` writes `"class.<name>" = "<treatment>"` to `tag_treatments` in `envs/dev/env.auto.tfvars` (prod's source), then commit it, `make rehearse ENV=dev`, `make promote-to ENV=prod`, commit and push that, `make rehearse ENV=dev` again on that commit, `make release-plan ENV=prod` and `make release ENV=prod`. Without `TREATMENT` it refuses; `TREATMENT=redact` keeps full redaction. See [the mask library reference](../../REFERENCE.md#customer-classes-tag_treatments).
 - `make materialize-treatment ENV=dev TREATMENT=<new>` writes that treatment's mask policy for every governed dev catalog, plus its function, into `envs/dev/generated/`. It adds no tag assignments, so no dev column needs the class. Re-running it changes nothing. A policy or function already there for the treatment is kept as reviewed. It refuses past Unity Catalog's 100 policies per catalog, and refuses prod or any env with `promote_from` (also via `ENV_DIR` or a symlinked env dir). Later `make generate ENV=dev` runs keep the mask.
-- Then `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make release ENV=prod`.
+- Then `make rehearse ENV=dev`, `make promote-to ENV=prod`, commit and push to `origin/main`, `make rehearse ENV=dev` again on that commit, `make release-plan ENV=prod` and `make release ENV=prod` (legacy envs have no `release-plan`: `promote-to`, then `make release ENV=prod`).
 - A newly tagged column is a masking gap, not an access breach. For your most sensitive data, prefer "locked down until proven safe" over "open until tagged".
 
 ---

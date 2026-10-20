@@ -92,7 +92,8 @@ or changes its ID, so conversations stay. Never edit a prod agent in the UI.
 Edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`: prod owns it and
 `promote-to` never overwrites it. If a new group can't read the agent's tables,
 governance adds it to `table_readers` in the same PR. Then PR, merge, rehearse
-(a no-op that writes a receipt) and release.
+dev on the merged commit (a no-op that writes a receipt), `release-plan` and
+`release`.
 
 ## Remove an agent
 

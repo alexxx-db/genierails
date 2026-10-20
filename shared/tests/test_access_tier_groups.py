@@ -613,3 +613,32 @@ def test_champion_walkthrough_rehearses_dev_on_the_promotion_commit():
     # A coverage-gap fix commits a new promotion too: rehearse dev again before release-plan.
     after_promote = gap[gap.index("`make promote-to ENV=prod`"):]
     assert after_promote.index("`make rehearse ENV=dev`") < after_promote.index("`make release-plan ENV=prod`")
+
+
+
+def _in_order(text, steps):
+    pos = 0
+    for step in steps:
+        pos = text.index(step, pos) + len(step)
+    return True
+
+
+def test_reference_coverage_gap_shortcuts_rehearse_the_promotion_before_release_plan():
+    """Both REFERENCE.md shortcuts after promote-to: push, rehearse dev on that commit, release-plan, release."""
+    ref = (SHARED / "examples/dev_to_prod/REFERENCE.md").read_text()
+    stop = next(line for line in ref.splitlines() if "Stops at `coverage-gate` or `audit-rulebook`" in line)
+    then = next(line for line in ref.splitlines() if line.startswith("- Then `make rehearse ENV=dev`"))
+    for line in (stop, then):
+        assert _in_order(line, ["promote-to", "push to `origin/main`", "`make rehearse ENV=dev`",
+                                "`make release-plan ENV=prod`", "`make release ENV=prod`"]), line
+
+
+def test_deterministic_docs_rehearse_the_promotion_commit_before_release_plan():
+    for path, start in (("access.md", "`make promote-to ENV=prod` (seeds prod's"),
+                        ("playbooks/agents.md", "in the same PR. Then PR"),
+                        ("playbooks/governance.md", "promoted from. Then generate"),
+                        ("playbooks/governance.md", "`make promote-to ENV=prod` in the same PR. Then merge"),
+                        ("design/deterministic-governance.md", "Approve and merge the promotion PR")):
+        text = " ".join((SHARED / "docs" / path).read_text().split())
+        after = text[text.index(start):][:300]
+        assert _in_order(after, ["rehearse", "release-plan", "release"]), (path, start)

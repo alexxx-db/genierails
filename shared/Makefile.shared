@@ -351,7 +351,9 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
 		if [ "$$det" = 1 ]; then \
-			echo "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=dev (release-plan needs it), then:"; \
+			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+			[ -n "$$src" ] || src=dev; \
+			echo "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
 			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
 			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \
