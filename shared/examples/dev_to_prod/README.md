@@ -24,6 +24,7 @@ make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
 git add envs/ && git commit -m "Promote the rules to prod" && git push
 make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't run it)
+make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks
 make maintain ENV=prod      # run on a schedule
@@ -122,21 +123,23 @@ Then:
 make promote-to ENV=prod
 ```
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
-Commit and push the promoted files.
+Commit and push the promoted files to `main` (`git add envs/`, commit, `git push`).
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 
-**3. Check, plan, release.** Check the committed files, plan and review the manifest, then apply exactly what was approved:
+**3. Check, rehearse, plan, release.** Check the committed files, rehearse dev on the promotion commit, plan and review the manifest, then apply exactly what was approved:
 ```bash
 make check ENV=prod
+make rehearse ENV=dev
 make release-plan ENV=prod
 make release ENV=prod
 ```
+`make release-plan ENV=prod` plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit; the dev step 6 rehearsal was of an earlier commit. Otherwise it stops with `no passing rehearsal of <commit>`. Since the promotion changed only `envs/prod/`, this rehearse doesn't apply anything in dev again. It prints `code and dev inputs are unchanged since the passing rehearsal of <earlier commit>; wrote a receipt for <this commit> without re-applying` and the `promote-to ENV=prod digest` it recorded. If code or `envs/dev/` changed since, it runs the full rehearsal. Rehearse again after any later commit, before its `release-plan`.
 `make check ENV=prod` also runs `promote-to CHECK=1`. `make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
 **Pass looks like:** `ALL EFFECTIVE` (from its `verify-access` gate) and "Release complete". Business users can now open the agent and get masked answers. To re-run only that proof later: `make verify-access ENV=prod`.
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
-- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make check ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make check ENV=prod`, `make release-plan ENV=prod` and `make release ENV=prod`, committing after each step that changes `envs/`.
+- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make check ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make check ENV=prod`, `make rehearse ENV=dev` (again, on the promotion commit), `make release-plan ENV=prod` and `make release ENV=prod`, committing and pushing after each step that changes `envs/`.
 - **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Applying a custom mask in governance (`make adopt-custom-mask`) is not on `main` yet. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
 
 Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-gap-found-in-prod).

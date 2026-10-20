@@ -542,6 +542,9 @@ def test_the_coverage_gap_fix_points_deterministic_envs_at_tag_treatments(tmp_pa
     assert "envs/dev/env.auto.tfvars; shared/ is product code" in text
     assert "make scaffold-treatments ENV=prod TREATMENT=<mask-library treatment>" in text
     assert "make promote-to ENV=prod" in text
+    # The promotion is a new commit: push it and rehearse dev on it before release-plan.
+    after_promote = text[text.index("make promote-to ENV=prod"):]
+    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
     assert "shared/treatment_config.json" not in text
 
 

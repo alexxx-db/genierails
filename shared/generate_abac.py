@@ -8624,6 +8624,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 out_dir.resolve(), args.mode, WORK_DIR.name,
                 has_sql=bool(sql_block), champion_flow=champion_flow,
                 tuning=not deterministic_mode,
+                source_env=str(auth_cfg.get("promote_from") or "dev"),
             ):
                 print(line)
     print("=" * 60)
@@ -8631,11 +8632,12 @@ Before you apply, tune for your business roles, security requirements, and Genie
 
 def generate_next_steps(
     out_dir: Path, mode: str, env_name: str, *, has_sql: bool, champion_flow: bool,
-    tuning: bool = True,
+    tuning: bool = True, source_env: str = "dev",
 ) -> list[str]:
     """Next steps printed after a full (non --space, non --promote) generate.
 
     ``tuning`` is false for a deterministic draft, which has no TUNING.md.
+    ``source_env`` is the env a deterministic prod is promoted from (its promote_from).
     Deterministic and walkthrough envs follow the walkthrough; legacy envs keep
     validate-generated then apply / apply-governance / apply-genie.
     """
@@ -8645,7 +8647,9 @@ def generate_next_steps(
         # make check reads only committed env files, and a rehearse or
         # release-plan needs a clean checkout. Rehearse already runs
         # validate-generated + apply; prod never rehearses (the Makefile
-        # refuses). A deterministic prod releases the manifest release-plan wrote.
+        # refuses). A deterministic prod releases the manifest release-plan wrote,
+        # and release-plan plans only a commit on origin/main with a passing
+        # rehearsal of the source env at that same commit.
         lines = ["  Next steps:", "    1. Review the draft:"]
         if has_sql:
             lines.append(f"       {out_dir}/masking_functions.sql")
@@ -8658,7 +8662,12 @@ def generate_next_steps(
         elif tuning:
             lines.append(f"    3. make release ENV={env_name}")
         else:
-            lines += [f"    3. make release-plan ENV={env_name}", f"    4. make release ENV={env_name}"]
+            lines += [
+                "    3. git push (or merge the PR) so the commit is on origin/main; on that commit:",
+                f"       make rehearse ENV={source_env}   (release-plan needs a rehearsal of this exact commit)",
+                f"    4. make release-plan ENV={env_name}",
+                f"    5. make release ENV={env_name}",
+            ]
         return lines
     env_suffix = f" ENV={env_name}" if env_name != "dev" else ""
     lines = [

@@ -303,7 +303,10 @@ def deterministic_fix_lines(env_name: str, env_dir: Path, source: str, rerun: st
     ]
     if owner != env_name:
         lines.append(f"       then commit envs/{owner}/env.auto.tfvars, make rehearse ENV={owner}, "
-                     f"make promote-to ENV={env_name}, {rerun}")
+                     f"make promote-to ENV={env_name}")
+        # release-plan needs HEAD on origin/main and a source rehearsal of that same commit.
+        lines.append(f"       then commit and push envs/{env_name}/, make rehearse ENV={owner} "
+                     f"again on that commit, {rerun}")
     else:
         lines.append(f"       then make generate ENV={env_name} and {rerun}; commit envs/{env_name}/")
     return lines

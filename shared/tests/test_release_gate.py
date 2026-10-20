@@ -229,6 +229,22 @@ def test_provenance_refuses_a_stale_receipt(repo):
         rg.provenance(repo.prod, "prod")
 
 
+def test_the_promotion_commit_needs_its_own_dev_rehearse_which_reuses_the_apply(repo):
+    """Walkthrough Prod step 3: rehearse dev on the promotion commit before release-plan."""
+    first = rehearse(repo)
+    promoted = repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"},
+                           message="Promote the rules to prod")
+    with pytest.raises(rg.Refused, match=f"no passing rehearsal of {promoted[:12]}"):
+        rg.provenance(repo.prod, "prod")
+    # Only envs/prod changed: dev isn't applied again, the receipt records the new promote-to digest.
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "reused"
+    receipt = rg.passing_receipt(repo.cloud, "dev", promoted)
+    assert receipt["applied"] is False and receipt["reused_from"] == first["commit"]
+    assert receipt["targets"]["prod"]["digest"] == rg.generated_digest(repo.prod / "generated")
+    assert receipt["targets"]["prod"]["digest"] != first["targets"]["prod"]["digest"]
+    assert rg.provenance(repo.prod, "prod")["commit"] == promoted
+
+
 def test_provenance_refuses_a_failed_rehearsal(repo):
     rehearse(repo, "failed")
     with pytest.raises(rg.Refused, match="no passing rehearsal of"):

@@ -151,13 +151,15 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "envs/prod/auth.auto.tfvars",
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
-        "  5. Run: make release-plan ENV=prod",
+        "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=dev",
+        "     make release-plan ENV=prod   (checks the commit was rehearsed",
         "Get that manifest approved, then: make release ENV=prod\n",
         "make maintain ENV=prod",
     ]
     positions = [out.index(step) for step in order]
     assert positions == sorted(positions)
-    assert "make rehearse" not in out
+    # release-plan needs a dev rehearsal of the promotion commit; prod itself never rehearses.
+    assert "make rehearse ENV=prod" not in out
     assert "make generate" not in out
     assert "deployer_principal_id" in out
     assert "VERIFY_KEY_COLUMN" not in out
