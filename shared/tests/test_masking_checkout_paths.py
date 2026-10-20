@@ -315,25 +315,33 @@ def _legacy_state(tmp_path: Path) -> tuple[Layer, Path]:
     return Layer(tmp_path, checkout(tmp_path, "checkout-b", real_deployer=True), state, log), log
 
 
-def test_a_direct_destroy_of_unmigrated_state_drops_from_the_new_checkout(tmp_path):
-    """Review B3: the old checkout's script and files are gone; this checkout's are found in their place."""
+def test_a_direct_destroy_of_unmigrated_state_refuses_until_an_apply_records_its_identity(tmp_path):
+    """Review B3: the old checkout's files are gone and state has no sql_hash to check a stand-in by."""
     new, log = _legacy_state(tmp_path)
+    result = new.run("destroy", "-auto-approve")
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "which no longer exists, and no sql_hash" in output and "Run make apply once" in output
+    assert "nothing was dropped" in output
+    assert _calls(log) == []
+    # The apply the message asks for re-keys the drop; the destroy then drops this checkout's.
+    new.apply()
+    log.unlink()
     result = new.run("destroy", "-auto-approve")
     assert result.returncode == 0, result.stdout + result.stderr
     assert _calls(log) == [{"step": "auth", "auth_file": str(new.env_dir / "auth.auto.tfvars")},
                            {"step": "drop", "sql_file": str(new.env_dir / "masking_functions.sql")}]
-    assert "is gone; using" in result.stdout
 
 
-def test_a_direct_destroy_of_unmigrated_state_refuses_when_nothing_is_in_its_place(tmp_path):
+def test_a_direct_destroy_of_unmigrated_state_never_drops_another_checkouts_dev(tmp_path):
+    """Review r2 B1: a dev checkout whose SQL is another catalog's sits where the gone one was."""
     new, log = _legacy_state(tmp_path)
-    # Not the SQL: the destroy's refresh of its hash already fails without it.
-    (new.env_dir / "auth.auto.tfvars").unlink()
+    write_env(new.env_dir, SQL.replace("cat.sch", "wrongcat.sch"))
     result = new.run("destroy", "-auto-approve")
     output = result.stdout + result.stderr
     assert result.returncode != 0
-    assert "which no longer exists" in output and "nothing was dropped" in output
-    assert _calls(log) == []
+    assert "no sql_hash" in output and "nothing was dropped" in output
+    assert _calls(log) == []  # no credentials loaded, wrongcat.sch's functions untouched
 
 
 def test_the_runner_exports_the_base_dir_the_root_records_against():
@@ -391,6 +399,28 @@ def test_a_gone_absolute_path_relocates_only_to_the_same_place_or_refuses(tmp_pa
             _resolve(f"{gone}/envs/dev/data_access/masking_functions.sql",
                      f"{gone}/envs/dev/data_access/auth.auto.tfvars", str(base))
     assert "nothing was dropped" in capsys.readouterr().err
+
+
+def test_a_gone_absolute_path_without_a_recorded_hash_is_never_relocated(tmp_path, capsys):
+    """Review r2 B1: the same place in another dev checkout may hold another env's SQL."""
+    env = tmp_path / "envs" / "dev"
+    write_env(env / "data_access", SQL.replace("cat.sch", "wrongcat.sch"))
+    with pytest.raises(SystemExit):
+        _resolve("/gone/checkout/shared/envs/dev/data_access/masking_functions.sql",
+                 "/gone/checkout/shared/envs/dev/data_access/auth.auto.tfvars", str(env), expect_sql_hash="")
+    assert "no sql_hash" in capsys.readouterr().err
+
+
+def test_a_relocation_through_a_symlink_out_of_the_base_dir_refuses(tmp_path, capsys):
+    """Review r2 B1: data_access under the env dir links elsewhere; lexically it is under it."""
+    env, outside = tmp_path / "envs" / "dev", tmp_path / "outside" / "dev"
+    write_env(outside / "data_access", SQL)
+    env.mkdir(parents=True)
+    (env / "data_access").symlink_to(outside / "data_access", target_is_directory=True)
+    with pytest.raises(SystemExit):
+        _resolve("/gone/checkout/shared/envs/dev/data_access/masking_functions.sql",
+                 "/gone/checkout/shared/envs/dev/data_access/auth.auto.tfvars", str(env))
+    assert "which no longer exists" in capsys.readouterr().err
 
 
 def test_the_identity_check_passes_this_envs_sql_and_refuses_any_other(tmp_path, capsys):

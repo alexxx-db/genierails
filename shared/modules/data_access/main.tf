@@ -558,8 +558,11 @@ resource "terraform_data" "masking_functions" {
 # resolved and refuses, before it connects, when that is another env's (a
 # wrong GENIERAILS_MASKING_BASE_DIR) or the file changed since the last apply.
 # State from before this recorded absolute paths and no hash: the drop runs
-# this checkout's script, and a path that is gone is found by its place under
-# the old shared/ (the old script's dir) or the env dir, or the drop refuses.
+# this checkout's script with them while they exist. Once they are gone it
+# refuses until an apply from this checkout re-keys the drop (relative paths
+# and sql_hash): a file in their place could be another env's SQL. An absolute
+# path recorded with sql_hash is found by its place under the old shared/ (the
+# old script's dir) or the env dir, and the hash then checked.
 resource "terraform_data" "masking_functions_drop" {
   input = {
     sql_file     = local.masking_drop_files.sql_file

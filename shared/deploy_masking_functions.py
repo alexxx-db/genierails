@@ -14,9 +14,11 @@ Usage:
 terraform_data.masking_functions_drop records --sql-file and --auth-file
 relative to the env dir, so its destroy-time drop passes --base-dir (the
 GENIERAILS_MASKING_BASE_DIR terraform_layer.sh exports) and runs from any
-checkout. Absolute paths are used as given while they exist; one an older
-state recorded under a checkout that is gone is looked up at the same place
-under this shared/ (--relocate-from names the old one) or the env dir.
+checkout. Absolute paths are used as given while they exist; one recorded
+under a checkout that is gone is looked up at the same place under this
+shared/ (--relocate-from names the old one) or the env dir, but only when
+state records the sql_hash that identifies it. Older state without one
+refuses until an apply from this checkout re-keys it.
 --expect-sql-hash is the normalized SQL hash the last apply recorded: the
 drop hashes the SQL it resolved and refuses, before it connects, on a
 mismatch (another env's SQL, or a file changed since the apply).
@@ -408,8 +410,10 @@ def _refuse(problem: str) -> None:
     sys.exit(1)
 
 
-def _under(path: str, base: str) -> bool:
-    return os.path.commonpath([os.path.abspath(path), os.path.abspath(base)]) == os.path.abspath(base)
+def _under(path: str, base: str, resolve=os.path.realpath) -> bool:
+    """Whether path is under base, symlinks resolved (abspath for a path that is gone)."""
+    path, base = resolve(path), resolve(base)
+    return os.path.commonpath([path, base]) == base
 
 
 def _relocated(path: str, args):
@@ -419,17 +423,19 @@ def _relocated(path: str, args):
     same file is at the same place under this script's shared/ (when it was
     under the old one, --relocate-from) or, by its last two parts
     (data_access/<file>), under the env dir when the dir above those is named
-    like it (the env). With a --base-dir, only a place under it counts.
+    like it (the env). A place counts only if, symlinks resolved, it is still
+    under the dir it was found in and under --base-dir when one is given.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = []
-    if args.relocate_from and _under(path, args.relocate_from):
-        candidates.append(os.path.join(here, os.path.relpath(path, args.relocate_from)))
+    if args.relocate_from and _under(path, args.relocate_from, os.path.abspath):
+        candidates.append((os.path.join(here, os.path.relpath(path, args.relocate_from)), here))
     parts = os.path.normpath(path).split(os.sep)
     if args.base_dir and len(parts) > 3 and parts[-3] == os.path.basename(os.path.normpath(args.base_dir)):
-        candidates.append(os.path.join(args.base_dir, *parts[-2:]))
-    for candidate in candidates:
-        if os.path.isfile(candidate) and (not args.base_dir or _under(candidate, args.base_dir)):
+        candidates.append((os.path.join(args.base_dir, *parts[-2:]), args.base_dir))
+    for candidate, anchor in candidates:
+        if (os.path.isfile(candidate) and _under(candidate, anchor)
+                and (not args.base_dir or _under(candidate, args.base_dir))):
             return candidate
     return None
 
@@ -440,7 +446,9 @@ def resolve_paths(args) -> None:
     Relative paths resolve against --base-dir (given but empty refuses), and
     only with a recorded --expect-sql-hash, which is what tells this env's
     SQL from another's there. An absolute path that is gone is relocated
-    (_relocated) or refuses.
+    (_relocated) only with a recorded --expect-sql-hash, for the same reason:
+    another checkout's file at the same place may be another env's SQL.
+    Otherwise it refuses.
     """
     base_dir = getattr(args, "base_dir", None)
     for key in ("sql_file", "auth_file"):
@@ -462,6 +470,14 @@ def resolve_paths(args) -> None:
                 )
             setattr(args, key, os.path.join(base_dir, path))
         elif not os.path.exists(path) and getattr(args, "drop", False):
+            if not getattr(args, "expect_sql_hash", ""):
+                _refuse(
+                    f"masking_functions_drop records {path}, which no longer exists, and no "
+                    "sql_hash, so the drop can't tell whether a file in its place in this "
+                    "checkout is the SQL it deployed. Run make apply once from this checkout "
+                    "(it re-keys masking_functions_drop to relative paths and records "
+                    "sql_hash; see docs/deterministic-policies.md), then destroy"
+                )
             moved = _relocated(path, args)
             if moved is None:
                 _refuse(
