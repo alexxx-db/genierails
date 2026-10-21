@@ -353,8 +353,10 @@ def test_scheduled_job_hcl_parses_with_read_only_default():
 ])
 def test_legacy_coverage_docs_require_treatment_upgrade_before_enablement(path):
     text = " ".join(path.read_text().split())
-    assert ("must run `make generate ENV=<env>` and then `make apply ENV=<env>` "
-            "(review the plan as usual) to add `gr_treatment` tags") in text
+    assert ("must run `make generate ENV=<env>`, then `make validate-generated ENV=<env>` "
+            "and `make plan ENV=<env>`") in text
+    assert ("Expect existing legacy mask policies to be replaced by `gr_mask_*` ones; "
+            "review the plan, then run `make apply ENV=<env>` to add `gr_treatment` tags") in text
     assert "`classified but unprotected ... no gr_treatment`" in text
 
 
