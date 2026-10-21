@@ -1046,9 +1046,14 @@ override _ENV_LOCK = trap '$(_NO_SIGNALS); $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR
 # Removed, not aliased: certify used to stop before granting access, so a
 # pipeline running certify -> approval -> release must not grant at certify.
 certify:
-	@echo "make certify was removed; run make release ENV=$(or $(ENV),<env>) (it runs the coverage check, audit and verification, then grants access)." >&2
-	@echo "  To review before granting, run make plan ENV=$(or $(ENV),<env>) and gate make release behind your approval step." >&2
-	@exit 1
+	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+		echo "make certify was removed; ENV=$(ENV) is deterministic: $$($(_RELEASE_STEPS) --env-dir "$(ENV_DIR)" --env "$(ENV)")." >&2; \
+		echo "  To review before granting, approve the manifest make release-plan ENV=$(ENV) writes (it grants nothing) and gate make release behind your approval step." >&2; \
+	else \
+		echo "make certify was removed; run make release ENV=$(or $(ENV),<env>) (it runs the coverage check, audit and verification, then grants access)." >&2; \
+		echo "  To review before granting, run make plan ENV=$(or $(ENV),<env>) and gate make release behind your approval step." >&2; \
+	fi; \
+	exit 1
 
 release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove coverage, audit, apply all layers, and verify access (deterministic envs: the current manifest from make release-plan; MANIFEST=<path> to name one)
 	@$(_GUARD_WORKSPACE_ENV); \
@@ -1063,7 +1068,6 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	$(_GROUP_CHECK) "make release" || exit 1; \
 	$(_AGENT_OWNERSHIP) check-deletes --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
-	if [ "$$mode" = deterministic ]; then python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)" || exit 1; fi; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" check --env-dir "$(ENV_DIR)" --mode "$$mode" --ack "$(ACK_UNCLASSIFIED)" || exit 1; \
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
@@ -1115,11 +1119,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	$(_AGENT_OWNERSHIP) receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 	echo ""; \
 	echo "=== Release complete ($(ENV)) ==="; \
-	if [ "$$mode" = deterministic ]; then \
-		$(_RELEASE_HELPER) access-summary "$(ENV_DIR)"; \
-	else \
-		echo "  Business access: applied (granted only after the coverage check passed)"; \
-	fi; \
+	echo "  Business access: applied (granted only after the coverage check passed)"; \
 	echo "  Verification:  make verify-access ENV=$(ENV) passed"; \
 	echo "  Steady state:  make maintain ENV=$(ENV)"
 
@@ -1198,10 +1198,14 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	echo "    make release ENV=$(ENV)"; \
 	echo "  A pipeline names it explicitly: make release ENV=$(ENV) MANIFEST=$$manifest"
 
+# 1 when the saved data_access phases include a grant step with changes.
+override _SAVED_GRANT_CHANGES = python3 -c 'import json,sys; print(int(any(s.get("phase") == "grant" and s.get("changes") for s in json.load(open(sys.argv[1]))["steps"])))'
 # Saves one plan per root into PLAN_DIR for release-plan. The account plan must
 # be empty (only make apply-account changes the account layer). data_access is
 # planned by the staged policy controller; a staged policy change saves only
-# its next changing phase, and the workspace is planned with the last one.
+# its next changing phase, and the workspace is planned with the last one;
+# when that phase's grant opens SELECT the agent coverage check still lacks,
+# the workspace waits for the next release-plan (CAN_RUN only after SELECT).
 _release-plan-roots:
 	@set -e; $(_DRY_RUN_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
 	echo "=== Saved plan (account) ==="; \
@@ -1240,7 +1244,12 @@ _release-plan-roots:
 		echo "=== Saved plan (workspace:$(ENV)) ==="; \
 		$(_AGENT_OWNERSHIP) guard-removals --env-dir "$(ENV_DIR)" --env "$(ENV)"; \
 		$(_GENIE_ID_FILE_CHECK); \
-		$(_AGENT_COVERAGE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" || true; \
+		agents_rc=0; $(_AGENT_COVERAGE) run --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)" --strict || agents_rc=$$?; \
+		if [ $$agents_rc -eq 1 ] && [ "$$($(_SAVED_GRANT_CHANGES) "$$plan_dir/data_access/phases.json")" = 1 ]; then \
+			echo '{"skipped": "deferred: the saved grant phase opens SELECT first; the next release-plan plans the workspace with it live"}' > "$$plan_dir/workspace.json"; \
+			echo "  The agent coverage check fails until the saved grant phase is applied: the workspace is planned once its SELECT is live (the next release-plan)."; \
+			exit 0; \
+		fi; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
 		python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --arm --quiet; \
 		set +e; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"; status=$$?; set -e; \
@@ -1281,7 +1290,8 @@ _release-manifest: _guard-not-ci-apply
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
-	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_REQUIRE_MASK_PROOF) || exit 1; \
+	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
+	$(_REQUIRE_MASK_PROOF) || exit 1; \
 	imports="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field imports.count)" || exit 1; \
 	if [ "$$imports" != 0 ] && [ "$$imports" != null ]; then \
 		echo "=== Import existing resources ($(ENV)): the manifest's recorded imports and stale-tag cleanups ==="; \
@@ -1313,6 +1323,15 @@ _release-manifest: _guard-not-ci-apply
 	if [ $$staged_rc -ne 0 ]; then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the saved data_access plans failed"; \
 		exit 1; \
+	fi; \
+	ws_skipped="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.skipped)" || exit 1; \
+	if [ "$${ws_skipped#deferred:}" != "$$ws_skipped" ]; then \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		echo ""; \
+		echo "=== Release phase applied ($(ENV)) ==="; \
+		echo "  This manifest opened the SELECT the Genie agents need; the workspace (CAN_RUN) is planned with it live."; \
+		echo "  Next: make release-plan ENV=$(ENV), approve the new manifest, make release ENV=$(ENV)."; \
+		exit 0; \
 	fi; \
 	ws_file="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.file)"; \
 	ws_changes="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.changes)"; \

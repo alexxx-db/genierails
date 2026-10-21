@@ -315,8 +315,12 @@ runs `apply-saved`, which applies exactly those saved plans
 verifications. It refuses when the journal, the generated config or a stage's
 render moved since the plan. A change that replaces policies or moves tiers
 is therefore one manifest and approval per changing phase; a release with no
-policy change is one manifest. A failed tighten or switch still restores the
-previous protection at once.
+policy change is one manifest. The workspace (Genie CAN_RUN) is planned with
+the last phase, except when that phase's `grant` opens `SELECT` the live agent
+coverage check still lacks (a first release): then the workspace waits for one
+more manifest, planned once that `SELECT` is live, so CAN_RUN never opens before
+its masks and `SELECT`. A failed tighten or switch still restores the previous
+protection at once.
 
 Hook environment (also `GENIERAILS_POLICY_PLAN_OUT`, `GENIERAILS_POLICY_PLAN_BASIS`
 and `GENIERAILS_POLICY_SAVED_PLAN` for the saved-plan modes; see
