@@ -158,16 +158,26 @@ def changed_fields(before: Any, after: Any, prefix: str = "") -> list[str]:
 # ── Workspace access ─────────────────────────────────────────────────────────
 
 def _api(env_dir: Path):
-    """The workspace API client from the env's auth.auto.tfvars (or the SDK's defaults)."""
+    """The workspace API client pinned to the env's auth.auto.tfvars."""
     from databricks.sdk import WorkspaceClient
+    from databricks.sdk.config import Config
+    from scripts.auth_configured import auth_configured
 
-    auth = agent_files._load_hcl(env_dir / "auth.auto.tfvars")
-    kwargs = {}
-    for source, target in (("databricks_workspace_host", "host"), ("databricks_client_id", "client_id"),
-                           ("databricks_client_secret", "client_secret")):
-        if auth.get(source):
-            kwargs[target] = auth[source]
-    return WorkspaceClient(**kwargs).api_client
+    auth_path = env_dir / "auth.auto.tfvars"
+    if not auth_configured(auth_path):
+        raise AgentError(
+            f"fill in {auth_path} (workspace host, client ID, and client secret) before reading a Genie agent"
+        )
+    auth = agent_files._load_hcl(auth_path)
+    config = Config(
+        host=auth["databricks_workspace_host"],
+        client_id=auth["databricks_client_id"],
+        client_secret=auth["databricks_client_secret"],
+        auth_type="oauth-m2m",
+        product="genierails",
+        product_version="0.1.0",
+    )
+    return WorkspaceClient(config=config).api_client
 
 
 def _get_space(api, space_id: str) -> dict:

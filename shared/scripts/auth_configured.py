@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exit successfully when workspace host and client ID are non-placeholder values."""
+"""Exit successfully when workspace OAuth M2M credentials are non-placeholder values."""
 
 import sys
 from pathlib import Path
@@ -20,12 +20,14 @@ def auth_configured(path: Path) -> bool:
         value = str(config.get(name, "") or "").strip()
         normalized = value.lower().replace("-", "_").replace(" ", "_")
         placeholders = ("placeholder", "change_me", "changeme", "your_client_id",
-                        "your_workspace_host")
+                        "your_client_secret", "your_workspace_host")
         return bool(value) and "<" not in value and ">" not in value and not any(
             marker in normalized for marker in placeholders
         )
 
-    return configured("databricks_client_id") and configured("databricks_workspace_host")
+    return all(configured(name) for name in (
+        "databricks_workspace_host", "databricks_client_id", "databricks_client_secret"
+    ))
 
 
 if __name__ == "__main__":

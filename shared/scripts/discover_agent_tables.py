@@ -101,7 +101,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not auth_configured(auth_path):
             print(
-                f"ERROR: fill in envs/{env_dir.name}/auth.auto.tfvars before discovering agent tables",
+                f"ERROR: fill in envs/{env_dir.name}/auth.auto.tfvars "
+                "(workspace host, client ID, and client secret) before discovering agent tables",
                 file=sys.stderr,
             )
             return 1

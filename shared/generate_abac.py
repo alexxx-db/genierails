@@ -6163,6 +6163,7 @@ def list_account_group_names(auth_cfg: dict) -> list[str] | None:
             account_id=account_id,
             client_id=client_id,
             client_secret=client_secret,
+            auth_type="oauth-m2m",
         )
         return [g.display_name for g in ac.groups.list() if g.display_name]
     except Exception as e:
@@ -7109,7 +7110,10 @@ def main():
     auth_file = Path(args.auth_file)
     from scripts.auth_configured import auth_configured
     if not auth_configured(auth_file):
-        print(f"ERROR: fill in {auth_file} before running generate", file=sys.stderr)
+        print(
+            f"ERROR: fill in {auth_file} (workspace host, client ID, and client secret) before running generate",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # ── Delta mode: incremental schema-drift classification ─────────────
