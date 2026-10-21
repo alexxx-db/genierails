@@ -377,7 +377,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		if [ "$$det" = 1 ]; then \
 			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 			[ -n "$$src" ] || src=dev; \
-			echo "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
+			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
 			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
 			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \

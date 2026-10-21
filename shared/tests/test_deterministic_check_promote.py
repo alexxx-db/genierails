@@ -144,6 +144,7 @@ def repo(tmp_path):
     (bin_dir / "terraform").chmod(0o755)
     result = _make(repo, tmp_path, "promote", "ENV=dev")
     assert result.returncode == 0, result.stdout + result.stderr
+    # The rest of what make generate writes (_write_generated stands in for it).
     subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
                     "--env-dir", str(dev), "--config", str(dev / "generated" / "abac.auto.tfvars")], check=True)
     _git(repo, "init", "-q")
@@ -161,8 +162,9 @@ def _promote_to_prod(repo, tmp_path, env_text=None, deployer=DEPLOYER):
     result = _make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
-    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
-                    "--env-dir", str(prod), "--config", str(prod / "generated" / "abac.auto.tfvars")], check=True)
+    # Inline agents: promote-to writes no governed-tables record (as before agent files),
+    # and make check ENV=prod expects none.
+    assert not (prod / "generated" / "governed_tables.json").exists()
     _commit(repo, "promote")
     return repo
 
@@ -485,7 +487,79 @@ def _assert_check_and_promote_check_pass(repo, tmp_path, ci):
 
 @pytest.mark.parametrize("ci", ["", "true"])
 def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, ci):
+    """An inline-agent promotion commits no governed-tables record, and check expects none."""
     _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+    assert not (_envs(promoted) / "prod" / "generated" / "governed_tables.json").exists()
+
+
+def _commit_prod_record(repo, record, message):
+    (_envs(repo) / "prod" / "generated" / "governed_tables.json").write_text(json.dumps(record, indent=2) + "\n")
+    _commit(repo, message)
+
+
+def _stale_prod_record(repo):
+    """A record from when Payments was in an agents/ file; its agents are inline now."""
+    _commit_prod_record(repo, {"tables": ["ppay.s.t"], "agent_tables": {"Payments": ["ppay.s.t"]}},
+                        "prod's record is stale")
+
+
+def _tampered_prod_record(repo):
+    """A hand edit: the governed set out of order, one table twice."""
+    _commit_prod_record(repo, {"tables": ["ppay.s.u", "ppay.s.t", "PPAY.S.T"]}, "prod's record edited by hand")
+
+
+def _added_prod_record(repo):
+    """A record added by hand, not as a regeneration writes it."""
+    (_envs(repo) / "prod" / "generated" / "governed_tables.json").write_text('{"tables": ["ppay.s.t"]}')
+    _commit(repo, "prod's record added by hand")
+
+
+STALE_RECORDS = {"added": _added_prod_record, "stale": _stale_prod_record, "tampered": _tampered_prod_record}
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+@pytest.mark.parametrize("case", sorted(STALE_RECORDS))
+def test_check_prod_names_promote_to_when_the_governed_tables_record_is_stale(promoted, tmp_path, case, ci):
+    """An inline-agent promotion writes no record, but a committed one is checked, and promote-to fixes it."""
+    STALE_RECORDS[case](promoted)
+    extra = {"CI": ci} if ci else {}
+
+    check = _make(promoted, tmp_path, "check", "ENV=prod", **extra)
+
+    out = check.stdout + check.stderr
+    assert check.returncode != 0, out
+    assert "governed_tables.json" in out, out
+    assert "Run make promote-to ENV=prod" in out, out
+    assert "make generate ENV=prod" not in out, out
+    assert "OK: generated files (envs/prod): committed files match." not in out, out
+
+    result = _make(promoted, tmp_path, "promote-to", "ENV=prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    _commit(promoted, "re-promote")
+    _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+
+
+@pytest.mark.parametrize("case", sorted(STALE_RECORDS))
+def test_checks_same_env_step_names_promote_to_for_a_promoted_env(promoted, tmp_path, monkeypatch, capsys, case):
+    """The same-env regeneration's hint, past promote-to CHECK=1 (which catches the same gap first)."""
+    from scripts import check_env
+
+    STALE_RECORDS[case](promoted)
+    for key, value in _env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    for key in ("CI", "MAKEFLAGS", "MAKELEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(check_env, "_promote_check", lambda args: None)
+
+    code = check_env.main(["check", "--env", "prod", "--cloud-dir", str(promoted / "aws"),
+                           "--makefile", str(promoted / "aws" / "Makefile")])
+
+    out = capsys.readouterr()
+    text = out.out + out.err
+    assert code == 1, text
+    assert "governed_tables.json" in text, text
+    assert "Run make promote-to ENV=prod on the latest main and commit the result." in text, text
+    assert "make generate ENV=prod" not in text, text
 
 
 def _policies(env_dir):

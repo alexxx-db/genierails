@@ -271,6 +271,39 @@ def test_the_promotion_commit_needs_its_own_dev_rehearse_which_reuses_the_apply(
     assert rg.provenance(repo.prod, "prod")["commit"] == promoted
 
 
+@pytest.mark.parametrize("rel, text", [
+    # make setup ENV=prod adds prod's lines to the cloud .gitignore.
+    ("aws/.gitignore", GITIGNORE + "/envs/prod/abac.auto.tfvars\n"),
+    ("shared/scratch.txt", "untracked\n"),
+    ("aws/notes.txt", "untracked\n"),
+])
+def test_a_reused_rehearsal_of_an_unclean_checkout_says_so_and_release_plan_names_why(repo, capsys, rel, text):
+    rehearse(repo)
+    promoted = repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"})
+    (repo.root / rel).write_text(text)
+    capsys.readouterr()
+
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "reused"
+
+    out = capsys.readouterr().out
+    assert "NOT a clean checkout; release-plan ignores this receipt" in out, out
+    assert "uncommitted: " in out and Path(rel).name in out, out
+    assert rg.passing_receipt(repo.cloud, "dev", promoted) is None
+    with pytest.raises(rg.Refused) as refused:
+        rg.provenance(repo.prod, "prod")
+    assert "a receipt exists but its checkout wasn't clean: uncommitted: " in str(refused.value)
+    assert Path(rel).name in str(refused.value).split("wasn't clean:")[1]
+
+
+def test_release_plan_does_not_blame_a_dirty_receipt_it_does_not_have(repo):
+    rehearse(repo)
+    repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"})
+    with pytest.raises(rg.Refused) as refused:
+        rg.provenance(repo.prod, "prod")
+    assert "no passing rehearsal of" in str(refused.value)
+    assert "wasn't clean" not in str(refused.value)
+
+
 def test_provenance_refuses_a_failed_rehearsal(repo):
     rehearse(repo, "failed")
     with pytest.raises(rg.Refused, match="no passing rehearsal of"):
