@@ -799,6 +799,20 @@ def test_describe_of_a_config_that_moved_on_points_at_abandon(harness, capsys):
     assert "(make policy-abandon ENV=dev, then re-run)" in capsys.readouterr().out
 
 
+def test_describe_of_a_change_abandon_would_refuse_points_at_resume_only(harness, capsys):
+    """A switch whose restore failed, then a config that moved on: make plan offers resume, not abandon."""
+    released(harness)
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    assert harness.apply(FAKE_TF_FAIL_APPLY="switch", FAKE_TF_FAIL_PLAN="restore") == 1
+    assert harness.journal()["transition"]["restore_failed"]
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "initials"}})
+    capsys.readouterr()
+    assert harness.controller().describe() == 0
+    out = capsys.readouterr().out
+    assert "a restore of the previous protection failed" in out
+    assert "policy-abandon" not in out and "refuses until this is resumed (re-run the same command at commit" in out
+
+
 def test_a_change_abandon_would_refuse_is_pointed_at_resume_only(harness):
     """A switch whose restore failed may have columns on either generation: abandon refuses it, so the
     mismatch refusal doesn't offer it."""

@@ -1142,7 +1142,9 @@ class Controller:
             print(self.describe_transition(t))
             if t["to"] != desired["fingerprint"]:
                 print("  The generated config has moved on: the next apply refuses until this is resumed or "
-                      f"abandoned (make policy-abandon ENV={self.env_name}, then re-run).")
+                      f"abandoned (make policy-abandon ENV={self.env_name}, then re-run)." if _may_abandon(t) else
+                      "  The generated config has moved on: the next apply refuses until this is resumed (re-run "
+                      f"the same command at commit {t['commit'] or '?'}).")
             return 0
         try:
             plan = self._new_transition(journal or self._adopt_preview(desired), desired)
@@ -1196,7 +1198,7 @@ class Controller:
         drift = (f"\n{len(moved)} column(s) have another treatment in the generated config than in generation "
                  f"{t['to']} ({', '.join(moved[:10])}): their live class.* tags changed since the change started, or "
                  "its treatment settings were edited." if moved else "")
-        if not t["switch_attempted"] or (t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t):
+        if _may_abandon(t):
             # Abandon re-checks a rolled-back switch live before it drops anything.
             step = f"run make policy-abandon ENV={self.env_name}, then re-run; or {resume}"
             if t["switch_attempted"]:
@@ -1271,6 +1273,11 @@ def _held_digest(t: dict, record: dict) -> str:
 
 # _restore_unproven's reason when the verified restore kept newly governed columns on the change's value.
 KEPT_NEW_COLUMNS = "keep the new generation's treatment"
+
+
+def _may_abandon(t: dict) -> bool:
+    """Whether abandon would take this transition up: it never switched, or the switch was a verified rollback."""
+    return not t["switch_attempted"] or bool(t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t)
 
 
 def _unabandonable(reason: str) -> str:
