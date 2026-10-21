@@ -8,13 +8,15 @@ first-time users. A diagnostic box is dropped only when its COMPLETE content
 is one of those two warnings (compared with colour codes, box glyphs and line
 wrapping removed). Any other box, including one with an error interleaved
 into it from merged stderr, is emitted verbatim, as is every line outside a
-box and an unterminated box at EOF.
+box and an unterminated box at EOF. The known missing-usage-policy error also
+gets a cloud-specific remediation hint after its unmodified diagnostic.
 
-Usage: terraform ... 2>&1 | python3 -u filter_target_warnings.py
+Usage: terraform ... 2>&1 | python3 -u filter_target_warnings.py --cloud aws
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from typing import Iterable, Iterator
@@ -43,27 +45,46 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _OPEN = "╷"
 _CLOSE = "╵"
 _BAR = "│"
+_USAGE_POLICY_ERROR = "Usage policy ID must not be empty"
+_USAGE_POLICY_DOCS = {
+    "aws": "https://docs.databricks.com/aws/en/admin/usage/budget-policies",
+    "azure": "https://learn.microsoft.com/en-us/azure/databricks/admin/usage/budget-policies",
+}
 
 
 def _plain(line: str) -> str:
     return _ANSI.sub("", line).strip()
 
 
-def _is_benign(inner: list[str]) -> bool:
-    """True only if every inner line is a box line and together they spell a known warning."""
+def _box_text(inner: list[str]) -> str | None:
+    """Return normalized box text, or None if an inner line is not a box line."""
     words: list[str] = []
     for line in inner:
         plain = _plain(line)
         if not plain.startswith(_BAR):
-            return False  # e.g. an error line interleaved from stderr
+            return None  # e.g. an error line interleaved from stderr
         words.extend(plain[len(_BAR):].split())
-    return " ".join(words) in BENIGN_TARGET_WARNINGS
+    return " ".join(words)
 
 
-def filter_lines(lines: Iterable[str], hide_outputs: bool = False) -> Iterator[str]:
+def _is_benign(inner: list[str]) -> bool:
+    """True only if the complete box spells a known target warning."""
+    return _box_text(inner) in BENIGN_TARGET_WARNINGS
+
+
+def _is_usage_policy_error(inner: list[str]) -> bool:
+    """True for a Terraform Error box containing the missing-policy signature."""
+    text = _box_text(inner)
+    return text is not None and text.startswith("Error:") and _USAGE_POLICY_ERROR in text
+
+
+def filter_lines(
+    lines: Iterable[str], hide_outputs: bool = False, cloud: str = "aws"
+) -> Iterator[str]:
     """Yield lines minus benign target warnings and, optionally, final outputs."""
     block: list[str] | None = None
     in_outputs = False
+    missing_usage_policy = False
     for line in lines:
         if hide_outputs and _plain(line) == "Outputs:":
             in_outputs = True
@@ -79,15 +100,27 @@ def filter_lines(lines: Iterable[str], hide_outputs: bool = False) -> Iterator[s
             continue
         block.append(line)
         if plain == _CLOSE:
-            if not _is_benign(block[1:-1]):
+            inner = block[1:-1]
+            if not _is_benign(inner):
                 yield from block
+            if _is_usage_policy_error(inner):
+                missing_usage_policy = True
             block = None
     if block:  # unterminated box at EOF: never swallow it
         yield from block
+    if missing_usage_policy:
+        yield (
+            "\nEnable classification in the UI, or create and attach a serverless "
+            f"usage policy: {_USAGE_POLICY_DOCS[cloud]}\n"
+        )
 
 
 def main() -> int:
-    for line in filter_lines(sys.stdin, hide_outputs="--verbose" not in sys.argv[1:]):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cloud", choices=sorted(_USAGE_POLICY_DOCS), default="aws")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+    for line in filter_lines(sys.stdin, hide_outputs=not args.verbose, cloud=args.cloud):
         sys.stdout.write(line)
         sys.stdout.flush()
     return 0
