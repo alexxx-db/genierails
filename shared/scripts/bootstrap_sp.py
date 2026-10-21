@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .auth_tfvars import render_auth_tfvars, write_auth_tfvars
+    from .auth_tfvars import preflight_auth_tfvars, render_auth_tfvars, write_auth_tfvars
 except ImportError:  # pragma: no cover - direct script execution
-    from auth_tfvars import render_auth_tfvars, write_auth_tfvars
+    from auth_tfvars import preflight_auth_tfvars, render_auth_tfvars, write_auth_tfvars
 
 
 MODEL_ENDPOINT = "databricks-claude-sonnet-4-6"
@@ -837,6 +837,8 @@ def bootstrap(
     )
     secret = None
     if created or cfg.rotate_secret or not existing_secrets:
+        if cfg.auth_file:
+            preflight_auth_tfvars(cfg.auth_file, force=cfg.force_auth_file)
         secret_response = account.service_principal_secrets.create(service_principal_id=int(sp_id))
         secret = str(_value(secret_response, "secret"))
         if cfg.auth_file:
@@ -852,6 +854,7 @@ def bootstrap(
                     client_secret=secret,
                     workspace_host=host,
                     workspace_id=workspace_id,
+                    existing=cfg.auth_file.read_text() if cfg.auth_file.exists() else "",
                 ),
                 force=cfg.force_auth_file,
             )
@@ -1016,6 +1019,11 @@ def bootstrap(
 
     emit("\nSummary: GenieRails deployer access is configured.")
     for workspace_id, host in workspace_summaries:
+        if cfg.auth_file and secret is not None:
+            emit(f"\nOAuth client credentials were written to {cfg.auth_file} for workspace {workspace_id}.")
+            emit("# envs/<env>/env.auto.tfvars (deterministic governance; committed, not secret)")
+            emit(f'deployer_principal_id = "{client_id}"')
+            continue
         if secret is None:
             shown_secret = "<existing-secret-not-retrievable>"
         else:

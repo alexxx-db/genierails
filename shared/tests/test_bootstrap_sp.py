@@ -32,6 +32,7 @@ from scripts.bootstrap_sp import (
     main,
     parser,
 )
+from scripts.auth_tfvars import ensure_template
 
 
 ROOT = Path(__file__).parents[2]
@@ -1388,6 +1389,21 @@ def _mode(path):
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def test_ensure_template_fchmod_overrides_restrictive_umask(tmp_path):
+    template = tmp_path / "template"
+    template.write_text('databricks_client_secret = ""\n')
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    previous_umask = os.umask(0o400)
+    try:
+        ensure_template(auth, template)
+    finally:
+        os.umask(previous_umask)
+        auth.parent.parent.chmod(0o700)
+        auth.parent.chmod(0o700)
+
+    assert _mode(auth) == 0o600
+
+
 def test_write_auth_file_writes_secret_private_without_printing_value(tmp_path):
     _account, _workspace, _workspace_factory, factory = _fake()
     auth = tmp_path / "envs/dev/auth.auto.tfvars"
@@ -1409,6 +1425,9 @@ def test_write_auth_file_writes_secret_private_without_printing_value(tmp_path):
     assert not any("super-secret" in line for line in output)
     assert "secret_id = secret-id" in output
     assert "expires_at = 2099-01-01T00:00:00Z" in output
+    assert any(f"credentials were written to {auth}" in line for line in output)
+    assert not any("newly-minted secret shown above" in line for line in output)
+    assert 'deployer_principal_id = "client-123"' in output
 
 
 def test_write_auth_file_tightens_existing_template_before_replace(tmp_path, capsys):
@@ -1437,6 +1456,7 @@ def test_write_auth_file_refuses_symlink(tmp_path):
         bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
 
     assert "super-secret" not in target.read_text()
+    account.service_principal_secrets.create.assert_not_called()
     account.api_client.do.assert_not_called()
 
 
@@ -1452,7 +1472,69 @@ def test_write_auth_file_refuses_filled_secret_without_force(tmp_path):
 
     assert "old-secret" in auth.read_text()
     assert "super-secret" not in auth.read_text()
+    account.service_principal_secrets.create.assert_not_called()
     account.api_client.do.assert_not_called()
+
+
+def test_write_auth_file_refuses_symlink_parent_before_minting(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    env_dir = tmp_path / "envs/dev"
+    env_dir.parent.mkdir()
+    env_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="is a symlink; refusing"):
+        bootstrap(
+            _cfg(auth_file=env_dir / "auth.auto.tfvars"),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+    account.service_principal_secrets.create.assert_not_called()
+
+
+def test_write_auth_file_preserves_azure_account_host_and_comments(tmp_path):
+    _account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        '# Azure account endpoint\n'
+        'databricks_account_host = "https://accounts.azuredatabricks.net"\n'
+        'databricks_client_secret = ""\n'
+        '# user-managed setting\n'
+        'custom_auth_setting = "keep-me"\n'
+    )
+    auth.chmod(0o600)
+
+    bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
+
+    text = auth.read_text()
+    assert '# Azure account endpoint\n' in text
+    assert 'databricks_account_host = "https://accounts.azuredatabricks.net"\n' in text
+    assert '# user-managed setting\ncustom_auth_setting = "keep-me"\n' in text
+
+
+@pytest.mark.parametrize(
+    "secret_line",
+    [
+        'databricks_client_secret = "old-secret"\r\n',
+        'databricks_client_secret = <<EOF\nold-secret\nEOF\n',
+    ],
+)
+def test_write_auth_file_refuses_nonempty_crlf_or_heredoc_secret_before_minting(
+    tmp_path, secret_line
+):
+    account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_bytes(secret_line.encode())
+    auth.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="client secret"):
+        bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
+
+    account.service_principal_secrets.create.assert_not_called()
 
 
 def test_write_auth_file_refusal_tightens_existing_filled_secret(tmp_path, capsys):

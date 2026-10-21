@@ -2050,7 +2050,7 @@ SP_NAME ?= genierails-deployer
 MODEL_ENDPOINT ?= databricks-claude-sonnet-4-6
 BOOTSTRAP_AUTH_ENV ?=
 $(if $(BOOTSTRAP_AUTH_ENV),$(call _check_env_name,BOOTSTRAP_AUTH_ENV))
-_BOOTSTRAP_SP_FLAGS = $(if $(filter 1,$(PLAN)),--dry-run,) $(if $(filter 1,$(YES)),--yes,) $(if $(filter 1,$(ROTATE_SECRET)),--rotate-secret,) $(if $(TARGET_CATALOG),--target-catalog "$(TARGET_CATALOG)",) $(if $(WORKSPACE_PROFILE),--workspace-profile "$(WORKSPACE_PROFILE)",) $(if $(BOOTSTRAP_AUTH_ENV),--write-auth-file "$(CLOUD_ROOT)/envs/$(BOOTSTRAP_AUTH_ENV)/auth.auto.tfvars",) $(if $(filter 1,$(BOOTSTRAP_AUTH_OVERWRITE)),--force-auth-file,)
+_BOOTSTRAP_SP_FLAGS = $(if $(filter 1,$(PLAN)),--dry-run,) $(if $(filter 1,$(YES)),--yes,) $(if $(filter 1,$(ROTATE_SECRET)),--rotate-secret,) $(if $(TARGET_CATALOG),--target-catalog "$(TARGET_CATALOG)",) $(if $(WORKSPACE_PROFILE),--workspace-profile "$(WORKSPACE_PROFILE)",) $(if $(BOOTSTRAP_AUTH_ENV),--write-auth-file "$(CLOUD_ROOT)/envs/$(BOOTSTRAP_AUTH_ENV)/auth.auto.tfvars",) $(if $(and $(filter command line,$(origin BOOTSTRAP_AUTH_OVERWRITE)),$(filter 1,$(BOOTSTRAP_AUTH_OVERWRITE))),--force-auth-file,)
 
 bootstrap-sp: ## Create/reuse and authorize the GenieRails deployment service principal
 	@test -n "$(ACCOUNT_ID)" || { echo "ERROR: ACCOUNT_ID is required"; exit 2; }
@@ -2473,6 +2473,7 @@ migrate-root-to-env: _prepare-env ## Move existing root working files into envs/
 	for file in auth.auto.tfvars env.auto.tfvars .genie_space_id .terraform.lock.hcl; do \
 		if [ -e "$(CLOUD_ROOT)/$$file" ]; then \
 			mv "$(CLOUD_ROOT)/$$file" "$(ENV_DIR)/$$file"; \
+			[ "$$file" != auth.auto.tfvars ] || chmod 0600 "$(ENV_DIR)/$$file"; \
 			echo "Moved $$file"; \
 			found=1; \
 		fi; \
@@ -2519,6 +2520,7 @@ migrate-root-to-env: _prepare-env ## Move existing root working files into envs/
 	fi; \
 	if [ ! -e "$(ENV_DIR)/auth.auto.tfvars" ] && [ ! -L "$(ENV_DIR)/auth.auto.tfvars" ]; then \
 		cp "$(SHARED_ROOT)/auth.auto.tfvars.example" "$(ENV_DIR)/auth.auto.tfvars"; \
+		chmod 0600 "$(ENV_DIR)/auth.auto.tfvars"; \
 	fi; \
 	if [ -L "$(ENV_DIR)/env.auto.tfvars" ] && [ ! -e "$(ENV_DIR)/env.auto.tfvars" ]; then \
 		echo "ERROR: $(ENV_DIR)/env.auto.tfvars is a dangling symlink; fix or remove it before migrating."; exit 1; \

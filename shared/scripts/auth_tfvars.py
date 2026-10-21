@@ -13,8 +13,9 @@ from pathlib import Path
 
 AUTH_MODE = 0o600
 _SECRET_RE = re.compile(
-    r'(?m)^[ \t]*databricks_client_secret[ \t]*=[ \t]*"(?P<value>(?:[^"\\]|\\.)*)"[ \t]*(?:#.*)?$'
+    r'(?m)^[ \t]*databricks_client_secret[ \t]*=[ \t]*"(?P<value>(?:[^"\\\r\n]|\\.)*)"[ \t]*(?:#[^\r\n]*)?\r?$'
 )
+_SECRET_KEY_RE = re.compile(r"(?m)^[ \t]*databricks_client_secret[ \t]*=")
 
 
 def _mode(path: Path) -> int:
@@ -43,6 +44,7 @@ def ensure_template(path: Path, template: Path) -> None:
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, AUTH_MODE)
     try:
+        os.fchmod(fd, AUTH_MODE)
         with os.fdopen(fd, "wb") as handle:
             handle.write(template.read_bytes())
             handle.flush()
@@ -64,7 +66,33 @@ def _secret_value(text: str) -> str | None:
 
 def _can_overwrite(text: str) -> bool:
     value = _secret_value(text)
-    return value in (None, "", "<newly-minted secret shown above>", "<existing-secret-not-retrievable>")
+    if value is None:
+        return _SECRET_KEY_RE.search(text) is None
+    return value in ("", "<newly-minted secret shown above>", "<existing-secret-not-retrievable>")
+
+
+def preflight_auth_tfvars(path: Path, *, force: bool = False) -> None:
+    """Fail closed before a secret is minted; the writer repeats these checks."""
+    try:
+        parent_stat = path.parent.lstat()
+    except FileNotFoundError:
+        parent_stat = None
+    if parent_stat is not None and stat.S_ISLNK(parent_stat.st_mode):
+        raise RuntimeError(f"{path.parent} is a symlink; refusing to write secrets through it")
+    try:
+        existing_stat = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(existing_stat.st_mode):
+        raise RuntimeError(f"{path} is a symlink; refusing to write secrets through it")
+    if not stat.S_ISREG(existing_stat.st_mode):
+        raise RuntimeError(f"{path} is not a regular file")
+    _warn_tighten(path)
+    if not force and not _can_overwrite(path.read_text()):
+        raise RuntimeError(
+            f"{path} already contains a client secret or an unparseable secret assignment; "
+            "pass --force to replace it"
+        )
 
 
 def render_auth_tfvars(
@@ -74,14 +102,33 @@ def render_auth_tfvars(
     client_secret: str,
     workspace_host: str,
     workspace_id: int,
+    existing: str = "",
 ) -> str:
-    return (
-        f'databricks_account_id    = "{account_id}"\n'
-        f'databricks_client_id     = "{client_id}"\n'
-        f'databricks_client_secret = "{client_secret}"\n'
-        f'databricks_workspace_host = "{workspace_host}"\n'
-        f'databricks_workspace_id   = "{workspace_id}"\n'
-    )
+    values = {
+        "databricks_account_id": (account_id, "databricks_account_id   "),
+        "databricks_client_id": (client_id, "databricks_client_id    "),
+        "databricks_client_secret": (client_secret, "databricks_client_secret"),
+        "databricks_workspace_host": (workspace_host, "databricks_workspace_host"),
+        "databricks_workspace_id": (str(workspace_id), "databricks_workspace_id  "),
+    }
+    text = existing
+    for key, (value, padded_key) in values.items():
+        replacement = f'{padded_key} = "{value}"'
+        pattern = re.compile(
+            rf'(?m)^(?P<prefix>[ \t]*{re.escape(key)}[ \t]*=[ \t]*)'
+            rf'(?P<old>"(?:[^"\\\r\n]|\\.)*")(?P<suffix>[ \t]*(?:#[^\r\n]*)?\r?$)'
+        )
+        if pattern.search(text):
+            text = pattern.sub(
+                lambda match: f'{match.group("prefix")}"{value}"{match.group("suffix")}',
+                text,
+                count=1,
+            )
+        else:
+            if text and not text.endswith(("\n", "\r")):
+                text += "\n"
+            text += replacement + "\n"
+    return text
 
 
 def write_auth_tfvars(
@@ -90,20 +137,7 @@ def write_auth_tfvars(
     content: str,
     force: bool = False,
 ) -> None:
-    try:
-        existing_stat = path.lstat()
-    except FileNotFoundError:
-        existing_stat = None
-    if existing_stat is not None:
-        if stat.S_ISLNK(existing_stat.st_mode):
-            raise RuntimeError(f"{path} is a symlink; refusing to write secrets through it")
-        if not stat.S_ISREG(existing_stat.st_mode):
-            raise RuntimeError(f"{path} is not a regular file")
-        _warn_tighten(path)
-        if not force and not _can_overwrite(path.read_text()):
-            raise RuntimeError(
-                f"{path} already contains a client secret; pass --force to replace it"
-            )
+    preflight_auth_tfvars(path, force=force)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
