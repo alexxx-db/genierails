@@ -559,7 +559,9 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
     source = source_env(env_dir)
     problems = []
     source_dir = cloud_dir / "envs" / source
-    if deterministic(env_dir) and not deterministic(source_dir):
+    if not (source_dir / "env.auto.tfvars").is_file():
+        problems.append(f"envs/{source}/env.auto.tfvars was not found; fix promote_from in envs/{env}/env.auto.tfvars")
+    elif deterministic(env_dir) and not deterministic(source_dir):
         problems.append(
             f"envs/{source} uses legacy governance but envs/{env} is deterministic; migrate the source first "
             f'(shared/docs/legacy-migration.md), or set governance_mode = "legacy" in envs/{env}/env.auto.tfvars'
@@ -1755,21 +1757,21 @@ APPLY_OWNERS = {
 
 
 def env_role(env_dir: Path) -> str:
-    """legacy; promoted (a promote-to target: promote_from set, or prod); else the rehearse env."""
+    """Promoted (promote_from set, or prod); else deterministic rehearsal or legacy."""
     env_dir = Path(env_dir)
-    if not deterministic(env_dir):
-        return LEGACY
     cfg = _load_hcl(env_dir / "env.auto.tfvars")
-    return PROMOTED if cfg.get("promote_from") or env_dir.name == "prod" else REHEARSE
+    if cfg.get("promote_from") or env_dir.name == "prod":
+        return PROMOTED
+    return REHEARSE if deterministic(env_dir) else LEGACY
 
 
 def apply_guard(env_dir: Path, env: str, target: str) -> None:
     from scripts.environment_lock import held_by_ancestor
 
-    role = env_role(env_dir)
-    if role == LEGACY:
+    if not deterministic(env_dir):
         legacy_guard(env_dir, env, target.split(":")[0])
         return
+    role = env_role(env_dir)
     allowed = APPLY_OWNERS[role].get(target)
     if allowed is None:
         raise Refused(f"unknown applying target {target!r}")
@@ -1808,7 +1810,7 @@ def legacy_guard(env_dir: Path, env: str, command: str) -> None:
 
 
 def destroy_guard(env_dir: Path, env: str, confirm: str) -> None:
-    if env_role(env_dir) != PROMOTED or confirm == env:
+    if not deterministic(env_dir) or env_role(env_dir) != PROMOTED or confirm == env:
         return
     raise Refused(f"make destroy refused: ENV={env} is a deterministic promoted env; destroying it removes its "
                   f"masks and grants outside any manifest. If you mean it (a throwaway env, an operations "

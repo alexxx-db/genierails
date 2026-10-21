@@ -46,6 +46,16 @@ def test_generate_banner_follows_env_role(env, promoted, expected, absent, tmp_p
     assert absent not in banner
 
 
+@pytest.mark.parametrize("env", ["prod", "stg"])
+def test_generate_banner_keeps_legacy_promoted_envs_on_release(env, tmp_path):
+    banner = "\n".join(generate_next_steps(tmp_path, "full", env, has_sql=True,
+                                             champion_flow=True, tuning=True,
+                                             source_env="dev", promoted=True))
+    assert f"make release ENV={env}" in banner
+    assert f"make rehearse ENV={env}" not in banner
+    assert "make release-plan" not in banner
+
+
 def _text(path: str) -> str:
     return " ".join((ROOT / path).read_text().split())
 

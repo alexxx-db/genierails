@@ -8628,19 +8628,27 @@ Before you apply, tune for your business roles, security requirements, and Genie
             print(f"    3. make validate-generated{env_suffix}")
             print(f"    4. make apply{env_suffix}")
         else:
-            role = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "scripts" / "release_gate.py"), "env-role",
-                 "--env-dir", str(WORK_DIR), "--env", WORK_DIR.name],
-                text=True, capture_output=True, check=True,
-            ).stdout.strip()
-            for line in generate_next_steps(
-                out_dir.resolve(), args.mode, WORK_DIR.name,
-                has_sql=bool(sql_block), champion_flow=champion_flow,
-                tuning=not deterministic_mode,
-                source_env=str(auth_cfg.get("promote_from") or "dev"),
-                promoted=role == "promoted",
-            ):
-                print(line)
+            try:
+                role_result = subprocess.run(
+                    [sys.executable, str(SCRIPT_DIR / "scripts" / "release_gate.py"), "env-role",
+                     "--env-dir", str(WORK_DIR), "--env", WORK_DIR.name],
+                    text=True, capture_output=True,
+                )
+            except OSError:
+                role_result = None
+            role = role_result.stdout.strip() if role_result and role_result.returncode == 0 else ""
+            if role not in {"promoted", "rehearse", "legacy"}:
+                print(f"  Next steps: review the generated files, then run make setup ENV={WORK_DIR.name} "
+                      "for role-aware commands.")
+            else:
+                for line in generate_next_steps(
+                    out_dir.resolve(), args.mode, WORK_DIR.name,
+                    has_sql=bool(sql_block), champion_flow=champion_flow,
+                    tuning=not deterministic_mode,
+                    source_env=str(auth_cfg.get("promote_from") or "dev"),
+                    promoted=role == "promoted",
+                ):
+                    print(line)
     print("=" * 60)
 
 
