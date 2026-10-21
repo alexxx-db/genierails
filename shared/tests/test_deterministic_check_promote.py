@@ -162,8 +162,9 @@ def _promote_to_prod(repo, tmp_path, env_text=None, deployer=DEPLOYER):
     result = _make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
-    # promote-to itself records the governed tables, inline agents or not: make check expects them.
-    assert (prod / "generated" / "governed_tables.json").is_file()
+    # Inline agents: promote-to writes no governed-tables record (as before agent files),
+    # and make check ENV=prod expects none.
+    assert not (prod / "generated" / "governed_tables.json").exists()
     _commit(repo, "promote")
     return repo
 
@@ -489,14 +490,15 @@ def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, 
     _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
 
 
-def _drop_prod_record(repo):
-    (_envs(repo) / "prod" / "generated" / "governed_tables.json").unlink()
-    _commit(repo, "prod lost its record")
+def _stale_prod_split(repo):
+    split = _envs(repo) / "prod" / "data_access" / "abac.auto.tfvars"
+    split.write_text(split.read_text() + "# hand edit\n")
+    _commit(repo, "prod's split edited by hand")
 
 
 @pytest.mark.parametrize("ci", ["", "true"])
-def test_check_prod_names_promote_to_when_the_governed_tables_record_is_stale(promoted, tmp_path, ci):
-    _drop_prod_record(promoted)
+def test_check_prod_names_promote_to_when_its_generated_files_are_stale(promoted, tmp_path, ci):
+    _stale_prod_split(promoted)
 
     check = _make(promoted, tmp_path, "check", "ENV=prod", **({"CI": ci} if ci else {}))
 
@@ -510,7 +512,7 @@ def test_checks_same_env_step_names_promote_to_for_a_promoted_env(promoted, tmp_
     """The same-env regeneration's hint, past promote-to CHECK=1 (which catches the same gap first)."""
     from scripts import check_env
 
-    _drop_prod_record(promoted)
+    _stale_prod_split(promoted)
     for key, value in _env(tmp_path).items():
         monkeypatch.setenv(key, value)
     for key in ("CI", "MAKEFLAGS", "MAKELEVEL"):

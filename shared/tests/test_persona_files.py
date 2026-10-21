@@ -314,6 +314,27 @@ def test_check_fails_while_governed_tables_json_is_stale(promoted, tmp_path, ci)
     assert current.returncode == 0, current.stdout + current.stderr
 
 
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_prod_passes_on_what_an_agent_file_promotion_writes(tmp_path, monkeypatch, ci):
+    """promote-to records prod's governed tables itself; make check expects exactly that."""
+    repo = _agent_repo(tmp_path, monkeypatch)
+    prod = base._envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    (prod / "auth.auto.tfvars").write_text(base._auth(base.DEPLOYER, host=""))
+    result = base._make(repo, tmp_path, "promote-to", "ENV=prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _governed(prod)["agent_tables"] == {"Payments": ["ppay.s.t"]}
+    base._commit(repo, "first promotion")
+
+    check = base._make(repo, tmp_path, "check", "ENV=prod", **({"CI": ci} if ci else {}))
+
+    out = check.stdout + check.stderr
+    assert "OK: generated files (envs/prod): committed files match." in out, out
+    # The plan (6) needs prod's live classification config.
+    assert check.returncode == 0 or "=== make check ENV=prod: FAILED (plan) ===" in out, out
+
+
 def test_an_agent_only_change_adding_a_table_changes_only_agent_and_governance_owned_generated_files(
         promoted, tmp_path):
     dev = base._envs(promoted) / "dev"

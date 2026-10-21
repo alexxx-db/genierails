@@ -103,10 +103,10 @@
   prints the uncommitted lines, like an applying one, and `release-plan` names
   them (`a receipt exists but its checkout wasn't clean`). An agent capture
   whose name contains `conf` (`Confidential Deals.space.json`) is no longer
-  ignored by the root `*conf*.json`. `make promote-to` always records
-  `generated/governed_tables.json` in a deterministic env (before, only with
-  agent files), so `make check ENV=prod` passes right after it, and that
-  check's hint for a promoted env says `make promote-to`.
+  ignored by the root `*conf*.json`. `make check ENV=prod` expects
+  `generated/governed_tables.json` only where `make promote-to` writes it
+  (agents in `agents/` files), so it passes right after an inline-agent
+  promotion too, and its hint for a promoted env says `make promote-to`.
 
 - **The champion walkthrough sets who may run the agent**: an agent given by ID
   without `acl_groups` is refused by `make generate` (decision 4), but the

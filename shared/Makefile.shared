@@ -1530,7 +1530,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
 	fi; \
 	if [ "$$($(_IS_DETERMINISTIC) "$$dest_dir/env.auto.tfvars")" = 1 ]; then \
-		$(_STICKY) record --env-dir "$$dest_dir" --config "$$dest_dir/generated/abac.auto.tfvars" || exit 1; \
+		$(_STICKY) record --if-agent-files --env-dir "$$dest_dir" --config "$$dest_dir/generated/abac.auto.tfvars" || exit 1; \
 	fi; \
 	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" changes --from "$$txn_dir/snapshot" || exit 1; \
 	$(_PROMOTION_TXN_COMMIT); \
