@@ -97,6 +97,34 @@ data_access root refuses, at plan time, any change to a live deterministic mask
 (removal, new principals, a new function, a retag) outside the controller's
 phases (`policy_stage`), so a raw `terraform apply` can't make one in one shot.
 
+**Coverage check on a staged render.** Each hook re-runs the coverage check
+on its own render. In a native-classification env (`enable_classification =
+true`) the live refresh records the treatment tags derive-assignments
+derived, which are the change's. The phases before the switch (`create`,
+`tighten`, `restore`, `abandon`, and a rebind, judged as `restore`) keep the
+active generation's values live instead. For those phases the check accepts
+a render whose tags differ from the refresh only when all of these hold:
+
+- the render is exactly the refreshed config with every treatment tag at the
+  value the active generation recorded (after an attempted switch, except
+  for abandon, newly governed columns keep their new value);
+- the journal moves from that generation to the generated config's (for
+  abandon the config may have moved on: abandon keeps that generation's
+  recorded values whatever the config says now; a rebind needs the config
+  to be the change with only recreated principals);
+- the generation's snapshot still hashes to its fingerprint.
+
+A legacy active generation also needs its adopted migration record
+([legacy-migration.md](legacy-migration.md)). The pass records the
+generation kept (`kept_from` in `data_access/.coverage_gate.json`) and the
+columns the refresh governs that the phase leaves untagged
+(`uncovered_columns`, for example a newly classified column before the
+switch), and prints both. Those phases create no business grant, so an
+untagged column gains no reader through them. A phase that can open access
+(the `grant` re-check, both rebind phases) must tag every column the refresh
+governs. `switch` and `retire` must match the refresh exactly. Anything else
+fails closed, as before.
+
 **Journal.** `<env>/data_access/.policy_generations/journal.json`, next to the
 layer's state (with `GENIERAILS_STATE_DIR` set, the same path under
 `$GENIERAILS_STATE_DIR/<cloud>/<env>/records/`, so a fresh checkout sees it),
@@ -105,7 +133,10 @@ any unfinished transition with its completed phases. Writes are atomic.
 
 - A failed or crashed run is **resumed** by re-running the same command on the
   same commit. A run whose generated config differs from the unfinished one is
-  **refused** before anything is applied.
+  **refused** before anything is applied (`make apply`, `rehearse`,
+  `release-plan`, and `release MANIFEST=` of the change's own manifest). When
+  abandon can drop the change, the refusal says so: "run `make
+  policy-abandon ENV=<env>`, then re-run".
 - A failure in `tighten`, `switch` or their verification **restores** the
   previous protection at once (through `tighten` again when principals may
   already be moved), so columns go back to their old value and principals;
@@ -140,8 +171,25 @@ any unfinished transition with its completed phases. Writes are atomic.
   Abandon holds the env lock from its first check to its last, and binds
   the live check to what it applies. Under the lock, make first re-reads
   live tags and DDL (`derive-assignments`, or the DDL alone, as `rehearse`
-  does), which records the live refresh the coverage check needs; a failed
-  refresh stops abandon before it plans anything.
+  does), which records the live refresh the coverage check needs, then
+  re-splits the result into `data_access/` (`promote`, as `make plan`
+  does). A failed refresh stops abandon before it plans anything. The render
+  takes its non-treatment tag assignments from the split, while the refresh
+  records the generated config's. The re-split normally makes them agree, so
+  a split edited or left stale before abandon is reconciled, not refused;
+  abandon refuses before it plans, naming the entries, only when they still
+  differ after the re-split (or when `staged_policy_apply.py abandon` runs
+  without make's re-split).
+
+  Abandon also works after the generated config **drifted** from the change
+  (live `class.*` tags changed after it started, or its treatment settings
+  were edited): the abandon render is built from the journal's snapshots of
+  the change and the previous generation, not from the config, so drift
+  changes nothing it deletes, keeps or checks. It then prints the drifted
+  columns; the next apply stages them as a new change from the previous
+  generation. With drift, abandon first checks that the previous
+  generation's snapshot still hashes to its fingerprint, and refuses before
+  any plan, naming the file, when it is edited or unreadable.
 
   1. It saves a refreshed plan of the abandon render (the previous
      generation without the change's policies). That plan may only delete
@@ -193,7 +241,12 @@ any unfinished transition with its completed phases. Writes are atomic.
   dropping a `TO` refuses. It re-applies the restore render with the
   config's principals, under the env lock, in two phases. Like abandon, it
   first re-reads live tags and DDL under the lock for the access phase's
-  coverage check; a failed refresh stops rebind before it plans anything.
+  coverage check and re-splits them; a failed refresh stops rebind before it
+  plans anything, and so does a split whose non-treatment assignments still
+  differ from the generated config's after that re-split. A generated config whose treatment values
+  differ from the change's (live `class.*` tags changed since it started,
+  or its treatment settings were edited) refuses before any plan and names
+  the columns.
 
   1. **Protection.** Every policy depends on the grants in Terraform, so
      `-target` can't leave them out. Instead rebind plans the whole render,
@@ -243,6 +296,32 @@ any unfinished transition with its completed phases. Writes are atomic.
   exceptions.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
+
+### Changes that can't be dropped
+
+Abandon and rebind never untag or retag a column, so one shape has no
+GenieRails way out yet. It refuses before anything is applied, names the
+columns, and leaves live protection as it is:
+
+- **A rolled-back switch that kept newly governed columns.** The restore
+  leaves a column the change newly governs on its new value, masked by the
+  change's policies. Abandon would delete those policies, so abandon and
+  rebind both refuse ("N column(s) keep the new generation's treatment").
+  The way out is to resume the change: re-run the command that started it
+  with the generated config on that generation. If principals it names were
+  deleted and recreated under new IDs, the config can't be that generation
+  again, and no command can finish or drop the change yet.
+How to un-govern such columns, or supersede the change, is an open design
+decision.
+
+**Live `class.*` tags changed after the change started** (or its treatment
+settings were edited) is not one of these shapes. Resume refuses ("N
+column(s) have another treatment in the generated config than in generation
+..."), naming the columns, because the config is no longer the change; when
+abandon can drop it, the refusal says "run `make policy-abandon ENV=<env>`,
+then re-run". Abandon drops it like any other change it may drop (above).
+A rebind still refuses, since it only re-points principals: put the tags
+back and rebind, or, if no principal was deleted, abandon and re-run.
 
 ### Masking functions and checkout paths
 
@@ -315,8 +394,12 @@ runs `apply-saved`, which applies exactly those saved plans
 verifications. It refuses when the journal, the generated config or a stage's
 render moved since the plan. A change that replaces policies or moves tiers
 is therefore one manifest and approval per changing phase; a release with no
-policy change is one manifest. A failed tighten or switch still restores the
-previous protection at once.
+policy change is one manifest. The workspace (Genie CAN_RUN) is planned with
+the last phase, except when that phase's `grant` opens `SELECT` the live agent
+coverage check still lacks (a first release): then the workspace waits for one
+more manifest, planned once that `SELECT` is live, so CAN_RUN never opens before
+its masks and `SELECT`. A failed tighten or switch still restores the previous
+protection at once.
 
 Hook environment (also `GENIERAILS_POLICY_PLAN_OUT`, `GENIERAILS_POLICY_PLAN_BASIS`
 and `GENIERAILS_POLICY_SAVED_PLAN` for the saved-plan modes; see

@@ -118,7 +118,8 @@ class Make:
         }
 
     def __call__(self, target: str, env: str, *extra: str, stub_make: bool = True, ci: bool = False,
-                 stubs: dict[str, str] | None = None, environ_extra: dict[str, str] | None = None):
+                 stubs: dict[str, str] | None = None, environ_extra: dict[str, str] | None = None,
+                 cwd: Path | None = None):
         env_dir = self.repo.cloud / "envs" / env
         args = ["make", "--no-print-directory", target, f"ENV={env}", f"ENV_DIR={env_dir}",
                 f"ACCOUNT_ENV_DIR={self.repo.cloud / 'envs' / 'account'}",
@@ -130,7 +131,7 @@ class Make:
                    if k not in ("MAKEFLAGS", "MAKELEVEL", "VERIFY_KEY_COLUMN", "APPLY_FLAGS", "MANIFEST")}
         environ |= self.repo.env | ({"CI": "true"} if ci else {}) | (environ_extra or {})
         environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
-        return subprocess.run(args, cwd=ROOT / self.cloud, text=True, capture_output=True, env=environ)
+        return subprocess.run(args, cwd=cwd or ROOT / self.cloud, text=True, capture_output=True, env=environ)
 
     def calls(self) -> list[list[str]]:
         if not self.log.exists():
@@ -962,3 +963,22 @@ def test_release_plan_and_release_run_the_custom_mask_cases_before_the_lock(make
     result = make("release-plan", "prod", stubs=stubs)
     assert result.returncode != 0
     assert make.names() == ["inventory", "cases"] and _no_lock(repo, "prod")
+
+
+# -- a failed verify-key stops every release path ---------------------------------------
+
+@pytest.mark.parametrize("target", ["release-plan", "_release-manifest", "legacy-release"])
+def test_a_failed_verify_key_stops_before_the_mask_proof_and_applies_nothing(make, repo, target):
+    proof = make._recorder("proof")
+    stubs = {"resolve_env_config.py verify-key": "false", "release_helpers.py require-mask-proof": str(proof)}
+    if target == "_release-manifest":
+        _planned(make)
+    elif target == "legacy-release":
+        (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    result = make("release" if target == "legacy-release" else target, "prod", stubs=stubs)
+    assert result.returncode != 0, result.stdout + result.stderr
+    names = make.names()
+    assert "proof" not in names
+    assert not [c for c in make.calls() if c[0] in ("staged", "runner")]
+    assert "_release-plan-roots" not in names and "derive-assignments" not in names
+    assert not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")

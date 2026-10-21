@@ -144,6 +144,7 @@ def repo(tmp_path):
     (bin_dir / "terraform").chmod(0o755)
     result = _make(repo, tmp_path, "promote", "ENV=dev")
     assert result.returncode == 0, result.stdout + result.stderr
+    # The rest of what make generate writes (_write_generated stands in for it).
     subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
                     "--env-dir", str(dev), "--config", str(dev / "generated" / "abac.auto.tfvars")], check=True)
     _git(repo, "init", "-q")
@@ -161,8 +162,9 @@ def _promote_to_prod(repo, tmp_path, env_text=None, deployer=DEPLOYER):
     result = _make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
-    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
-                    "--env-dir", str(prod), "--config", str(prod / "generated" / "abac.auto.tfvars")], check=True)
+    # Inline agents: promote-to writes no governed-tables record (as before agent files),
+    # and make check ENV=prod expects none.
+    assert not (prod / "generated" / "governed_tables.json").exists()
     _commit(repo, "promote")
     return repo
 
@@ -485,7 +487,79 @@ def _assert_check_and_promote_check_pass(repo, tmp_path, ci):
 
 @pytest.mark.parametrize("ci", ["", "true"])
 def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, ci):
+    """An inline-agent promotion commits no governed-tables record, and check expects none."""
     _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+    assert not (_envs(promoted) / "prod" / "generated" / "governed_tables.json").exists()
+
+
+def _commit_prod_record(repo, record, message):
+    (_envs(repo) / "prod" / "generated" / "governed_tables.json").write_text(json.dumps(record, indent=2) + "\n")
+    _commit(repo, message)
+
+
+def _stale_prod_record(repo):
+    """A record from when Payments was in an agents/ file; its agents are inline now."""
+    _commit_prod_record(repo, {"tables": ["ppay.s.t"], "agent_tables": {"Payments": ["ppay.s.t"]}},
+                        "prod's record is stale")
+
+
+def _tampered_prod_record(repo):
+    """A hand edit: the governed set out of order, one table twice."""
+    _commit_prod_record(repo, {"tables": ["ppay.s.u", "ppay.s.t", "PPAY.S.T"]}, "prod's record edited by hand")
+
+
+def _added_prod_record(repo):
+    """A record added by hand, not as a regeneration writes it."""
+    (_envs(repo) / "prod" / "generated" / "governed_tables.json").write_text('{"tables": ["ppay.s.t"]}')
+    _commit(repo, "prod's record added by hand")
+
+
+STALE_RECORDS = {"added": _added_prod_record, "stale": _stale_prod_record, "tampered": _tampered_prod_record}
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+@pytest.mark.parametrize("case", sorted(STALE_RECORDS))
+def test_check_prod_names_promote_to_when_the_governed_tables_record_is_stale(promoted, tmp_path, case, ci):
+    """An inline-agent promotion writes no record, but a committed one is checked, and promote-to fixes it."""
+    STALE_RECORDS[case](promoted)
+    extra = {"CI": ci} if ci else {}
+
+    check = _make(promoted, tmp_path, "check", "ENV=prod", **extra)
+
+    out = check.stdout + check.stderr
+    assert check.returncode != 0, out
+    assert "governed_tables.json" in out, out
+    assert "Run make promote-to ENV=prod" in out, out
+    assert "make generate ENV=prod" not in out, out
+    assert "OK: generated files (envs/prod): committed files match." not in out, out
+
+    result = _make(promoted, tmp_path, "promote-to", "ENV=prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    _commit(promoted, "re-promote")
+    _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+
+
+@pytest.mark.parametrize("case", sorted(STALE_RECORDS))
+def test_checks_same_env_step_names_promote_to_for_a_promoted_env(promoted, tmp_path, monkeypatch, capsys, case):
+    """The same-env regeneration's hint, past promote-to CHECK=1 (which catches the same gap first)."""
+    from scripts import check_env
+
+    STALE_RECORDS[case](promoted)
+    for key, value in _env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    for key in ("CI", "MAKEFLAGS", "MAKELEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(check_env, "_promote_check", lambda args: None)
+
+    code = check_env.main(["check", "--env", "prod", "--cloud-dir", str(promoted / "aws"),
+                           "--makefile", str(promoted / "aws" / "Makefile")])
+
+    out = capsys.readouterr()
+    text = out.out + out.err
+    assert code == 1, text
+    assert "governed_tables.json" in text, text
+    assert "Run make promote-to ENV=prod on the latest main and commit the result." in text, text
+    assert "make generate ENV=prod" not in text, text
 
 
 def _policies(env_dir):
@@ -763,6 +837,76 @@ def test_promote_to_maps_groups_with_policies_tiers_and_acls_and_check_passes(re
             if path.name == "env.auto.tfvars":
                 text = text.replace('"dev_ops" = "prod_ops"', "")
             assert '"dev_ops"' not in text, path
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+# The champion layout: dev keeps its agent in agents/ files, prod maps every
+# dev group. Before the fix promote-to seeded prod's agent file with dev's
+# acl_groups and exited 2: group 'dev_ops' not defined in 'groups'.
+PROD_GROUPS = ["prod_ops", "prod_analysts"]
+PROD_ENV_AGENT_FILES = ('governance_mode = "deterministic"\npromote_from = "dev"\ncatalog_map = { "paycat" = "ppay" }\n'
+                        f'deployer_principal_id = "{DEPLOYER}"\n'
+                        'group_map = { dev_ops = "prod_ops", dev_analysts = "prod_analysts" }\n')
+
+
+def _move_dev_agent_to_files(repo, tmp_path):
+    from scripts.agent_ownership import write_payload
+
+    dev = _envs(repo) / "dev"
+    env = dev / "env.auto.tfvars"
+    env.write_text(env.read_text().replace(re.search(r"genie_spaces = \[.*?\n\]\n", DEV_ENV, re.S).group(0), ""))
+    (dev / "agents").mkdir()
+    (dev / "agents" / f"{SPACE}.auto.tfvars").write_text(
+        f'genie_space_id = "{DEV_SPACE_ID}"\nuc_tables = ["paycat.s.t"]\nacl_groups = {json.dumps(TIERS)}\n')
+    write_payload({"version": 2, "data_sources": {"tables": [{"identifier": "paycat.s.t"}]}},
+                  dev / "agents" / f"{SPACE}.space.json")
+    result = _make(repo, tmp_path, "promote", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    _commit(repo, "dev agent in agents/ files")
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_maps_agent_file_acl_groups_through_group_map_and_check_passes(repo, tmp_path, ci):
+    _move_dev_agent_to_files(repo, tmp_path)
+    _promote_to_prod(repo, tmp_path, env_text=PROD_ENV_AGENT_FILES)
+
+    prod = _envs(repo) / "prod"
+    agent = hcl2.loads((prod / "agents" / f"{SPACE}.auto.tfvars").read_text())
+    assert agent["acl_groups"] == PROD_GROUPS
+    env = hcl2.loads((prod / "env.auto.tfvars").read_text())
+    assert env["access_tier_groups"] == PROD_GROUPS
+    assert env["table_readers"] == {"ppay.s.t": PROD_GROUPS}
+    assert list(hcl2.loads((prod / "generated" / "abac.auto.tfvars").read_text())["groups"]) == PROD_GROUPS
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+def test_promote_to_refuses_prods_own_tiers_without_group_map_and_restores_prod(repo, tmp_path):
+    """README Prod step 1 used to say to replace prod's access_tier_groups placeholders with prod's groups."""
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    text = _prod_env(extra=f"access_tier_groups = {json.dumps(PROD_GROUPS)}\n")
+    (prod / "env.auto.tfvars").write_text(text)
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+    before = _snapshot(_envs(repo))
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "access_tier_groups promoted" not in out
+    assert "name prod's own group(s) prod_ops, prod_analysts" in out, out
+    assert 'group_map = { "dev_analysts" = "prod_analysts", "dev_ops" = "prod_ops" }' in out, out
+    assert _snapshot(_envs(repo)) == before, "a refused promotion restores everything it touched"
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_accepts_prods_tier_placeholders_and_writes_tiers_through_group_map(repo, tmp_path, ci):
+    """README Prod step 1: set group_map, leave the setup template's access_tier_groups placeholders."""
+    text = PROD_ENV_GROUP_MAP + 'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n'
+    _promote_to_prod(repo, tmp_path, env_text=text)
+
+    env = hcl2.loads((_envs(repo) / "prod" / "env.auto.tfvars").read_text())
+    assert env["access_tier_groups"] == PROD_TIERS
     _assert_check_and_promote_check_pass(repo, tmp_path, ci)
 
 

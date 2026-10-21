@@ -20,6 +20,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import generate_abac
 
+AUTH = (
+    'databricks_workspace_host = "https://env-under-test.example"\n'
+    'databricks_client_id = "env-client"\n'
+    'databricks_client_secret = "env-secret"\n'
+)
+AUTH_CFG = {
+    "databricks_workspace_host": "https://env-under-test.example",
+    "databricks_client_id": "env-client",
+    "databricks_client_secret": "env-secret",
+}
+
 from generate_abac import (
     fix_hcl_syntax,
     autofix_canonical_tag_vocabulary,
@@ -326,7 +337,7 @@ def test_discovered_tables_must_be_a_list(tmp_path, invalid, operation):
 
 def test_non_string_discovered_table_exits_cleanly_from_main(tmp_path, monkeypatch, capsys):
     auth = tmp_path / "auth.auto.tfvars"
-    auth.write_text("")
+    auth.write_text(AUTH)
     discovered = tmp_path / "data_access" / "discovered_uc_tables.auto.tfvars"
     discovered.parent.mkdir()
     discovered.write_text('discovered_uc_tables = [{ table = "main.kept.table" }]\n')
@@ -351,7 +362,7 @@ def test_non_string_discovered_table_exits_cleanly_from_main(tmp_path, monkeypat
 def test_strict_environment_parse_failure_aborts(tmp_path):
     auth = tmp_path / "auth.auto.tfvars"
     env = tmp_path / "env.auto.tfvars"
-    auth.write_text("")
+    auth.write_text(AUTH)
     env.write_text('genie_spaces = [\n')
 
     with pytest.raises(ValueError, match="Failed to parse environment"):
@@ -375,7 +386,7 @@ def test_incomplete_discovery_folds_persisted_tables_into_masking_footprint(tmp_
 
 def _run_main_until_footprint(monkeypatch, tmp_path, cli_args, env_text, fetch_result=None):
     auth = tmp_path / "auth.auto.tfvars"
-    auth.write_text("")
+    auth.write_text(AUTH)
     (tmp_path / "env.auto.tfvars").write_text(env_text)
     discovered = tmp_path / "data_access" / "discovered_uc_tables.auto.tfvars"
     persist_discovered_uc_tables(discovered, ["main.persisted.customers"])
@@ -422,6 +433,42 @@ def test_unreachable_api_warns_before_using_raw_space_id_as_name(
     output = capsys.readouterr().out
     assert "Genie API lookup failed for 'dev-space-id'" in output
     assert "raw workspace-specific ID" in output
+
+
+def test_unreachable_id_only_agent_stops_with_named_actionable_error(
+    monkeypatch, tmp_path, capsys
+):
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.write_text("")
+    (tmp_path / "env.auto.tfvars").write_text(
+        'genie_spaces = [{ name = "Payments", genie_space_id = "space-unreachable" }]\n'
+    )
+    calls = []
+
+    class FakeApiClient:
+        def do(self, method, path, **kwargs):
+            calls.append((method, path))
+            raise RuntimeError("not found")
+
+    class FakeWorkspaceClient:
+        def __init__(self, **kwargs):
+            self.api_client = FakeApiClient()
+
+    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(sys.modules["databricks.sdk"], "WorkspaceClient", FakeWorkspaceClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate_abac.py", "--auth-file", str(auth), "--create-groups"],
+    )
+
+    assert generate_abac.main() == 1
+    output = capsys.readouterr().out
+    assert "Could not read Genie agent 'Payments'" in output
+    assert "genie_space_id='space-unreachable'" in output
+    assert "Check genie_space_id and Databricks authentication" in output
+    assert "--catalog is required when using DDL files" not in output
+    assert calls == [("GET", "/api/2.0/genie/spaces/space-unreachable")]
 
 
 def test_main_incomplete_discovery_preserves_grants_and_remasks(monkeypatch, tmp_path):
@@ -501,26 +548,37 @@ def test_main_does_not_write_empty_owner_attribution(monkeypatch, tmp_path):
     assert "main.unnamed.events" not in discovered_cfg["discovered_table_agents"]
 
 
-def test_main_incomplete_empty_discovery_reaches_empty_governance_guard(monkeypatch, tmp_path):
-    _, _, auth_cfg = _run_main_until_footprint(
-        monkeypatch,
-        tmp_path,
-        [],
-        '''genie_spaces = [{
+def test_main_incomplete_empty_discovery_fails_before_empty_governance(monkeypatch, tmp_path, capsys):
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.write_text("")
+    (tmp_path / "env.auto.tfvars").write_text('''genie_spaces = [{
   name = "Live agent"
   genie_space_id = "space-1"
   uc_tables = []
-}]\n''',
-        fetch_result=([], {}, "Live", False),
+}]\n''')
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_genie_space",
+        lambda *args, **kwargs: ([], {}, "Live", False),
     )
+    monkeypatch.setattr(sys, "argv", ["generate_abac.py", "--auth-file", str(auth), "--create-groups"])
+
+    assert generate_abac.main() == 1
+    assert "Could not read Genie agent 'Live agent'" in capsys.readouterr().out
+
+
+def test_post_generate_semantic_check_rejects_empty_governance_for_configured_tables(
+    monkeypatch, tmp_path
+):
     generated = tmp_path / "empty.auto.tfvars"
     generated.write_text("tag_assignments = []\nfgac_policies = []\n")
-    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda: {})
+    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda *_: {})
 
-    errors, _ = generate_abac.post_generate_semantic_check(generated, auth_cfg)
+    errors, warnings = generate_abac.post_generate_semantic_check(
+        generated, {"uc_tables": ["main.persisted.customers"]}
+    )
 
+    assert warnings == []
     assert any("0 tag_assignments and 0 fgac_policies" in error for error in errors)
-    assert "main.persisted.customers" in auth_cfg["uc_tables"]
 
 
 def test_main_tables_unions_persisted_grants_into_declared_and_checks(monkeypatch, tmp_path):
@@ -760,7 +818,7 @@ fgac_policies = []
         path = tmp_tfvars(self._base_hcl('"public"', "public"))
         monkeypatch.setattr(generate_abac, "_LIVE_POLICIES_REPORTED", False)
         monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values",
-                            lambda: {"pii_level": {"public"}})
+                            lambda *_: {"pii_level": {"public"}})
         autofix_tag_policies(path)
         autofix_tag_policies(path)
         assert capsys.readouterr().out.count("[AUTOFIX] Loaded 1 live tag policy/ies") == 1
@@ -1108,7 +1166,7 @@ class TestGenieFetchFailureIsolation:
             def __init__(self, **kwargs):
                 self.api_client = FakeApiClient()
 
-        monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+        monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
         monkeypatch.setattr(
             sys.modules["databricks.sdk"], "WorkspaceClient", FakeWorkspaceClient
         )
@@ -1136,7 +1194,7 @@ class TestGenieFetchFailureIsolation:
             def __init__(self, **kwargs):
                 self.api_client = FakeApiClient()
 
-        monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+        monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr(
             sys.modules["databricks.sdk"], "WorkspaceClient", FakeWorkspaceClient
@@ -2079,15 +2137,15 @@ def test_required_native_classification_fails_without_warehouse(monkeypatch):
     class FakeClient:
         warehouses = FakeWarehouses()
 
-    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: FakeClient())
 
     with pytest.raises(generate_abac.NativeClassificationRequiredError, match="No SQL warehouse"):
         generate_abac._fetch_live_classification_source(
-            ["cat.sch.*"], {}, require_native=True,
+            ["cat.sch.*"], AUTH_CFG, require_native=True,
         )
     assert generate_abac._fetch_live_classification_source(
-        ["cat.sch.*"], {}, require_native=False,
+        ["cat.sch.*"], AUTH_CFG, require_native=False,
     ) is None
 
 
@@ -2112,12 +2170,12 @@ def test_required_native_classification_qualifies_schema_table(monkeypatch):
     class FakeClient:
         warehouses = FakeWarehouses()
 
-    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: FakeClient())
 
     with pytest.raises(generate_abac.NativeClassificationRequiredError, match="No SQL warehouse"):
         generate_abac._fetch_live_classification_source(
-            ["sch.table"], {"uc_catalog": "cat"}, require_native=True,
+            ["sch.table"], {**AUTH_CFG, "uc_catalog": "cat"}, require_native=True,
         )
 
 
@@ -2136,7 +2194,7 @@ def test_required_native_classification_fails_on_successful_empty_scan(monkeypat
     class FakeClient:
         statement_execution = FakeStatements()
 
-    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: FakeClient())
 
     with pytest.raises(
@@ -2144,7 +2202,7 @@ def test_required_native_classification_fails_on_successful_empty_scan(monkeypat
         match=r"returned 0 class\.\* findings",
     ) as exc_info:
         generate_abac._fetch_live_classification_source(
-            ["cat.sch.*"], {"sql_warehouse_id": "warehouse"}, require_native=True,
+            ["cat.sch.*"], {**AUTH_CFG, "sql_warehouse_id": "warehouse"}, require_native=True,
         )
     assert "review the detections and exclude any false positives" in str(exc_info.value)
     assert "turn on auto-tagging" in str(exc_info.value)
@@ -2163,7 +2221,7 @@ def test_generate_native_classification_fails_closed_on_bad_sql_state(monkeypatc
     client = SimpleNamespace(
         statement_execution=SimpleNamespace(execute_statement=lambda **_: response),
     )
-    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: client)
 
     with pytest.raises(
@@ -2171,7 +2229,7 @@ def test_generate_native_classification_fails_closed_on_bad_sql_state(monkeypatc
         match=rf"SQL failed \(StatementState\.{state_name}\)",
     ):
         generate_abac._fetch_live_classification_source(
-            ["cat.sch.tbl"], {"sql_warehouse_id": "warehouse"}, require_native=True,
+            ["cat.sch.tbl"], {**AUTH_CFG, "sql_warehouse_id": "warehouse"}, require_native=True,
         )
 
 
@@ -2220,11 +2278,11 @@ def test_generate_native_classification_reads_all_sql_chunks(monkeypatch):
         get_statement_result_chunk_n=lambda statement_id, index: chunks[index],
     )
     client = SimpleNamespace(statement_execution=execution)
-    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: client)
 
     source = generate_abac._fetch_live_classification_source(
-        ["cat.sch.tbl"], {"sql_warehouse_id": "warehouse"}, require_native=True,
+        ["cat.sch.tbl"], {**AUTH_CFG, "sql_warehouse_id": "warehouse"}, require_native=True,
     )
 
     assert source.classified_columns() == {
@@ -2244,10 +2302,10 @@ def test_generate_native_classification_plumbs_required_read_mode(monkeypatch):
             raise RuntimeError("SQL failed (StatementState.CANCELED): x")
         return [["cat", "sch", "tbl", "email", "class.email", ""]]
 
-    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda *_a, **_k: object())
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", lambda **_: FakeClient())
     monkeypatch.setattr(audit_schema_drift, "_run_sql", fake_run_sql)
-    cfg = {"sql_warehouse_id": "warehouse"}
+    cfg = {**AUTH_CFG, "sql_warehouse_id": "warehouse"}
 
     with pytest.raises(
         generate_abac.NativeClassificationRequiredError,

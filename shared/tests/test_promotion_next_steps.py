@@ -250,6 +250,31 @@ def test_promote_and_ungovern_print_the_mode_aware_release_steps():
     assert "after rehearse, make release-plan" not in makefile
 
 
+@pytest.mark.parametrize("auth_text, expected, absent", [
+    (None, "Next: edit", "not valid HCL"),
+    ('databricks_client_secret = "unterminated\n', "Next: fix", "Next: edit"),
+])
+def test_promote_auth_hint_distinguishes_missing_from_malformed(tmp_path, auth_text, expected, absent):
+    makefile = (SHARED / "Makefile.shared").read_text()
+    promote = makefile[makefile.index("=== Promote complete:"):]
+    assert 'if [ $$status -eq 2 ]; then' in promote
+    assert 'Next: fix $$dest_env_dir/auth.auto.tfvars (not valid HCL)' in promote
+    assert 'elif [ $$status -ne 0 ]; then' in promote
+    assert 'Next: edit $$dest_env_dir/auth.auto.tfvars' in promote
+    auth = tmp_path / "auth.auto.tfvars"
+    if auth_text is not None:
+        auth.write_text(auth_text)
+    recipe = (
+        'status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(CLOUD_ROOT)/auth.auto.tfvars" '
+        '|| status=$$?; if [ $$status -eq 2 ]; then echo "Next: fix (not valid HCL)"; '
+        'elif [ $$status -ne 0 ]; then echo "Next: edit (workspace credentials)"; fi'
+    )
+    result = _make(tmp_path, recipe=recipe)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout
+    assert absent not in result.stdout
+
+
 @pytest.mark.parametrize("text, expected", [
     (DETERMINISTIC_STG, "rehearse: ENV=prod is not allowed; rehearse its source env, then make release-plan ENV=prod "
                         "and make release ENV=prod"),
@@ -301,3 +326,39 @@ def test_a_ready_cutover_rehearses_the_source_before_release_plan(tmp_path, name
     assert _in_order(steps, expected), steps
     if name == "dev":
         assert "release-plan" not in steps
+
+
+def test_prod_setup_says_set_group_map_not_replace_access_tier_groups():
+    """promote-to writes prod's tiers from dev's through group_map, so prod's own tier names
+    without a group_map are refused; README Prod step 1 and the setup banner say so."""
+    readme = (ROOT / "shared/examples/dev_to_prod/README.md").read_text()
+    step = readme[readme.index("**1. Set up and promote.**"):readme.index("**2. Classify")]
+    assert "group_map" in step and "Leave the `access_tier_groups` placeholders" in step, step
+    assert "`access_tier_groups` placeholders, and set" not in step
+    makefile = (SHARED / "Makefile.shared").read_text()
+    banner = makefile[makefile.index("Next steps ($(ENV) promotion"):makefile.index("  3. In $(_SETUP_ENV_REL)/env.auto.tfvars")]
+    assert "set group_map there" in banner and "leave those placeholders" in banner, banner
+    assert "Replace this env's access_tier_groups placeholders" not in banner
+    # promote-to (and the promote it wraps) accept the destination's tier placeholders it overwrites.
+    for guard in ("override _PROMOTE_TO_PLACEHOLDER_GUARD", "override _GENIE_PLACEHOLDER_GUARD"):
+        line = makefile[makefile.index(guard):].split("\n\n")[0]
+        assert "GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1" in line, line
+
+
+def test_prod_setup_advice_does_not_ask_to_replace_tier_placeholders(tmp_path):
+    env = tmp_path / "env.auto.tfvars"
+    env.write_text('governance_mode = "deterministic"\n'
+                   'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n')
+    script = SHARED / "genie_space_placeholder.py"
+    makefile = (SHARED / "Makefile.shared").read_text()
+    # A promoted env (prod, or any env with promote_from) gets its tiers from promotion.
+    advice_line = makefile[makefile.index("\t@allow=0;"):makefile.index("--advice")]
+    assert 'env-role' in advice_line and '= promoted ] && allow=1' in advice_line, advice_line
+    assert "GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$$allow python3" in advice_line, advice_line
+    advice = {
+        flag: subprocess.run([sys.executable, str(script), "--advice", str(env)], text=True, capture_output=True,
+                             env={**os.environ, "GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS": flag}).stdout
+        for flag in ("0", "1")
+    }
+    assert "access_tier_groups placeholder" in advice["0"]
+    assert advice["1"] == ""

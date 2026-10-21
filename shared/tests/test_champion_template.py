@@ -69,6 +69,9 @@ def cloud(tmp_path, monkeypatch):
     sdk.mkdir(parents=True)
     (sdk.parent / "__init__.py").write_text("")
     (sdk / "__init__.py").write_text(FAKE_SDK)
+    (sdk / "config.py").write_text(
+        "class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n"
+    )
     # The customer's repo is a git checkout: import-new refuses outside one.
     root = tmp_path / "aws"
     root.mkdir()
@@ -111,7 +114,11 @@ def _readme_dev_setup(cloud, acl_groups='["viewers"]'):
                                  ", ".join(json.dumps(t) for t in TIERS)))
     agent.write_text(agent.read_text().replace("<your-genie-space-id>", SPACE_ID)
                      .replace('["<group-that-may-run-the-agent>"]', acl_groups))
-    (dev / "auth.auto.tfvars").write_text(f'databricks_client_id = "{DEPLOYER}"\n')
+    (dev / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://dev.example.invalid"\n'
+        f'databricks_client_id = "{DEPLOYER}"\n'
+        'databricks_client_secret = "test-only-secret"\n'
+    )
     return dev, agent
 
 

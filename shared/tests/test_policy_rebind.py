@@ -238,19 +238,34 @@ def test_rebind_refuses_a_policy_create_or_delete(harness, capsys, edit):
     _unchanged(harness, before, state)
 
 
+@pytest.mark.parametrize("config, column", [
+    ({"deployer": "new-sp"}, "cat.sch.t.email"),
+    ({"versions": VERSIONS, "deployer": "new-sp", "columns": ("email", "contact")}, "cat.sch.t.contact"),
+], ids=["policies-renamed", "column-added"])
+def test_rebind_refuses_a_config_that_changes_more_than_principals(harness, config, column):
+    """A config whose treatment values aren't the change's is refused before any plan, naming the columns."""
+    deleted_principals(harness)
+    write_env(harness.env_dir, **config)
+    before, state = harness.journal(), live_state(harness.env_dir)
+    with pytest.raises(spa.Refused, match=rf"1 column\(s\) have another treatment .* \({column}\)"):
+        harness.controller().rebind()
+    assert harness.calls == []
+    _unchanged(harness, before, state)
+
+
 @pytest.mark.parametrize("config, message", [
     ({"deployer": "new-sp"}, "by the generated config"),
     ({"versions": VERSIONS, "deployer": "new-sp", "columns": ("email", "contact")}, "change their treatment"),
 ], ids=["policies-renamed", "column-added"])
-def test_rebind_refuses_a_config_that_changes_more_than_principals(harness, capsys, config, message):
-    deleted_principals(harness)
+def test_the_rebind_hooks_refuse_the_same_configs(harness, config, message):
+    """Below the controller, rebind_problems (both rebind hooks, and the coverage check) refuses them too."""
+    _, failed, _ = deleted_principals(harness)
     write_env(harness.env_dir, **config)
-    before, state = harness.journal(), live_state(harness.env_dir)
-    capsys.readouterr()
-    with pytest.raises(spa.Refused, match="rebind-protect plan was refused"):
-        harness.controller().rebind()
-    assert harness.calls == ["rebind-protect:plan"] and message in capsys.readouterr().err
-    _unchanged(harness, before, state)
+    t = harness.journal()["transition"]
+    old = pg.load_snapshot(harness.env_dir, t["from"])
+    problems = pg.rebind_problems(pg.desired_generation(harness.env_dir), failed, [old],
+                                  pg.rebind_approved(harness.env_dir, pg.desired_generation(harness.env_dir)))
+    assert any(message in p for p in problems), problems
 
 
 def test_rebind_refuses_a_retained_policy_naming_the_replaced_deployer(harness, capsys):

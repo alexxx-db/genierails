@@ -243,6 +243,16 @@ def _patch_common(monkeypatch, *, account_groups=None):
 
 
 class TestCliGroupMode:
+    @staticmethod
+    def _auth(tmp_path):
+        auth = tmp_path / "auth.auto.tfvars"
+        auth.write_text(
+            'databricks_workspace_host = "https://example.invalid"\n'
+            'databricks_client_id = "client"\n'
+            'databricks_client_secret = "test-only-secret"\n'
+        )
+        return ["--auth-file", str(auth)]
+
     def test_groups_and_create_groups_are_mutually_exclusive(self, monkeypatch):
         # argparse rejects the contradictory combination with exit code 2.
         monkeypatch.setattr(sys, "argv", [
@@ -263,7 +273,7 @@ class TestCliGroupMode:
         _patch_common(monkeypatch)
         monkeypatch.setattr(sys, "argv", [
             "generate_abac.py", "--tables", "cat.sch.tbl", "--dry-run",
-            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path), *self._auth(tmp_path),
         ])
         with pytest.raises(SystemExit) as excinfo:
             main()
@@ -286,7 +296,7 @@ class TestCliGroupMode:
         monkeypatch.setattr(sys, "argv", [
             "generate_abac.py", "--groups", "Finance_Analyst",
             "--tables", "cat.sch.tbl", "--dry-run",
-            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path), *self._auth(tmp_path),
         ])
         with pytest.raises(SystemExit) as excinfo:
             main()
@@ -306,7 +316,7 @@ class TestCliGroupMode:
         monkeypatch.setattr(sys, "argv", [
             "generate_abac.py", "--groups", "Ghost_Group",
             "--tables", "cat.sch.tbl", "--dry-run",
-            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path), *self._auth(tmp_path),
         ])
         with pytest.raises(SystemExit) as excinfo:
             main()
@@ -329,7 +339,7 @@ class TestCliGroupMode:
         monkeypatch.setattr(sys, "argv", [
             "generate_abac.py", "--create-groups",
             "--tables", "cat.sch.tbl", "--dry-run",
-            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path),
+            "--ddl-dir", str(tmp_path), "--out-dir", str(tmp_path), *self._auth(tmp_path),
         ])
         with pytest.raises(SystemExit) as excinfo:
             main()

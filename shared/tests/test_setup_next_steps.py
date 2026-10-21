@@ -198,7 +198,7 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "envs/prod/auth.auto.tfvars",
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
-        "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=dev",
+        "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=dev",
         "     make release-plan ENV=prod   (checks the commit was rehearsed",
         "Get that manifest approved, then: make release ENV=prod\n",
         "make maintain ENV=prod",
@@ -243,7 +243,7 @@ def test_setup_prod_rehearses_its_promote_from_source_before_release_plan(tmp_pa
 
     assert result.returncode == 0, result.stderr
     out = result.stdout
-    assert "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=stg" in out
+    assert "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=stg" in out
     assert "make rehearse ENV=dev" not in out
     assert out.index("make rehearse ENV=stg") < out.index("make release-plan ENV=prod")
 
@@ -302,6 +302,21 @@ def test_setup_stg_promoted_uses_the_promotion_banner_without_overwrite_or_rehea
     assert "make rehearse ENV=dev" in out
     assert "make rehearse ENV=stg" not in out
     assert "cp ../shared/examples/dev_to_prod/env.auto.tfvars.example envs/stg/env.auto.tfvars" not in out
+
+
+@pytest.mark.parametrize("env", ["prod", "stg"])
+def test_setup_promoted_env_says_set_group_map_and_keeps_the_tier_placeholders(env, tmp_path):
+    """promote-to writes a promoted env's tiers from its source's through group_map."""
+    result = _make("aws", tmp_path, "setup", f"ENV={env}")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert (f"     Where {env}'s group names differ from dev's, set group_map there (each dev group = its {env} "
+            "group): promote-to writes this env's access_tier_groups from dev's through it, so leave those "
+            "placeholders.\n") in out, out
+    assert "Replace this env's access_tier_groups placeholders" not in out
+    assert "access_tier_groups placeholder" not in out  # no "Setup required" advice to replace them
+    cfg = hcl2.loads((tmp_path / "aws" / "envs" / env / "env.auto.tfvars").read_text())
+    assert cfg["access_tier_groups"] == ["<most-privileged-group>", "<least-privileged-group>"]
 
 
 def test_setup_stg_without_promote_from_uses_the_rehearsal_banner(tmp_path):

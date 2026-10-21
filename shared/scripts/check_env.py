@@ -311,7 +311,9 @@ def _check(args) -> None:
 
     try:
         step(1, "validate")
-        if not (scratch.envs / env / "abac.auto.tfvars").is_file() and has_generated:
+        if not has_generated and not (scratch.envs / env / "abac.auto.tfvars").is_file():
+            print(f"  NOTE: skipped: envs/{env} has not been generated; run make generate ENV={env}.")
+        elif not (scratch.envs / env / "abac.auto.tfvars").is_file():
             then = ("the regeneration below splits generated/ and validates every layer" if is_deterministic
                     else "validate-generated below checks generated/")
             print(f"  NOTE: skipped: envs/{env}/abac.auto.tfvars (the split config) is not committed; {then}.")
@@ -330,12 +332,16 @@ def _check(args) -> None:
                 before = _snapshot(scratch.envs)
                 if scratch.make("promote", f"ENV={env}") != 0:
                     raise CheckFailed(f"promote ENV={env} (the same-env split) failed")
+                # A promoted env records only what promote-to records (agents in agents/
+                # files, or a record already committed), so an inline-agent promotion is
+                # current without a record and a committed one must still be current.
                 if subprocess.run([sys.executable, str(SHARED_ROOT / "scripts" / "sticky_governance.py"),
-                                   "record", "--env-dir", str(env_dir),
+                                   "record", *(["--if-agent-files"] if promotes else []), "--env-dir", str(env_dir),
                                    "--config", str(env_dir / "generated" / "abac.auto.tfvars")]).returncode != 0:
                     raise CheckFailed("recording the governed tables failed")
                 _report(f"generated files (envs/{env})", before, _snapshot(scratch.envs),
-                        f"Run make generate ENV={env} on the latest main and commit the result.")
+                        f"Run make {'promote-to' if promotes else 'generate'} ENV={env} on the latest main "
+                        "and commit the result.")
             else:
                 print(f"  NOTE: envs/{env}/generated/abac.auto.tfvars is not committed; nothing to regenerate.")
 
@@ -385,7 +391,8 @@ def _check(args) -> None:
 
         token = mint(scratch.envs / env)
         try:
-            if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token)}) != 0:
+            if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token),
+                                                             "CLASSIFICATION_READ_ONLY": "1"}) != 0:
                 raise CheckFailed("plan")
         finally:
             token.unlink(missing_ok=True)

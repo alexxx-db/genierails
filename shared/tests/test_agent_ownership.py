@@ -518,6 +518,27 @@ def test_promote_seeds_settings_once_and_rewrites_the_capture(tmp_path):
     assert json.loads((prod / "agents" / "Sales.space.json").read_text()) == promoted
 
 
+@pytest.mark.parametrize("mode, expected", [
+    ('governance_mode = "deterministic"\n', ["prod_sales_analysts", "etl"]),
+    # group_map applies only to a deterministic target; a legacy one is seeded as before.
+    ("", ["sales_analysts", "etl"]),
+])
+def test_promote_seeds_acl_groups_through_the_targets_group_map(tmp_path, capsys, mode, expected):
+    dev, prod = _promote_envs(tmp_path)
+    (dev / "agents" / "Sales.auto.tfvars").write_text('genie_space_id = "dev-id"\nacl_groups = ["sales_analysts", "etl"]\n')
+    (dev / "env.auto.tfvars").write_text((dev / "env.auto.tfvars").read_text() + 'raw_exempt_principals = ["etl"]\n')
+    (prod / "env.auto.tfvars").write_text(
+        mode + 'group_map = { sales_analysts = "prod_sales_analysts", etl = "prod_etl" }\n')
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+    # dev's raw_exempt_principals are never mapped (as in remap_env_config.py).
+    assert agent_files.load(prod, "Sales")["acl_groups"] == expected
+    assert "seeded agents/Sales.auto.tfvars (acl_groups from dev, through group_map)" in capsys.readouterr().out
+    # A later promotion keeps prod's file and compares dev's groups through group_map.
+    agent_promote.promote(dev, prod, {"dev_sales": "prod_sales"})
+    assert "keeps acl_groups" not in capsys.readouterr().out
+    assert agent_files.load(prod, "Sales")["acl_groups"] == expected
+
+
 def test_promote_is_a_pure_function_of_the_committed_files(tmp_path, monkeypatch):
     dev, prod = _promote_envs(tmp_path)
     monkeypatch.setattr(ownership, "_api", lambda *a: pytest.fail("promote-to read live Databricks"))

@@ -318,6 +318,8 @@ def test_block_lists_deterministic_layer_files_per_env(tmp_path):
 
 COMMITTED_ANY = [
     "env.auto.tfvars", "ack.txt", "agents/sales.auto.tfvars", "agents/sales.space.json",
+    # Upstream's root .gitignore has *conf*.json; an agent capture is still committed.
+    "agents/confidential_deals.auto.tfvars", "agents/confidential_deals.space.json",
     "generated/abac.auto.tfvars", "generated/masking_functions.sql", "generated/governed_tables.json",
     "generated/expected_classification.json", "generated/TUNING.md",
     "generated/spaces/sales/abac.auto.tfvars", "ddl/customers.sql",
@@ -429,3 +431,31 @@ def test_git_status_ignores_every_runtime_file_and_tracks_every_committed_one(
     _git(repo, "add", "-A")
     staged = set(_git(repo, "diff", "--cached", "--name-only").splitlines())
     assert not staged & set(runtime)
+
+
+@pytest.mark.parametrize("cloud", CLOUDS)
+def test_an_agent_capture_named_like_conf_is_committed_even_with_ignorecase(cloud, tmp_path):
+    """macOS checkouts set core.ignorecase, so the root *conf*.json matches "Confidential"."""
+    repo = tmp_path / "repo"
+    cloud_root = repo / cloud
+    cloud_root.mkdir(parents=True)
+    (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text())
+    (cloud_root / ".gitignore").write_text((ROOT / cloud / ".gitignore").read_text())
+    _git(repo, "init", "-q")
+    _git(repo, "config", "core.ignorecase", "true")
+    assert _setup(cloud, cloud_root, "ENV=dev").returncode == 0
+    result = _setup(cloud, cloud_root, "ENV=dev", "GITIGNORE=customer")
+    assert result.returncode == 0, result.stdout + result.stderr
+    agents = cloud_root / "envs" / "dev" / "agents"
+    for name in ("Confidential Deals.space.json", "Confidential Deals.auto.tfvars"):
+        _touch(agents / name)
+    # Other *conf*.json files stay ignored.
+    _touch(cloud_root / "envs" / "dev" / "app_config.json")
+
+    def ignored(rel):
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        return subprocess.run(["git", "check-ignore", "-q", rel], cwd=repo, env=env).returncode == 0
+
+    assert not ignored(f"{cloud}/envs/dev/agents/Confidential Deals.space.json")
+    assert not ignored(f"{cloud}/envs/dev/agents/Confidential Deals.auto.tfvars")
+    assert ignored(f"{cloud}/envs/dev/app_config.json")
