@@ -151,7 +151,7 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "envs/prod/auth.auto.tfvars",
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
-        "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=dev",
+        "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=dev",
         "     make release-plan ENV=prod   (checks the commit was rehearsed",
         "Get that manifest approved, then: make release ENV=prod\n",
         "make maintain ENV=prod",
@@ -196,7 +196,7 @@ def test_setup_prod_rehearses_its_promote_from_source_before_release_plan(tmp_pa
 
     assert result.returncode == 0, result.stderr
     out = result.stdout
-    assert "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=stg" in out
+    assert "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=stg" in out
     assert "make rehearse ENV=dev" not in out
     assert out.index("make rehearse ENV=stg") < out.index("make release-plan ENV=prod")
 

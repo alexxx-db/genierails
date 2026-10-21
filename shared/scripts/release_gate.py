@@ -470,6 +470,7 @@ def rehearse_start(env_dir: Path, env: str, makefile: Path, make: str) -> str:
     print(f"=== Rehearse ({env}): code and {env} inputs are unchanged since the passing rehearsal of "
           f"{earlier['commit'][:12]}; wrote a receipt for {status['commit'][:12]} without re-applying ===")
     print(f"  Receipt: {path}")
+    _print_unclean(status)
     _print_targets(receipt["targets"])
     return "reused"
 
@@ -496,15 +497,21 @@ def rehearse_finish(env_dir: Path, env: str, result: str, makefile: Path, make: 
     path = _write_rehearse(cloud_dir, env, receipt)
     pending_path.unlink(missing_ok=True)
     print(f"Rehearse receipt ({result}{'' if status['clean_tree'] else ', NOT a clean checkout'}): {path}")
-    if not status["clean_tree"]:
-        for line in status["dirty"][:5]:
-            print(f"  {line}")
-        print("  A release needs a passing rehearsal of a clean checkout of the commit it releases.")
+    _print_unclean(status)
     if result == "passed":
         _print_targets(receipt["targets"])
     else:
         print(f"  rehearse failed: {reason or 'see above'}", file=sys.stderr)
     return receipt | {"_path": str(path)}
+
+
+def _print_unclean(status: Mapping) -> None:
+    if not status["clean_tree"]:
+        print("  NOT a clean checkout; release-plan ignores this receipt:")
+        for line in status["dirty"][:5]:
+            print(f"  {line}")
+        print("  A release needs a passing rehearsal of a clean checkout of the commit it releases: "
+              "commit or remove these, then rehearse again.")
 
 
 def _print_targets(targets: Mapping) -> None:
@@ -573,10 +580,16 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
     if receipt is None:
         foreign = [r for r in rehearse_receipts(cloud_dir, source, any_store=True)
                    if r.get("commit") == commit and r.get("store") != store_id(cloud_dir, source)]
+        unclean = [r for r in rehearse_receipts(cloud_dir, source)
+                   if r.get("commit") == commit and r.get("result") == "passed" and r.get("clean_tree") is not True]
         problems.append(f"no passing rehearsal of {commit[:12]} (a clean checkout): run make rehearse "
                         f"ENV={source} on this commit first (receipts: {rehearse_dir(cloud_dir, source)})"
                         + (f"; {len(foreign)} receipt(s) for it were written by another store (a downloaded "
                            "CI artifact or a copy) and are informational only" if foreign else ""))
+        if unclean:
+            problems.append("a receipt exists but its checkout wasn't clean: "
+                            + "; ".join(unclean[-1].get("dirty") or ["(no details recorded)"])
+                            + f". Commit or remove these, then re-run make rehearse ENV={source}")
     else:
         if receipt.get("fingerprint") != fp["fingerprint"]:
             changed = [k for k in ("code", "env", "account")

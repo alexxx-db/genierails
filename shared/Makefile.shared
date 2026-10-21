@@ -370,7 +370,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		if [ "$$det" = 1 ]; then \
 			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 			[ -n "$$src" ] || src=dev; \
-			echo "  5. Commit and push envs/ to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
+			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
 			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
 			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \
@@ -1530,7 +1530,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 		$(_SAVED_SETTINGS) promote-save --env-file "$$dest_dir/env.auto.tfvars" --from "$$src" --catalog-map "$$map"; \
 	fi; \
 	if [ "$$($(_IS_DETERMINISTIC) "$$dest_dir/env.auto.tfvars")" = 1 ]; then \
-		$(_STICKY) record --if-agent-files --env-dir "$$dest_dir" --config "$$dest_dir/generated/abac.auto.tfvars" || exit 1; \
+		$(_STICKY) record --env-dir "$$dest_dir" --config "$$dest_dir/generated/abac.auto.tfvars" || exit 1; \
 	fi; \
 	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" changes --from "$$txn_dir/snapshot" || exit 1; \
 	$(_PROMOTION_TXN_COMMIT); \

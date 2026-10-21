@@ -144,6 +144,7 @@ def repo(tmp_path):
     (bin_dir / "terraform").chmod(0o755)
     result = _make(repo, tmp_path, "promote", "ENV=dev")
     assert result.returncode == 0, result.stdout + result.stderr
+    # The rest of what make generate writes (_write_generated stands in for it).
     subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
                     "--env-dir", str(dev), "--config", str(dev / "generated" / "abac.auto.tfvars")], check=True)
     _git(repo, "init", "-q")
@@ -161,8 +162,8 @@ def _promote_to_prod(repo, tmp_path, env_text=None, deployer=DEPLOYER):
     result = _make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
-    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
-                    "--env-dir", str(prod), "--config", str(prod / "generated" / "abac.auto.tfvars")], check=True)
+    # promote-to itself records the governed tables, inline agents or not: make check expects them.
+    assert (prod / "generated" / "governed_tables.json").is_file()
     _commit(repo, "promote")
     return repo
 
@@ -486,6 +487,44 @@ def _assert_check_and_promote_check_pass(repo, tmp_path, ci):
 @pytest.mark.parametrize("ci", ["", "true"])
 def test_check_prod_and_promote_check_pass_on_the_promotion(promoted, tmp_path, ci):
     _assert_check_and_promote_check_pass(promoted, tmp_path, ci)
+
+
+def _drop_prod_record(repo):
+    (_envs(repo) / "prod" / "generated" / "governed_tables.json").unlink()
+    _commit(repo, "prod lost its record")
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_prod_names_promote_to_when_the_governed_tables_record_is_stale(promoted, tmp_path, ci):
+    _drop_prod_record(promoted)
+
+    check = _make(promoted, tmp_path, "check", "ENV=prod", **({"CI": ci} if ci else {}))
+
+    out = check.stdout + check.stderr
+    assert check.returncode != 0, out
+    assert "Run make promote-to ENV=prod" in out, out
+    assert "make generate ENV=prod" not in out, out
+
+
+def test_checks_same_env_step_names_promote_to_for_a_promoted_env(promoted, tmp_path, monkeypatch, capsys):
+    """The same-env regeneration's hint, past promote-to CHECK=1 (which catches the same gap first)."""
+    from scripts import check_env
+
+    _drop_prod_record(promoted)
+    for key, value in _env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    for key in ("CI", "MAKEFLAGS", "MAKELEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(check_env, "_promote_check", lambda args: None)
+
+    code = check_env.main(["check", "--env", "prod", "--cloud-dir", str(promoted / "aws"),
+                           "--makefile", str(promoted / "aws" / "Makefile")])
+
+    out = capsys.readouterr()
+    text = out.out + out.err
+    assert code == 1, text
+    assert "Run make promote-to ENV=prod on the latest main and commit the result." in text, text
+    assert "make generate ENV=prod" not in text, text
 
 
 def _policies(env_dir):

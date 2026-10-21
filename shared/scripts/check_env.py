@@ -335,7 +335,8 @@ def _check(args) -> None:
                                    "--config", str(env_dir / "generated" / "abac.auto.tfvars")]).returncode != 0:
                     raise CheckFailed("recording the governed tables failed")
                 _report(f"generated files (envs/{env})", before, _snapshot(scratch.envs),
-                        f"Run make generate ENV={env} on the latest main and commit the result.")
+                        f"Run make {'promote-to' if promotes else 'generate'} ENV={env} on the latest main "
+                        "and commit the result.")
             else:
                 print(f"  NOTE: envs/{env}/generated/abac.auto.tfvars is not committed; nothing to regenerate.")
 

@@ -417,8 +417,6 @@ def main(argv: list[str] | None = None) -> int:
     rec = sub.add_parser("record", help="add tables tagged in --config to the governed set")
     rec.add_argument("--env-dir", type=Path, required=True)
     rec.add_argument("--config", type=Path, required=True)
-    rec.add_argument("--if-agent-files", action="store_true",
-                     help="only in an env whose agents are in agents/ files (promote-to's target)")
     rebuilt = sub.add_parser("rebuild", help="rewrite the record from history, state and config")
     rebuilt.add_argument("--env-dir", type=Path, required=True)
     layout = sub.add_parser("check-layout", help="refuse treatment tags still at the old state address")
@@ -431,8 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "record":
-            if not args.if_agent_files or _records_agents(args.env_dir, agent_tables(args.env_dir)):
-                record(args.env_dir, _load_hcl(args.config).get("tag_assignments") or [])
+            record(args.env_dir, _load_hcl(args.config).get("tag_assignments") or [])
         elif args.command == "rebuild":
             rebuild(args.env_dir)
         elif args.command == "check-layout":

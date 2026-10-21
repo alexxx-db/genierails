@@ -22,7 +22,7 @@ make rehearse ENV=dev       # applies in dev and proves the masks work (verify-a
 make setup ENV=prod         # set deployer_principal_id, groups and catalog_map
 make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
-git add envs/ && git commit -m "Promote the rules to prod" && git push
+git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git push
 make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't run it)
 make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
@@ -123,7 +123,7 @@ Then:
 make promote-to ENV=prod
 ```
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
-Commit and push the promoted files to `main` (`git add envs/`, commit, `git push`).
+Commit and push the promoted files to `main` (`git add .gitignore envs/`, commit, `git push`): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 

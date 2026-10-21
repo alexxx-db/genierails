@@ -49,6 +49,8 @@ COMMON = """\
 !/envs/
 !/envs/**/generated/
 !/envs/**/masking_functions.sql
+# Agent captures, even ones the root *conf*.json matches ("Confidential Deals").
+!/envs/**/agents/*.space.json
 # Never commit credentials, Terraform state or plans, locks, receipts, Genie ID
 # and adoption markers, or runtime records (all GenieRails runtime files under
 # envs/ start with a dot: .genie_*, .policy_generations/, generated/.runtime/,
