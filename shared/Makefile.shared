@@ -1420,6 +1420,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		dest_env_dir="$(DEST_ENV_DIR)"; \
 		$(call _PROMOTION_TXN_BEGIN,"$$dest_env_dir" "$(ACCOUNT_ENV_DIR)"); \
 		_SEED_PROMOTION_SETTINGS=0 $(MAKE) --no-print-directory _prepare-env ENV="$(DEST_ENV)" ENV_DIR="$(DEST_ENV_DIR)"; \
+		$(if $(_REUSE_SOURCE_AUTH),$(_PREPARE_DEST_AUTH) || exit 1;) \
 		python3 "$(SHARED_ROOT)/scripts/remap_env_config.py" "$(SOURCE_ENV_DIR)" "$$dest_env_dir" "$(DEST_CATALOG_MAP)" || exit 1; \
 		mkdir -p "$$dest_env_dir/generated"; \
 		map_flags=$$(python3 -c 'pairs = [p.strip() for p in "$(DEST_CATALOG_MAP)".split(",") if "=" in p]; print(" ".join("--map " + p for p in pairs))'); \
@@ -1445,6 +1446,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		echo "=== Promote complete: $(SOURCE_ENV) -> $(DEST_ENV) ==="; \
 		if ! python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$$dest_env_dir/auth.auto.tfvars"; then \
 			echo "  Next: edit $$dest_env_dir/auth.auto.tfvars  ($(DEST_ENV) workspace credentials)"; \
+			echo "        (same service principal as $(SOURCE_ENV)? add REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<$(DEST_ENV) host> WORKSPACE_ID=<$(DEST_ENV) id>)"; \
 		fi; \
 		echo "  Then: in Catalog Explorer, open the $(DEST_ENV) catalog > Details tab > Data classification and turn it on."; \
 		echo "        When the scan finishes, review detections, exclude false positives, enable auto-tagging,"; \
@@ -1480,6 +1482,16 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		cd "$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" && if [ -f abac.auto.tfvars ]; then python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars masking_functions.sql $(call _VALIDATION_FLAGS,promote-data-access); fi; \
 		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-workspace); trap - EXIT; \
 	fi
+
+# REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<dest host> WORKSPACE_ID=<dest id> (command line only):
+# both envs use one SP, so fill the destination's still-blank auth.auto.tfvars with
+# the source's account ID, client ID and secret, keeping the destination's host and
+# ID (scripts/prepare_destination_auth.py). It runs inside the promotion transaction.
+_REUSE_SOURCE_AUTH = $(filter command line,$(origin REUSE_SOURCE_AUTH) $(origin WORKSPACE_HOST) $(origin WORKSPACE_ID))
+override _PREPARE_DEST_AUTH = python3 "$(SHARED_ROOT)/scripts/prepare_destination_auth.py" \
+	--source "$(SOURCE_ENV_DIR)/auth.auto.tfvars" --dest "$$dest_env_dir/auth.auto.tfvars" \
+	--dest-env-file "$$dest_env_dir/env.auto.tfvars" --reuse "$(REUSE_SOURCE_AUTH)" \
+	--workspace-host "$(WORKSPACE_HOST)" --workspace-id "$(WORKSPACE_ID)"
 
 # A refused promotion changes nothing: _PROMOTION_TXN_BEGIN snapshots the trees
 # it writes (the destination env and the shared account layer) and, when the
