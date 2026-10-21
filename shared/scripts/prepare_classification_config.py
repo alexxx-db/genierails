@@ -18,6 +18,8 @@ from scripts.footprint import FootprintError, resolve_footprint
 
 
 def _load(path: Path) -> dict:
+    if not path.is_file():
+        raise SystemExit(f"ERROR: {path} is missing")
     try:
         with path.open() as handle:
             return hcl2.load(handle)
@@ -64,6 +66,7 @@ def _env_file_label(env_dir: Path) -> str:
 
 
 def main() -> int:
+    read_only = "--read-only" in sys.argv[2:]
     env_dir = Path(sys.argv[1]).resolve()
     config = _load(env_dir / "env.auto.tfvars")
     auth = _load(env_dir / "auth.auto.tfvars")
@@ -129,7 +132,7 @@ def main() -> int:
         try:
             remote = client.data_classification.get_catalog_config(name)
         except NotFound:
-            if usage_policy_id:
+            if usage_policy_id and not read_only:
                 client.api_client.do(
                     "POST",
                     f"/api/data-classification/v1/catalogs/{catalog}/config",
