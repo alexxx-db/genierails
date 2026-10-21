@@ -740,9 +740,77 @@ def test_a_new_config_is_refused_while_a_change_is_unfinished(harness):
     before = harness.journal()
     write_env(harness.env_dir, versions={"email_partial": {"partial": "initials"}})
     harness.calls.clear()
-    with pytest.raises(spa.Refused, match="can't start until this one is finished"):
+    with pytest.raises(spa.Refused, match="can't start until this one is finished") as refused:
         harness.apply()
     assert harness.calls == [] and harness.journal() == before
+    # The switch was rolled back, so the way out is abandon, then the same command again.
+    assert "Next: run make policy-abandon ENV=dev, then re-run; or re-run the same command at commit" \
+        in str(refused.value)
+
+
+ABANDON_HINT = "run make policy-abandon ENV=dev, then re-run"
+
+
+def _unfinished_create(harness) -> dict:
+    """A change that failed at create's verification (never switched), then a config that moved on."""
+    released(harness)
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    harness.fail_verify = {"create"}
+    assert harness.apply() == 1
+    harness.fail_verify = set()
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "initials"}})
+    harness.calls.clear()
+    return harness.journal()
+
+
+@pytest.mark.parametrize("command", ["run", "plan"])
+def test_a_config_that_moved_on_points_at_abandon(harness, tmp_path, command):
+    """make apply/rehearse (run) and make release-plan (plan) refuse a config the unfinished change isn't,
+    naming the env's abandon command; nothing is planned or applied."""
+    before = _unfinished_create(harness)
+    with pytest.raises(spa.Refused) as refused:
+        harness.controller().run() if command == "run" else harness.controller().plan(tmp_path / "plan")
+    message = str(refused.value)
+    assert f"Next: {ABANDON_HINT}; or re-run the same command at commit" in message
+    assert "can't start until this one is finished" in message
+    assert harness.calls == [] and harness.journal() == before
+
+
+def test_a_saved_manifest_of_the_unfinished_change_points_at_abandon_once_the_config_moved_on(harness, tmp_path):
+    """make release MANIFEST= of the change's own manifest, after the config moved on: the same refusal."""
+    released(harness)
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    out = tmp_path / "plan"
+    assert harness.controller().plan(out) == 0
+    assert harness.controller().apply_saved(out) == spa.MORE_PHASES
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "initials"}})
+    before, state = harness.journal(), live_state(harness.env_dir)
+    harness.calls.clear()
+    with pytest.raises(spa.Refused) as refused:
+        harness.controller().apply_saved(out)
+    assert f"Next: {ABANDON_HINT}; or re-run the same command at commit" in str(refused.value)
+    assert harness.calls == [] and harness.journal() == before and live_state(harness.env_dir) == state
+
+
+def test_describe_of_a_config_that_moved_on_points_at_abandon(harness, capsys):
+    _unfinished_create(harness)
+    capsys.readouterr()
+    assert harness.controller().describe() == 0
+    assert "(make policy-abandon ENV=dev, then re-run)" in capsys.readouterr().out
+
+
+def test_a_change_abandon_would_refuse_is_pointed_at_resume_only(harness):
+    """A switch whose restore failed may have columns on either generation: abandon refuses it, so the
+    mismatch refusal doesn't offer it."""
+    released(harness)
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    assert harness.apply(FAKE_TF_FAIL_APPLY="switch", FAKE_TF_FAIL_PLAN="restore") == 1
+    assert harness.journal()["transition"]["restore_failed"]
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "initials"}})
+    with pytest.raises(spa.Refused) as refused:
+        harness.apply()
+    message = str(refused.value)
+    assert "policy-abandon" not in message and "Next: re-run the same command at commit" in message
 
 
 def test_abandon_drops_a_change_that_never_switched(harness):
