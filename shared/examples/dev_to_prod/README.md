@@ -124,7 +124,7 @@ Then:
 ```bash
 make promote-to ENV=prod
 ```
-It copies dev's reviewed rules into prod, renamed to prod's catalogs: masks and policies, `tag_treatments`, adopted custom masks, the agent capture, the access tiers (through `group_map`) and the proven `verify_key_columns`. It leaves dev's tag assignments behind (prod derives its own from its own tags) and keeps prod's own agent ID, warehouse, `acl_groups` and `table_readers` once set, and the names of policies already live in prod.
+It copies dev's reviewed rules into prod, renamed to prod's catalogs: masks and policies, `tag_treatments`, adopted custom masks, the agent capture and the proven `verify_key_columns`; dev's tier groups are mapped through prod's `group_map`. It leaves dev's tag assignments behind (prod derives its own from its own tags) and keeps prod's own agent ID, warehouse, `acl_groups` and `table_readers` once set, and the names of policies already live in prod.
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
 Commit and push the promoted files to `main` (`git add envs/`, commit, `git push`).
 
