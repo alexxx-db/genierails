@@ -1,3 +1,8 @@
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -29,6 +34,10 @@ from scripts.bootstrap_sp import (
 )
 
 
+ROOT = Path(__file__).parents[2]
+SHARED_ROOT = ROOT / "shared"
+
+
 def _fake(*, existing=False, existing_secrets=True, roles=()):
     account = MagicMock()
     sp = SimpleNamespace(
@@ -42,7 +51,9 @@ def _fake(*, existing=False, existing_secrets=True, roles=()):
     account.service_principal_secrets.list.return_value = (
         [SimpleNamespace(id="existing-secret")] if existing_secrets else []
     )
-    account.service_principal_secrets.create.return_value = SimpleNamespace(secret="super-secret")
+    account.service_principal_secrets.create.return_value = SimpleNamespace(
+        secret="super-secret", id="secret-id", expire_time="2099-01-01T00:00:00Z"
+    )
     account.access_control.get_rule_set.return_value = SimpleNamespace(
         etag="etag-1", grant_rules=[]
     )
@@ -1371,3 +1382,201 @@ def test_secret_is_printed_once_and_never_repeated_in_summary():
     )
     assert output[warning_index + 2] == "client_secret = super-secret"
     assert 'databricks_client_secret = "<newly-minted secret shown above>"' in output
+
+
+def _mode(path):
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_write_auth_file_writes_secret_private_without_printing_value(tmp_path):
+    _account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    output = []
+
+    assert bootstrap(
+        _cfg(auth_file=auth),
+        client_factory=factory,
+        emit=output.append,
+    ) == 0
+
+    text = auth.read_text()
+    assert _mode(auth) == 0o600
+    assert 'databricks_account_id    = "acct"' in text
+    assert 'databricks_client_id     = "client-123"' in text
+    assert 'databricks_client_secret = "super-secret"' in text
+    assert 'databricks_workspace_host = "https://dbc.example.com"' in text
+    assert 'databricks_workspace_id   = "123"' in text
+    assert not any("super-secret" in line for line in output)
+    assert "secret_id = secret-id" in output
+    assert "expires_at = 2099-01-01T00:00:00Z" in output
+
+
+def test_write_auth_file_tightens_existing_template_before_replace(tmp_path, capsys):
+    _account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = ""\n')
+    auth.chmod(0o644)
+
+    bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
+
+    assert _mode(auth) == 0o600
+    assert 'databricks_client_secret = "super-secret"' in auth.read_text()
+    assert "tightening to 0600" in capsys.readouterr().err
+
+
+def test_write_auth_file_refuses_symlink(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    target = tmp_path / "outside.auto.tfvars"
+    target.write_text('databricks_client_secret = ""\n')
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="symlink; refusing"):
+        bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
+
+    assert "super-secret" not in target.read_text()
+    account.api_client.do.assert_not_called()
+
+
+def test_write_auth_file_refuses_filled_secret_without_force(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = "old-secret"\n')
+    auth.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="already contains a client secret"):
+        bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
+
+    assert "old-secret" in auth.read_text()
+    assert "super-secret" not in auth.read_text()
+    account.api_client.do.assert_not_called()
+
+
+def test_write_auth_file_refusal_tightens_existing_filled_secret(tmp_path, capsys):
+    _account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = "old-secret"\n')
+    auth.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="already contains a client secret"):
+        bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
+
+    assert _mode(auth) == 0o600
+    assert "old-secret" in auth.read_text()
+    assert "tightening to 0600" in capsys.readouterr().err
+
+
+def test_write_auth_file_force_replaces_filled_secret(tmp_path):
+    _account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = "old-secret"\n')
+    auth.chmod(0o600)
+
+    bootstrap(
+        _cfg(auth_file=auth, force_auth_file=True),
+        client_factory=factory,
+        emit=MagicMock(),
+    )
+
+    text = auth.read_text()
+    assert "old-secret" not in text
+    assert 'databricks_client_secret = "super-secret"' in text
+
+
+def test_write_auth_file_subprocess_does_not_leak_fake_secret(tmp_path):
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    fake_secret = "fake-secret-subprocess-value"
+    script = r'''
+import os
+import sys
+import types
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+catalog = types.ModuleType("databricks.sdk.service.catalog")
+class Privilege:
+    CREATE_CATALOG = "CREATE_CATALOG"
+    def __class_getitem__(cls, name):
+        return name
+class PermissionsChange:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+catalog.Privilege = Privilege
+catalog.PermissionsChange = PermissionsChange
+
+iam = types.ModuleType("databricks.sdk.service.iam")
+class WorkspacePermission:
+    ADMIN = "ADMIN"
+class GrantRule:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+class RuleSetUpdateRequest:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+iam.WorkspacePermission = WorkspacePermission
+iam.GrantRule = GrantRule
+iam.RuleSetUpdateRequest = RuleSetUpdateRequest
+
+sys.modules["databricks"] = types.ModuleType("databricks")
+sys.modules["databricks.sdk"] = types.ModuleType("databricks.sdk")
+sys.modules["databricks.sdk.service"] = types.ModuleType("databricks.sdk.service")
+sys.modules["databricks.sdk.service.catalog"] = catalog
+sys.modules["databricks.sdk.service.iam"] = iam
+
+from scripts import bootstrap_sp
+
+account = MagicMock()
+sp = SimpleNamespace(id="42", application_id="client-123", roles=[])
+account.service_principals.list.return_value = []
+account.service_principals.create.return_value = sp
+account.service_principal_secrets.list.return_value = []
+account.service_principal_secrets.create.return_value = SimpleNamespace(
+    secret=os.environ["FAKE_BOOTSTRAP_SECRET"], id="sec-1", expire_time="2099"
+)
+account.access_control.get_rule_set.return_value = SimpleNamespace(etag="e", grant_rules=[])
+account.workspaces.get.return_value = SimpleNamespace(workspace_url="dbc.example.com")
+account.workspace_assignment.list.return_value = []
+
+workspace = MagicMock()
+workspace.current_user.me.return_value = SimpleNamespace(
+    user_name="caller@example.com", groups=[SimpleNamespace(display="admins")]
+)
+workspace.metastores.current.return_value = SimpleNamespace(metastore_id="meta-1")
+workspace.metastores.get.return_value = SimpleNamespace(owner="caller@example.com")
+workspace.api_client.do.side_effect = [
+    {"id": "endpoint-1"},
+    None,
+]
+workspace_factory = MagicMock(return_value=workspace)
+bootstrap_sp._clients = lambda _cfg: (account, workspace_factory)
+raise SystemExit(bootstrap_sp.main([
+    "--account-id", "acct",
+    "--workspace-id", "123",
+    "--sp-name", "deploy",
+    "--yes",
+    "--write-auth-file", sys.argv[1],
+]))
+'''
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(SHARED_ROOT),
+        "FAKE_BOOTSTRAP_SECRET": fake_secret,
+    }
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(auth)],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert fake_secret not in result.stdout
+    assert fake_secret not in result.stderr
+    assert fake_secret in auth.read_text()
+    assert _mode(auth) == 0o600

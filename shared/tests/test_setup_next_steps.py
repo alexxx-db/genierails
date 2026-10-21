@@ -2,6 +2,7 @@
 
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -53,6 +54,10 @@ def _defined_targets():
 def _mentioned_targets(output):
     # Commands appear as "Run: make <t>", "or: make <t>", or indented on their own line.
     return re.findall(r"(?:^\s+|: )make ([a-z][a-z-]*)", output, flags=re.MULTILINE)
+
+
+def _mode(path):
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 @pytest.mark.parametrize("cloud", CLOUDS)
@@ -111,6 +116,27 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
         < out.rindex("make generate")
         < out.index("make rehearse")
     )
+
+
+@pytest.mark.parametrize("cloud", CLOUDS)
+def test_setup_creates_auth_tfvars_private(cloud, tmp_path):
+    result = _make(cloud, tmp_path, "setup", "ENV=dev")
+
+    assert result.returncode == 0, result.stderr
+    assert _mode(tmp_path / cloud / "envs/dev/auth.auto.tfvars") == 0o600
+
+
+def test_setup_warns_and_tightens_existing_auth_tfvars(tmp_path):
+    auth = tmp_path / "aws/envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = "already-here"\n')
+    auth.chmod(0o644)
+
+    result = _make("aws", tmp_path, "setup", "ENV=dev")
+
+    assert result.returncode == 0, result.stderr
+    assert _mode(auth) == 0o600
+    assert "tightening to 0600" in result.stderr
 
 
 @pytest.mark.parametrize("cloud", CLOUDS)

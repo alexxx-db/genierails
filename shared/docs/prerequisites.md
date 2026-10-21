@@ -209,6 +209,15 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
    make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap ACCOUNT_ID=<id> WORKSPACE_ID=<dev-workspace-id>,<prod-workspace-id> TARGET_CATALOG=<dev-catalog>,<prod-catalog> YES=1
    ```
 
+   Optional safer secret handling for a single workspace/env: add
+   `BOOTSTRAP_AUTH_ENV=<env>` to write the newly minted secret directly to
+   `envs/<env>/auth.auto.tfvars` with file mode `0600`. In that mode the secret
+   value is not printed; bootstrap prints only the secret id and expiry. For an
+   existing SP, also pass `ROTATE_SECRET=1` so there is a new secret to write.
+   Existing filled `databricks_client_secret` values are refused unless you
+   explicitly pass `BOOTSTRAP_AUTH_OVERWRITE=1`; symlinked auth files are always
+   refused.
+
    To preview the changes first, run the same command with `PLAN=1` instead of `YES=1`.
    Plan mode performs the same read-only authentication, endpoint, access-path, and
    grant-authority preflight as apply mode. If credentials are absent, it explicitly
@@ -224,9 +233,11 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
    | `TARGET_CATALOG` | Recommended | Exact name of the existing Unity Catalog catalog GenieRails will govern, from Catalog Explorer. With multiple `WORKSPACE_ID` values, supply either one catalog for every workspace (back-compatible) or one comma-separated catalog per workspace in the same order. Omit only for the greenfield alternative below. |
    | `MODEL_ENDPOINT` | No | Model serving endpoint to grant query access; bootstrap grants `CAN QUERY` on custom endpoints or Unity Catalog `EXECUTE` on the backing `system.ai` function for Foundation Model API endpoints. Defaults to `databricks-claude-sonnet-4-6`. |
    | `PLAN=1` / `YES=1` | No | `PLAN=1` previews without changing anything; `YES=1` applies without an interactive prompt. |
+   | `BOOTSTRAP_AUTH_ENV` | No | Target env whose `envs/<env>/auth.auto.tfvars` should receive a newly minted secret instead of printing the value. Supports one `WORKSPACE_ID` per run. |
+   | `BOOTSTRAP_AUTH_OVERWRITE=1` | No | Allow `BOOTSTRAP_AUTH_ENV` to replace an existing filled `databricks_client_secret`; template/empty secrets can be filled without this. |
 
    - A preflight confirms the catalog exists and the caller can grant access. It stops before making changes if either check fails.
-   - On success, it grants the required catalog permissions and prints the `auth.auto.tfvars` values, including a new OAuth secret when one is created.
+   - On success, it grants the required catalog permissions and prints the `auth.auto.tfvars` values, including a new OAuth secret when one is created. With `BOOTSTRAP_AUTH_ENV`, it writes the new secret to the env file instead and does not print the value.
    - Run once per environment, or combine environments positionally: `WORKSPACE_ID=<dev-id>,<prod-id> TARGET_CATALOG=<dev-catalog>,<prod-catalog>`. A single catalog value still applies to every workspace for backward compatibility.
    - The first run creates the SP and prints its OAuth secret; the second run reuses the SP and doesn't print a new secret. Use the same `client_id` / `client_secret` in both `envs/dev/auth.auto.tfvars` and `envs/prod/auth.auto.tfvars`.
 
@@ -248,12 +259,12 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
 
 You'll need these values in each `envs/<env>/auth.auto.tfvars`.
 
-**Used `make bootstrap-sp`?** It prints a ready-to-paste block for each workspace with `databricks_client_id`, `databricks_client_secret`, `databricks_workspace_host` and `databricks_workspace_id`. Paste it, then add:
+**Used `make bootstrap-sp`?** By default it prints a ready-to-paste block for each workspace with `databricks_client_id`, `databricks_client_secret`, `databricks_workspace_host` and `databricks_workspace_id`. Paste it, then add:
 
 - `databricks_account_id` — the same `ACCOUNT_ID` you passed to `bootstrap-sp`.
 - `databricks_account_host` — **Azure only:** `https://accounts.azuredatabricks.net`. On AWS you can omit it (defaults to `https://accounts.cloud.databricks.com`).
 
-The OAuth secret is shown only on the run that creates it — save it then. A later run shows `<existing-secret-not-retrievable>`; use `ROTATE_SECRET=1` to mint a new one.
+The OAuth secret is shown only on the run that creates it — save it then. A later run shows `<existing-secret-not-retrievable>`; use `ROTATE_SECRET=1` to mint a new one. To avoid printing the value, rerun one workspace at a time with `BOOTSTRAP_AUTH_ENV=<env>`; it writes `auth.auto.tfvars` with mode `0600` and prints only the secret id/expiry.
 
 <details>
 <summary><strong>Created the SP manually? Where to find each value</strong></summary>

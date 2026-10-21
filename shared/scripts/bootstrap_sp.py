@@ -8,7 +8,13 @@ import dataclasses
 import os
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+
+try:
+    from .auth_tfvars import render_auth_tfvars, write_auth_tfvars
+except ImportError:  # pragma: no cover - direct script execution
+    from auth_tfvars import render_auth_tfvars, write_auth_tfvars
 
 
 MODEL_ENDPOINT = "databricks-claude-sonnet-4-6"
@@ -28,6 +34,8 @@ class Config:
     rotate_secret: bool = False
     model_endpoint: str = MODEL_ENDPOINT
     target_catalogs: tuple[str, ...] = ()
+    auth_file: Path | None = None
+    force_auth_file: bool = False
     # Kept for callers constructing Config directly; CLI input is normalized above.
     target_catalog: str | None = None
 
@@ -73,6 +81,19 @@ def parser() -> argparse.ArgumentParser:
               "supply one value for every workspace or comma-separated values matching "
               "--workspace-id"),
     )
+    p.add_argument(
+        "--write-auth-file",
+        type=Path,
+        help=(
+            "write a newly minted OAuth secret to this auth.auto.tfvars instead of printing "
+            "the value; refuses symlinks and filled secrets unless --force-auth-file is set"
+        ),
+    )
+    p.add_argument(
+        "--force-auth-file",
+        action="store_true",
+        help="allow --write-auth-file to replace an existing filled databricks_client_secret",
+    )
     return p
 
 
@@ -100,6 +121,8 @@ def _plan(cfg: Config, emit: Callable[[str], None]) -> None:
         emit("  secret: mint/rotate OAuth M2M secret")
     else:
         emit("  secret: mint for a new SP or when the reused SP has no secret")
+    if cfg.auth_file:
+        emit(f"  secret output: write auth.auto.tfvars at {cfg.auth_file} (value not printed)")
 
 
 def _clients(cfg: Config) -> tuple[Any, Callable[[str], Any]]:
@@ -747,6 +770,22 @@ def _grant_tag_policy_roles(account: Any, cfg: Config, client_id: str) -> bool:
     return changed
 
 
+def _secret_metadata(secret_response: Any) -> tuple[str, str]:
+    secret_id = (
+        _value(secret_response, "id")
+        or _value(secret_response, "secret_id")
+        or _value(secret_response, "key_id")
+        or "<unavailable>"
+    )
+    expiry = (
+        _value(secret_response, "expire_time")
+        or _value(secret_response, "expiration_time")
+        or _value(secret_response, "expires_at")
+        or "<unavailable>"
+    )
+    return str(secret_id), str(expiry)
+
+
 def bootstrap(
     cfg: Config,
     *,
@@ -800,10 +839,35 @@ def bootstrap(
     if created or cfg.rotate_secret or not existing_secrets:
         secret_response = account.service_principal_secrets.create(service_principal_id=int(sp_id))
         secret = str(_value(secret_response, "secret"))
-        emit("WARNING: STORE THIS NOW. The OAuth client secret below is shown once and cannot be retrieved.")
-        emit(f"client_id = {client_id}")
-        emit(f"client_secret = {secret}")
+        if cfg.auth_file:
+            if len(cfg.workspace_ids) != 1:
+                raise RuntimeError("--write-auth-file supports exactly one workspace ID")
+            workspace_id = cfg.workspace_ids[0]
+            _workspace, host = preflight[workspace_id].workspace, preflight[workspace_id].host
+            write_auth_tfvars(
+                cfg.auth_file,
+                content=render_auth_tfvars(
+                    account_id=cfg.account_id,
+                    client_id=client_id,
+                    client_secret=secret,
+                    workspace_host=host,
+                    workspace_id=workspace_id,
+                ),
+                force=cfg.force_auth_file,
+            )
+            secret_id, expiry = _secret_metadata(secret_response)
+            emit(f"OAuth client secret minted and written to {cfg.auth_file}.")
+            emit(f"secret_id = {secret_id}")
+            emit(f"expires_at = {expiry}")
+        else:
+            emit("WARNING: STORE THIS NOW. The OAuth client secret below is shown once and cannot be retrieved.")
+            emit(f"client_id = {client_id}")
+            emit(f"client_secret = {secret}")
     else:
+        if cfg.auth_file:
+            raise RuntimeError(
+                "--write-auth-file needs a newly minted secret; use --rotate-secret when reusing an SP"
+            )
         emit("OAuth secret unchanged (use --rotate-secret to mint a replacement).")
 
     if "account_admin" not in _role_values(sp):
@@ -967,6 +1031,8 @@ def bootstrap(
 
 
 def _config_from_args(args: argparse.Namespace) -> Config:
+    if args.write_auth_file and len(args.workspace_id) != 1:
+        raise ValueError("--write-auth-file supports exactly one workspace ID")
     return Config(
         account_id=args.account_id,
         workspace_ids=args.workspace_id,
@@ -978,6 +1044,8 @@ def _config_from_args(args: argparse.Namespace) -> Config:
         rotate_secret=args.rotate_secret,
         model_endpoint=args.model_endpoint,
         target_catalogs=_target_catalogs(args.target_catalog, len(args.workspace_id)),
+        auth_file=args.write_auth_file,
+        force_auth_file=args.force_auth_file,
     )
 
 
