@@ -143,10 +143,13 @@ def test_a_forged_or_missing_migration_record_refuses(migrating, forge, reason):
     assert refreshed_at is None and reason in detail, detail
 
 
-def test_a_deterministic_generation_is_not_a_legacy_migration(migrating):
+def test_a_deterministic_generation_the_journal_isnt_moving_from_refuses(migrating):
+    """A deterministic old generation gets the deterministic branch (tests/test_staged_det_coverage.py),
+    which needs the journal to move from it: here it moves from the legacy generation."""
     refreshed_at, detail = migrating.judge(migrating.render("create"), "create",
                                            old=migrating.desired["fingerprint"])
-    assert refreshed_at is None and "is not a legacy migration's" in detail
+    assert refreshed_at is None and "records no transition from" in detail
+    assert "is not a legacy migration's" not in detail
 
 
 def test_a_create_render_with_any_other_value_refuses(migrating):

@@ -97,6 +97,35 @@ data_access root refuses, at plan time, any change to a live deterministic mask
 (removal, new principals, a new function, a retag) outside the controller's
 phases (`policy_stage`), so a raw `terraform apply` can't make one in one shot.
 
+**Coverage check on a staged render.** Each hook re-runs the coverage check
+on its own render. In a native-classification env (`enable_classification =
+true`) the live refresh records the treatment tags derive-assignments
+derived, which are the change's. The phases before the switch (`create`,
+`tighten`, `restore`, `abandon`, and a rebind, judged as `restore`) keep the
+active generation's values live instead. For those phases the check accepts
+a render whose tags differ from the refresh only when all of these hold:
+
+- the render is exactly the refreshed config with every treatment tag at the
+  value the active generation recorded (after an attempted switch, except
+  for abandon, newly governed columns keep their new value);
+- the journal moves from that generation to the generated config's (for
+  abandon the config may have moved on, but abandon itself refuses first
+  when its treatment values are neither the change's nor that generation's;
+  a rebind needs the config to be the change with only recreated
+  principals);
+- the generation's snapshot still hashes to its fingerprint.
+
+A legacy active generation also needs its adopted migration record
+([legacy-migration.md](legacy-migration.md)). The pass records the
+generation kept (`kept_from` in `data_access/.coverage_gate.json`) and the
+columns the refresh governs that the phase leaves untagged
+(`uncovered_columns`, for example a newly classified column before the
+switch), and prints both. Those phases create no business grant, so an
+untagged column gains no reader through them. A phase that can open access
+(the `grant` re-check, both rebind phases) must tag every column the refresh
+governs. `switch` and `retire` must match the refresh exactly. Anything else
+fails closed, as before.
+
 **Journal.** `<env>/data_access/.policy_generations/journal.json`, next to the
 layer's state (with `GENIERAILS_STATE_DIR` set, the same path under
 `$GENIERAILS_STATE_DIR/<cloud>/<env>/records/`, so a fresh checkout sees it),
@@ -140,8 +169,19 @@ any unfinished transition with its completed phases. Writes are atomic.
   Abandon holds the env lock from its first check to its last, and binds
   the live check to what it applies. Under the lock, make first re-reads
   live tags and DDL (`derive-assignments`, or the DDL alone, as `rehearse`
-  does), which records the live refresh the coverage check needs; a failed
-  refresh stops abandon before it plans anything.
+  does), which records the live refresh the coverage check needs, then
+  re-splits the result into `data_access/` (`promote`, as `make plan`
+  does). A failed refresh stops abandon before it plans anything. The render
+  takes its non-treatment tag assignments from the split, while the refresh
+  records the generated config's. The re-split normally makes them agree, so
+  a split edited or left stale before abandon is reconciled, not refused;
+  abandon refuses before it plans, naming the entries, only when they still
+  differ after the re-split (or when `staged_policy_apply.py abandon` runs
+  without make's re-split). Abandon also refuses before it plans when the
+  generated config's treatment values are neither the change's nor the
+  previous generation's (live `class.*` tags changed after the change
+  started, or its treatment settings were edited), naming the columns: see
+  [Changes that can't be dropped](#changes-that-cant-be-dropped).
 
   1. It saves a refreshed plan of the abandon render (the previous
      generation without the change's policies). That plan may only delete
@@ -193,7 +233,12 @@ any unfinished transition with its completed phases. Writes are atomic.
   dropping a `TO` refuses. It re-applies the restore render with the
   config's principals, under the env lock, in two phases. Like abandon, it
   first re-reads live tags and DDL under the lock for the access phase's
-  coverage check; a failed refresh stops rebind before it plans anything.
+  coverage check and re-splits them; a failed refresh stops rebind before it
+  plans anything, and so does a split whose non-treatment assignments still
+  differ from the generated config's after that re-split. A generated config whose treatment values
+  differ from the change's (live `class.*` tags changed since it started,
+  or its treatment settings were edited) refuses before any plan and names
+  the columns.
 
   1. **Protection.** Every policy depends on the grants in Terraform, so
      `-target` can't leave them out. Instead rebind plans the whole render,
@@ -243,6 +288,36 @@ any unfinished transition with its completed phases. Writes are atomic.
   exceptions.
 - `make plan` prints the phases the next apply will run, then plans the end
   state.
+
+### Changes that can't be dropped
+
+Abandon and rebind never untag or retag a column, so two shapes have no
+GenieRails way out yet. Each refuses before anything is applied, names the
+columns, and leaves live protection as it is:
+
+- **A rolled-back switch that kept newly governed columns.** The restore
+  leaves a column the change newly governs on its new value, masked by the
+  change's policies. Abandon would delete those policies, so abandon and
+  rebind both refuse ("N column(s) keep the new generation's treatment").
+  The way out is to resume the change: re-run the command that started it
+  with the generated config on that generation. If principals it names were
+  deleted and recreated under new IDs, the config can't be that generation
+  again, and no command can finish or drop the change yet.
+- **Live `class.*` tags changed after the change started** (or its
+  treatment settings were edited). Resume refuses ("N column(s) have another
+  treatment in the generated config than in generation ..."), because the
+  config is no longer the change. Abandon refuses too ("this change can't
+  be abandoned: N column(s) ..."), unless the generated config's treatment
+  values are back on the previous generation's. That exception trusts the
+  previous generation's snapshot only while it still hashes to its
+  fingerprint; an edited or unreadable snapshot refuses before any plan.
+  A rebind refuses too. Each
+  names the columns. The way out is to put those columns' `class.*` tags
+  (or the treatment settings) back as they were when the change started,
+  then resume it, or abandon or rebind it as before.
+
+How to un-govern such columns, or supersede the change, is an open design
+decision.
 
 ### Masking functions and checkout paths
 

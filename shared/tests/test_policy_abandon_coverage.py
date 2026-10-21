@@ -157,8 +157,18 @@ def _abandon_render(h) -> dict:
     return pg.plan_stage("abandon", changed, old, None, keep_new_tags=t["switch_attempted"])["rendered"]
 
 
+GROUPS = "groups = {\n  raw = {}\n  regional = {}\n  masked = {}\n}\n\n"
+
+
 def _promoted(h, *generations) -> None:
-    """The split config as promote leaves it: the account groups, and tag policies in the account layer."""
+    """The split config as promote leaves it: the account groups, and tag policies in the account layer.
+
+    The generated config carries the groups too, so a promote under make (policy-abandon and
+    policy-rebind re-split after their live refresh) splits the same config out again.
+    """
+    generated = h.env_dir / "generated" / "abac.auto.tfvars"
+    if not generated.read_text().startswith(GROUPS):
+        generated.write_text(GROUPS + generated.read_text())
     values = sorted({v for g in generations for v in g["tags"].values()})
     account = h.env_dir.parent / "account"
     account.mkdir(exist_ok=True)
@@ -167,7 +177,7 @@ def _promoted(h, *generations) -> None:
         f"    values = {json.dumps(values)}\n  }}\n]\n")
     layer = h.env_dir / "data_access" / "abac.auto.tfvars"
     rest = layer.read_text().split("tag_assignments = [", 1)[1]
-    layer.write_text("groups = {\n  raw = {}\n  regional = {}\n  masked = {}\n}\n\ntag_assignments = [" + rest)
+    layer.write_text(GROUPS + "tag_assignments = [" + rest)
 
 
 def _delete_principals(h) -> None:
@@ -236,7 +246,9 @@ def _make(target: str, h, tmp_path: Path, runner: Path, **stubs: str) -> subproc
                 "GATED_RUNNER": str(runner), "DERIVE_LOG": str(tmp_path / "derive.log"),
                 "GIT_CONFIG_GLOBAL": "/dev/null"}
     return subprocess.run(
-        ["make", "--no-print-directory", target, "ENV=dev", f"ENV_DIR={h.env_dir}", f"ROOT_RUNNER={runner}"],
+        ["make", "--no-print-directory", target, "ENV=dev", f"ENV_DIR={h.env_dir}", f"ROOT_RUNNER={runner}",
+         # Next to the test's env, so _prepare-env never links the checkout's envs/account to it.
+         f"ACCOUNT_ENV_DIR={h.env_dir.parent / 'account'}"],
         cwd=ROOT / "aws", text=True, capture_output=True, env=environ, timeout=600)
 
 
