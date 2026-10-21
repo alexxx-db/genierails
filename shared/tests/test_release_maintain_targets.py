@@ -86,6 +86,24 @@ def _make(target, env_dir, stub, audit, *extra):
                           text=True, capture_output=True, env=_env(audit))
 
 
+def _make_deterministic_maintain(env_dir, stub, audit):
+    bin_dir = script_stubs.install(
+        Path(audit).parent / "deterministic-stub-bin",
+        {
+            "audit_schema_drift.py": script_stubs.python_file(audit),
+            "deployer_identity.py": "true",
+            "release_gate.py": "true",
+            "external_mask_inventory.py": "true",
+        },
+    )
+    environ = _env()
+    environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
+    return subprocess.run(
+        ["make", "maintain", "ENV=prod", f"ENV_DIR={env_dir}", f"MAKE={stub}"],
+        cwd=CLOUD_ROOT, text=True, capture_output=True, env=environ,
+    )
+
+
 def _calls(log):
     return [shlex.split(x) for x in log.read_text().splitlines()] if log.exists() else []
 
@@ -152,6 +170,42 @@ def test_maintain_remains_governance_only_and_writes_no_receipt(tmp_path):
                      "validate-generated", "audit-rulebook", "apply-governance"]
     assert "apply" not in names and "_verify-access-gate" not in names
     assert not list(env_dir.rglob(".certified*"))
+
+
+@pytest.mark.parametrize("finding", ["patient_count", "email_opt_in"])
+def test_deterministic_maintain_drift_is_advisory_and_still_uses_apply_gates(
+        tmp_path, finding):
+    env_dir = _env_dir(tmp_path, 'governance_mode = "deterministic"\n')
+    stub, log, audit = _stub(tmp_path, fail="audit-schema")
+    audit.write_text(
+        f"open({str(log)!r}, 'a').write('audit-schema ENV=prod\\n')\n"
+        f"print('FORWARD DRIFT: {finding}')\nraise SystemExit(1)\n"
+    )
+
+    result = _make_deterministic_maintain(env_dir, stub, audit)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    names = [c[1] if c[0] == "--no-print-directory" else c[0] for c in _calls(log)]
+    names = [name for name in names if name != "_guarded-bootstrap"]
+    assert names == ["derive-assignments", "audit-schema", "coverage-gate",
+                     "validate-generated", "audit-rulebook", "apply-governance"]
+    assert "continuing through the existing safety gates" in result.stderr
+
+
+def test_deterministic_maintain_derives_before_reverse_drift_audit(tmp_path):
+    env_dir = _env_dir(tmp_path, 'governance_mode = "deterministic"\n')
+    stub, log, audit = _stub(tmp_path, fail="audit-schema")
+    audit.write_text(
+        f"open({str(log)!r}, 'a').write('audit-schema ENV=prod\\n')\n"
+        "print('REVERSE DRIFT: dropped_email')\nraise SystemExit(1)\n"
+    )
+
+    result = _make_deterministic_maintain(env_dir, stub, audit)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    names = [c[1] if c[0] == "--no-print-directory" else c[0] for c in _calls(log)]
+    assert names.index("derive-assignments") < names.index("audit-schema")
+    assert "Reverse findings: derive-assignments has removed dropped columns" in result.stderr
 
 
 @pytest.mark.parametrize("audit_rc, says", [(1, "reported drift"), (2, "failed (error, not drift)")])

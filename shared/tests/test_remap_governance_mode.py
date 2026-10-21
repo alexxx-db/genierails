@@ -12,6 +12,9 @@ from pathlib import Path
 import hcl2
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import saved_settings  # noqa: E402
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "remap_env_config.py"
 PROD_SP = "5a7e0000-0000-0000-0000-00000000beef"
 # A deterministic env commits its own deployer SP (deployer_identity.py).
@@ -41,6 +44,18 @@ def test_promote_into_a_deterministic_prod_leaves_it_deterministic(tmp_path, sou
     assert cfg["deployer_principal_id"] == PROD_SP
     assert "Preserved destination governance_mode='deterministic'" in out
     assert cfg["uc_tables"] == ["prod_catalog.s.t"]
+
+
+def test_promote_to_refuses_legacy_source_for_deterministic_destination(tmp_path):
+    envs = tmp_path / "envs"
+    source, dest = envs / "dev", envs / "prod"
+    source.mkdir(parents=True)
+    dest.mkdir()
+    source.joinpath("env.auto.tfvars").write_text('uc_tables = ["dev_catalog.s.t"]\n')
+    dest.joinpath("env.auto.tfvars").write_text(
+        DETERMINISTIC_PROD + 'promote_from = "dev"\ncatalog_map = { "dev_catalog" = "prod_catalog" }\n')
+    with pytest.raises(ValueError, match="legacy.*deterministic.*legacy-migration.md"):
+        saved_settings.resolve_promote("prod", dest, envs, "", "")
 
 
 # A legacy prod may set its ID before it opts in (legacy-migration.md).

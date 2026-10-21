@@ -23,12 +23,37 @@ sys.path.insert(0, str(SHARED / "scripts"))
 from scripts import coverage_fix, migration  # noqa: E402
 import classification_completeness  # noqa: E402
 import run_scheduled_governance  # noqa: E402
+from generate_abac import generate_next_steps  # noqa: E402
 
 DETERMINISTIC_STG = 'governance_mode = "deterministic"\npromote_from = "stg"\n'
 DETERMINISTIC = 'governance_mode = "deterministic"\n'
 LEGACY = 'governance_mode = "legacy"\n'
 FULL_STG = ["commit and push envs/prod/", "make rehearse ENV=stg on that commit", "make release-plan ENV=prod",
             "make release ENV=prod"]
+
+
+@pytest.mark.parametrize("env,promoted,expected,absent", [
+    ("stg", True, "make release-plan ENV=stg", "make rehearse ENV=stg   (applies"),
+    ("stg", False, "make rehearse ENV=stg   (applies", "make release-plan ENV=stg"),
+    ("prod", True, "make release-plan ENV=prod", "make rehearse ENV=prod   (applies"),
+    ("dev", False, "make rehearse ENV=dev   (applies", "make release-plan ENV=dev"),
+])
+def test_generate_banner_follows_env_role(env, promoted, expected, absent, tmp_path):
+    banner = "\n".join(generate_next_steps(tmp_path, "full", env, has_sql=True,
+                                             champion_flow=True, tuning=False,
+                                             source_env="dev", promoted=promoted))
+    assert expected in banner
+    assert absent not in banner
+
+
+@pytest.mark.parametrize("env", ["prod", "stg"])
+def test_generate_banner_keeps_legacy_promoted_envs_on_release(env, tmp_path):
+    banner = "\n".join(generate_next_steps(tmp_path, "full", env, has_sql=True,
+                                             champion_flow=True, tuning=True,
+                                             source_env="dev", promoted=True))
+    assert f"make release ENV={env}" in banner
+    assert f"make rehearse ENV={env}" not in banner
+    assert "make release-plan" not in banner
 
 
 def _text(path: str) -> str:
@@ -286,7 +311,7 @@ def test_prod_setup_says_set_group_map_not_replace_access_tier_groups():
     assert "group_map" in step and "Leave the `access_tier_groups` placeholders" in step, step
     assert "`access_tier_groups` placeholders, and set" not in step
     makefile = (SHARED / "Makefile.shared").read_text()
-    banner = makefile[makefile.index("Next steps (production"):makefile.index("  3. In $(_SETUP_ENV_REL)/env.auto.tfvars")]
+    banner = makefile[makefile.index("Next steps ($(ENV) promotion"):makefile.index("  3. In $(_SETUP_ENV_REL)/env.auto.tfvars")]
     assert "set group_map there" in banner and "leave those placeholders" in banner, banner
     assert "Replace this env's access_tier_groups placeholders" not in banner
     # promote-to (and the promote it wraps) accept the destination's tier placeholders it overwrites.
@@ -301,8 +326,10 @@ def test_prod_setup_advice_does_not_ask_to_replace_tier_placeholders(tmp_path):
                    'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n')
     script = SHARED / "genie_space_placeholder.py"
     makefile = (SHARED / "Makefile.shared").read_text()
-    assert ('$(if $(filter prod,$(ENV)),GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 ,)python3 '
-            '"$(SHARED_ROOT)/genie_space_placeholder.py" --advice') in makefile
+    # A promoted env (prod, or any env with promote_from) gets its tiers from promotion.
+    advice_line = makefile[makefile.index("\t@allow=0;"):makefile.index("--advice")]
+    assert 'env-role' in advice_line and '= promoted ] && allow=1' in advice_line, advice_line
+    assert "GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$$allow python3" in advice_line, advice_line
     advice = {
         flag: subprocess.run([sys.executable, str(script), "--advice", str(env)], text=True, capture_output=True,
                              env={**os.environ, "GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS": flag}).stdout

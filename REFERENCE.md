@@ -244,7 +244,7 @@ Off by default. See [scheduled governance](shared/docs/scheduled-governance.md) 
 | Setting | Type | Default | Meaning |
 |---|---|---|---|
 | `enable_scheduled_governance` | bool | `false` | Create a scheduled job that runs the read-only governance checks. |
-| `scheduled_governance_mode` | string | `"check"` | `check` (read-only audits) or `legacy` (the old audit, generate-delta, coverage flow). |
+| `scheduled_governance_mode` | string | `"check"` | `check` (read-only audits) or `legacy` (audit, generate-delta, then `validate_abac.py --coverage-gate` against the generated or split config; never apply). |
 | `scheduled_governance_env` | string | `"prod"` | The env the job checks. |
 | `scheduled_governance_cloud` | string | `"aws"` | `aws` or `azure`: the cloud dir holding that env. |
 | `scheduled_governance_catalog` | string | `""` | Legacy mode only: the catalog for generate-delta. |
@@ -258,6 +258,13 @@ Off by default. See [scheduled governance](shared/docs/scheduled-governance.md) 
 | `scheduled_governance_dependencies` | list(string) | `["python-hcl2>=7.3.1,<8", "databricks-sdk", "pyyaml", "requests"]` | PyPI packages for the job. |
 | `scheduled_governance_notification_emails` | list(string) | `[]` | Who is emailed when the job fails. |
 | `scheduled_governance_job_name` | string | `""` (a generated name) | Override the job name. |
+
+Before enabling legacy scheduled coverage, legacy envs generated before
+`gr_treatment` existed must run `make generate ENV=<env>`, then
+`make validate-generated ENV=<env>` and `make plan ENV=<env>`. Expect existing
+legacy mask policies to be replaced by `gr_mask_*` ones; review the plan, then
+run `make apply ENV=<env>` to add `gr_treatment` tags. Otherwise every scheduled
+run fails with `classified but unprotected ... no gr_treatment`.
 
 ### `env.auto.tfvars`: settings make reads but Terraform doesn't
 
