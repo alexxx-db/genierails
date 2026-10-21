@@ -144,10 +144,16 @@ def _recipe(target: str) -> str:
 
 def test_inventory_runs_before_every_rehearse_release_and_maintain_in_deterministic_envs_only():
     # rehearse reaches apply through _derive-before-exposure, like plan and apply.
-    for target in ("_derive-before-exposure", "release"):
-        recipe = _recipe(target)
-        assert 'if [ "$$' in recipe and "= deterministic ]; then python3 \"$(SHARED_ROOT)/scripts/external_mask_inventory.py\"" in recipe, target
-        assert "external_mask_inventory.py\" --env-dir \"$(ENV_DIR)\" || exit 1" in recipe, target
+    recipe = _recipe("_derive-before-exposure")
+    assert 'if [ "$$' in recipe and "= deterministic ]; then python3 \"$(SHARED_ROOT)/scripts/external_mask_inventory.py\"" in recipe
+    assert "external_mask_inventory.py\" --env-dir \"$(ENV_DIR)\" || exit 1" in recipe
+    # release hands every deterministic env to _release-manifest before any other
+    # step and exits; the legacy recipe after it never sees a deterministic env,
+    # so it carries no deterministic branch (the inventory runs in _release-manifest).
+    dispatch, legacy = _recipe("release").split("\texit $$?; \\\n\tfi; \\\n", 1)
+    assert '"$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then' in dispatch
+    assert "$(MAKE) --no-print-directory _release-manifest" in dispatch
+    assert "external_mask_inventory" not in legacy and "= deterministic" not in legacy
     # maintain, release-plan and the manifest release run it through a variable tests can stub.
     makefile = (SHARED / "Makefile.shared").read_text()
     assert '_EXTERNAL_MASK_INVENTORY = python3 "$(SHARED_ROOT)/scripts/external_mask_inventory.py" --env-dir "$(ENV_DIR)"' in makefile
