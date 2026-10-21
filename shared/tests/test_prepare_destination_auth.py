@@ -221,6 +221,91 @@ def test_unexpected_failure_prints_a_fixed_message_and_no_traceback(tmp_path):
     assert dest.read_text() == TEMPLATE
     _no_secret(result)
 
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "fifo"])
+def test_source_that_is_not_a_regular_file_is_refused(tmp_path, kind):
+    real = tmp_path / "real.tfvars"
+    real.write_text(_source_auth())
+    source = tmp_path / "linked.auth.auto.tfvars"
+    if kind == "symlink":
+        source.symlink_to(real)
+    elif kind == "directory":
+        source.mkdir()
+    else:
+        os.mkfifo(source)  # O_NONBLOCK: opening it must not hang
+    dest = tmp_path / "dest" / "auth.auto.tfvars"
+    dest.parent.mkdir()
+    dest.write_text(TEMPLATE)
+
+    result = subprocess.run([sys.executable, str(SCRIPT), "--source", str(source), "--dest", str(dest), "--reuse", "1",
+                             "--workspace-host", PROD_HOST, "--workspace-id", "222"],
+                            text=True, capture_output=True, timeout=30)
+
+    assert result.returncode == 1
+    assert "is not a regular file" in result.stderr, result.stderr
+    assert dest.read_text() == TEMPLATE
+    _no_secret(result)
+
+
+def _swap_configured(dest):
+    fresh = dest.with_name("fresh.tfvars")
+    fresh.write_text(_source_auth(secret="typed-meanwhile", host=PROD_HOST))
+    os.replace(fresh, dest)
+
+
+def _edit_in_place(dest):
+    with dest.open("r+") as handle:  # same inode, new bytes
+        handle.write(_source_auth(secret="typed-meanwhile", host=PROD_HOST))
+
+
+def _swap_symlink(dest):
+    target = dest.with_name("elsewhere.tfvars")
+    target.write_text(TEMPLATE)
+    dest.unlink()
+    dest.symlink_to(target)
+
+
+@pytest.mark.parametrize("swap", [_swap_configured, _edit_in_place, _swap_symlink],
+                         ids=["new-configured-file", "edited-in-place", "symlink"])
+def test_destination_swapped_after_validation_is_not_overwritten(tmp_path, monkeypatch, swap):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    import prepare_destination_auth as module
+    source = tmp_path / "src.auth.auto.tfvars"
+    source.write_text(_source_auth())
+    dest = tmp_path / "dest" / "auth.auto.tfvars"
+    dest.parent.mkdir()
+    dest.write_text(TEMPLATE)
+    render = module._render
+    swapped = []
+
+    def render_then_swap(text, values):
+        rendered = render(text, values)
+        swap(dest)  # between the checks and the replace
+        swapped.append(_contents(dest))
+        return rendered
+
+    monkeypatch.setattr(module, "_render", render_then_swap)
+
+    with pytest.raises(module.AuthError, match="changed while it was being prepared"):
+        module.prepare(source, dest, None, PROD_HOST, "222")
+
+    assert swapped == [_contents(dest)]
+    assert SECRET not in dest.read_text()
+    assert not list(dest.parent.glob(".auth.*.tmp"))
+
+
+def _contents(path):
+    return ("link", os.readlink(path)) if path.is_symlink() else ("file", path.read_text())
+
+
+def test_opt_in_outside_any_make_command_line_is_refused(tmp_path):
+    result, dest = _run(tmp_path, "--reuse", "1", "--workspace-host", PROD_HOST, "--workspace-id", "222",
+                        "--require-make-command-line")
+
+    assert result.returncode == 1
+    assert "REUSE_SOURCE_AUTH=1 is not on the make command line" in result.stderr
+    assert dest.read_text() == TEMPLATE
+
 # Malformed source (or destination) files whose broken token is the secret: the
 # parser's text would echo it, so the message must be the fixed one.
 MALFORMED = {
@@ -352,5 +437,34 @@ def test_promote_to_refuses_reuse_for_a_different_prod_deployer(repo, tmp_path):
     out = result.stdout + result.stderr
     assert result.returncode != 0
     assert "do not share one service principal" in out, out
+    assert _state(repo) == before
+    assert SECRET not in out
+
+
+def test_shell_opt_in_is_ignored_even_with_command_line_workspace(repo, tmp_path):
+    prod = _prod(repo)
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod", f"WORKSPACE_HOST={PROD_HOST}", "WORKSPACE_ID=222",
+                   REUSE_SOURCE_AUTH="1")
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert (prod / "auth.auto.tfvars").read_text() == TEMPLATE
+    assert OLD_HINT.format(prod) in out, out
+    assert "REUSE_SOURCE_AUTH:" not in out
+
+
+def test_opt_in_from_an_exported_makeflags_is_refused(repo, tmp_path):
+    prod = _prod(repo)
+    (prod / "auth.auto.tfvars").write_text(TEMPLATE)
+    before = _state(repo)
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod", f"WORKSPACE_HOST={PROD_HOST}", "WORKSPACE_ID=222",
+                   MAKEFLAGS="REUSE_SOURCE_AUTH=1")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "REUSE_SOURCE_AUTH=1 is not on the make command line" in out, out
+    assert "Refused: nothing was changed" in out, out
     assert _state(repo) == before
     assert SECRET not in out
