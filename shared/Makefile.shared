@@ -1344,7 +1344,7 @@ _release-manifest: _guard-not-ci-apply
 	echo "  Verification:  make verify-access ENV=$(ENV) passed"; \
 	echo "  Steady state:  make maintain ENV=$(ENV) (from this commit)"
 
-maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): audit-schema -> derive-assignments -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
+maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (including existing covered SELECT): derive-assignments -> audit-schema -> coverage check -> validate -> audit-rulebook -> apply-governance; never widen past coverage or touch Genie
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); export GENIERAILS_RERUN_TARGET=maintain; mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || exit 1; \
 	if [ "$$mode" = deterministic ]; then $(_DEPLOYER_CHECK) "make maintain" || exit 1; $(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
@@ -1353,20 +1353,27 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 	$(_RELEASE_HELPER) clear-old-receipts "$(ENV_DIR)" || exit 1; \
 	$(MAKE) --no-print-directory _guarded-bootstrap _guard-workspace-target ENV="$(ENV)" || exit 1; \
 	if [ "$$($(call _HAS_AGENTS,$(ENV_DIR)/env.auto.tfvars))" = 1 ]; then python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --id-files --warn; fi; \
+	if [ "$$mode" = deterministic ]; then $(MAKE) derive-assignments ENV="$(ENV)" || exit 1; fi; \
 	echo "=== Schema Drift Audit ($(ENV)) ==="; \
 	(cd "$(ENV_DIR)" && python3 "$(AUDIT_SCHEMA_SCRIPT)"); audit_rc=$$?; \
 	if [ $$audit_rc -ne 0 ]; then \
 		if [ $$audit_rc -eq 1 ]; then \
-			echo "maintain: audit-schema reported drift (output above). For sensitive-looking columns with no class.* tag," >&2; \
-			echo "  review native UC classification detections, exclude false positives, and enable auto-tagging in Catalog Explorer," >&2; \
-			echo "  then wait for class.* tags," >&2; \
-			echo "  then re-run make maintain ENV=$(ENV). maintain never LLM-tags columns." >&2; \
+			if [ "$$mode" = deterministic ]; then \
+				echo "maintain: audit-schema reported drift (output above); continuing through the existing safety gates." >&2; \
+				echo "  Forward findings: review native UC classifications. Reverse findings: derive-assignments has removed dropped columns." >&2; \
+			else \
+				echo "maintain: audit-schema reported drift (output above). For sensitive-looking columns with no class.* tag," >&2; \
+				echo "  review native UC classification detections, exclude false positives, and enable auto-tagging in Catalog Explorer," >&2; \
+				echo "  then wait for class.* tags," >&2; \
+				echo "  then re-run make maintain ENV=$(ENV). maintain never LLM-tags columns." >&2; \
+				exit $$audit_rc; \
+			fi; \
 		else \
 			echo "maintain: audit-schema failed (error, not drift); review the error output above." >&2; \
+			exit $$audit_rc; \
 		fi; \
-		exit $$audit_rc; \
 	fi; \
-	$(MAKE) derive-assignments ENV="$(ENV)" || exit 1; \
+	if [ "$$mode" != deterministic ]; then $(MAKE) derive-assignments ENV="$(ENV)" || exit 1; fi; \
 	$(MAKE) coverage-gate ENV="$(ENV)" || exit 1; \
 	$(MAKE) validate-generated ENV="$(ENV)" || exit 1; \
 	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)"; key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac" || exit 1; fi; \

@@ -27,7 +27,7 @@ make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't
 make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks
-make maintain ENV=prod      # run on a schedule
+make maintain ENV=prod      # deployment machine, scheduled at the last released commit
 ```
 
 <a id="prerequisites--gather-required-values"></a>
@@ -148,9 +148,9 @@ Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-ga
 ## Keep it safe
 
 ```bash
-make maintain ENV=prod      # schedule it (cron or CI)
+make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
-It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
+Run it from the [deployment machine](../../docs/deployment-machine.md). It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
 
 <a id="commit-it"></a>
 ## Commit it

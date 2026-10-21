@@ -25,6 +25,7 @@ from scripts.audit_schema_drift import (
     find_uncovered_tags,
     _parse_condition_tag_refs,
     _applied_tags_sql,
+    detect_forward_drift,
 )
 import scripts.audit_schema_drift as audit_mod
 
@@ -111,6 +112,34 @@ class TestPIIPattern:
     ])
     def test_rejects_non_pii_columns(self, col):
         assert not PII_COLUMN_PATTERN.search(col), f"{col} should NOT match PII pattern"
+
+
+class TestForwardDrift:
+    def test_deterministic_native_classification_counts_as_covered(self, monkeypatch):
+        seen = {}
+
+        def fake_run_sql(_w, _warehouse_id, sql):
+            seen["sql"] = sql
+            # The fake workspace applies the anti-join: email has class.pii.
+            return [] if "tag_name LIKE 'class.%'" in sql else [
+                ["cat", "sch", "customers", "email", ""]
+            ]
+
+        monkeypatch.setattr(audit_mod, "_run_sql", fake_run_sql)
+        assert detect_forward_drift(
+            object(), "warehouse", ["cat.sch.customers"], ["gr_treatment"],
+            deterministic=True,
+        ) == []
+        assert "tag_name LIKE 'class.%'" in seen["sql"]
+
+    def test_legacy_does_not_count_native_classification_as_covered(self, monkeypatch):
+        monkeypatch.setattr(
+            audit_mod, "_run_sql",
+            lambda *_args: [["cat", "sch", "customers", "email", ""]],
+        )
+        assert detect_forward_drift(
+            object(), "warehouse", ["cat.sch.customers"], ["gr_treatment"],
+        ) == [("cat", "sch", "customers", "email", "")]
 
 
 # ---------------------------------------------------------------------------
