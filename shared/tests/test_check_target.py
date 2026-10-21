@@ -239,6 +239,85 @@ def test_check_notes_uncommitted_split_files_without_failing(repo, tmp_path):
     _assert_read_only(repo, before)
 
 
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_of_setup_but_not_generated_env_skips_with_next_step(repo, tmp_path, ci):
+    dev = _envs(repo) / "dev"
+    shutil.rmtree(dev / "generated")
+    for path in (dev / "abac.auto.tfvars", dev / "workspace.auto.tfvars"):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(dev / "data_access", ignore_errors=True)
+    _commit(repo, "setup only")
+    before = _baseline(repo)
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "NOTE: skipped: envs/dev has not been generated; run make generate ENV=dev." in out
+    assert "FAILED (validate)" not in out
+    _assert_read_only(repo, before)
+
+
+@pytest.mark.parametrize("target", ["check", "plan"])
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_read_only_targets_never_post_classification_config(repo, tmp_path, target, ci):
+    dev = _envs(repo) / "dev"
+    env_file = dev / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + '\nenable_classification = true\n')
+    (dev / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://example.invalid"\n'
+        'serverless_usage_policy_id = "policy-123"\n'
+    )
+    _commit(repo, "classification configured")
+
+    sdk = tmp_path / "fake-sdk/databricks/sdk"
+    sdk.mkdir(parents=True)
+    (sdk.parent / "__init__.py").write_text("")
+    (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
+    (sdk / "useragent.py").write_text(
+        "def with_extra(*args, **kwargs):\n    return None\n"
+    )
+    (sdk / "__init__.py").write_text('''
+import os
+from .errors import NotFound
+class _Classification:
+    def get_catalog_config(self, name):
+        raise NotFound(name)
+class _API:
+    def do(self, method, path, **kwargs):
+        with open(os.environ["FAKE_SDK_CALLS"], "a") as handle:
+            handle.write(f"{method} {path}\\n")
+class WorkspaceClient:
+    def __init__(self, **kwargs):
+        self.data_classification = _Classification()
+        self.api_client = _API()
+''')
+    calls = tmp_path / f"{target}-{ci or 'local'}-sdk-calls"
+    site_packages = next(path for path in sys.path if path.endswith("site-packages"))
+    before = _baseline(repo)
+    token_env = {}
+    if target == "plan":
+        token = tmp_path / f"{target}-{ci or 'local'}-exposure-token"
+        token.write_text(str(dev.resolve()) + "\n")
+        token.chmod(0o600)
+        token_env["GENIERAILS_EXPOSURE_TOKEN"] = str(token)
+
+    result = _make(
+        repo, tmp_path, target, "ENV=dev",
+        PYTHONPATH=os.pathsep.join((str(tmp_path / "fake-sdk"), site_packages)),
+        PIP_NO_INDEX="1", DATABRICKS_CONFIG_FILE="/dev/null",
+        GIT_CONFIG_GLOBAL="/dev/null", FAKE_SDK_CALLS=str(calls),
+        **token_env,
+        **({"CI": ci} if ci else {}),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = calls.read_text().splitlines() if calls.exists() else []
+    assert all(call.startswith("GET ") for call in recorded), recorded
+    if target == "check":
+        _assert_read_only(repo, before)
+
+
 def test_legacy_check_skips_regeneration_with_a_note(repo, tmp_path):
     env_file = _envs(repo) / "dev" / "env.auto.tfvars"
     env_file.write_text(env_file.read_text().replace('governance_mode = "deterministic"\n', ""))
@@ -251,6 +330,26 @@ def test_legacy_check_skips_regeneration_with_a_note(repo, tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "NOTE: skipped: envs/dev is in legacy mode" in result.stdout
+    _assert_read_only(repo, before)
+
+
+def test_legacy_check_validates_committed_split_config_without_generated(repo, tmp_path):
+    dev = _envs(repo) / "dev"
+    env_file = dev / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace('governance_mode = "deterministic"\n', ""))
+    shutil.rmtree(dev / "generated")
+    split = dev / "data_access" / "abac.auto.tfvars"
+    split.write_text(split.read_text().replace('to_principals = ["pay_group"]',
+                                                'to_principals = ["no_such_group"]'))
+    _commit(repo, "broken legacy split without generated output")
+    before = _baseline(repo)
+
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    assert "=== make check ENV=dev: FAILED (validate) ===" in result.stderr
+    assert "has not been generated; run make generate" not in out
     _assert_read_only(repo, before)
 
 

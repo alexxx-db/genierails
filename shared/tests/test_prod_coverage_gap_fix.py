@@ -177,6 +177,9 @@ class Repo:
         (sdk / "service").mkdir(parents=True)
         (sdk.parent / "__init__.py").write_text("")
         (sdk / "__init__.py").write_text(FAKE_SDK)
+        (sdk / "config.py").write_text(
+            "class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n"
+        )
         # generate_abac pip-upgrades a databricks.sdk without useragent.
         (sdk / "useragent.py").write_text("")
         (sdk / "service" / "__init__.py").write_text("")
@@ -188,7 +191,9 @@ class Repo:
         self.envs = root / "aws" / "envs"
         for env, table in (("dev", DEV_TABLE), ("prod", PROD_TABLE)):
             (self.envs / env / "auth.auto.tfvars").write_text(
-                f'databricks_workspace_host = "https://{env}.example.invalid"\n')
+                f'databricks_workspace_host = "https://{env}.example.invalid"\n'
+                f'databricks_client_id = "{env}-client"\n'
+                'databricks_client_secret = "test-only-secret"\n')
             text = f'uc_tables = ["{table}"]\nsql_warehouse_id = "wh"\n'
             if env == "prod":
                 text += 'promote_from = "dev"\ncatalog_map = { dev_fin = "prod_fin" }\n'

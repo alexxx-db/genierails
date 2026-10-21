@@ -426,7 +426,11 @@ def test_real_generate_commits_the_id_only_agents_tables_before_promotion(tmp_pa
         "\ngenie_spaces = []\n",
         f'\ngenie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = ["analyst"] }}]\n').replace(
         '"<your-deployer-principal-id>"', '"d0000000-0000-0000-0000-00000000d001"'))
-    (dev / "auth.auto.tfvars").write_text('databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n')
+    (dev / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://dev.example.invalid"\n'
+        'databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n'
+        'databricks_client_secret = "test-only-secret"\n'
+    )
     record = dev / "generated" / "governed_tables.json"
 
     # README step 3: import by ID. The recipe records the agent's tables right
