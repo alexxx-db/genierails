@@ -28,7 +28,7 @@ make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehea
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks
 GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod   # live compliance record; finds the warehouse itself
-make maintain ENV=prod      # run on a schedule
+make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
 
 <a id="prerequisites--gather-required-values"></a>
@@ -157,9 +157,9 @@ It reads the live tags, masks and grants of prod's agent tables and writes a JSO
 ## Keep it safe
 
 ```bash
-make maintain ENV=prod      # schedule it (cron or CI)
+make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
-It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. In a deterministic env it runs only from the last released commit, on a clean checkout. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
+Run it from the [deployment machine](../../docs/deployment-machine.md). It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. In a deterministic env it runs only from the last released commit, on a clean checkout. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
 
 <a id="commit-it"></a>
 ## Commit it
