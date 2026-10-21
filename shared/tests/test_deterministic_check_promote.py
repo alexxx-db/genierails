@@ -766,6 +766,76 @@ def test_promote_to_maps_groups_with_policies_tiers_and_acls_and_check_passes(re
     _assert_check_and_promote_check_pass(repo, tmp_path, ci)
 
 
+# The champion layout: dev keeps its agent in agents/ files, prod maps every
+# dev group. Before the fix promote-to seeded prod's agent file with dev's
+# acl_groups and exited 2: group 'dev_ops' not defined in 'groups'.
+PROD_GROUPS = ["prod_ops", "prod_analysts"]
+PROD_ENV_AGENT_FILES = ('governance_mode = "deterministic"\npromote_from = "dev"\ncatalog_map = { "paycat" = "ppay" }\n'
+                        f'deployer_principal_id = "{DEPLOYER}"\n'
+                        'group_map = { dev_ops = "prod_ops", dev_analysts = "prod_analysts" }\n')
+
+
+def _move_dev_agent_to_files(repo, tmp_path):
+    from scripts.agent_ownership import write_payload
+
+    dev = _envs(repo) / "dev"
+    env = dev / "env.auto.tfvars"
+    env.write_text(env.read_text().replace(re.search(r"genie_spaces = \[.*?\n\]\n", DEV_ENV, re.S).group(0), ""))
+    (dev / "agents").mkdir()
+    (dev / "agents" / f"{SPACE}.auto.tfvars").write_text(
+        f'genie_space_id = "{DEV_SPACE_ID}"\nuc_tables = ["paycat.s.t"]\nacl_groups = {json.dumps(TIERS)}\n')
+    write_payload({"version": 2, "data_sources": {"tables": [{"identifier": "paycat.s.t"}]}},
+                  dev / "agents" / f"{SPACE}.space.json")
+    result = _make(repo, tmp_path, "promote", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    _commit(repo, "dev agent in agents/ files")
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_maps_agent_file_acl_groups_through_group_map_and_check_passes(repo, tmp_path, ci):
+    _move_dev_agent_to_files(repo, tmp_path)
+    _promote_to_prod(repo, tmp_path, env_text=PROD_ENV_AGENT_FILES)
+
+    prod = _envs(repo) / "prod"
+    agent = hcl2.loads((prod / "agents" / f"{SPACE}.auto.tfvars").read_text())
+    assert agent["acl_groups"] == PROD_GROUPS
+    env = hcl2.loads((prod / "env.auto.tfvars").read_text())
+    assert env["access_tier_groups"] == PROD_GROUPS
+    assert env["table_readers"] == {"ppay.s.t": PROD_GROUPS}
+    assert list(hcl2.loads((prod / "generated" / "abac.auto.tfvars").read_text())["groups"]) == PROD_GROUPS
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
+def test_promote_to_refuses_prods_own_tiers_without_group_map_and_restores_prod(repo, tmp_path):
+    """README Prod step 1 used to say to replace prod's access_tier_groups placeholders with prod's groups."""
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    text = _prod_env(extra=f"access_tier_groups = {json.dumps(PROD_GROUPS)}\n")
+    (prod / "env.auto.tfvars").write_text(text)
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+    before = _snapshot(_envs(repo))
+
+    result = _make(repo, tmp_path, "promote-to", "ENV=prod")
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "access_tier_groups promoted" not in out
+    assert "name prod's own group(s) prod_ops, prod_analysts" in out, out
+    assert 'group_map = { "dev_analysts" = "prod_analysts", "dev_ops" = "prod_ops" }' in out, out
+    assert _snapshot(_envs(repo)) == before, "a refused promotion restores everything it touched"
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_promote_to_accepts_prods_tier_placeholders_and_writes_tiers_through_group_map(repo, tmp_path, ci):
+    """README Prod step 1: set group_map, leave the setup template's access_tier_groups placeholders."""
+    text = PROD_ENV_GROUP_MAP + 'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n'
+    _promote_to_prod(repo, tmp_path, env_text=text)
+
+    env = hcl2.loads((_envs(repo) / "prod" / "env.auto.tfvars").read_text())
+    assert env["access_tier_groups"] == PROD_TIERS
+    _assert_check_and_promote_check_pass(repo, tmp_path, ci)
+
+
 def test_group_keys_rename_bare_and_quoted_keys_and_group_members():
     sys.path.insert(0, str(SHARED / "scripts"))
     from remap_generated_config import map_group_keys

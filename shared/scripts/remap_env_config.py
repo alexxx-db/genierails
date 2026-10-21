@@ -213,6 +213,61 @@ def _source_policies(source_env_dir: str) -> list:
         sys.exit(1)
 
 
+def _uncovered_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict, dest_env_dir: str,
+                           group_map: dict[str, str], map_groups) -> list[str]:
+    """Refusal lines when promotion would replace a deterministic destination's
+    own access_tier_groups with source group names, else [].
+
+    The tiers are promoted through group_map on every promotion, so a
+    destination group that is in neither the promoted tiers nor what the last
+    promotion wrote (its generated groups) is the destination's own: replacing
+    it silently would give the source's groups its SELECT and CAN_RUN.
+    """
+    from access_tier_groups import persisted_access_tier_groups
+
+    value = dest_cfg.get("access_tier_groups")
+    dest_tiers = [g.strip() for g in (value if isinstance(value, list) else []) if isinstance(g, str)
+                  and g.strip() and not (g.strip().startswith("<") and g.strip().endswith(">"))]
+    if not dest_tiers:
+        return []
+    try:
+        source_tiers = persisted_access_tier_groups(cfg, Path(source_env_dir) / "env.auto.tfvars")
+    except ValueError:
+        return []  # reported where the tiers are written
+    tiers = map_groups(source_tiers)
+    generated = Path(dest_env_dir) / "generated" / "abac.auto.tfvars"
+    try:
+        promoted_before = set((load_hcl(generated).get("groups") or {}) if generated.is_file() else {})
+    except FootprintError:
+        promoted_before = set()
+    own = [g for g in dest_tiers if g not in tiers and g not in promoted_before]
+    if not own:
+        return []
+    dest_env, source_env = Path(dest_env_dir).name, Path(source_env_dir).name
+    lines = [f"ERROR: destination access_tier_groups {dest_tiers!r} name {dest_env}'s own group(s) "
+             f"{', '.join(own)}, but promotion would replace them with {tiers!r} from {source_env}: "
+             f"{dest_env}'s tiers, table_readers and acl_groups would name {source_env}'s groups. "
+             "Nothing was written."]
+    if len(source_tiers) == len(dest_tiers):
+        suggested = dict(group_map)
+        for dev, target in zip(source_tiers, dest_tiers):
+            if map_groups([dev]) != [target]:
+                suggested[dev] = target
+        suggested = {dev: target for dev, target in suggested.items() if dev != target}
+        lines.append(f"       Map {source_env}'s tiers to {dest_env}'s (most to least privileged) with this line "
+                     f"in envs/{dest_env}/env.auto.tfvars, then promote again:")
+        lines.append("         group_map = { " + ", ".join(
+            f"{json.dumps(dev)} = {json.dumps(target)}" for dev, target in sorted(suggested.items())) + " }")
+    else:
+        lines.append(f"       {source_env} has {len(source_tiers)} tier(s) and {dest_env} {len(dest_tiers)}; tiers are "
+                     f"promoted from {source_env}. Map each {source_env} tier to its {dest_env} group with "
+                     f"group_map in envs/{dest_env}/env.auto.tfvars (or remove {dest_env}'s access_tier_groups "
+                     "line to use them as they are), then promote again:")
+        lines.append("         group_map = { " + ", ".join(
+            f"{json.dumps(dev)} = \"<{dest_env} group>\"" for dev in source_tiers if map_groups([dev])[0] == dev) + " }")
+    return lines
+
+
 def _promoted_access_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict,
                                  deterministic: bool = False, map_groups=None) -> list[str]:
     """Deterministic destinations get the source's tiers through group_map on
@@ -600,6 +655,12 @@ def main():
 
     def map_groups(groups):
         return _map_groups(groups or [], group_map, source_exempt)
+
+    if dest_deterministic:
+        refusal = _uncovered_tier_groups(cfg, source_env_dir, dest_cfg, dest_env_dir, group_map, map_groups)
+        if refusal:
+            print("\n".join(refusal))
+            sys.exit(1)
 
     # table_readers is env-owned: the first promotion seeds it from the source
     # (keys remapped to the destination catalogs, groups through group_map);

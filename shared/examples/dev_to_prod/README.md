@@ -114,10 +114,12 @@ It applies in dev, then runs `verify-access` as its last gate (`_verify-access-g
 ```bash
 make setup ENV=prod
 ```
-Fill in `envs/prod/auth.auto.tfvars`, replace its `deployer_principal_id` and `access_tier_groups` placeholders, and set:
+Fill in `envs/prod/auth.auto.tfvars`, replace its `deployer_principal_id` placeholder, and set:
 ```hcl
 catalog_map = { "dev_finance" = "prod_finance" }   # dev catalog = prod catalog
+group_map   = { "payments_ops" = "prod_payments_ops" }   # dev group = prod group, only where they differ
 ```
+Leave the `access_tier_groups` placeholders: `promote-to` writes prod's tiers from dev's (and seeds `table_readers` and agent `acl_groups`), through `group_map`.
 Then:
 ```bash
 make promote-to ENV=prod
