@@ -39,7 +39,7 @@ git clone https://github.com/databricks-solutions/genierails.git
 cd genierails
 git remote rename origin genierails      # keep GenieRails for upgrades
 git remote add origin <your-repo-url>    # an empty repo you own
-cd aws                     # or: cd ../azure — every make command runs from the cloud folder
+cd aws                     # or: cd azure — every make command runs from the cloud folder
 ```
 
 | You need | Notes |
@@ -126,9 +126,10 @@ Then:
 make promote-to ENV=prod
 ```
 It copies dev's reviewed rules into prod, renamed to prod's catalogs: masks and policies, `tag_treatments`, adopted custom masks, the agent capture and the proven `verify_key_columns`; dev's tier groups are mapped through prod's `group_map`. It leaves dev's tag assignments behind (prod derives its own from its own tags) and keeps prod's own agent ID, warehouse, `acl_groups` and `table_readers` once set, and the names of policies already live in prod.
-Promotion writes `enable_classification = true` for prod. Keep it true when
-prod should run its own classifier; only turn it off when classification is
-deliberately managed outside GenieRails.
+Every promotion writes `enable_classification = true` for prod, for both
+deterministic and legacy environments. A prod value of `false` does not persist;
+in a deterministic environment, committing it also fails the promotion-current
+check.
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
 Commit and push the promoted files to `main` (`git add envs/`, commit, `git push`).
 
@@ -169,5 +170,7 @@ Run it from the [deployment machine](../../docs/deployment-machine.md). It masks
 ## Commit it
 
 The [before-you-start](#prerequisites--gather-required-values) remote rename puts the checkout in your own repo before [Dev step 1](#phase-0--dev-set-up), so `make setup` writes `.gitignore`; Dev step 2 commits it with `envs/`. Do this before `make check`, `make rehearse` or `make release-plan`.
+If you already ran `make setup` before renaming the remote, rename the remote,
+re-run `make setup ENV=dev`, then commit `.gitignore` and `envs/`.
 
 From then on every change goes through a PR into `main`, with `make check` as its check (`make release-plan` plans only a commit on `origin/main`): see [Pipelines](../../docs/pipelines.md) to set up CI, and the [agents](../../docs/playbooks/agents.md), [governance](../../docs/playbooks/governance.md) or [one-team](../../docs/playbooks/one-team.md) playbook for day-2 changes.

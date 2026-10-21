@@ -106,13 +106,15 @@ No VPN is required unless your Databricks workspace is on a private network. (`m
 - **SQL Warehouse** — serverless (auto-created) or existing warehouse
 - **Genie agents** — for the Genie agent governance workflow
 
-GenieRails governs **existing catalogs**; it does not create them. For a fresh
-metastore, the metastore owner (or a principal granted metastore `CREATE
-CATALOG`) must create the dev and prod catalogs first. If the metastore has no
-storage root, do not use the Catalog REST create call with "Default Storage":
-that default is a UI choice, not a REST storage location. Open a SQL warehouse
-in the target workspace and run, for example, `CREATE CATALOG dev_finance;` and
-`CREATE CATALOG prod_finance;`, or create each catalog in Catalog Explorer.
+The normal GenieRails deployment path governs **existing catalogs**; `make
+apply` does not create them. Optional greenfield/demo setup tooling can create a
+catalog when explicitly selected. Otherwise, on a fresh metastore the
+metastore owner (or a principal granted metastore `CREATE CATALOG`) must create
+the dev and prod catalogs first. If the metastore has no storage root, do not
+use the Catalog REST create call with "Default Storage": that default is a UI
+choice, not a REST storage location. Open a SQL warehouse in the target
+workspace and run, for example, `CREATE CATALOG dev_finance;` and `CREATE
+CATALOG prod_finance;`, or create each catalog in Catalog Explorer.
 
 If you set a catalog's isolation mode to **ISOLATED**, also bind it explicitly
 to the workspace that must use it: Catalog Explorer → catalog → **Workspaces**
