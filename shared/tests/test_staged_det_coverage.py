@@ -473,6 +473,7 @@ def test_rebind_with_a_column_classified_after_the_change_refuses_and_grants_not
     assert result.returncode != 0
     assert "1 column(s) have another treatment in the generated config than in the unfinished change" in out
     assert "cat.sch.t.phone" in out and "class.* tags" in out and "re-run make policy-rebind ENV=dev" in out
+    assert "If no principal it names was deleted, run make policy-abandon ENV=dev, then re-run." in out
     # Nothing planned or applied: the lost grants are still lost (fake_access.json's "gone").
     assert (harness.journal(), live_state(harness.env_dir), access_file(harness).read_text()) == before
     assert "table_access|cat.sch.t|raw" in json.loads(access_file(harness).read_text())["gone"]
@@ -506,46 +507,82 @@ def test_rebind_of_a_restore_that_kept_a_newly_governed_column_refuses_naming_it
     assert old["tags"].keys() == {"cat.sch.t.email"}
 
 
-def test_resume_and_abandon_after_class_drift_refuse_naming_the_drifted_columns(harness, tmp_path, monkeypatch):
-    """S4: a column is classified after B started. Resume and abandon both refuse before any plan, naming
-    it and the way out (put the class.* tags back); nothing is planned, applied or recorded."""
-    old = released(harness, deployer=OLD_SP)
-    gate_on(harness, tmp_path, monkeypatch)
-    new = change(harness, old, versions=RETAG)
-    harness.fail_verify = {"create"}
-    assert harness.apply() == 1
-    drifted = write_env(harness.env_dir, versions=RETAG, deployer=OLD_SP, columns=("email", "phone"))
+# -- (8) class.* or treatment-setting drift after the change started: resume points at abandon --------
+# The ways the generated config drifts from B after it started: a column classified live (class.*), or
+# B's treatment settings edited.
+DRIFTS = {"class": {"columns": ("email", "phone")}, "settings": {"versions": {"email_partial": {"partial": "initials"}}}}
+
+
+def _unchanged_but_policies(before: dict, after: dict) -> dict:
+    """Every resource of the data_access state but the mask policies (tags, grants, functions...), before vs after."""
+    def others(state):
+        return {(r["type"], r["name"]): r["instances"] for r in state["resources"]
+                if r["type"] != "databricks_policy_info" and not r["name"].endswith("wait")}
+    return {"before": others(before), "after": others(after)}
+
+
+@pytest.mark.parametrize("drift", sorted(DRIFTS))
+@pytest.mark.parametrize("switched", [False, True], ids=["never-switched", "rolled-back"])
+def test_after_drift_resume_points_at_abandon_and_abandon_drops_only_the_change(harness, tmp_path, monkeypatch,
+                                                                                drift, switched):
+    """S4 (F2, option 3): the config drifted after B started. Resume refuses before any plan, naming the
+    columns and pointing at abandon; abandon then deletes only B's own policies, A stays live, and no tag or
+    grant changes. The next apply starts the drifted config as a new change from A."""
+    if switched:
+        old, new, _ = rolled_back(harness, tmp_path, monkeypatch, versions=RETAG)
+    else:
+        old = released(harness, deployer=OLD_SP)
+        gate_on(harness, tmp_path, monkeypatch)
+        new = change(harness, old, versions=RETAG)
+        harness.fail_verify = {"create"}
+        assert harness.apply() == 1
+    drifted = write_env(harness.env_dir, **({"versions": RETAG, "deployer": OLD_SP} | DRIFTS[drift]))
     _promoted(harness, old, new, drifted)
     _refresh(harness.env_dir)
+    moved = sorted(c for c in drifted["tags"].keys() | new["tags"].keys()
+                   if drifted["tags"].get(c) != new["tags"].get(c))
+    assert moved and drifted["tags"] != old["tags"]
     gate_file = harness.env_dir / "data_access" / cg.GATE_FILENAME
     before = (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes())
     harness.calls.clear()
     with pytest.raises(spa.Refused) as refused:
         harness.apply()
     message = str(refused.value)
-    assert "1 column(s) have another treatment in the generated config than in generation" in message
-    assert "(cat.sch.t.phone)" in message and "live class.* tags changed" in message
-    assert "make policy-abandon refuses too" in message and "or drop it with make policy-abandon" not in message
-    assert "put those columns' class.* tags (or the treatment settings) back as they were when the change " \
-           "started, then resume it or run make policy-abandon ENV=dev" in message
+    assert f"{len(moved)} column(s) have another treatment in the generated config than in generation " \
+           f"{new['fingerprint']} ({', '.join(moved)})" in message and "live class.* tags changed" in message
+    assert "Next: run make policy-abandon ENV=dev, then re-run; or re-run the same command at commit" in message
     assert harness.calls == []
     assert (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes()) == before
 
-    with pytest.raises(spa.Refused) as refused:
-        harness.controller().abandon()
-    message = str(refused.value)
-    assert f"this change can't be abandoned: 1 column(s) have another treatment in the generated config than " \
-           f"in the unfinished change {new['fingerprint']} (cat.sch.t.phone)" in message
-    assert "live class.* tags changed" in message and "nothing was applied" in message
-    assert "put those columns' class.* tags (or the treatment settings) back as they were when the change " \
-           "started, then re-run make policy-abandon ENV=dev" in message
-    assert "Changes that can't be dropped" in message
-    # No plan, no apply, no gate re-run: the journal, the live state and the check's result are as before.
-    assert harness.calls == []
-    assert (harness.journal(), live_state(harness.env_dir), gate_file.read_bytes()) == before
-    assert harness.journal()["transition"]["to"] == new["fingerprint"]
-    assert not (pg.ledger_dir(harness.env_dir) / "abandon").exists()
+    state = live_state(harness.env_dir)
+    policies = {p["name"]: p for p in live_policies(state)}
+    created = {p["name"] for p in new["fgac_policies"]} - {p["name"] for p in old["fgac_policies"]}
+    assert created and created <= policies.keys()
+    assert harness.controller().abandon() == 0
+    after = live_state(harness.env_dir)
+    # Only B's own policies left; A's are untouched, and nothing else in the state changed.
+    assert policies.keys() - {p["name"] for p in live_policies(after)} == created
+    assert {p["name"]: p for p in live_policies(after)} == {n: p for n, p in policies.items() if n not in created}
+    assert live_tags(after) == live_tags(state) == old["tags"]
+    assert grant_keys(after) == grant_keys(state)
+    diff = _unchanged_but_policies(state, after)
+    assert diff["before"] == diff["after"]
+    assert harness.calls == ["abandon:plan"] + (["inventory:restore"] if switched else []) + [
+        "abandon:saved", "inventory:abandon"]
+    journal = harness.journal()
+    assert journal["transition"] is None and journal["active"] == old["fingerprint"]
+    assert journal["history"][-1]["abandoned"] == new["fingerprint"]
+    # The check re-ran on the abandon render against the drifted refresh (phone is classified only there).
+    gate = gate_result(harness)
+    assert gate["status"] == "pass" and gate["kept_from"] == old["fingerprint"]
+    assert gate["uncovered_columns"] == (["cat.sch.t.phone"] if drift == "class" else [])
 
+    # "then re-run": the drifted config is staged as a new change from A.
+    harness.fail_verify = set()
+    harness.calls.clear()
+    assert harness.apply() == 0
+    assert harness.journal()["active"] == drifted["fingerprint"]
+    assert live_tags(live_state(harness.env_dir)) == drifted["tags"]
 
 
 def test_abandon_after_class_drift_refuses_a_previous_snapshot_edited_to_match_the_drift(harness, tmp_path,
