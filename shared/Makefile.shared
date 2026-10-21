@@ -488,6 +488,12 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 # outside git, where history cannot tell; make capture replaces a capture on purpose.
 generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in the selected workspace environment (set SPACE="Name" to regenerate only one space; set MODE=governance|genie for self-service Genie deployments)
 	@echo "=== Generate ABAC Config ($(ENV)$(if $(SPACE), — space: $(SPACE),)$(if $(MODE), — mode: $(MODE),)) ==="
+	@status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(ENV_DIR)/auth.auto.tfvars" || status=$$?; \
+	if [ $$status -eq 2 ]; then \
+		echo "ERROR: $(_SETUP_ENV_REL)/auth.auto.tfvars is not valid HCL" >&2; exit 1; \
+	elif [ $$status -ne 0 ]; then \
+		echo "ERROR: fill in $(_SETUP_ENV_REL)/auth.auto.tfvars (workspace host, client ID, and client secret) before running make generate" >&2; exit 1; \
+	fi
 	@if [ "$(ENV)" = "$(DEFAULT_ENV)" ]; then $(_AGENT_OWNERSHIP) import-new --check --env-dir "$(ENV_DIR)" --env "$(ENV)"; fi
 	@if [ -n "$(SPACE)" ]; then \
 		if [ ! -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \
@@ -520,6 +526,12 @@ override _AGENT_OWNERSHIP = python3 "$(SHARED_ROOT)/scripts/agent_ownership.py"
 capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/dev/agents/<agent>.space.json: SPACE="<agent>" (read-only)
 	@if [ -z "$(SPACE)" ]; then echo 'ERROR: SPACE="<agent>" is required.' >&2; exit 1; fi
 	@if [ "$(ENV)" != "$(DEFAULT_ENV)" ]; then echo "ERROR: capture runs only with ENV=$(DEFAULT_ENV); promote-to carries agents to $(ENV)." >&2; exit 1; fi
+	@status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(ENV_DIR)/auth.auto.tfvars" || status=$$?; \
+	if [ $$status -eq 2 ]; then \
+		echo "ERROR: $(_SETUP_ENV_REL)/auth.auto.tfvars is not valid HCL" >&2; exit 1; \
+	elif [ $$status -ne 0 ]; then \
+		echo "ERROR: fill in $(_SETUP_ENV_REL)/auth.auto.tfvars (workspace host, client ID, and client secret) before running make capture" >&2; exit 1; \
+	fi
 	@$(_DRY_RUN_GUARD); $(_AGENT_OWNERSHIP) capture --env-dir "$(ENV_DIR)" --env "$(ENV)" --space "$(SPACE)"
 	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars")" = 1 ]; then \
 		$(_STICKY) record --env-dir "$(ENV_DIR)" --config "$(ENV_DIR)/generated/abac.auto.tfvars"; \
@@ -1477,7 +1489,10 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		cd "$$dest_env_dir" && python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-workspace); \
 		echo ""; \
 		echo "=== Promote complete: $(SOURCE_ENV) -> $(DEST_ENV) ==="; \
-		if ! python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$$dest_env_dir/auth.auto.tfvars"; then \
+		status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$$dest_env_dir/auth.auto.tfvars" || status=$$?; \
+		if [ $$status -eq 2 ]; then \
+			echo "  Next: fix $$dest_env_dir/auth.auto.tfvars (not valid HCL)"; \
+		elif [ $$status -ne 0 ]; then \
 			echo "  Next: edit $$dest_env_dir/auth.auto.tfvars  ($(DEST_ENV) workspace credentials)"; \
 			echo "        (same service principal as $(SOURCE_ENV)? add REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<$(DEST_ENV) host> WORKSPACE_ID=<$(DEST_ENV) id>)"; \
 		fi; \

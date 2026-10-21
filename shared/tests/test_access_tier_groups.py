@@ -451,7 +451,11 @@ def test_promote_carries_access_tier_groups_and_prod_generate_uses_them(
     assert "business_access_enabled" not in prod_cfg
 
     # derive-assignments / certify load prod config through load_auth_config.
-    (dest / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://x.invalid"\n')
+    (dest / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://x.invalid"\n'
+        'databricks_client_id = "client"\n'
+        'databricks_client_secret = "test-only-secret"\n'
+    )
     (dest / "data_access").mkdir()
     loaded = generate_abac.load_auth_config(dest / "auth.auto.tfvars")
     assert loaded["access_tier_groups"] == TIERS
@@ -613,4 +617,3 @@ def test_champion_walkthrough_rehearses_dev_on_the_promotion_commit():
     # A coverage-gap fix commits a new promotion too: rehearse dev again before release-plan.
     after_promote = gap[gap.index("`make promote-to ENV=prod`"):]
     assert after_promote.index("`make rehearse ENV=dev`") < after_promote.index("`make release-plan ENV=prod`")
-

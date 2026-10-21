@@ -539,17 +539,34 @@ def _validated_discovered_table_agents(cfg: dict, path: Path) -> dict[str, list[
     return normalized
 
 
+_ACTIVE_DATABRICKS_AUTH: dict = {}
+
+
 def configure_databricks_env(auth_cfg: dict):
-    """Set Databricks SDK env vars from auth config."""
-    mapping = {
-        "databricks_workspace_host": "DATABRICKS_HOST",
-        "databricks_client_id": "DATABRICKS_CLIENT_ID",
-        "databricks_client_secret": "DATABRICKS_CLIENT_SECRET",
-    }
-    for tfvar_key, env_key in mapping.items():
-        val = auth_cfg.get(tfvar_key, "")
-        if val:
-            os.environ[env_key] = val
+    """Select explicit env-file auth for later model calls.
+
+    Kept under its historical name for callers, but deliberately does not
+    mutate ``DATABRICKS_*``.  Mutating only non-empty values left ambient shell
+    variables and CLI profiles eligible to authenticate the SDK.
+    """
+    global _ACTIVE_DATABRICKS_AUTH
+    _ACTIVE_DATABRICKS_AUTH = dict(auth_cfg)
+
+
+def databricks_config(auth_cfg: dict | None = None, **kwargs):
+    """Build an SDK Config pinned to auth.auto.tfvars, never ambient auth."""
+    from databricks.sdk.config import Config
+
+    auth = auth_cfg if auth_cfg is not None else _ACTIVE_DATABRICKS_AUTH
+    return Config(
+        host=str(auth.get("databricks_workspace_host") or "").strip(),
+        client_id=str(auth.get("databricks_client_id") or "").strip(),
+        client_secret=str(auth.get("databricks_client_secret") or "").strip(),
+        auth_type="oauth-m2m",
+        product=PRODUCT_NAME,
+        product_version=PRODUCT_VERSION,
+        **kwargs,
+    )
 
 
 def load_ddl_files(ddl_dir: Path) -> str:
@@ -1009,8 +1026,7 @@ def fetch_tables_from_genie_space(
 
     from databricks.sdk import WorkspaceClient
 
-    configure_databricks_env(auth_cfg)
-    w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+    w = WorkspaceClient(config=databricks_config(auth_cfg))
 
     print(f"  Querying Genie agent {space_id}...")
     _used_patch_fallback = False
@@ -1122,8 +1138,7 @@ def fetch_tables_from_databricks(
     """
     from databricks.sdk import WorkspaceClient
 
-    configure_databricks_env(auth_cfg)
-    w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+    w = WorkspaceClient(config=databricks_config(auth_cfg))
 
     tables = []
     for ref in table_refs:
@@ -1539,9 +1554,7 @@ def call_databricks(prompt: str, model: str) -> str:
         print("  pip install databricks-sdk")
         sys.exit(2)
 
-    from databricks.sdk.config import Config
-
-    cfg = Config(http_timeout_seconds=900, product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+    cfg = databricks_config(http_timeout_seconds=900)
     w = WorkspaceClient(config=cfg)
     print(f"  Calling Databricks FMAPI ({model})...")
 
@@ -1649,7 +1662,7 @@ def call_with_retries(call_fn, prompt: str, model: str, max_retries: int) -> str
     raise RuntimeError(f"All {max_retries} attempts failed. Last error: {last_error}")
 
 
-def _fetch_live_tag_policy_values() -> dict[str, set[str]]:
+def _fetch_live_tag_policy_values(auth_cfg: dict | None = None) -> dict[str, set[str]]:
     """Query Databricks for existing tag policy keys and their allowed values.
 
     Returns {tag_key: set(values)}.  Returns an empty dict on any failure
@@ -1657,7 +1670,9 @@ def _fetch_live_tag_policy_values() -> dict[str, set[str]]:
     """
     try:
         from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient(product="genierails", product_version="0.1.0")
+        if auth_cfg is None and not _ACTIVE_DATABRICKS_AUTH:
+            return {}
+        w = WorkspaceClient(config=databricks_config(auth_cfg))
         result: dict[str, set[str]] = {}
         for tp in w.tag_policies.list_tag_policies():
             tag_key = getattr(tp, "tag_key", "") or ""
@@ -1728,8 +1743,7 @@ def _fetch_live_classification_source(
         from databricks.sdk import WorkspaceClient
         from scripts.audit_schema_drift import _run_sql
 
-        configure_databricks_env(auth_cfg)
-        w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+        w = WorkspaceClient(config=databricks_config(auth_cfg))
 
         warehouse_id = str(auth_cfg.get("sql_warehouse_id") or "").strip()
         if not warehouse_id:
@@ -1780,16 +1794,16 @@ def _fetch_live_classification_source(
 _LIVE_POLICIES_REPORTED = False
 
 
-def autofix_tag_policies(tfvars_path: Path) -> int:
+def autofix_tag_policies(tfvars_path: Path, auth_cfg: dict | None = None) -> int:
     """Add tag values used in assignments/policies but missing from tag_policies.
 
-    When Databricks credentials are available (env vars set by configure_databricks_env),
-    also seeds allowed values from live tag policies so the generated config doesn't
-    reference values that don't exist in the live policy.
+    When explicit environment credentials are supplied, also seeds allowed values
+    from live tag policies so the generated config doesn't reference values that
+    don't exist in the live policy.
     """
     text = tfvars_path.read_text()
 
-    live_policies = _fetch_live_tag_policy_values()
+    live_policies = _fetch_live_tag_policy_values(auth_cfg)
     global _LIVE_POLICIES_REPORTED
     if live_policies and (not _LIVE_POLICIES_REPORTED or os.environ.get("VERBOSE") == "1"):
         print(f"  [AUTOFIX] Loaded {len(live_policies)} live tag policy/ies from Databricks")
@@ -6149,6 +6163,7 @@ def list_account_group_names(auth_cfg: dict) -> list[str] | None:
             account_id=account_id,
             client_id=client_id,
             client_secret=client_secret,
+            auth_type="oauth-m2m",
         )
         return [g.display_name for g in ac.groups.list() if g.display_name]
     except Exception as e:
@@ -6719,7 +6734,7 @@ def post_generate_semantic_check(tfvars_path: Path, auth_cfg: dict, mode: str = 
             )
 
     # Check 2: tag_assignment values are valid for their key in the live policy
-    live = _fetch_live_tag_policy_values()
+    live = _fetch_live_tag_policy_values(auth_cfg)
     if live:
         for ta in cfg.get("tag_assignments", []):
             key = ta.get("tag_key", "")
@@ -7092,6 +7107,19 @@ def main():
 
     args = parser.parse_args()
 
+    auth_file = Path(args.auth_file)
+    from scripts.auth_configured import AuthStatus, auth_status
+    auth_state = auth_status(auth_file)
+    if auth_state is AuthStatus.MALFORMED:
+        print(f"ERROR: {auth_file} is not valid HCL", file=sys.stderr)
+        sys.exit(1)
+    if auth_state is AuthStatus.INCOMPLETE:
+        print(
+            f"ERROR: fill in {auth_file} (workspace host, client ID, and client secret) before running generate",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # ── Delta mode: incremental schema-drift classification ─────────────
     if args.delta:
         # Decision 5: the delta path drafts with a model, so a deterministic
@@ -7117,8 +7145,6 @@ def main():
 
     ddl_dir = Path(args.ddl_dir).resolve()
     out_dir = Path(args.out_dir).resolve()
-    auth_file = Path(args.auth_file)
-
     print("=" * 60)
     print("  ABAC Configuration Generator")
     if args.space:
@@ -8004,7 +8030,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
         # but were accidentally omitted from the policy definition.  Running it
         # after autofix_invalid_tag_values ensures it only promotes real values,
         # not LLM typos that were already stripped above.
-        n_fixed = autofix_tag_policies(tfvars_path)
+        n_fixed = autofix_tag_policies(tfvars_path, auth_cfg)
         if n_fixed:
             print(f"  Auto-fixed {n_fixed} missing tag_policy value(s)")
 
@@ -8047,7 +8073,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 # PII autofix may introduce new tag keys (e.g. financial_sensitivity)
                 # that don't exist in tag_policies yet.  Run tag_policies autofix now
                 # so the new keys/values are registered before missing-policy detection.
-                n_pii_tp = autofix_tag_policies(tfvars_path)
+                n_pii_tp = autofix_tag_policies(tfvars_path, auth_cfg)
                 if n_pii_tp:
                     print(f"  Auto-fixed: added {n_pii_tp} tag_policy value(s) for PII-detected tags")
 
@@ -8063,7 +8089,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
         # Second pass: autofix_missing_fgac_policies (above) may have injected
         # new hasTagValue() conditions referencing values that weren't in the
         # original tag_policies.  Re-run autofix_tag_policies to pick them up.
-        n_fixed_2 = autofix_tag_policies(tfvars_path)
+        n_fixed_2 = autofix_tag_policies(tfvars_path, auth_cfg)
         if n_fixed_2:
             print(f"  Auto-fixed {n_fixed_2} additional missing tag_policy value(s) (second pass)")
 
@@ -8310,7 +8336,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                     autofix_canonical_tag_vocabulary(tfvars_path)
                     autofix_ambiguous_tag_values(tfvars_path)
                     autofix_invalid_tag_values(tfvars_path)
-                    autofix_tag_policies(tfvars_path)
+                    autofix_tag_policies(tfvars_path, auth_cfg)
                     autofix_undefined_tag_refs(tfvars_path)
                     # Strip bodyless CREATE FUNCTION statements before
                     # overlay injection — see main path comment above.
@@ -8335,7 +8361,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                             agent_footprint=agent_footprint,
                             authoritative_classification=classification_source is not None,
                         )
-                        autofix_tag_policies(tfvars_path)  # register new PII tag values
+                        autofix_tag_policies(tfvars_path, auth_cfg)  # register new PII tag values
                     autofix_missing_fgac_policies(tfvars_path, sql_path if sql_block else None)
                     if args.mode != "governance":
                         autofix_genie_config_fields(tfvars_path)
@@ -8433,7 +8459,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
                 n_bad_vals_assembled = autofix_invalid_tag_values(assembled_abac_path)
                 if n_bad_vals_assembled:
                     print(f"  Auto-fixed assembled abac: removed {n_bad_vals_assembled} tag_assignment(s) with invalid tag_value(s)")
-                n_fixed_assembled = autofix_tag_policies(assembled_abac_path)
+                n_fixed_assembled = autofix_tag_policies(assembled_abac_path, auth_cfg)
                 if n_fixed_assembled:
                     print(f"  Auto-fixed assembled abac: added {n_fixed_assembled} missing tag_policy value(s)")
                 n_undef_assembled = autofix_undefined_tag_refs(assembled_abac_path)

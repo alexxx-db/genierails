@@ -105,6 +105,12 @@ def classification_cloud(tmp_path):
     (sdk / "__init__.py").write_text(FAKE_SDK)
     (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
     (sdk / "useragent.py").write_text("")
+    (sdk / "config.py").write_text("class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n")
+    (cloud_root / "envs/dev/auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://env-under-test.example"\n'
+        'databricks_client_id = "env-client"\n'
+        'databricks_client_secret = "env-secret"\n'
+    )
     logs = {"genie": tmp_path / "genie.log", "tf": tmp_path / "tf.log"}
 
     def run(**fake):
@@ -208,6 +214,11 @@ def _discovery_env(tmp_path, spaces, discovered=None, id_to_name=None):
     (tmp_path / "data_access").mkdir()
     (tmp_path / "generated").mkdir()
     (tmp_path / "env.auto.tfvars").write_text(f"genie_spaces = {spaces}\nenable_classification = true\n")
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://env-under-test.example"\n'
+        'databricks_client_id = "env-client"\n'
+        'databricks_client_secret = "env-secret"\n'
+    )
     if discovered is not None:
         (tmp_path / "data_access/discovered_uc_tables.auto.tfvars").write_text(discovered)
     if id_to_name:
@@ -260,6 +271,11 @@ def test_discovery_is_skipped_when_classification_is_off(tmp_path, monkeypatch):
 
 @pytest.fixture
 def agent_env(env_dir, monkeypatch):
+    (env_dir / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://env-under-test.example"\n'
+        'databricks_client_id = "env-client"\n'
+        'databricks_client_secret = "env-secret"\n'
+    )
     (env_dir / "env.auto.tfvars").write_text(
         f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}" }}]\nenable_classification = true\n')
     calls = []

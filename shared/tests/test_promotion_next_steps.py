@@ -250,6 +250,31 @@ def test_promote_and_ungovern_print_the_mode_aware_release_steps():
     assert "after rehearse, make release-plan" not in makefile
 
 
+@pytest.mark.parametrize("auth_text, expected, absent", [
+    (None, "Next: edit", "not valid HCL"),
+    ('databricks_client_secret = "unterminated\n', "Next: fix", "Next: edit"),
+])
+def test_promote_auth_hint_distinguishes_missing_from_malformed(tmp_path, auth_text, expected, absent):
+    makefile = (SHARED / "Makefile.shared").read_text()
+    promote = makefile[makefile.index("=== Promote complete:"):]
+    assert 'if [ $$status -eq 2 ]; then' in promote
+    assert 'Next: fix $$dest_env_dir/auth.auto.tfvars (not valid HCL)' in promote
+    assert 'elif [ $$status -ne 0 ]; then' in promote
+    assert 'Next: edit $$dest_env_dir/auth.auto.tfvars' in promote
+    auth = tmp_path / "auth.auto.tfvars"
+    if auth_text is not None:
+        auth.write_text(auth_text)
+    recipe = (
+        'status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(CLOUD_ROOT)/auth.auto.tfvars" '
+        '|| status=$$?; if [ $$status -eq 2 ]; then echo "Next: fix (not valid HCL)"; '
+        'elif [ $$status -ne 0 ]; then echo "Next: edit (workspace credentials)"; fi'
+    )
+    result = _make(tmp_path, recipe=recipe)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout
+    assert absent not in result.stdout
+
+
 @pytest.mark.parametrize("text, expected", [
     (DETERMINISTIC_STG, "rehearse: ENV=prod is not allowed; rehearse its source env, then make release-plan ENV=prod "
                         "and make release ENV=prod"),

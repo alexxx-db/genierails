@@ -271,7 +271,8 @@ def test_the_scanner_sees_the_suite_patches():
             if where.startswith("tests/test_deterministic_generate.py")} >= {
         "call_with_retries", "call_anthropic", "configure_databricks_env"}
     assert sum(counts.values()) >= 60
-    for attr, at_least in {"configure_databricks_env": 11, "fetch_tables_from_databricks": 9,
+    assert counts.get("configure_databricks_env", 0) + counts.get("databricks_config", 0) >= 11
+    for attr, at_least in {"fetch_tables_from_databricks": 9,
                            "call_with_retries": 7, "_FGAC_PER_CATALOG_LIMIT": 6,
                            "_fetch_live_classification_source": 5}.items():
         assert counts.get(attr, 0) >= at_least, (attr, counts.get(attr))
