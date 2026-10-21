@@ -347,6 +347,17 @@ def test_scheduled_job_hcl_parses_with_read_only_default():
     assert variables["scheduled_governance_mode"]["default"] == "check"
 
 
+@pytest.mark.parametrize("path", [
+    REPO_ROOT / "shared" / "docs" / "scheduled-governance.md",
+    REPO_ROOT / "REFERENCE.md",
+])
+def test_legacy_coverage_docs_require_treatment_upgrade_before_enablement(path):
+    text = " ".join(path.read_text().split())
+    assert ("must run `make generate ENV=<env>` and then `make apply ENV=<env>` "
+            "(review the plan as usual) to add `gr_treatment` tags") in text
+    assert "`classified but unprotected ... no gr_treatment`" in text
+
+
 def test_catalog_warns_when_unused_by_check(tmp_path, monkeypatch, capsys):
     env_dir = _env_dir(tmp_path)
     monkeypatch.setattr(rsg, "_check", lambda ed: 0)

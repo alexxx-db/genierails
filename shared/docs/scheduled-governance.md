@@ -66,6 +66,12 @@ name for actionable failure guidance. The runner also
 retains `--step all|audit|delta|coverage` for existing callers;
 `--auth-file` and `--catalog` are legacy-only.
 
+Before enabling legacy scheduled coverage, legacy envs generated before
+`gr_treatment` existed must run `make generate ENV=<env>` and then
+`make apply ENV=<env>` (review the plan as usual) to add `gr_treatment` tags.
+Otherwise every scheduled run fails with
+`classified but unprotected ... no gr_treatment`.
+
 ## Upgrading
 
 The mode defaults to `"check"`, so existing jobs stop running legacy

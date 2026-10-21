@@ -259,6 +259,12 @@ Off by default. See [scheduled governance](shared/docs/scheduled-governance.md) 
 | `scheduled_governance_notification_emails` | list(string) | `[]` | Who is emailed when the job fails. |
 | `scheduled_governance_job_name` | string | `""` (a generated name) | Override the job name. |
 
+Before enabling legacy scheduled coverage, legacy envs generated before
+`gr_treatment` existed must run `make generate ENV=<env>` and then
+`make apply ENV=<env>` (review the plan as usual) to add `gr_treatment` tags.
+Otherwise every scheduled run fails with
+`classified but unprotected ... no gr_treatment`.
+
 ### `env.auto.tfvars`: settings make reads but Terraform doesn't
 
 These have no `variable` block (Terraform only warns that they're undeclared); the scripts behind `make` read them.
