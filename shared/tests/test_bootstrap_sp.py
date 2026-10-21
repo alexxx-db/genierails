@@ -1456,6 +1456,7 @@ def test_write_auth_file_refuses_symlink(tmp_path):
         bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
 
     assert "super-secret" not in target.read_text()
+    account.service_principals.create.assert_not_called()
     account.service_principal_secrets.create.assert_not_called()
     account.api_client.do.assert_not_called()
 
@@ -1472,6 +1473,7 @@ def test_write_auth_file_refuses_filled_secret_without_force(tmp_path):
 
     assert "old-secret" in auth.read_text()
     assert "super-secret" not in auth.read_text()
+    account.service_principals.create.assert_not_called()
     account.service_principal_secrets.create.assert_not_called()
     account.api_client.do.assert_not_called()
 
@@ -1491,6 +1493,7 @@ def test_write_auth_file_refuses_symlink_parent_before_minting(tmp_path):
             emit=MagicMock(),
         )
 
+    account.service_principals.create.assert_not_called()
     account.service_principal_secrets.create.assert_not_called()
 
 
@@ -1534,6 +1537,26 @@ def test_write_auth_file_refuses_nonempty_crlf_or_heredoc_secret_before_minting(
     with pytest.raises(RuntimeError, match="client secret"):
         bootstrap(_cfg(auth_file=auth), client_factory=factory, emit=MagicMock())
 
+    account.service_principals.create.assert_not_called()
+    account.service_principal_secrets.create.assert_not_called()
+
+
+def test_write_auth_file_dry_run_refuses_filled_secret_before_api_calls(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = "old-secret"\n')
+    auth.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="already contains a client secret"):
+        bootstrap(
+            _cfg(auth_file=auth, dry_run=True),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+    account.service_principals.list.assert_not_called()
+    account.service_principals.create.assert_not_called()
     account.service_principal_secrets.create.assert_not_called()
 
 

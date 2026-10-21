@@ -794,6 +794,8 @@ def bootstrap(
     ask: Callable[[str], str] = input,
 ) -> int:
     _plan(cfg, emit)
+    if cfg.auth_file:
+        preflight_auth_tfvars(cfg.auth_file, force=cfg.force_auth_file)
     if (not cfg.dry_run and not cfg.yes
             and ask("Apply these admin grants? Type 'yes' to continue: ").strip().lower() != "yes"):
         emit("Aborted; no changes were made.")
@@ -837,8 +839,6 @@ def bootstrap(
     )
     secret = None
     if created or cfg.rotate_secret or not existing_secrets:
-        if cfg.auth_file:
-            preflight_auth_tfvars(cfg.auth_file, force=cfg.force_auth_file)
         secret_response = account.service_principal_secrets.create(service_principal_id=int(sp_id))
         secret = str(_value(secret_response, "secret"))
         if cfg.auth_file:
