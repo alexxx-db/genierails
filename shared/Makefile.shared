@@ -481,6 +481,10 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 # outside git, where history cannot tell; make capture replaces a capture on purpose.
 generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in the selected workspace environment (set SPACE="Name" to regenerate only one space; set MODE=governance|genie for self-service Genie deployments)
 	@echo "=== Generate ABAC Config ($(ENV)$(if $(SPACE), — space: $(SPACE),)$(if $(MODE), — mode: $(MODE),)) ==="
+	@if ! python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(ENV_DIR)/auth.auto.tfvars"; then \
+		echo "ERROR: fill in $(_SETUP_ENV_REL)/auth.auto.tfvars before running make generate" >&2; \
+		exit 1; \
+	fi
 	@if [ "$(ENV)" = "$(DEFAULT_ENV)" ]; then $(_AGENT_OWNERSHIP) import-new --check --env-dir "$(ENV_DIR)" --env "$(ENV)"; fi
 	@if [ -n "$(SPACE)" ]; then \
 		if [ ! -f "$(ENV_DIR)/generated/abac.auto.tfvars" ]; then \

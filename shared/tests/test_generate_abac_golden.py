@@ -231,7 +231,7 @@ def _offline(monkeypatch, env_dir):
                         lambda refs, cfg: (DDL, [("dev_fin", "payments")]))
     monkeypatch.setattr(generate_abac, "_fetch_live_classification_source",
                         lambda *a, **k: ClassificationSource(tag_rows=TAG_ROWS))
-    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda: {})
+    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda *_: {})
     monkeypatch.setattr(generate_abac, "_LIVE_POLICIES_REPORTED", False)
     # Module state an earlier test in the same process may have filled.
     monkeypatch.setattr(generate_abac, "_POLICY_AUTOFIXES", set())
