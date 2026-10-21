@@ -222,6 +222,32 @@ def test_provenance_passes_for_a_rehearsed_clean_pushed_commit(repo):
     assert prov["commit"] == repo.head() and prov["rollback"] is None and prov["source_env"] == "dev"
 
 
+def test_provenance_refuses_legacy_source_for_deterministic_destination(repo):
+    repo.commit({"aws/envs/dev/env.auto.tfvars": 'uc_tables = ["dev_catalog.s.t"]\n'})
+    with pytest.raises(rg.Refused, match="legacy.*deterministic.*legacy-migration.md"):
+        rg.provenance(repo.prod, "prod")
+
+
+def test_provenance_names_a_missing_promote_from_env(repo):
+    repo.commit({"aws/envs/prod/env.auto.tfvars": PROD_ENV.replace('promote_from = "dev"',
+                                                                    'promote_from = "typo"')})
+    with pytest.raises(rg.Refused, match=r"envs/typo/env\.auto\.tfvars was not found"):
+        rg.provenance(repo.prod, "prod")
+
+
+@pytest.mark.parametrize("name,text,expected", [
+    ("prod", 'governance_mode = "legacy"\n', rg.PROMOTED),
+    ("stg", 'governance_mode = "legacy"\npromote_from = "dev"\n', rg.PROMOTED),
+    ("dev", 'governance_mode = "legacy"\n', rg.LEGACY),
+    ("dev", 'governance_mode = "deterministic"\n', rg.REHEARSE),
+])
+def test_env_role_keeps_promotion_separate_from_governance_mode(tmp_path, name, text, expected):
+    env = tmp_path / name
+    env.mkdir()
+    env.joinpath("env.auto.tfvars").write_text(text)
+    assert rg.env_role(env) == expected
+
+
 def test_provenance_refuses_a_stale_receipt(repo):
     rehearse(repo)
     repo.commit({"aws/envs/dev/env.auto.tfvars": DEV_ENV + "# new\n"})

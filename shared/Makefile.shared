@@ -320,9 +320,8 @@ _guard-workspace-config:
 		python3 -c 'import sys,hcl2; cfg=hcl2.load(open("abac.auto.tfvars")); bad=[name for name in ("group_members","tag_policies","tag_assignments","fgac_policies") if cfg.get(name)]; bad and (print("Workspace config still contains shared sections: " + ", ".join(bad)), print("Re-run '\''make promote$(if $(filter $(ENV),$(DEFAULT_ENV)),, ENV=$(ENV))'\'' to resplit the generated config."), sys.exit(1))'; \
 	fi
 
-# Next steps follow shared/examples/dev_to_prod/README.md. ENV=prod (the name the
-# walkthrough and `make rehearse` reserve for production) gets the walkthrough's
-# Prod-section steps; every other workspace env gets the Dev-section rehearsal.
+# Next steps follow shared/examples/dev_to_prod/README.md. The configured env
+# role, not its name, selects the promoted or rehearsal instructions.
 _SETUP_ENV_REL = $(patsubst $(CLOUD_ROOT)/%,%,$(ENV_DIR))
 _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
@@ -330,8 +329,16 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@echo "=== Setup ($(ENV)) ==="
 	@python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
 	@gov_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+	role="$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" || exit 1; \
 	if python3 -c 'import sys,hcl2; c=hcl2.load(open(sys.argv[1])); raise SystemExit(0 if any(str(g).startswith("<") for g in c.get("access_tier_groups",[])) else 1)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then gov_only=0; fi; \
-	det="$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+	dest_det="$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; det="$$dest_det"; mode_note=""; \
+	if [ "$$role" = promoted ] && [ "$$dest_det" = 1 ]; then \
+		src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+		if [ -f "$(CLOUD_ROOT)/envs/$$src/env.auto.tfvars" ]; then \
+			det="$$($(_IS_DETERMINISTIC) "$(CLOUD_ROOT)/envs/$$src/env.auto.tfvars" 2>/dev/null)"; \
+			if [ "$$det" != 1 ]; then mode_note="  Before promote-to: migrate envs/$$src (shared/docs/legacy-migration.md), or set governance_mode = \"legacy\" in $(_SETUP_ENV_REL)/env.auto.tfvars."; fi; \
+		fi; \
+	fi; \
 	deployer_note=""; \
 	if [ "$$det" = 1 ] && ! python3 -c 'import sys,hcl2; sys.path.insert(0, "$(SHARED_ROOT)"); from deployer_identity import validation_errors; sys.exit(1 if validation_errors(hcl2.load(open(sys.argv[1]))) else 0)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
 		deployer_note="     Then commit that SP's client_id as deployer_principal_id in $(_SETUP_ENV_REL)/env.auto.tfvars (required in deterministic mode; not secret)"; \
@@ -349,18 +356,19 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "  1. Edit $(ACCOUNT_ENV_DIR)/auth.auto.tfvars"; \
 		echo "  2. Review $(ACCOUNT_ENV_DIR)/env.auto.tfvars"; \
 		echo "  3. Run: make apply ENV=$(ACCOUNT_ENV)"; \
-	elif [ "$(ENV)" = "prod" ]; then \
+	elif [ "$$role" = promoted ]; then \
 		echo "Shared account environment ready:     $(ACCOUNT_ENV_DIR)"; \
 		echo "Environment governance ready:         $(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
 		echo "Workspace environment ready:          $(ENV_DIR)"; \
 		echo ""; \
-		echo "Next steps (production — the walkthrough's Prod section; finish the dev rehearsal first):"; \
-		echo "  1. Set promote_from and catalog_map in $(_SETUP_ENV_REL)/env.auto.tfvars, then run:"; \
+		echo "Next steps ($(ENV) promotion — the walkthrough's Prod section; finish the source rehearsal first):"; \
+		if [ -n "$$mode_note" ]; then echo "$$mode_note"; fi; \
+		echo "  1. Replace the seeded promote_from and catalog_map values in $(_SETUP_ENV_REL)/env.auto.tfvars, then run:"; \
 		echo "       make promote-to ENV=$(ENV)"; \
 		echo "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)"; \
-		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + prod workspace host & id"; \
+		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + $(ENV) workspace host & id"; \
 		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
-		if [ "$$det" = 1 ]; then echo "     Replace this env's access_tier_groups placeholders with prod IdP groups, most to least privileged."; fi; \
+		if [ "$$det" = 1 ]; then echo "     Replace this env's access_tier_groups placeholders with $(ENV) IdP groups, most to least privileged."; fi; \
 		echo "  3. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
 		echo "  4. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
