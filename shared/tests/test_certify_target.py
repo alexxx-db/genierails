@@ -32,6 +32,28 @@ def test_certify_fails_with_a_migration_message_and_runs_nothing(tmp_path, cloud
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
+@pytest.mark.parametrize("mode", ["legacy", "deterministic"])
+def test_certify_points_each_mode_at_its_own_approval_step(tmp_path, cloud, mode):
+    env_dir = tmp_path / "envs" / "prod"
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text(f'governance_mode = "{mode}"\npromote_from = "dev"\n')
+    env = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL")}
+    result = subprocess.run(["make", "certify", "ENV=prod", f"ENV_DIR={env_dir}"], cwd=ROOT / cloud,
+                            text=True, capture_output=True, env=env)
+    assert result.returncode != 0
+    if mode == "deterministic":
+        assert ("make certify was removed; ENV=prod is deterministic: commit and push envs/prod/ to origin/main "
+                "(or merge its PR), make rehearse ENV=dev on that commit, make release-plan ENV=prod and "
+                "make release ENV=prod.") in result.stderr
+        assert "approve the manifest make release-plan ENV=prod writes (it grants nothing)" in result.stderr
+        assert "make plan" not in result.stderr
+    else:
+        assert "make certify was removed; run make release ENV=prod" in result.stderr
+        assert "run make plan ENV=prod and gate make release behind your approval step" in result.stderr
+        assert "release-plan" not in result.stderr
+
+
+@pytest.mark.parametrize("cloud", ["aws", "azure"])
 def test_changelog_records_the_removal(cloud):
     changelog = (ROOT / cloud / "CHANGELOG.md").read_text()
     unreleased = changelog[changelog.index("## [Unreleased]"):]

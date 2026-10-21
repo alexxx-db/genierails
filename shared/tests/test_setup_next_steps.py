@@ -3,6 +3,7 @@
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import hcl2
@@ -143,9 +144,9 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
     assert result.returncode == 0, result.stderr
     out = result.stdout
 
-    assert "Next steps (production — the walkthrough's Prod section; finish the dev rehearsal first):" in out
+    assert "Next steps (prod promotion — the walkthrough's Prod section; finish the source rehearsal first):" in out
     order = [
-        "Set promote_from and catalog_map in envs/prod/env.auto.tfvars",
+        "Replace the seeded promote_from and catalog_map values in envs/prod/env.auto.tfvars",
         'make promote-to ENV=prod\n',
         "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)\n",
         "envs/prod/auth.auto.tfvars",
@@ -201,6 +202,40 @@ def test_setup_prod_rehearses_its_promote_from_source_before_release_plan(tmp_pa
     assert out.index("make rehearse ENV=stg") < out.index("make release-plan ENV=prod")
 
 
+def test_setup_prod_banner_uses_legacy_promote_from_mode(tmp_path):
+    dev = tmp_path / "aws/envs/dev"
+    dev.mkdir(parents=True)
+    dev.joinpath("env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    result = _make("aws", tmp_path, "setup", "ENV=prod")
+    assert result.returncode == 0, result.stderr
+    assert "  5. Run: make release ENV=prod" in result.stdout
+    assert "make rehearse ENV=dev" not in result.stdout
+    assert "make release-plan ENV=prod" not in result.stdout
+    assert 'migrate envs/dev (shared/docs/legacy-migration.md), or set governance_mode = "legacy"' in result.stdout
+
+
+@pytest.mark.parametrize("env", ["prod", "stg"])
+def test_setup_legacy_promoted_env_keeps_the_promotion_banner(env, tmp_path):
+    dev = tmp_path / "aws/envs/dev"
+    target = tmp_path / f"aws/envs/{env}"
+    dev.mkdir(parents=True)
+    target.mkdir()
+    dev.joinpath("env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    target.joinpath("env.auto.tfvars").write_text(
+        'governance_mode = "legacy"\npromote_from = "dev"\n'
+        f'catalog_map = {{ "dev_catalog" = "{env}_catalog" }}\n')
+    result = _make("aws", tmp_path, "setup", f"ENV={env}")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert f"Next steps ({env} promotion" in out
+    assert f"{env} workspace host & id" in out
+    assert f"make promote-to ENV={env}" in out
+    assert f"make release ENV={env}" in out
+    assert f"make rehearse ENV={env}" not in out
+    assert "make release-plan" not in out
+    assert "cp ../shared/examples/dev_to_prod/env.auto.tfvars.example" not in out
+
+
 @pytest.mark.parametrize("cloud", CLOUDS)
 def test_setup_non_default_env_seeds_promotion_settings(cloud, tmp_path):
     result = _make(cloud, tmp_path, "setup", "ENV=stg")
@@ -208,6 +243,66 @@ def test_setup_non_default_env_seeds_promotion_settings(cloud, tmp_path):
     env_text = (tmp_path / cloud / "envs/stg/env.auto.tfvars").read_text()
     assert 'promote_from = "dev"' in env_text
     assert 'catalog_map  = { "<dev_catalog>" = "<stg_catalog>" }' in env_text
+
+
+def test_setup_stg_promoted_uses_the_promotion_banner_without_overwrite_or_rehearse(tmp_path):
+    result = _make("aws", tmp_path, "setup", "ENV=stg")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "Next steps (stg promotion" in out
+    assert "stg workspace host & id" in out
+    assert "prod workspace host & id" not in out
+    assert "make promote-to ENV=stg" in out
+    assert "make rehearse ENV=dev" in out
+    assert "make rehearse ENV=stg" not in out
+    assert "cp ../shared/examples/dev_to_prod/env.auto.tfvars.example envs/stg/env.auto.tfvars" not in out
+
+
+def test_setup_stg_without_promote_from_uses_the_rehearsal_banner(tmp_path):
+    env = tmp_path / "aws/envs/stg"
+    env.mkdir(parents=True)
+    env.joinpath("env.auto.tfvars").write_text('governance_mode = "deterministic"\n')
+    result = _make("aws", tmp_path, "setup", "ENV=stg")
+    assert result.returncode == 0, result.stderr
+    assert "Next steps (dev rehearsal" in result.stdout
+    assert "make rehearse ENV=stg" in result.stdout
+    assert "promotion — the walkthrough's Prod section" not in result.stdout
+
+
+@pytest.mark.parametrize("target", ["promote-to", "check"])
+@pytest.mark.parametrize("ci", [False, True])
+def test_duplicate_catalog_map_is_actionable_without_parser_traceback(target, ci, tmp_path):
+    assert _make("aws", tmp_path, "setup", "ENV=prod").returncode == 0
+    env_file = tmp_path / "aws/envs/prod/env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + '\ncatalog_map = { "other" = "prod" }\n')
+    args = [target, "ENV=prod"] + (["CI=true"] if ci else [])
+    result = _make("aws", tmp_path, *args)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "envs/prod/env.auto.tfvars: catalog_map is set twice; keep one" in output
+    assert "Traceback" not in output and "VisitError" not in output
+
+
+def test_duplicate_catalog_map_helpers_return_one(tmp_path):
+    envs = tmp_path / "envs"
+    dev, prod = envs / "dev", envs / "prod"
+    dev.mkdir(parents=True)
+    prod.mkdir()
+    dev.joinpath("env.auto.tfvars").write_text('uc_tables = ["dev.s.t"]\n')
+    duplicate = ('governance_mode = "deterministic"\npromote_from = "dev"\n'
+                 'catalog_map = { "dev" = "prod" }\ncatalog_map = { "other" = "prod" }\n')
+    prod_file = prod / "env.auto.tfvars"
+    prod_file.write_text(duplicate)
+    commands = [
+        [sys.executable, str(SHARED_ROOT / "genie_space_placeholder.py"), str(prod_file)],
+        [sys.executable, str(SHARED_ROOT / "scripts/saved_settings.py"), "promote-resolve",
+         "--env", "prod", "--env-dir", str(prod), "--envs-dir", str(envs)],
+    ]
+    for command in commands:
+        result = subprocess.run(command, text=True, capture_output=True, env=_clean_env())
+        assert result.returncode == 1
+        assert "catalog_map is set twice; keep one" in result.stderr
+        assert "Traceback" not in result.stderr and "VisitError" not in result.stderr
 
 
 @pytest.mark.parametrize("env", ["dev", "prod", "account"])

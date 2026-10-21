@@ -19,7 +19,7 @@ make check ENV=dev          # read-only check of the committed files (rehearse d
 make rehearse ENV=dev       # applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
 
 # prod (same for stg or any env)
-make setup ENV=prod         # set deployer_principal_id, groups and catalog_map
+make setup ENV=prod         # set deployer_principal_id and groups; replace the seeded catalog_map line
 make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
 git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git push
@@ -27,7 +27,8 @@ make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't
 make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks
-make maintain ENV=prod      # run on a schedule
+GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod   # live compliance record; finds the warehouse itself
+make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
 
 <a id="prerequisites--gather-required-values"></a>
@@ -104,6 +105,7 @@ make rehearse ENV=dev
 ```
 It applies in dev, then runs `verify-access` as its last gate (`_verify-access-gate`), querying as each test tier.
 **Pass looks like:** `ALL EFFECTIVE`: each test tier sees masked values, the authorized tier sees raw ones. To re-run only that proof later: `make verify-access ENV=dev`.
+You don't set a row-pairing key: it picks one per masked table (a single-column primary key, else an untagged id-like column such as `customer_id`) and proves it unique, non-null and unmasked. A deterministic env then prints the proven `verify_key_columns` line; committing it is optional and pins those keys. Only a table with no provable key needs `verify_key_columns` set ([how keys are picked](../../docs/effective-access-verification.md#how-genierails-picks-the-row-pairing-key)).
 
 <a id="phase-2--prod-set-up-and-promote-rules"></a>
 <a id="phase-3--prod-scan-real-data"></a>
@@ -114,7 +116,7 @@ It applies in dev, then runs `verify-access` as its last gate (`_verify-access-g
 ```bash
 make setup ENV=prod
 ```
-Fill in `envs/prod/auth.auto.tfvars`, replace its `deployer_principal_id` and `access_tier_groups` placeholders, and set:
+Fill in `envs/prod/auth.auto.tfvars` (same service principal as dev? leave it blank and add `REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<prod host> WORKSPACE_ID=<prod id>` to the `promote-to` below: it copies dev's account ID, client ID and secret into the still-blank file and never dev's host), replace its `deployer_principal_id` and `access_tier_groups` placeholders, and set:
 ```hcl
 catalog_map = { "dev_finance" = "prod_finance" }   # dev catalog = prod catalog
 ```
@@ -122,6 +124,7 @@ Then:
 ```bash
 make promote-to ENV=prod
 ```
+It copies dev's reviewed rules into prod, renamed to prod's catalogs: masks and policies, `tag_treatments`, adopted custom masks, the agent capture and the proven `verify_key_columns`; dev's tier groups are mapped through prod's `group_map`. It leaves dev's tag assignments behind (prod derives its own from its own tags) and keeps prod's own agent ID, warehouse, `acl_groups` and `table_readers` once set, and the names of policies already live in prod.
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
 Commit and push the promoted files to `main` (`git add .gitignore envs/`, commit, `git push`): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
 
@@ -140,17 +143,23 @@ make release ENV=prod
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
 - **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make check ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make check ENV=prod`, `make rehearse ENV=dev` (again, on the promotion commit), `make release-plan ENV=prod` and `make release ENV=prod`, committing and pushing after each step that changes `envs/`.
-- **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Applying a custom mask in governance (`make adopt-custom-mask`) is not on `main` yet. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
+- **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Once it passes, `make adopt-custom-mask ENV=dev TREATMENT=custom_<name>` copies it into `envs/dev/custom_masks/` and prints the `tag_treatments` line to add to `envs/dev/env.auto.tfvars`. Commit both, then continue from `make generate ENV=dev` as above. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
 
 Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-gap-found-in-prod).
+
+**4. Record evidence.**
+```bash
+GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod
+```
+It reads the live tags, masks and grants of prod's agent tables and writes a JSON record and Markdown summary to `envs/prod/generated/evidence/`. It finds the SQL warehouse itself (prod's `sql_warehouse_id`, else the one the release applied); `WAREHOUSE_ID=<id>` only pins another. Archive the record (e.g. with the change ticket), then delete that folder: `make maintain` and the next `release-plan` need a clean checkout. [Details](../../docs/evidence-report.md).
 
 <a id="phase-5--prod-maintain-coverage"></a>
 ## Keep it safe
 
 ```bash
-make maintain ENV=prod      # schedule it (cron or CI)
+make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
-It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
+Run it from the [deployment machine](../../docs/deployment-machine.md). It masks newly tagged columns, never grants access past a passing coverage check, and never changes the Genie agent. In a deterministic env it runs only from the last released commit, on a clean checkout. If it stops, it prints what to do: usually review a new detection in Catalog Explorer, or add a missing rule in dev and re-promote.
 
 <a id="commit-it"></a>
 ## Commit it

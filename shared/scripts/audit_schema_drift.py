@@ -243,6 +243,7 @@ def _run_sql(w, warehouse_id: str, sql: str, *, complete: bool = False) -> list[
 
 def detect_forward_drift(
     w, warehouse_id: str, managed_tables: list[str], governed_keys: list[str],
+    *, deterministic: bool = False,
 ) -> list[tuple[str, str, str, str, str]]:
     """Find columns in managed tables that match PII patterns but lack a governed tag."""
     if not managed_tables or not governed_keys:
@@ -251,12 +252,13 @@ def detect_forward_drift(
     table_list = ", ".join(f"'{t}'" for t in managed_tables)
     key_list = ", ".join(f"'{k}'" for k in governed_keys)
 
+    native_classification = " OR tag_name LIKE 'class.%'" if deterministic else ""
     sql = f"""\
 WITH classification_tags AS (
   SELECT catalog_name AS ct_catalog, schema_name AS ct_schema,
          table_name AS ct_table, column_name AS ct_column
   FROM system.information_schema.column_tags
-  WHERE tag_name IN ({key_list})
+  WHERE tag_name IN ({key_list}){native_classification}
 )
 SELECT c.table_catalog, c.table_schema, c.table_name, c.column_name,
        COALESCE(c.comment, '') AS col_comment
@@ -565,6 +567,9 @@ def main(argv: list[str] | None = None) -> int:
 
     governed_keys = resolve_governed_keys(env_dir)
     print(f"  Governed keys: {governed_keys}")
+    deterministic = _load_hcl(env_dir / "env.auto.tfvars").get(
+        "governance_mode", "legacy"
+    ) == "deterministic"
 
     config_assignments = extract_config_tag_assignments(env_dir)
 
@@ -579,7 +584,10 @@ def main(argv: list[str] | None = None) -> int:
     if run_drift:
         # Forward drift
         print("\n  Checking forward drift (untagged sensitive columns)...")
-        forward = detect_forward_drift(w, warehouse_id, managed_tables, governed_keys)
+        forward = detect_forward_drift(
+            w, warehouse_id, managed_tables, governed_keys,
+            deterministic=deterministic,
+        )
 
         # Reverse drift
         print("  Checking reverse drift (stale tag assignments)...")
@@ -598,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n  REVERSE DRIFT: {len(reverse)} stale tag assignment(s) (column no longer exists):")
             for entity in reverse:
                 print(f"    {entity}")
+            print("    Re-run derive-assignments to remove assignments for dropped columns.")
 
     if run_rulebook:
         print("\n  Checking rulebook drift (prod tags with no covering policy/mask)...")

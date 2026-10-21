@@ -24,6 +24,7 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 from scripts.footprint import FootprintError, load_discovered_footprint, load_env_config, load_hcl  # noqa: E402
+from scripts.auth_configured import AuthStatus, auth_status  # noqa: E402
 
 DISCOVERED = Path("data_access") / "discovered_uc_tables.auto.tfvars"
 
@@ -81,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: discover_agent_tables.py <env_dir>", file=sys.stderr)
         return 2
     env_dir = Path(argv[0]).resolve()
+    auth_path = env_dir / "auth.auto.tfvars"
     try:
         config = load_env_config(env_dir)
         if not config.get("enable_classification", False):
@@ -97,6 +99,20 @@ def main(argv: list[str] | None = None) -> int:
             if explicit:
                 print("Using listed uc_tables instead of discovering tables from genie_space_id.")
             return 0
+        status = auth_status(auth_path)
+        if status is AuthStatus.MALFORMED:
+            print(
+                f"ERROR: envs/{env_dir.name}/auth.auto.tfvars is not valid HCL",
+                file=sys.stderr,
+            )
+            return 1
+        if status is AuthStatus.INCOMPLETE:
+            print(
+                f"ERROR: fill in envs/{env_dir.name}/auth.auto.tfvars "
+                "(workspace host, client ID, and client secret) before discovering agent tables",
+                file=sys.stderr,
+            )
+            return 1
         _tables, existing = load_discovered_footprint(env_dir)
         keep = other_agent_names(env_dir, config)
     except FootprintError as exc:
@@ -106,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     import generate_abac as ga
 
     print(f"=== Discover Genie agent tables ({env_dir.name}) ===")
-    auth_cfg = {**load_hcl(env_dir / "auth.auto.tfvars"), **config}
+    auth_cfg = {**load_hcl(auth_path), **config}
     fresh: dict[str, list[str]] = {}
     for space in agents:
         space_id = _str(space.get("genie_space_id"))

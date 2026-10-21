@@ -311,7 +311,9 @@ def _check(args) -> None:
 
     try:
         step(1, "validate")
-        if not (scratch.envs / env / "abac.auto.tfvars").is_file() and has_generated:
+        if not has_generated and not (scratch.envs / env / "abac.auto.tfvars").is_file():
+            print(f"  NOTE: skipped: envs/{env} has not been generated; run make generate ENV={env}.")
+        elif not (scratch.envs / env / "abac.auto.tfvars").is_file():
             then = ("the regeneration below splits generated/ and validates every layer" if is_deterministic
                     else "validate-generated below checks generated/")
             print(f"  NOTE: skipped: envs/{env}/abac.auto.tfvars (the split config) is not committed; {then}.")
@@ -388,7 +390,8 @@ def _check(args) -> None:
 
         token = mint(scratch.envs / env)
         try:
-            if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token)}) != 0:
+            if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token),
+                                                             "CLASSIFICATION_READ_ONLY": "1"}) != 0:
                 raise CheckFailed("plan")
         finally:
             token.unlink(missing_ok=True)

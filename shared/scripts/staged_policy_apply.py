@@ -775,7 +775,7 @@ class Controller:
         if dict(rendered["tags"]) != old_tags:
             moved = sorted(c for c in rendered["tags"].keys() | old_tags.keys()
                            if rendered["tags"].get(c) != old_tags.get(c))
-            return f"{len(moved)} column(s) keep the new generation's treatment ({', '.join(moved[:5])})"
+            return f"{len(moved)} column(s) {KEPT_NEW_COLUMNS} ({', '.join(moved[:5])})"
         previous = _expected_live([g for g in (old, retain) if g])
         for policy in rendered["fgac_policies"]:
             want = previous.get(policy["name"])
@@ -811,9 +811,35 @@ class Controller:
             if t.get("rebind_incomplete"):
                 raise Refused(f"make policy-rebind of run {t['run_id']} didn't finish "
                               f"({t['rebind_incomplete']['reason']}). {t['rebind_incomplete']['next']}")
+            self._refuse_split_drift("policy-abandon")
+            desired = pg.desired_generation(self.env_dir)
+            if self._moved_treatments(t, desired):
+                # The drift allowance below trusts the previous generation's recorded tags.
+                problem = self._previous_snapshot_problem(t)
+                if problem:
+                    raise Refused(
+                        f"this change can't be abandoned: the generated config's treatment values differ from the "
+                        f"unfinished change {t['to']}, and {problem}, so whether the config is back on that "
+                        "generation's values can't be checked. Nothing was applied. Next: restore the snapshot "
+                        f"from where the env's records are kept (git history or GENIERAILS_STATE_DIR), then re-run "
+                        f"make policy-abandon ENV={self.env_name}.")
+            moved = self._drifted_treatments(t, desired)
+            if moved:
+                raise Refused(
+                    f"this change can't be abandoned: {len(moved)} column(s) have another treatment in the generated "
+                    f"config than in the unfinished change {t['to']} ({', '.join(moved[:10])}), and the config isn't "
+                    f"back on generation {t['from'] or 'none'}'s values either: their live class.* tags changed "
+                    "since the change started, or its treatment settings were edited. Abandon only drops the "
+                    "change's policies, so nothing was applied. Next: put those columns' class.* tags (or the "
+                    "treatment settings) back as they were when the change started, then re-run make "
+                    f"policy-abandon ENV={self.env_name}, or re-run the command that started it (commit "
+                    f"{t['commit'] or '?'}) to resume it. See 'Changes that can't be dropped' in "
+                    "shared/docs/deterministic-policies.md.")
             switched = t["switch_attempted"]
             if switched:
                 reason = self._restore_unproven(t)
+                if KEPT_NEW_COLUMNS in reason:
+                    raise Refused(self._kept_columns_message(t, "abandoned", reason))
                 if reason:
                     raise Refused(_unabandonable(reason))
             created = self._created_policies(t)
@@ -924,12 +950,24 @@ class Controller:
                 raise Refused("policy-rebind re-points a change whose switch was rolled back; this one never "
                               f"switched. Resume it, or drop it with make policy-abandon ENV={self.env_name}.")
             reason = self._restore_unproven(t, ("restore", "rebind"))
+            if KEPT_NEW_COLUMNS in reason:
+                raise Refused(self._kept_columns_message(t, "re-pointed", reason))
             if reason:
                 raise Refused(f"this change can't be re-pointed ({reason}); nothing was applied.")
+            self._refuse_split_drift("policy-rebind")
             desired = pg.desired_generation(self.env_dir)
             if desired["fingerprint"] == t["to"]:
                 raise Refused(f"the generated config is the unfinished change's own generation {t['to']}; "
                               "there is nothing to re-point. Re-run the command that started it to resume it.")
+            moved = self._moved_treatments(t, desired)
+            if moved:
+                raise Refused(
+                    f"{len(moved)} column(s) have another treatment in the generated config than in the unfinished "
+                    f"change {t['to']} ({', '.join(moved[:10])}): their live class.* tags changed since it started, "
+                    "or its treatment settings were edited. A rebind only re-points principals, so nothing was "
+                    "applied. Next: put those columns' class.* tags (or the treatment settings) back as they were "
+                    f"when the change started, then re-run make policy-rebind ENV={self.env_name}. If no principal "
+                    f"it names was deleted, make policy-abandon ENV={self.env_name} drops the change instead.")
             plan_dir = pg.ledger_dir(self.env_dir) / "rebind"
             # Grants earlier protect phases of this rebind held back, each proven by its saved plan.
             held = self._validated_held(t, plan_dir)
@@ -1154,14 +1192,76 @@ class Controller:
 
     def _unfinished_message(self, t: dict, desired: dict) -> str:
         options = [f"re-run the same command at commit {t['commit'] or '?'} (generation {t['to']}) to resume it"]
-        if not t["switch_attempted"]:
+        # With drifted treatment values abandon refuses too; the drift note below says what to put back.
+        drifted = self._drifted_treatments(t, desired)
+        if not drifted and not t["switch_attempted"]:
             options.append(f"or drop it with make policy-abandon ENV={self.env_name}")
-        elif (t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t):
+        elif not drifted and ((t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t)):
             options.append(f"or drop it with make policy-abandon ENV={self.env_name} (the switch was rolled "
                            "back; abandon re-checks live protection first). If principals it names were deleted "
                            f"and recreated, run make policy-rebind ENV={self.env_name} first")
+        moved = self._moved_treatments(t, desired)
+        drift = (f"\n{len(moved)} column(s) have another treatment in the generated config than in generation "
+                 f"{t['to']} ({', '.join(moved[:10])}): their live class.* tags changed since the change started, or "
+                 "its treatment settings were edited. Resuming needs them back as they were." if moved else "")
+        if drifted:
+            drift += (" make policy-abandon refuses too while the generated config is on neither the change's "
+                      f"treatment values nor generation {t['from'] or 'none'}'s. Next: put those columns' class.* "
+                      "tags (or the treatment settings) back as they were when the change started, then resume "
+                      f"it or run make policy-abandon ENV={self.env_name}.")
         return (self.describe_transition(t) + f"\nThe generated config is now generation {desired['fingerprint']}. "
-                "A new policy change can't start until this one is finished: " + "; ".join(options) + ".")
+                "A new policy change can't start until this one is finished: " + "; ".join(options) + "." + drift)
+
+    def _moved_treatments(self, t: dict, desired: dict) -> list[str]:
+        """Columns whose treatment value differs between the unfinished change and the generated config."""
+        try:
+            changed = self._snapshot(t["to"]) or {}
+        except pg.StageError:
+            return []
+        want, have = dict(desired.get("tags") or {}), dict(changed.get("tags") or {})
+        return sorted(c for c in want.keys() | have.keys() if want.get(c) != have.get(c))
+
+    def _drifted_treatments(self, t: dict, desired: dict) -> list[str]:
+        """_moved_treatments, unless the generated config is back on the treatment values the change started from."""
+        moved = self._moved_treatments(t, desired)
+        if not moved:
+            return []
+        if self._previous_snapshot_problem(t):
+            return moved
+        previous = (self._snapshot(t["from"]) or {}) if t["from"] else {}
+        return [] if dict(previous.get("tags") or {}) == dict(desired.get("tags") or {}) else moved
+
+    def _previous_snapshot_problem(self, t: dict) -> str:
+        """Why the snapshot of the generation the change started from can't be trusted, or ""."""
+        if not t["from"]:
+            return ""
+        try:
+            snapshot = self._snapshot(t["from"])
+        except (pg.StageError, OSError, ValueError) as exc:
+            return f"the snapshot of generation {t['from']} can't be read ({exc})"
+        if not pg.snapshot_intact(snapshot, t["from"]):
+            return (f"the snapshot of generation {t['from']} ({pg.ledger_dir(self.env_dir) / (t['from'] + '.json')}) "
+                    "doesn't match its fingerprint (edited since it was recorded)")
+        return ""
+
+    def _refuse_split_drift(self, command: str) -> None:
+        """Refuse before any plan when the split's non-treatment assignments aren't the generated config's."""
+        problems = pg.split_assignment_problems(self.env_dir)
+        if problems:
+            raise Refused(
+                "the split data_access config's non-treatment tag assignments differ from the generated config's, "
+                "so the coverage check and the plan would judge different assignments; nothing was applied:\n  - "
+                + "\n  - ".join(problems[:20])
+                + f"\nRun make promote ENV={self.env_name} to re-split it (make {command} promotes after its live "
+                "refresh), then re-run the same command.")
+
+    def _kept_columns_message(self, t: dict, action: str, reason: str) -> str:
+        return (f"this change can't be {action}: {reason}. The restore kept the mask the change gave them; dropping "
+                "or re-pointing the change would leave them on policies it deletes, and GenieRails never untags a "
+                "governed column on its own. Nothing was applied. Next: resume the change by re-running the command "
+                f"that started it (commit {t['commit'] or '?'}) with the generated config on generation {t['to']}. "
+                "If principals it names were deleted and recreated under new IDs, no GenieRails command can finish "
+                "or drop it yet: see 'Changes that can't be dropped' in shared/docs/deterministic-policies.md.")
 
 
 def _in_ci(environ: dict, *, opt_out: bool = True) -> bool:
@@ -1182,6 +1282,10 @@ def _held_digest(t: dict, record: dict) -> str:
     bound = {"run_id": t["run_id"], "from": t["from"], "to": t["to"], "plan": record.get("plan"),
              "sha256": record.get("sha256"), "grants": sorted(record.get("grants") or [])}
     return hashlib.sha256(json.dumps(bound, sort_keys=True).encode()).hexdigest()
+
+
+# _restore_unproven's reason when the verified restore kept newly governed columns on the change's value.
+KEPT_NEW_COLUMNS = "keep the new generation's treatment"
 
 
 def _unabandonable(reason: str) -> str:

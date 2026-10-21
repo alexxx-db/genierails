@@ -618,7 +618,11 @@ fgac_policies = [
 
 @pytest.fixture
 def env_dir(tmp_path, monkeypatch):
-    (tmp_path / "auth.auto.tfvars").write_text("")
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://env-under-test.example"\n'
+        'databricks_client_id = "env-client"\n'
+        'databricks_client_secret = "env-secret"\n'
+    )
     (tmp_path / "env.auto.tfvars").write_text(
         'genie_spaces = [{ name = "Payments", uc_tables = '
         '["dev_fin.payments.customers", "dev_fin.payments.payments"] }]\n'
@@ -626,7 +630,7 @@ def env_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(generate_abac, "WORK_DIR", tmp_path)
     monkeypatch.setattr(generate_abac, "_fetch_live_classification_source", lambda *a, **k: None)
-    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda: {})
+    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda *_: {})
     monkeypatch.setattr(generate_abac, "list_account_group_names", lambda cfg: None)
     monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda cfg: None)
     return tmp_path
@@ -732,6 +736,11 @@ def test_delta_mode_never_reads_or_merges_reviewed_rules(monkeypatch, tmp_path):
     ran = []
     # Legacy delta runs only after a real legacy env file is read (fail closed).
     (tmp_path / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://env-under-test.example"\n'
+        'databricks_client_id = "env-client"\n'
+        'databricks_client_secret = "env-secret"\n'
+    )
     monkeypatch.setattr(generate_abac, "_run_delta_mode", lambda auth: ran.append(auth))
     monkeypatch.setattr(sys, "argv", [
         "generate_abac.py", "--delta", "--auth-file", str(tmp_path / "auth.auto.tfvars"),

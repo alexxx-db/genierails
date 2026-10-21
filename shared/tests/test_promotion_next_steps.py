@@ -23,12 +23,37 @@ sys.path.insert(0, str(SHARED / "scripts"))
 from scripts import coverage_fix, migration  # noqa: E402
 import classification_completeness  # noqa: E402
 import run_scheduled_governance  # noqa: E402
+from generate_abac import generate_next_steps  # noqa: E402
 
 DETERMINISTIC_STG = 'governance_mode = "deterministic"\npromote_from = "stg"\n'
 DETERMINISTIC = 'governance_mode = "deterministic"\n'
 LEGACY = 'governance_mode = "legacy"\n'
 FULL_STG = ["commit and push envs/prod/", "make rehearse ENV=stg on that commit", "make release-plan ENV=prod",
             "make release ENV=prod"]
+
+
+@pytest.mark.parametrize("env,promoted,expected,absent", [
+    ("stg", True, "make release-plan ENV=stg", "make rehearse ENV=stg   (applies"),
+    ("stg", False, "make rehearse ENV=stg   (applies", "make release-plan ENV=stg"),
+    ("prod", True, "make release-plan ENV=prod", "make rehearse ENV=prod   (applies"),
+    ("dev", False, "make rehearse ENV=dev   (applies", "make release-plan ENV=dev"),
+])
+def test_generate_banner_follows_env_role(env, promoted, expected, absent, tmp_path):
+    banner = "\n".join(generate_next_steps(tmp_path, "full", env, has_sql=True,
+                                             champion_flow=True, tuning=False,
+                                             source_env="dev", promoted=promoted))
+    assert expected in banner
+    assert absent not in banner
+
+
+@pytest.mark.parametrize("env", ["prod", "stg"])
+def test_generate_banner_keeps_legacy_promoted_envs_on_release(env, tmp_path):
+    banner = "\n".join(generate_next_steps(tmp_path, "full", env, has_sql=True,
+                                             champion_flow=True, tuning=True,
+                                             source_env="dev", promoted=True))
+    assert f"make release ENV={env}" in banner
+    assert f"make rehearse ENV={env}" not in banner
+    assert "make release-plan" not in banner
 
 
 def _text(path: str) -> str:
@@ -223,6 +248,31 @@ def test_promote_and_ungovern_print_the_mode_aware_release_steps():
     ungovern = makefile[makefile.index("ENV=$(ENV) is promoted, so nothing was applied."):][:300]
     assert '$(_RELEASE_STEPS) --env-dir "$(ENV_DIR)" --env "$(ENV)"' in ungovern
     assert "after rehearse, make release-plan" not in makefile
+
+
+@pytest.mark.parametrize("auth_text, expected, absent", [
+    (None, "Next: edit", "not valid HCL"),
+    ('databricks_client_secret = "unterminated\n', "Next: fix", "Next: edit"),
+])
+def test_promote_auth_hint_distinguishes_missing_from_malformed(tmp_path, auth_text, expected, absent):
+    makefile = (SHARED / "Makefile.shared").read_text()
+    promote = makefile[makefile.index("=== Promote complete:"):]
+    assert 'if [ $$status -eq 2 ]; then' in promote
+    assert 'Next: fix $$dest_env_dir/auth.auto.tfvars (not valid HCL)' in promote
+    assert 'elif [ $$status -ne 0 ]; then' in promote
+    assert 'Next: edit $$dest_env_dir/auth.auto.tfvars' in promote
+    auth = tmp_path / "auth.auto.tfvars"
+    if auth_text is not None:
+        auth.write_text(auth_text)
+    recipe = (
+        'status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(CLOUD_ROOT)/auth.auto.tfvars" '
+        '|| status=$$?; if [ $$status -eq 2 ]; then echo "Next: fix (not valid HCL)"; '
+        'elif [ $$status -ne 0 ]; then echo "Next: edit (workspace credentials)"; fi'
+    )
+    result = _make(tmp_path, recipe=recipe)
+    assert result.returncode == 0, result.stderr
+    assert expected in result.stdout
+    assert absent not in result.stdout
 
 
 @pytest.mark.parametrize("text, expected", [

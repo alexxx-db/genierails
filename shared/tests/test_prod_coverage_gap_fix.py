@@ -177,6 +177,9 @@ class Repo:
         (sdk / "service").mkdir(parents=True)
         (sdk.parent / "__init__.py").write_text("")
         (sdk / "__init__.py").write_text(FAKE_SDK)
+        (sdk / "config.py").write_text(
+            "class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n"
+        )
         # generate_abac pip-upgrades a databricks.sdk without useragent.
         (sdk / "useragent.py").write_text("")
         (sdk / "service" / "__init__.py").write_text("")
@@ -188,7 +191,9 @@ class Repo:
         self.envs = root / "aws" / "envs"
         for env, table in (("dev", DEV_TABLE), ("prod", PROD_TABLE)):
             (self.envs / env / "auth.auto.tfvars").write_text(
-                f'databricks_workspace_host = "https://{env}.example.invalid"\n')
+                f'databricks_workspace_host = "https://{env}.example.invalid"\n'
+                f'databricks_client_id = "{env}-client"\n'
+                'databricks_client_secret = "test-only-secret"\n')
             text = f'uc_tables = ["{table}"]\nsql_warehouse_id = "wh"\n'
             if env == "prod":
                 text += 'promote_from = "dev"\ncatalog_map = { dev_fin = "prod_fin" }\n'
@@ -295,6 +300,43 @@ def test_e2e_prod_gap_reuse_existing_mask_then_prod_coverage_passes(repo):
     assert step is None, _out(result)
     derived = {a["entity_name"]: a["tag_value"] for a in repo.generated("prod")["tag_assignments"]}
     assert derived[f"{PROD_TABLE}.vat_number"] == "redact"
+
+
+def _configure_promoted_stg(repo):
+    result = repo.make("setup", "ENV=stg")
+    assert result.returncode == 0, _out(result)
+    stg = repo.envs / "stg"
+    (stg / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://stg.example.invalid"\n')
+    (stg / "env.auto.tfvars").write_text(
+        'governance_mode = "deterministic"\n'
+        'deployer_principal_id = "d0000000-0000-0000-0000-000000000003"\n'
+        'access_tier_groups = ["analysts"]\n'
+        f'uc_tables = ["{PROD_TABLE}"]\n'
+        'sql_warehouse_id = "wh"\n'
+        'promote_from = "dev"\n'
+        'catalog_map = { "dev_fin" = "prod_fin" }\n')
+
+
+def test_generate_end_to_end_uses_env_role_for_promoted_stg(repo):
+    """Real generate process: fake SDK includes useragent and pip stays offline."""
+    _configure_promoted_stg(repo)
+    result = repo.make("generate", "ENV=stg")
+    out = _out(result)
+    assert result.returncode == 0, out
+    assert "make rehearse ENV=dev" in out
+    assert "make release-plan ENV=stg" in out
+    assert "make release ENV=stg" in out
+    assert "make rehearse ENV=stg   (applies" not in out
+
+
+def test_generate_role_failure_keeps_successful_output_and_uses_generic_hint(repo):
+    _configure_promoted_stg(repo)
+    (repo.shared / "scripts/release_gate.py").write_text('raise SystemExit(1)\n')
+    result = repo.make("generate", "ENV=stg")
+    out = _out(result)
+    assert result.returncode == 0, out
+    assert "Next steps: review the generated files, then run make setup ENV=stg" in out
+    assert "CalledProcessError" not in out and "Traceback" not in out
 
 
 def test_e2e_prod_gap_new_mask_materialized_in_dev_then_promoted_and_covered(repo):
