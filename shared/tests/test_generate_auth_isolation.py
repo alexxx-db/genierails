@@ -5,6 +5,7 @@ from pathlib import Path
 
 import hcl2
 import generate_abac
+import pytest
 
 
 SHARED = Path(__file__).parents[1]
@@ -27,10 +28,11 @@ def _fake_sdk(root: Path) -> Path:
     return sdk.parent.parent
 
 
-def _run_generate(tmp_path: Path, auth_text: str) -> subprocess.CompletedProcess[str]:
+def _run_generate(tmp_path: Path, auth_text: str | None) -> subprocess.CompletedProcess[str]:
     auth = tmp_path / "envs" / "dev" / "auth.auto.tfvars"
     auth.parent.mkdir(parents=True)
-    auth.write_text(auth_text)
+    if auth_text is not None:
+        auth.write_text(auth_text)
     config = tmp_path / "ambient.cfg"
     config.write_text(
         "[DEFAULT]\n"
@@ -60,6 +62,15 @@ def test_empty_auth_refuses_before_sdk_even_with_ambient_auth(tmp_path):
     assert "envs/dev/auth.auto.tfvars" in result.stderr
     assert "SDK MUST NOT BE CALLED" not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
+
+
+def test_missing_auth_refuses_as_incomplete_before_sdk(tmp_path):
+    result = _run_generate(tmp_path, None)
+
+    assert result.returncode == 1
+    assert "fill in" in result.stderr
+    assert "is not valid HCL" not in result.stderr
+    assert "SDK MUST NOT BE CALLED" not in result.stdout + result.stderr
 
 
 def test_invalid_auth_never_prints_secret(tmp_path):
@@ -123,10 +134,21 @@ def test_make_generate_preflight_precedes_agent_sdk_hook():
     assert target.index("scripts/auth_configured.py") < target.index("import-new --check")
 
 
-def test_discover_agent_tables_refuses_empty_auth_before_sdk(tmp_path):
+@pytest.mark.parametrize(
+    "auth_text, expected, absent",
+    [
+        ("# empty template\n", "fill in envs/dev/auth.auto.tfvars", "is not valid HCL"),
+        (None, "fill in envs/dev/auth.auto.tfvars", "is not valid HCL"),
+        ('databricks_client_secret = "unterminated\n',
+         "envs/dev/auth.auto.tfvars is not valid HCL", "fill in"),
+    ],
+    ids=["empty", "missing", "malformed"],
+)
+def test_discover_agent_tables_refuses_unusable_auth_before_sdk(tmp_path, auth_text, expected, absent):
     env_dir = tmp_path / "envs" / "dev"
     env_dir.mkdir(parents=True)
-    (env_dir / "auth.auto.tfvars").write_text("# empty template\n")
+    if auth_text is not None:
+        (env_dir / "auth.auto.tfvars").write_text(auth_text)
     (env_dir / "env.auto.tfvars").write_text(
         'enable_classification = true\n'
         'genie_spaces = [{ genie_space_id = "space-from-wrong-workspace" }]\n'
@@ -151,12 +173,26 @@ def test_discover_agent_tables_refuses_empty_auth_before_sdk(tmp_path):
     )
 
     assert result.returncode == 1
-    assert "fill in envs/dev/auth.auto.tfvars" in result.stderr
+    assert expected in result.stderr
+    assert absent not in result.stderr
     assert "SDK MUST NOT BE CALLED" not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
 
 
-def test_make_capture_refuses_empty_auth_before_sdk(tmp_path):
+@pytest.mark.parametrize(
+    "target, auth_text, expected, absent",
+    [
+        ("capture", None, "fill in", "is not valid HCL"),
+        ("capture", "# empty template\n", "fill in", "is not valid HCL"),
+        ("generate", "# empty template\n", "fill in", "is not valid HCL"),
+        ("capture", 'databricks_client_secret = "unterminated\n', "is not valid HCL", "fill in"),
+        ("generate", 'databricks_client_secret = "unterminated\n', "is not valid HCL", "fill in"),
+    ],
+    ids=["capture-missing", "capture-empty", "generate-empty", "capture-malformed", "generate-malformed"],
+)
+def test_make_generate_and_capture_refuse_unusable_auth_before_sdk(
+    tmp_path, target, auth_text, expected, absent
+):
     cloud = tmp_path / "cloud"
     cloud.mkdir()
     base_env = os.environ.copy()
@@ -167,7 +203,11 @@ def test_make_capture_refuses_empty_auth_before_sdk(tmp_path):
     )
     assert setup.returncode == 0, setup.stdout + setup.stderr
     env_dir = cloud / "envs" / "dev"
-    (env_dir / "auth.auto.tfvars").write_text("# empty template\n")
+    auth = env_dir / "auth.auto.tfvars"
+    if auth_text is None:
+        auth.unlink()
+    else:
+        auth.write_text(auth_text)
     (env_dir / "env.auto.tfvars").write_text(
         'governance_mode = "legacy"\n'
         'genie_spaces = [{ name = "Payments", genie_space_id = "space-1", '
@@ -188,13 +228,15 @@ def test_make_capture_refuses_empty_auth_before_sdk(tmp_path):
     }
 
     result = subprocess.run(
-        ["make", "--no-print-directory", "capture", "ENV=dev", "SPACE=Payments",
+        ["make", "--no-print-directory", target, "ENV=dev", "SPACE=Payments",
          f"CLOUD_ROOT={cloud}", f"SHARED_ROOT={SHARED}"],
         cwd=SHARED.parent / "aws", text=True, capture_output=True, env=env, timeout=120,
     )
 
     assert result.returncode != 0
-    assert "before running make capture" in result.stderr
+    assert expected in result.stderr
+    assert absent not in result.stderr
+    assert f"before running make {target}" in result.stderr or "is not valid HCL" in result.stderr
     assert "SDK MUST NOT BE CALLED" not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
 
@@ -239,3 +281,13 @@ def test_capture_api_uses_explicit_env_config(monkeypatch, tmp_path):
         "product_version": "0.1.0",
     }
     assert set(captured["client"]) == {"config"}
+
+
+def test_capture_api_reports_missing_auth_as_incomplete(tmp_path):
+    from scripts import agent_ownership
+
+    env_dir = tmp_path / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    with pytest.raises(agent_ownership.AgentError, match="fill in") as raised:
+        agent_ownership._api(env_dir)
+    assert "is not valid HCL" not in str(raised.value)

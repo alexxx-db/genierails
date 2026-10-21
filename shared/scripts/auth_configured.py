@@ -18,6 +18,8 @@ def auth_status(path: Path) -> AuthStatus:
     try:
         with path.open() as handle:
             config = hcl2.load(handle)
+    except FileNotFoundError:
+        return AuthStatus.INCOMPLETE
     except Exception:
         # Never let parser text (which can echo credential fragments) propagate.
         return AuthStatus.MALFORMED

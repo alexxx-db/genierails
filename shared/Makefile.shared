@@ -1454,7 +1454,10 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		cd "$$dest_env_dir" && python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,promote-workspace); \
 		echo ""; \
 		echo "=== Promote complete: $(SOURCE_ENV) -> $(DEST_ENV) ==="; \
-		if ! python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$$dest_env_dir/auth.auto.tfvars"; then \
+		status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$$dest_env_dir/auth.auto.tfvars" || status=$$?; \
+		if [ $$status -eq 2 ]; then \
+			echo "  Next: fix $$dest_env_dir/auth.auto.tfvars (not valid HCL)"; \
+		elif [ $$status -ne 0 ]; then \
 			echo "  Next: edit $$dest_env_dir/auth.auto.tfvars  ($(DEST_ENV) workspace credentials)"; \
 		fi; \
 		echo "  Then: in Catalog Explorer, open the $(DEST_ENV) catalog > Details tab > Data classification and turn it on."; \

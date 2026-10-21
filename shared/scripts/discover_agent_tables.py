@@ -24,7 +24,7 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 from scripts.footprint import FootprintError, load_discovered_footprint, load_env_config, load_hcl  # noqa: E402
-from scripts.auth_configured import auth_configured  # noqa: E402
+from scripts.auth_configured import AuthStatus, auth_status  # noqa: E402
 
 DISCOVERED = Path("data_access") / "discovered_uc_tables.auto.tfvars"
 
@@ -99,7 +99,14 @@ def main(argv: list[str] | None = None) -> int:
             if explicit:
                 print("Using listed uc_tables instead of discovering tables from genie_space_id.")
             return 0
-        if not auth_configured(auth_path):
+        status = auth_status(auth_path)
+        if status is AuthStatus.MALFORMED:
+            print(
+                f"ERROR: envs/{env_dir.name}/auth.auto.tfvars is not valid HCL",
+                file=sys.stderr,
+            )
+            return 1
+        if status is AuthStatus.INCOMPLETE:
             print(
                 f"ERROR: fill in envs/{env_dir.name}/auth.auto.tfvars "
                 "(workspace host, client ID, and client secret) before discovering agent tables",
