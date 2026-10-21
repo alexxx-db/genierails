@@ -107,6 +107,9 @@
   `generated/governed_tables.json` only where `make promote-to` writes it
   (agents in `agents/` files), so it passes right after an inline-agent
   promotion too, and its hint for a promoted env says `make promote-to`.
+  A record an inline-agent env already commits is still checked: `make
+  check` fails while it is stale or hand-edited, and `make promote-to` now
+  keeps it current.
 
 - **The champion walkthrough sets who may run the agent**: an agent given by ID
   without `acl_groups` is refused by `make generate` (decision 4), but the

@@ -333,7 +333,8 @@ def _check(args) -> None:
                 if scratch.make("promote", f"ENV={env}") != 0:
                     raise CheckFailed(f"promote ENV={env} (the same-env split) failed")
                 # A promoted env records only what promote-to records (agents in agents/
-                # files), so an inline-agent promotion is current without a record.
+                # files, or a record already committed), so an inline-agent promotion is
+                # current without a record and a committed one must still be current.
                 if subprocess.run([sys.executable, str(SHARED_ROOT / "scripts" / "sticky_governance.py"),
                                    "record", *(["--if-agent-files"] if promotes else []), "--env-dir", str(env_dir),
                                    "--config", str(env_dir / "generated" / "abac.auto.tfvars")]).returncode != 0:
