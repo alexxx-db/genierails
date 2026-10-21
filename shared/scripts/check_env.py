@@ -311,7 +311,7 @@ def _check(args) -> None:
 
     try:
         step(1, "validate")
-        if not has_generated:
+        if not has_generated and not (scratch.envs / env / "abac.auto.tfvars").is_file():
             print(f"  NOTE: skipped: envs/{env} has not been generated; run make generate ENV={env}.")
         elif not (scratch.envs / env / "abac.auto.tfvars").is_file():
             then = ("the regeneration below splits generated/ and validates every layer" if is_deterministic

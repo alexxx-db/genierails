@@ -555,6 +555,21 @@ def test_main_incomplete_empty_discovery_fails_before_empty_governance(monkeypat
     assert "Could not read Genie agent 'Live agent'" in capsys.readouterr().out
 
 
+def test_post_generate_semantic_check_rejects_empty_governance_for_configured_tables(
+    monkeypatch, tmp_path
+):
+    generated = tmp_path / "empty.auto.tfvars"
+    generated.write_text("tag_assignments = []\nfgac_policies = []\n")
+    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda: {})
+
+    errors, warnings = generate_abac.post_generate_semantic_check(
+        generated, {"uc_tables": ["main.persisted.customers"]}
+    )
+
+    assert warnings == []
+    assert any("0 tag_assignments and 0 fgac_policies" in error for error in errors)
+
+
 def test_main_tables_unions_persisted_grants_into_declared_and_checks(monkeypatch, tmp_path):
     declared, persisted, auth_cfg = _run_main_until_footprint(
         monkeypatch,

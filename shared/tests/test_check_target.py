@@ -333,6 +333,26 @@ def test_legacy_check_skips_regeneration_with_a_note(repo, tmp_path):
     _assert_read_only(repo, before)
 
 
+def test_legacy_check_validates_committed_split_config_without_generated(repo, tmp_path):
+    dev = _envs(repo) / "dev"
+    env_file = dev / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace('governance_mode = "deterministic"\n', ""))
+    shutil.rmtree(dev / "generated")
+    split = dev / "data_access" / "abac.auto.tfvars"
+    split.write_text(split.read_text().replace('to_principals = ["pay_group"]',
+                                                'to_principals = ["no_such_group"]'))
+    _commit(repo, "broken legacy split without generated output")
+    before = _baseline(repo)
+
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    assert "=== make check ENV=dev: FAILED (validate) ===" in result.stderr
+    assert "has not been generated; run make generate" not in out
+    _assert_read_only(repo, before)
+
+
 def test_check_stops_on_the_first_failing_step(repo, tmp_path):
     split = _envs(repo) / "dev" / "data_access" / "abac.auto.tfvars"
     split.write_text(split.read_text() + "\nfgac_policies = [ {\n")
