@@ -95,6 +95,22 @@
 
 ### Fixed
 
+- **A promoted prod releases on the first try**: `make setup ENV=prod` adds
+  prod's lines to `.gitignore`, but the walkthrough and the setup banner said
+  only `git add envs/`, so the tree stayed dirty and `make rehearse ENV=dev`
+  wrote a receipt `release-plan` ignores, printing only that it wrote one. Both
+  now say `git add .gitignore envs/`; a reused rehearsal of an unclean checkout
+  prints the uncommitted lines, like an applying one, and `release-plan` names
+  them (`a receipt exists but its checkout wasn't clean`). An agent capture
+  whose name contains `conf` (`Confidential Deals.space.json`) is no longer
+  ignored by the root `*conf*.json`. `make check ENV=prod` expects
+  `generated/governed_tables.json` only where `make promote-to` writes it
+  (agents in `agents/` files), so it passes right after an inline-agent
+  promotion too, and its hint for a promoted env says `make promote-to`.
+  A record an inline-agent env already commits is still checked: `make
+  check` fails while it is stale or hand-edited, and `make promote-to` now
+  keeps it current.
+
 - **The champion walkthrough sets who may run the agent**: an agent given by ID
   without `acl_groups` is refused by `make generate` (decision 4), but the
   dev-to-prod template, README and live champion scenarios never set it, and

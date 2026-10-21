@@ -1,0 +1,197 @@
+"""The walkthrough's Prod section, word for word, in a customer repo, through release-plan.
+
+The repo starts as a GenieRails clone (the upstream root .gitignore) with
+its own origin, like the walkthrough's "your own repo first". Dev is
+committed and rehearsed at an earlier commit (dev step 6). Then every command
+in shared/examples/dev_to_prod/README.md's Prod section runs in order, read
+from the README itself, up to make release-plan ENV=prod: setup, promote-to,
+the commit command, check, rehearse and release-plan.
+
+setup, promote-to and check run the real recipes (Terraform is a stub);
+rehearse and release-plan run with tests/test_release_gate_make.py's stubbed
+recursive make and live checks, so nothing reaches Databricks.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from scripts import release_gate as rg
+from tests.test_check_target import FAKE_TERRAFORM, _env
+from tests.test_deterministic_check_promote import DEPLOYER, DEV_ENV, LEGACY_ACCOUNT, TIERS, _auth, _write_generated
+from tests.test_release_gate import git_env
+from tests.test_release_gate_make import Make
+
+ROOT = Path(__file__).resolve().parents[2]
+SHARED = ROOT / "shared"
+README = SHARED / "examples" / "dev_to_prod" / "README.md"
+
+if shutil.which("make") is None or shutil.which("git") is None:
+    pytest.skip("make and git are required", allow_module_level=True)
+
+
+def _section(title: str) -> str:
+    text = README.read_text()
+    start = text.index(f"\n## {title}\n")
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else None]
+
+
+def prod_commands() -> list[str]:
+    """Each command the Prod section tells the user to run, in order, up to release-plan.
+
+    Commands are the lines of its bash blocks plus the inline commit
+    instruction ("Commit and push ... (`git add ...`, commit, `git push`)").
+    """
+    section = _section("Prod")
+    commands = []
+    for match in re.finditer(r"```bash\n(.*?)```|Commit and push[^\n]*?\(`(git add [^`]+)`, commit, `(git push)`\)",
+                             section, re.S):
+        if match.group(1):
+            commands += [line.split("#")[0].strip() for line in match.group(1).splitlines()
+                         if line.split("#")[0].strip()]
+        else:
+            commands += [match.group(2), "git commit", match.group(3)]
+    assert "make release-plan ENV=prod" in commands, commands
+    return commands[:commands.index("make release-plan ENV=prod") + 1]
+
+
+class Customer:
+    """A GenieRails clone with its own origin; dev committed and rehearsed."""
+
+    def __init__(self, tmp_path: Path):
+        self.tmp = tmp_path
+        self.root = tmp_path / "repo"
+        self.cloud = self.root / "aws"
+        self.origin = tmp_path / "origin.git"
+        self.env = git_env(tmp_path) | {"GIT_CONFIG_NOSYSTEM": "1"}
+        os.environ.pop(rg.STATE_DIR_ENV, None)
+        self.cloud.mkdir(parents=True)
+        shutil.copy2(ROOT / ".gitignore", self.root / ".gitignore")
+        shutil.copy2(ROOT / "aws" / ".gitignore", self.cloud / ".gitignore")
+        shutil.copy2(ROOT / "aws" / "Makefile", self.cloud / "Makefile")
+        # A real copy: release_gate fingerprints and status-checks shared/ inside the repo.
+        shutil.copytree(SHARED, self.root / "shared", symlinks=True,
+                        ignore=shutil.ignore_patterns("tests", "__pycache__", ".pytest_cache", "logs"))
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
+        (bin_dir / "terraform").chmod(0o755)
+        self.git("init", "-q", "-b", "main")
+        subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True, env=os.environ | self.env)
+        self.git("remote", "add", "origin", str(self.origin))
+        self.stubbed = Make(tmp_path, self)
+
+    def git(self, *args: str, cwd: Path | None = None) -> str:
+        result = subprocess.run(["git", "-C", str(cwd or self.root), *args], text=True, capture_output=True,
+                                env=os.environ | self.env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result.stdout.strip()
+
+    def make(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["make", "--no-print-directory", *args], cwd=self.cloud, text=True,
+                              capture_output=True, env=_env(self.tmp, **self.env), timeout=600)
+
+    def stub_make(self, target: str, env: str) -> subprocess.CompletedProcess:
+        return self.stubbed(target, env, cwd=self.cloud)
+
+    def head(self) -> str:
+        return self.git("rev-parse", "HEAD")
+
+
+@pytest.fixture
+def customer(tmp_path, monkeypatch):
+    monkeypatch.delenv(rg.STATE_DIR_ENV, raising=False)
+    repo = Customer(tmp_path)
+    # Dev: set up, its rules generated and committed (the whole flow's first commit).
+    result = repo.make("setup", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    dev = repo.cloud / "envs" / "dev"
+    (dev / "env.auto.tfvars").write_text(DEV_ENV)
+    (dev / "auth.auto.tfvars").write_text(_auth(DEPLOYER))
+    (repo.cloud / "envs" / "account" / "abac.auto.tfvars").write_text(LEGACY_ACCOUNT)
+    (dev / "generated").rmdir()  # setup's empty dir; _write_generated writes generate's output
+    _write_generated(dev)
+    result = repo.make("promote", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The rest of what make generate writes.
+    subprocess.run([sys.executable, str(SHARED / "scripts" / "sticky_governance.py"), "record",
+                    "--env-dir", str(dev), "--config", str(dev / "generated" / "abac.auto.tfvars")], check=True)
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "Govern the first agent in dev")
+    repo.git("push", "-q", "-u", "origin", "main")
+    assert repo.git("status", "--porcelain") == ""
+    # Dev step 6.
+    result = repo.stub_make("rehearse", "dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head())
+    return repo
+
+
+def _fill_in_prod(repo: Customer) -> None:
+    """What Prod step 1 asks for between setup and promote-to."""
+    prod = repo.cloud / "envs" / "prod"
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+    env_file = prod / "env.auto.tfvars"
+    text = env_file.read_text()
+    text = re.sub(r'deployer_principal_id\s*=\s*"[^"]*"', f'deployer_principal_id = "{DEPLOYER}"', text)
+    text = re.sub(r"access_tier_groups\s*=\s*\[[^\]]*\]", f"access_tier_groups = {TIERS!r}".replace("'", '"'), text)
+    text, found = re.subn(r"^catalog_map\s*=.*$", 'catalog_map = { "paycat" = "ppay" }', text, flags=re.M)
+    env_file.write_text(text if found else text + 'catalog_map = { "paycat" = "ppay" }\n')
+
+
+def test_the_prod_section_reads_as_expected():
+    assert prod_commands() == [
+        "make setup ENV=prod", "make promote-to ENV=prod",
+        "git add .gitignore envs/", "git commit", "git push",
+        "make check ENV=prod", "make rehearse ENV=dev", "make release-plan ENV=prod",
+    ]
+    # The whole flow's prod commit adds the same files.
+    flow = _section("The whole flow")
+    assert "git add .gitignore envs/ && git commit -m \"Promote the rules to prod\"" in flow
+
+
+def test_following_the_prod_section_word_for_word_reaches_a_release_manifest(customer):
+    repo = customer
+    out = {}
+    for command in prod_commands():
+        words = shlex.split(command)
+        if words[0] == "git":
+            if words[1] == "commit":
+                words = ["git", "commit", "-q", "-m", "Promote the rules to prod"]
+            out[command] = repo.git(*words[1:], cwd=repo.cloud)  # the walkthrough runs from aws/
+            continue
+        target, env = words[1], words[2].split("=", 1)[1]
+        if target in ("rehearse", "release-plan"):
+            result = repo.stub_make(target, env)
+        else:
+            result = repo.make(target, f"ENV={env}")
+        text = out[command] = result.stdout + result.stderr
+        if target == "setup":
+            # make setup ENV=prod adds prod's lines to the .gitignore the next commit must include.
+            assert "/envs/prod/abac.auto.tfvars" in (repo.cloud / ".gitignore").read_text()
+            assert "git add .gitignore envs/" in text, text
+            _fill_in_prod(repo)
+        elif target == "check":
+            # Offline, check's plan step (6) needs prod's live classification config.
+            assert "OK: promote-to ENV=prod CHECK=1: committed files match." in text, text
+            assert "OK: generated files (envs/prod): committed files match." in text, text
+            assert result.returncode == 0 or "=== make check ENV=prod: FAILED (plan) ===" in text, text
+        else:
+            assert result.returncode == 0, f"{command}:\n{text}"
+
+    promoted = repo.head()
+    assert repo.git("status", "--porcelain") == ""
+    rehearse_out = out["make rehearse ENV=dev"]
+    assert "without re-applying" in rehearse_out and "NOT a clean checkout" not in rehearse_out, rehearse_out
+    assert rg.passing_receipt(repo.cloud, "dev", promoted)["applied"] is False
+    manifest = rg.current_manifest(repo.cloud / "envs" / "prod", "prod")
+    assert manifest and manifest.is_file(), out["make release-plan ENV=prod"]

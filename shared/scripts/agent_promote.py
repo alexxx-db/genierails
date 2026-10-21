@@ -11,9 +11,10 @@ receipt, so a removed detached agent cannot be silently recreated.
   never in keys or prose; every item ID is kept).
 - agents/<agent>.auto.tfvars is env-owned: the first promotion seeds it
   (the remapped display name, the target's own key, acl_groups from the
-  source, genie_space_id empty because the target's ID lives in its state and
-  release receipt); later promotions keep it and print how its acl_groups
-  differ from the source's.
+  source through a deterministic target's group_map, genie_space_id empty
+  because the target's ID lives in its state and release receipt); later
+  promotions keep it and print how its acl_groups differ from the source's
+  (also through group_map).
 - A source agent is the target agent with the same file name, else the one
   with its remapped title, else the one with that title's Terraform key; so a
   target split on its own is never seeded a second agent.
@@ -35,6 +36,7 @@ if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
 
 import agent_files  # noqa: E402
+from group_map import map_groups as _map_groups, mapping as _group_mapping  # noqa: E402
 from scripts.ack_file import AckFileError, parse_file  # noqa: E402
 from agent_files import AgentFileError  # noqa: E402
 from scripts.agent_ownership import render  # noqa: E402
@@ -85,7 +87,10 @@ def _hcl_list(values: list[str]) -> str:
     return "[" + ", ".join(json.dumps(v) for v in values) + "]"
 
 
-def seed_settings(agent: dict, catalogs: dict[str, str], title: str, key: str) -> str:
+def seed_settings(agent: dict, catalogs: dict[str, str], title: str, key: str, map_groups=None) -> str:
+    acl_groups = agent["acl_groups"] or []
+    if map_groups is not None:
+        acl_groups = map_groups(acl_groups)
     lines = [
         f"# {agent['name']} in this env. Env-owned: promote-to wrote it once and never overwrites it.",
         "# The agent's ID lives in this env's Terraform state and release receipt, not here.",
@@ -93,12 +98,25 @@ def seed_settings(agent: dict, catalogs: dict[str, str], title: str, key: str) -
         f"key            = {json.dumps(key)}",
         f"name           = {json.dumps(title)}",
         'genie_space_id = ""',
-        f"acl_groups     = {_hcl_list(agent['acl_groups'] or [])}",
+        f"acl_groups     = {_hcl_list(acl_groups)}",
     ]
     explicit = agent_files._load_hcl(agent_files.settings_path(agent["_dir"], agent["name"])).get("uc_tables")
     if explicit:
         lines.append(f"uc_tables      = {_hcl_list([remap_string(t, catalogs, {}) for t in explicit])}")
     return "\n".join(lines) + "\n"
+
+
+def group_mapper(source_dir: Path, dest_dir: Path):
+    """Map group names the way remap_env_config.py does (decision 8): a
+    deterministic target's group_map renames them; the source's
+    raw_exempt_principals are never mapped; a legacy target maps nothing."""
+    dest = agent_files._load_hcl(dest_dir / "env.auto.tfvars")
+    if dest.get("governance_mode") != "deterministic":
+        return lambda groups: list(groups or [])
+    group_map = _group_mapping(dest)
+    exempt = [str(p).strip() for p in agent_files._load_hcl(source_dir / "env.auto.tfvars").get(
+        "raw_exempt_principals") or []]
+    return lambda groups: _map_groups(groups or [], group_map, exempt)
 
 
 def warehouse_map(source_dir: Path, dest_dir: Path) -> dict[str, str]:
@@ -255,6 +273,7 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
     targets = match_targets(source_agents, dest_dir, catalogs)
     detached_keys = refuse_detached_recreation(source_agents, dest_dir, targets)
     warehouses = warehouse_map(source_dir, dest_dir)
+    map_groups = group_mapper(source_dir, dest_dir)
     folder = agent_files.agents_dir(dest_dir)
     folder.mkdir(parents=True, exist_ok=True)
     carried = []
@@ -275,12 +294,15 @@ def promote(source_dir: Path, dest_dir: Path, catalogs: dict[str, str]) -> list[
         settings = agent_files.settings_path(dest_dir, target["name"])
         label = name if target["name"] == name else f"{name} -> {target['name']}"
         if target["new"]:
-            settings.write_text(seed_settings(agent, catalogs, target["title"], target["key"]))
-            print(f"  {label}: promoted; seeded agents/{settings.name} (acl_groups from {source_dir.name})")
+            settings.write_text(seed_settings(agent, catalogs, target["title"], target["key"], map_groups))
+            print(f"  {label}: promoted; seeded agents/{settings.name} (acl_groups from {source_dir.name}, "
+                  "through group_map)")
         else:
             kept = agent_files.load(dest_dir, target["name"])["acl_groups"]
-            note = "" if kept == agent["acl_groups"] else (
-                f"; {dest_dir.name} keeps acl_groups {kept} ({source_dir.name} has {agent['acl_groups']})")
+            source_acl = map_groups(agent["acl_groups"])
+            note = "" if kept == source_acl else (
+                f"; {dest_dir.name} keeps acl_groups {kept} ({source_dir.name} has {source_acl}, "
+                "through group_map)")
             print(f"  {label}: promoted{note}")
         carried.append(name)
     gone = sorted(set(agent_files.names(dest_dir)) - {t["name"] for t in targets.values()}

@@ -22,7 +22,7 @@ make rehearse ENV=dev       # applies in dev and proves the masks work (verify-a
 make setup ENV=prod         # set deployer_principal_id and groups; replace the seeded catalog_map line
 make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
-git add envs/ && git commit -m "Promote the rules to prod" && git push
+git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git push
 make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't run it)
 make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
@@ -116,11 +116,15 @@ You don't set a row-pairing key: it picks one per masked table (a single-column 
 ```bash
 make setup ENV=prod
 ```
-Fill in `envs/prod/auth.auto.tfvars` (same service principal as dev? leave it blank and add `REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<prod host> WORKSPACE_ID=<prod id>` to the `promote-to` below: it copies dev's account ID, client ID and secret into the still-blank file and never dev's host), replace its `deployer_principal_id` and `access_tier_groups` placeholders, and set:
+Fill in `envs/prod/auth.auto.tfvars` (same service principal as dev? leave it blank and add `REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<prod host> WORKSPACE_ID=<prod id>` to the `promote-to` below: it copies dev's account ID, client ID and secret into the still-blank file and never dev's host), replace its `deployer_principal_id` placeholder, and set:
 ```hcl
 catalog_map = { "dev_finance" = "prod_finance" }   # dev catalog = prod catalog
 sql_warehouse_id = "<existing-prod-warehouse-id>"   # or "" to create a new serverless warehouse
+group_map   = { "payments_ops" = "prod_payments_ops" }   # dev group = prod group, only where they differ
 ```
+Leave the `access_tier_groups` placeholders: `promote-to` writes prod's tiers from dev's (and seeds `table_readers` and agent `acl_groups`), through `group_map`.
+If existing prod tiers cannot be traced to dev's mapped tiers, promotion refuses
+before writing and prints the missing `group_map` entry to add.
 Then:
 ```bash
 make promote-to ENV=prod
@@ -131,7 +135,7 @@ deterministic and legacy environments. A prod value of `false` does not persist;
 in a deterministic environment, committing it also fails the promotion-current
 check.
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
-Commit and push the promoted files to `main` (`git add envs/`, commit, `git push`).
+Commit and push the promoted files to `main` (`git add .gitignore envs/`, commit, `git push`): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 
