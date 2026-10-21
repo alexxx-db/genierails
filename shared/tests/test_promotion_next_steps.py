@@ -23,12 +23,27 @@ sys.path.insert(0, str(SHARED / "scripts"))
 from scripts import coverage_fix, migration  # noqa: E402
 import classification_completeness  # noqa: E402
 import run_scheduled_governance  # noqa: E402
+from generate_abac import generate_next_steps  # noqa: E402
 
 DETERMINISTIC_STG = 'governance_mode = "deterministic"\npromote_from = "stg"\n'
 DETERMINISTIC = 'governance_mode = "deterministic"\n'
 LEGACY = 'governance_mode = "legacy"\n'
 FULL_STG = ["commit and push envs/prod/", "make rehearse ENV=stg on that commit", "make release-plan ENV=prod",
             "make release ENV=prod"]
+
+
+@pytest.mark.parametrize("env,promoted,expected,absent", [
+    ("stg", True, "make release-plan ENV=stg", "make rehearse ENV=stg   (applies"),
+    ("stg", False, "make rehearse ENV=stg   (applies", "make release-plan ENV=stg"),
+    ("prod", True, "make release-plan ENV=prod", "make rehearse ENV=prod   (applies"),
+    ("dev", False, "make rehearse ENV=dev   (applies", "make release-plan ENV=dev"),
+])
+def test_generate_banner_follows_env_role(env, promoted, expected, absent, tmp_path):
+    banner = "\n".join(generate_next_steps(tmp_path, "full", env, has_sql=True,
+                                             champion_flow=True, tuning=False,
+                                             source_env="dev", promoted=promoted))
+    assert expected in banner
+    assert absent not in banner
 
 
 def _text(path: str) -> str:

@@ -12,6 +12,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -109,6 +110,9 @@ def main() -> int:
     advice = "--advice" in sys.argv[1:]
     paths = [Path(arg) for arg in sys.argv[1:] if arg != "--advice"]
     for path in paths:
+        if path.is_file() and len(re.findall(r"(?m)^\s*catalog_map\s*=", path.read_text())) > 1:
+            print(f"ERROR: {_display_path(path)}: catalog_map is set twice; keep one", file=sys.stderr)
+            return 1
         # An agent's ID is reported first, as when it lived in env.auto.tfvars.
         error = agent_files_placeholder_error(path.parent)
         # Legacy configs have no placeholders. Avoid importing the HCL parser in

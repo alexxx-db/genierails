@@ -558,6 +558,12 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
     repo, commit = Path(status["repo"]), status["commit"]
     source = source_env(env_dir)
     problems = []
+    source_dir = cloud_dir / "envs" / source
+    if deterministic(env_dir) and not deterministic(source_dir):
+        problems.append(
+            f"envs/{source} uses legacy governance but envs/{env} is deterministic; migrate the source first "
+            f'(shared/docs/legacy-migration.md), or set governance_mode = "legacy" in envs/{env}/env.auto.tfvars'
+        )
     if not status["clean_tree"]:
         problems.append("the checkout is not clean:\n      " + "\n      ".join(status["dirty"][:10]))
     if fetch:

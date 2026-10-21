@@ -222,6 +222,12 @@ def test_provenance_passes_for_a_rehearsed_clean_pushed_commit(repo):
     assert prov["commit"] == repo.head() and prov["rollback"] is None and prov["source_env"] == "dev"
 
 
+def test_provenance_refuses_legacy_source_for_deterministic_destination(repo):
+    repo.commit({"aws/envs/dev/env.auto.tfvars": 'uc_tables = ["dev_catalog.s.t"]\n'})
+    with pytest.raises(rg.Refused, match="legacy.*deterministic.*legacy-migration.md"):
+        rg.provenance(repo.prod, "prod")
+
+
 def test_provenance_refuses_a_stale_receipt(repo):
     rehearse(repo)
     repo.commit({"aws/envs/dev/env.auto.tfvars": DEV_ENV + "# new\n"})

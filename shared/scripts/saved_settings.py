@@ -41,6 +41,8 @@ UC_CATALOG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _parse(text: str, path: Path) -> dict:
+    if len(re.findall(r"(?m)^\s*catalog_map\s*=", text)) > 1:
+        raise ValueError(f"{display_path(path)}: catalog_map is set twice; keep one")
     try:
         return hcl2.loads(text)
     except Exception as exc:
@@ -433,6 +435,14 @@ def resolve_promote(env: str, env_dir: Path, envs_dir: Path, source: str, catalo
     if source in RESERVED_ENVS:
         raise ValueError(f"FROM must be a workspace env, not {source}")
     source_dir = source_env_dir(envs_dir, source)
+    source_mode = _load(source_dir / "env.auto.tfvars").get("governance_mode", "legacy")
+    destination_mode = saved.get("governance_mode", "legacy")
+    if source_mode != "deterministic" and destination_mode == "deterministic":
+        raise ValueError(
+            f"cannot promote legacy envs/{source} into deterministic envs/{env}; "
+            f"migrate the source first (shared/docs/legacy-migration.md), or set "
+            f'governance_mode = "legacy" in {display_path(env_file)}'
+        )
     validate_source_catalogs(source_dir, catalog_map, env_file)
     try:
         normalized_saved_map = normalize_catalog_map(saved_map) if saved_map else ""
