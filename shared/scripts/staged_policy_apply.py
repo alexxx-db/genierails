@@ -765,8 +765,6 @@ class Controller:
         if not t.get("restored"):
             if not _pre_marker_restored(t):
                 return "no verified restore of the previous protection is recorded"
-            print("  The journal predates the restore marker; treating the recorded failed switch as restored "
-                  "after a fresh live check.")
         record = pg.load_stage_record(self.env_dir)
         if not record or record.get("stage") not in stages \
                 or record.get("desired") != t["to"] or record.get("old") != t["from"]:
@@ -803,6 +801,54 @@ class Controller:
         kept = {p["name"] for fp in (t["from"], t["retain"]) if fp for p in generations[fp]["fgac_policies"]}
         return {p["name"] for p in generations[t["to"]]["fgac_policies"]} - kept
 
+    def _abandon_refusal(self, t: dict, desired: dict) -> str:
+        """Why abandon would refuse ``t`` before making its plan ('' when it goes on to plan).
+
+        abandon raises exactly this, and the abandon hints (_may_abandon) offer
+        it only when this is ''. What abandon checks after the plan is saved, the
+        live check that Unity Catalog still matches the restore, isn't predicted:
+        it reads Unity Catalog, and it refuses only if live governance was
+        changed outside GenieRails since the verified restore.
+        """
+        if t.get("rebind_incomplete"):
+            return (f"make policy-rebind of run {t['run_id']} didn't finish "
+                    f"({t['rebind_incomplete']['reason']}). {t['rebind_incomplete']['next']}")
+        split = self._split_drift_message("policy-abandon")
+        if split:
+            return split
+        if self._moved_treatments(t, desired):
+            # Abandon keeps the previous generation's recorded values whatever the config says now, so
+            # after drift that record must still be the one the change started from.
+            problem = self._previous_snapshot_problem(t)
+            if problem:
+                return (f"this change can't be abandoned: the generated config's treatment values differ from the "
+                        f"unfinished change {t['to']}, and {problem}, so what abandon would keep live can't be "
+                        "checked. Nothing was applied. Next: restore the snapshot from where the env's records are "
+                        f"kept (git history or GENIERAILS_STATE_DIR), then re-run make policy-abandon "
+                        f"ENV={self.env_name}.")
+        if t["switch_attempted"]:
+            reason = self._restore_unproven(t)
+            if KEPT_NEW_COLUMNS in reason:
+                return self._kept_columns_message(t, "abandoned", reason)
+            if reason:
+                return _unabandonable(reason)
+        try:
+            self._created_policies(t)
+        except Refused as exc:
+            return str(exc)
+        return ""
+
+    def _may_abandon(self, t: dict, desired: dict) -> bool:
+        """Whether make policy-abandon would take ``t`` up, for the hints that offer it.
+
+        Conservative: a check that can't run (a snapshot or record unreadable)
+        counts as a refusal, so the hint falls back to resume only.
+        """
+        try:
+            return not self._abandon_refusal(t, desired)
+        except (Refused, pg.StageError, OSError, ValueError, KeyError, TypeError):
+            return False
+
     def abandon(self) -> int:
         """Drop an unfinished transition that never switched, or whose switch was rolled back and still is."""
         if governance_mode(self.env_dir) != "deterministic":
@@ -814,30 +860,15 @@ class Controller:
             if not t:
                 print("Staged policy apply: no unfinished policy change; nothing to abandon.")
                 return 0
-            if t.get("rebind_incomplete"):
-                raise Refused(f"make policy-rebind of run {t['run_id']} didn't finish "
-                              f"({t['rebind_incomplete']['reason']}). {t['rebind_incomplete']['next']}")
-            self._refuse_split_drift("policy-abandon")
             desired = pg.desired_generation(self.env_dir)
-            moved = self._moved_treatments(t, desired)
-            if moved:
-                # Abandon keeps the previous generation's recorded values whatever the config says now, so
-                # after drift that record must still be the one the change started from.
-                problem = self._previous_snapshot_problem(t)
-                if problem:
-                    raise Refused(
-                        f"this change can't be abandoned: the generated config's treatment values differ from the "
-                        f"unfinished change {t['to']}, and {problem}, so what abandon would keep live can't be "
-                        "checked. Nothing was applied. Next: restore the snapshot from where the env's records are "
-                        f"kept (git history or GENIERAILS_STATE_DIR), then re-run make policy-abandon "
-                        f"ENV={self.env_name}.")
+            refusal = self._abandon_refusal(t, desired)
+            if refusal:
+                raise Refused(refusal)
             switched = t["switch_attempted"]
-            if switched:
-                reason = self._restore_unproven(t)
-                if KEPT_NEW_COLUMNS in reason:
-                    raise Refused(self._kept_columns_message(t, "abandoned", reason))
-                if reason:
-                    raise Refused(_unabandonable(reason))
+            if switched and "restored" not in t:
+                print("  The journal predates the restore marker; treating the recorded failed switch as restored "
+                      "after a fresh live check.")
+            moved = self._moved_treatments(t, desired)
             created = self._created_policies(t)
             print(f"=== Policy staged apply: abandoning run {t['run_id']} (generation {t['to']}) ===")
             # 1. A refreshed, saved plan of the abandon render; the hook refuses any change but
@@ -953,6 +984,9 @@ class Controller:
                 raise Refused(self._kept_columns_message(t, "re-pointed", reason))
             if reason:
                 raise Refused(f"this change can't be re-pointed ({reason}); nothing was applied.")
+            if "restored" not in t:
+                print("  The journal predates the restore marker; treating the recorded failed switch as restored "
+                      "after a fresh live check.")
             self._refuse_split_drift("policy-rebind")
             desired = pg.desired_generation(self.env_dir)
             if desired["fingerprint"] == t["to"]:
@@ -1142,7 +1176,7 @@ class Controller:
             print(self.describe_transition(t))
             if t["to"] != desired["fingerprint"]:
                 print("  The generated config has moved on: the next apply refuses until this is resumed or "
-                      f"abandoned (make policy-abandon ENV={self.env_name}, then re-run)." if _may_abandon(t) else
+                      f"abandoned (make policy-abandon ENV={self.env_name}, then re-run)." if self._may_abandon(t, desired) else
                       "  The generated config has moved on: the next apply refuses until this is resumed (re-run "
                       f"the same command at commit {t['commit'] or '?'}).")
             return 0
@@ -1198,7 +1232,7 @@ class Controller:
         drift = (f"\n{len(moved)} column(s) have another treatment in the generated config than in generation "
                  f"{t['to']} ({', '.join(moved[:10])}): their live class.* tags changed since the change started, or "
                  "its treatment settings were edited." if moved else "")
-        if _may_abandon(t):
+        if self._may_abandon(t, desired):
             # Abandon re-checks a rolled-back switch live before it drops anything.
             step = f"run make policy-abandon ENV={self.env_name}, then re-run; or {resume}"
             if t["switch_attempted"]:
@@ -1233,10 +1267,15 @@ class Controller:
 
     def _refuse_split_drift(self, command: str) -> None:
         """Refuse before any plan when the split's non-treatment assignments aren't the generated config's."""
+        message = self._split_drift_message(command)
+        if message:
+            raise Refused(message)
+
+    def _split_drift_message(self, command: str) -> str:
         problems = pg.split_assignment_problems(self.env_dir)
-        if problems:
-            raise Refused(
-                "the split data_access config's non-treatment tag assignments differ from the generated config's, "
+        if not problems:
+            return ""
+        return ("the split data_access config's non-treatment tag assignments differ from the generated config's, "
                 "so the coverage check and the plan would judge different assignments; nothing was applied:\n  - "
                 + "\n  - ".join(problems[:20])
                 + f"\nRun make promote ENV={self.env_name} to re-split it (make {command} promotes after its live "
@@ -1273,11 +1312,6 @@ def _held_digest(t: dict, record: dict) -> str:
 
 # _restore_unproven's reason when the verified restore kept newly governed columns on the change's value.
 KEPT_NEW_COLUMNS = "keep the new generation's treatment"
-
-
-def _may_abandon(t: dict) -> bool:
-    """Whether abandon would take this transition up: it never switched, or the switch was a verified rollback."""
-    return not t["switch_attempted"] or bool(t.get("restored") and not t["restore_failed"]) or _pre_marker_restored(t)
 
 
 def _unabandonable(reason: str) -> str:

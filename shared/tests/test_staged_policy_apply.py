@@ -813,6 +813,37 @@ def test_describe_of_a_change_abandon_would_refuse_points_at_resume_only(harness
     assert "policy-abandon" not in out and "refuses until this is resumed (re-run the same command at commit" in out
 
 
+def test_a_restore_that_kept_a_new_column_is_never_pointed_at_abandon(harness, tmp_path, capsys):
+    """A verified restore that kept a newly governed column on the change's treatment, then a config that moved
+    on: abandon refuses it before planning, so neither make plan nor any mismatch refusal offers it."""
+    old = released(harness)
+    failed = write_env(harness.env_dir, columns=("email", "contact"))
+    assert failed["tags"].keys() - old["tags"].keys()
+    harness.fail_verify = {"switch"}
+    assert harness.apply() == 1
+    harness.fail_verify = set()
+    t = harness.journal()["transition"]
+    assert t["restored"] and not t["restore_failed"] and t["restored"]["tags"] != old["tags"]
+    out = tmp_path / "plan"
+    assert harness.controller().plan(out) == 0
+    write_env(harness.env_dir, columns=("email", "contact"), versions={"email_partial": {"partial": "initials"}})
+    before, state = harness.journal(), live_state(harness.env_dir)
+    harness.calls.clear()
+    capsys.readouterr()
+    assert harness.controller().describe() == 0
+    described = capsys.readouterr().out
+    assert "policy-abandon" not in described and "refuses until this is resumed (re-run the same command" in described
+    for refuse in (harness.controller().run, lambda: harness.controller().plan(tmp_path / "plan-c"),
+                   lambda: harness.controller().apply_saved(out)):
+        with pytest.raises(spa.Refused, match="can't start until this one is finished") as refused:
+            refuse()
+        assert "policy-abandon" not in str(refused.value)
+        assert "Next: re-run the same command at commit" in str(refused.value)
+    with pytest.raises(spa.Refused, match="keep the new generation's treatment"):
+        harness.controller().abandon()
+    assert harness.calls == [] and harness.journal() == before and live_state(harness.env_dir) == state
+
+
 def test_a_change_abandon_would_refuse_is_pointed_at_resume_only(harness):
     """A switch whose restore failed may have columns on either generation: abandon refuses it, so the
     mismatch refusal doesn't offer it."""
