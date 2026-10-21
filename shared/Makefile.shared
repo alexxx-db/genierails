@@ -238,8 +238,7 @@ _bootstrap:
 # _prepare-env side effect, even under make -j. setup/destroy/clean keep _bootstrap.
 _guarded-bootstrap:
 	@$(_GENIE_PLACEHOLDER_GUARD)
-	@$(MAKE) --no-print-directory _guard-root ENV="$(ENV)" ENV_ORIGIN="$(ENV_ORIGIN)"
-	@$(MAKE) --no-print-directory _prepare-env ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
+	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 
 _guard-workspace-target:
 	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
