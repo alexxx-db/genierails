@@ -1028,15 +1028,15 @@ def fetch_tables_from_genie_space(
             print(f"  GET blocked by Partner Powered AI — falling back to PATCH...")
             try:
                 resp = _fetch_via_patch_fallback(w, space_id)
-            except Exception as patch_error:
+            except Exception:
                 print(
                     f"  WARNING: Could not reach Genie agent {space_id} via "
-                    f"PATCH fallback: {patch_error}"
+                    "PATCH fallback."
                 )
                 return [], {}, "", False
             _used_patch_fallback = True
         else:
-            print(f"  WARNING: Could not reach Genie agent {space_id}: {e}")
+            print(f"  WARNING: Could not reach Genie agent {space_id}.")
             return [], {}, "", False
 
     if not isinstance(resp, dict):
@@ -7438,6 +7438,13 @@ def main():
                     )
                     if not discovery_ok:
                         discovery_incomplete = True
+                        if not space_tables:
+                            print(
+                                f"ERROR: Could not read Genie agent {space_name!r} "
+                                f"(genie_space_id={space_id!r}). Check genie_space_id and "
+                                "Databricks authentication, then retry."
+                            )
+                            return 1
 
                     # Use the API title as the canonical name if no name was given
                     effective_name = space_name if space_name != space_id else (api_title or space_id)

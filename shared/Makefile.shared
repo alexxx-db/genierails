@@ -1549,7 +1549,7 @@ check: ## Read-only PR check: validate, generated files current, validate-genera
 	$(_CHECK_ENV) check
 
 _prepare-classification:
-	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)")" || exit 1; \
+	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)" $(if $(filter 1,$(CLASSIFICATION_READ_ONLY)),--read-only,))" || exit 1; \
 	if [ "$(IMPORT_CLASSIFICATION)" = "1" ] || [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
 		for catalog in $$existing_catalogs; do \
 			address='module.data_access.databricks_data_classification_catalog_config.classification["'"$$catalog"'"]'; \
@@ -1600,6 +1600,7 @@ _plan-layer:
 	echo "=== Terraform Plan ($$layer:$$target_env) ==="; \
 	LAYER_ENV_DIR="$(LAYER_ENV_DIR)" "$(ROOT_RUNNER)" "$$layer" "$$target_env" plan $$stage_flag
 
+plan: override CLASSIFICATION_READ_ONLY := 1
 plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspace env
 	@set -e; $(_DRY_RUN_GUARD); if [ "$(ENV)" = "$(ACCOUNT_ENV)" ]; then \
 		$(_WARN_ACCOUNT_RETIRED_FLAG); $(MAKE) --no-print-directory _guard-account-config; \
@@ -1609,7 +1610,7 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 		if ! $(_EXPOSURE_TOKEN) consume --env-dir "$(ENV_DIR)"; then $(MAKE) --no-print-directory ENV="$(ENV)" APPLY_FLAGS="$(APPLY_FLAGS)" PROMOTE_AFTER=1 TOLERATE_REFRESH_FAILURE=1 _derive-before-exposure; fi; \
 		$(MAKE) --no-print-directory ENV="$(ENV)" TARGET_ENV="$(ENV)" _guard-data-access-config; \
 		$(_TABLE_READERS) show --env-dir "$(ENV_DIR)"; \
-		$(MAKE) --no-print-directory _plan-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
+		$(MAKE) --no-print-directory _plan-layer LAYER=data_access TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)/$(DATA_ACCESS_SUBDIR)" CLASSIFICATION_READ_ONLY=1; \
 		$(MAKE) --no-print-directory _plan-layer LAYER=workspace TARGET_ENV=$(ENV) LAYER_ENV_DIR="$(ENV_DIR)"; \
 	fi
 

@@ -336,6 +336,62 @@ def test_prepare_seeds_aws_classification_with_serverless_usage_policy(
     )
 
 
+@pytest.mark.parametrize("caller", ["check", "plan"])
+def test_read_only_callers_never_create_classification_config(tmp_path, monkeypatch, caller):
+    env_dir = tmp_path / "envs/dev"
+    (env_dir / "data_access").mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text(
+        'enable_classification = true\nuc_tables = ["catalog.schema.table"]\n'
+    )
+    (env_dir / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://example.invalid"\n'
+        'serverless_usage_policy_id = "policy-123"\n'
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"prepare_classification_read_only_{caller}",
+        SHARED / "scripts/prepare_classification_config.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    writes = []
+
+    class FakeClassification:
+        def get_catalog_config(self, _name):
+            raise module.NotFound("missing")
+
+    fake = SimpleNamespace(
+        data_classification=FakeClassification(),
+        api_client=SimpleNamespace(do=lambda *args, **kwargs: writes.append((args, kwargs))),
+    )
+    monkeypatch.setattr(module, "WorkspaceClient", lambda **_: fake)
+    monkeypatch.setattr(module.sys, "argv", ["prepare", str(env_dir), "--read-only"])
+
+    assert module.main() == 0
+    assert writes == []
+    makefile = (SHARED / "Makefile.shared").read_text()
+    check_env = (SHARED / "scripts/check_env.py").read_text()
+    if caller == "plan":
+        assert "plan: override CLASSIFICATION_READ_ONLY := 1" in makefile
+    else:
+        assert '"CLASSIFICATION_READ_ONLY": "1"' in check_env
+
+
+def test_prepare_classification_reports_missing_auth_as_missing(tmp_path):
+    (tmp_path / "env.auto.tfvars").write_text("enable_classification = true\n")
+    with pytest.raises(SystemExit, match=r"auth\.auto\.tfvars is missing"):
+        # The missing file is distinguished before HCL parsing; malformed auth
+        # continues to use the secret-safe generic parse error.
+        spec = importlib.util.spec_from_file_location(
+            "prepare_classification_missing_auth",
+            SHARED / "scripts/prepare_classification_config.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        module._load(tmp_path / "auth.auto.tfvars")
+
+
 def test_data_access_plan_and_apply_refresh_classification_without_swallowing_errors():
     source = MAKEFILE.read_text()
     prepare = source[source.index("_prepare-classification:") : source.index("_plan-layer:")]

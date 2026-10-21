@@ -424,6 +424,42 @@ def test_unreachable_api_warns_before_using_raw_space_id_as_name(
     assert "raw workspace-specific ID" in output
 
 
+def test_unreachable_id_only_agent_stops_with_named_actionable_error(
+    monkeypatch, tmp_path, capsys
+):
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.write_text("")
+    (tmp_path / "env.auto.tfvars").write_text(
+        'genie_spaces = [{ name = "Payments", genie_space_id = "space-unreachable" }]\n'
+    )
+    calls = []
+
+    class FakeApiClient:
+        def do(self, method, path, **kwargs):
+            calls.append((method, path))
+            raise RuntimeError("not found")
+
+    class FakeWorkspaceClient:
+        def __init__(self, **kwargs):
+            self.api_client = FakeApiClient()
+
+    monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(sys.modules["databricks.sdk"], "WorkspaceClient", FakeWorkspaceClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate_abac.py", "--auth-file", str(auth), "--create-groups"],
+    )
+
+    assert generate_abac.main() == 1
+    output = capsys.readouterr().out
+    assert "Could not read Genie agent 'Payments'" in output
+    assert "genie_space_id='space-unreachable'" in output
+    assert "Check genie_space_id and Databricks authentication" in output
+    assert "--catalog is required when using DDL files" not in output
+    assert calls == [("GET", "/api/2.0/genie/spaces/space-unreachable")]
+
+
 def test_main_incomplete_discovery_preserves_grants_and_remasks(monkeypatch, tmp_path):
     declared, persisted, auth_cfg = _run_main_until_footprint(
         monkeypatch,
@@ -501,26 +537,22 @@ def test_main_does_not_write_empty_owner_attribution(monkeypatch, tmp_path):
     assert "main.unnamed.events" not in discovered_cfg["discovered_table_agents"]
 
 
-def test_main_incomplete_empty_discovery_reaches_empty_governance_guard(monkeypatch, tmp_path):
-    _, _, auth_cfg = _run_main_until_footprint(
-        monkeypatch,
-        tmp_path,
-        [],
-        '''genie_spaces = [{
+def test_main_incomplete_empty_discovery_fails_before_empty_governance(monkeypatch, tmp_path, capsys):
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.write_text("")
+    (tmp_path / "env.auto.tfvars").write_text('''genie_spaces = [{
   name = "Live agent"
   genie_space_id = "space-1"
   uc_tables = []
-}]\n''',
-        fetch_result=([], {}, "Live", False),
+}]\n''')
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_genie_space",
+        lambda *args, **kwargs: ([], {}, "Live", False),
     )
-    generated = tmp_path / "empty.auto.tfvars"
-    generated.write_text("tag_assignments = []\nfgac_policies = []\n")
-    monkeypatch.setattr(generate_abac, "_fetch_live_tag_policy_values", lambda: {})
+    monkeypatch.setattr(sys, "argv", ["generate_abac.py", "--auth-file", str(auth), "--create-groups"])
 
-    errors, _ = generate_abac.post_generate_semantic_check(generated, auth_cfg)
-
-    assert any("0 tag_assignments and 0 fgac_policies" in error for error in errors)
-    assert "main.persisted.customers" in auth_cfg["uc_tables"]
+    assert generate_abac.main() == 1
+    assert "Could not read Genie agent 'Live agent'" in capsys.readouterr().out
 
 
 def test_main_tables_unions_persisted_grants_into_declared_and_checks(monkeypatch, tmp_path):
