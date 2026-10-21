@@ -27,3 +27,5 @@ After the first deployment: [one team doing both](shared/docs/playbooks/one-team
 **[Browse all docs →](shared/docs/)** — the full index: walkthrough, playbooks, pipelines, architecture, effective-access verification, and troubleshooting.
 
 **[Command and settings reference →](REFERENCE.md)** — every `make` target and every `env.auto.tfvars` / `auth.auto.tfvars` setting.
+
+Bootstrap note: `make bootstrap-sp` prints a new OAuth secret by default; `BOOTSTRAP_AUTH_ENV=<env>` writes a newly minted secret directly to that env's private `auth.auto.tfvars` instead. See the command reference for the guardrails.

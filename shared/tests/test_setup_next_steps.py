@@ -2,6 +2,7 @@
 
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -53,6 +54,10 @@ def _defined_targets():
 def _mentioned_targets(output):
     # Commands appear as "Run: make <t>", "or: make <t>", or indented on their own line.
     return re.findall(r"(?:^\s+|: )make ([a-z][a-z-]*)", output, flags=re.MULTILINE)
+
+
+def _mode(path):
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 @pytest.mark.parametrize("cloud", CLOUDS)
@@ -111,6 +116,47 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
         < out.rindex("make generate")
         < out.index("make rehearse")
     )
+
+
+@pytest.mark.parametrize("cloud", CLOUDS)
+def test_setup_creates_auth_tfvars_private(cloud, tmp_path):
+    result = _make(cloud, tmp_path, "setup", "ENV=dev")
+
+    assert result.returncode == 0, result.stderr
+    assert _mode(tmp_path / cloud / "envs/dev/auth.auto.tfvars") == 0o600
+
+
+def test_setup_warns_and_tightens_existing_auth_tfvars(tmp_path):
+    auth = tmp_path / "aws/envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = "already-here"\n')
+    auth.chmod(0o644)
+
+    result = _make("aws", tmp_path, "setup", "ENV=dev")
+
+    assert result.returncode == 0, result.stderr
+    assert _mode(auth) == 0o600
+    assert "tightening to 0600" in result.stderr
+
+
+def test_bootstrap_auth_overwrite_only_honored_on_command_line(tmp_path):
+    cloud_root = tmp_path / "aws"
+    cloud_root.mkdir()
+    common = [
+        "make", "--no-print-directory", "-n", "bootstrap-sp",
+        f"CLOUD_ROOT={cloud_root}", f"SHARED_ROOT={SHARED_ROOT}",
+        "ACCOUNT_ID=acct", "WORKSPACE_ID=123", "BOOTSTRAP_AUTH_ENV=dev",
+    ]
+    env = {**_clean_env(), "BOOTSTRAP_AUTH_OVERWRITE": "1"}
+
+    from_env = subprocess.run(common, cwd=ROOT / "aws", text=True, capture_output=True, env=env)
+    from_cli = subprocess.run(
+        [*common, "BOOTSTRAP_AUTH_OVERWRITE=1"],
+        cwd=ROOT / "aws", text=True, capture_output=True, env=_clean_env(),
+    )
+
+    assert "--force-auth-file" not in from_env.stdout
+    assert "--force-auth-file" in from_cli.stdout
 
 
 @pytest.mark.parametrize("cloud", CLOUDS)
