@@ -882,17 +882,111 @@ def test_destination_tiers_that_promotion_may_write_are_not_refused(tmp_path, mo
     assert hcl2.load(dest.open())["access_tier_groups"] == ["dev_ops", "dev_analysts"]
 
 
-def test_tiers_a_previous_promotion_wrote_still_follow_the_source(tmp_path, monkeypatch, capsys):
-    # prod's generated groups record what the last promotion wrote: a dev tier
-    # rename is promoted governance, not prod's own tiers being replaced.
-    dest = _tier_promote(tmp_path, monkeypatch, TIER_DEST + 'access_tier_groups = ["dev_ops", "dev_viewers"]\n',
-                         source_text=TIER_SOURCE)
-    (tmp_path / "prod" / "generated").mkdir()
-    (tmp_path / "prod" / "generated" / "abac.auto.tfvars").write_text(
-        'groups = { dev_ops = {}, dev_viewers = {} }\n')
+RENAMED_SOURCE = TIER_SOURCE.replace('"dev_analysts"', '"dev_viewers"')
+RECORD = Path("generated") / "promoted_access_tiers.json"
+
+
+def _first_promote_then_rename(tmp_path, monkeypatch):
+    """A first promote into placeholder tiers records what it wrote; then dev renames a tier."""
+    placeholders = TIER_DEST + 'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n'
+    dest = _tier_promote(tmp_path, monkeypatch, placeholders, source_text=RENAMED_SOURCE)
+    remap_env_config.main()
+    (tmp_path / "dev" / "env.auto.tfvars").write_text(TIER_SOURCE)
+    return dest
+
+
+def test_the_first_promote_into_placeholders_records_the_tiers_it_wrote(tmp_path, monkeypatch):
+    dest = _tier_promote(tmp_path, monkeypatch, TIER_DEST + 'access_tier_groups = ["<a>", "<b>"]\n')
+    remap_env_config.main()
+    assert hcl2.load(dest.open())["access_tier_groups"] == ["dev_ops", "dev_analysts"]
+    record = json.loads((tmp_path / "prod" / RECORD).read_text())
+    assert record["access_tier_groups"] == ["dev_ops", "dev_analysts"]
+    assert record["env"] == "prod" and record["source_env"] == "dev"
+    assert remap_env_config._recorded_promoted_tiers(str(tmp_path / "prod")) == ({"dev_ops", "dev_analysts"}, "")
+
+
+def test_tiers_a_previous_promotion_recorded_still_follow_the_source(tmp_path, monkeypatch, capsys):
+    # A dev tier rename is promoted governance, not prod's own tiers being replaced.
+    dest = _first_promote_then_rename(tmp_path, monkeypatch)
+    assert hcl2.load(dest.open())["access_tier_groups"] == ["dev_ops", "dev_viewers"]
+    capsys.readouterr()
     remap_env_config.main()
     assert hcl2.load(dest.open())["access_tier_groups"] == ["dev_ops", "dev_analysts"]
     assert "access_tier_groups promoted: ['dev_ops', 'dev_viewers'] -> ['dev_ops', 'dev_analysts']" in capsys.readouterr().out
+    assert json.loads((tmp_path / "prod" / RECORD).read_text())["access_tier_groups"] == ["dev_ops", "dev_analysts"]
+
+
+def _assert_refused(tmp_path, dest, capsys, own, reason=None):
+    capsys.readouterr()
+    before = dest.read_text()
+    record = tmp_path / "prod" / RECORD
+    record_before = record.read_bytes() if record.exists() else None
+    with pytest.raises(SystemExit) as exc:
+        remap_env_config.main()
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert dest.read_text() == before, "nothing was written"
+    assert (record.read_bytes() if record.exists() else None) == record_before
+    assert f"name prod's own group(s) {own}, but promotion would replace them" in out
+    assert "access_tier_groups promoted" not in out
+    assert "group_map = { " in out
+    if reason:
+        assert f"(envs/prod/generated/promoted_access_tiers.json {reason}, so no tier there counts" in out
+    return out
+
+
+def test_generated_groups_naming_prod_tiers_do_not_bypass_the_refusal(tmp_path, monkeypatch, capsys):
+    # Codex's repro: prod's own tiers also appear in prod's generated config
+    # (a hand edit, or any other reason). Without a promotion record they stay
+    # prod's own, so promotion must not swap in dev's names.
+    dest = _tier_promote(tmp_path, monkeypatch, TIER_DEST + 'access_tier_groups = ["prod_ops", "prod_analysts"]\n')
+    (tmp_path / "prod" / "generated").mkdir()
+    (tmp_path / "prod" / "generated" / "abac.auto.tfvars").write_text(
+        'groups = { prod_ops = {}, prod_analysts = {} }\n')
+    out = _assert_refused(tmp_path, dest, capsys, "prod_ops, prod_analysts", "is missing")
+    assert 'group_map = { "dev_analysts" = "prod_analysts", "dev_ops" = "prod_ops" }' in out
+
+
+def test_a_missing_record_leaves_promoted_looking_tiers_prod_owned(tmp_path, monkeypatch, capsys):
+    # Tiers that look like dev's but carry no record could have been typed in.
+    dest = _tier_promote(tmp_path, monkeypatch, TIER_DEST + 'access_tier_groups = ["dev_ops", "dev_viewers"]\n')
+    _assert_refused(tmp_path, dest, capsys, "dev_viewers", "is missing")
+
+
+@pytest.mark.parametrize("tamper", [
+    "tiers",       # the record's tiers edited, digest left as it was
+    "digest",      # the digest edited
+    "other_env",   # a valid record copied from another env
+    "unreadable",  # not JSON
+    "version",     # an unknown record version
+])
+def test_a_record_that_does_not_verify_vouches_for_nothing(tmp_path, monkeypatch, capsys, tamper):
+    dest = _first_promote_then_rename(tmp_path, monkeypatch)
+    path = tmp_path / "prod" / RECORD
+    record = json.loads(path.read_text())
+    if tamper == "tiers":
+        record["access_tier_groups"] = ["prod_ops", "prod_analysts"]
+    elif tamper == "digest":
+        record["sha256"] = "0" * 64
+    elif tamper == "other_env":
+        record["env"] = "staging"
+        record["sha256"] = remap_env_config._promoted_tiers_digest("staging", record["access_tier_groups"])
+    elif tamper == "version":
+        record["version"] = 99
+    path.write_text("{not json" if tamper == "unreadable" else json.dumps(record))
+    if tamper == "tiers":
+        dest.write_text(dest.read_text().replace('"dev_ops", "dev_viewers"', '"prod_ops", "prod_analysts"'))
+        _assert_refused(tmp_path, dest, capsys, "prod_ops, prod_analysts", "does not verify")
+    else:
+        _assert_refused(tmp_path, dest, capsys, "dev_viewers", "does not verify")
+
+
+def test_prod_tiers_edited_after_a_recorded_promote_are_prod_owned(tmp_path, monkeypatch, capsys):
+    # The record only vouches for the groups it lists.
+    dest = _first_promote_then_rename(tmp_path, monkeypatch)
+    dest.write_text(dest.read_text().replace('"dev_ops", "dev_viewers"', '"prod_ops", "dev_viewers"'))
+    out = _assert_refused(tmp_path, dest, capsys, "prod_ops")
+    assert "so no tier there counts" not in out
 
 
 def test_legacy_destination_tiers_are_still_kept(tmp_path, monkeypatch):

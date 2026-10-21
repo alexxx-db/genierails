@@ -620,11 +620,10 @@ def test_tiers_are_promoted_on_every_promote_but_seeded_access_is_kept(tmp_path)
     text = dest.read_text().replace('"prod_partial", "dev_etl"]', '"prod_partial"]')  # a prod-only ACL edit
     assert text != dest.read_text()
     dest.write_text(text)
-    # What promote-to's generated remap wrote last time (the mapped tier groups):
-    # tiers from a previous promotion follow the source, they aren't prod's own.
-    (dest.parent / "generated").mkdir()
-    (dest.parent / "generated" / "abac.auto.tfvars").write_text(
-        'groups = { prod_raw = {}, prod_partial = {}, full = {} }\n')
+    # The first promote recorded the (mapped) tiers it wrote: tiers from a
+    # previous promotion follow the source, they aren't prod's own.
+    assert json.loads((dest.parent / "generated" / "promoted_access_tiers.json").read_text())[
+        "access_tier_groups"] == ["prod_raw", "prod_partial", "full"]
     source = (tmp_path / "envs" / "dev" / "env.auto.tfvars")
     source.write_text(SOURCE.replace('"dev_partial", "full"]', '"dev_partial", "viewers"]'))
     cfg, out = _promote(tmp_path, source.read_text(), None)

@@ -213,15 +213,70 @@ def _source_policies(source_env_dir: str) -> list:
         sys.exit(1)
 
 
+# What promote-to last wrote to a deterministic destination's
+# access_tier_groups, committed with it. Only this record (verified against
+# its digest) marks a destination tier as promotion-written; any other group
+# there is the destination's own.
+PROMOTED_TIERS_RECORD = Path("generated") / "promoted_access_tiers.json"
+_PROMOTED_TIERS_VERSION = 1
+
+
+def _promoted_tiers_digest(env: str, tiers: list[str]) -> str:
+    import hashlib
+
+    body = json.dumps({"version": _PROMOTED_TIERS_VERSION, "env": env, "access_tier_groups": tiers},
+                      sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _write_promoted_tiers(dest_env_dir: str, source_env: str, tiers: list[str]) -> None:
+    env = Path(dest_env_dir).name
+    path = Path(dest_env_dir) / PROMOTED_TIERS_RECORD
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "_comment": "Written by make promote-to; do not edit. The access_tier_groups it last wrote to this env.",
+        "version": _PROMOTED_TIERS_VERSION,
+        "env": env,
+        "source_env": source_env,
+        "access_tier_groups": tiers,
+        "sha256": _promoted_tiers_digest(env, tiers),
+    }, indent=2) + "\n")
+
+
+def _recorded_promoted_tiers(dest_env_dir: str) -> tuple[set[str], str]:
+    """The tiers the last promotion recorded writing, and why there are none.
+
+    Returns (tiers, "") for a record that verifies, else (set(), reason): a
+    missing, unreadable or edited record vouches for nothing, nor does one
+    copied from another env (the digest covers this env's name).
+    """
+    env = Path(dest_env_dir).name
+    path = Path(dest_env_dir) / PROMOTED_TIERS_RECORD
+    if not path.is_file():
+        return set(), f"envs/{env}/{PROMOTED_TIERS_RECORD.as_posix()} is missing"
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        record = None
+    tiers = record.get("access_tier_groups") if isinstance(record, dict) else None
+    if (not isinstance(tiers, list) or not all(isinstance(g, str) for g in tiers)
+            or record.get("version") != _PROMOTED_TIERS_VERSION
+            or record.get("sha256") != _promoted_tiers_digest(env, tiers)):
+        return set(), f"envs/{env}/{PROMOTED_TIERS_RECORD.as_posix()} does not verify"
+    return set(tiers), ""
+
+
 def _uncovered_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict, dest_env_dir: str,
                            group_map: dict[str, str], map_groups) -> list[str]:
     """Refusal lines when promotion would replace a deterministic destination's
     own access_tier_groups with source group names, else [].
 
     The tiers are promoted through group_map on every promotion, so a
-    destination group that is in neither the promoted tiers nor what the last
-    promotion wrote (its generated groups) is the destination's own: replacing
-    it silently would give the source's groups its SELECT and CAN_RUN.
+    destination group that is in neither the promoted tiers nor the verified
+    record of what the last promotion wrote is the destination's own:
+    replacing it silently would give the source's groups its SELECT and
+    CAN_RUN. Group names found elsewhere (e.g. generated/abac.auto.tfvars)
+    vouch for nothing.
     """
     from access_tier_groups import persisted_access_tier_groups
 
@@ -235,11 +290,7 @@ def _uncovered_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict, dest_
     except ValueError:
         return []  # reported where the tiers are written
     tiers = map_groups(source_tiers)
-    generated = Path(dest_env_dir) / "generated" / "abac.auto.tfvars"
-    try:
-        promoted_before = set((load_hcl(generated).get("groups") or {}) if generated.is_file() else {})
-    except FootprintError:
-        promoted_before = set()
+    promoted_before, unverified = _recorded_promoted_tiers(dest_env_dir)
     own = [g for g in dest_tiers if g not in tiers and g not in promoted_before]
     if not own:
         return []
@@ -248,6 +299,8 @@ def _uncovered_tier_groups(cfg: dict, source_env_dir: str, dest_cfg: dict, dest_
              f"{', '.join(own)}, but promotion would replace them with {tiers!r} from {source_env}: "
              f"{dest_env}'s tiers, table_readers and acl_groups would name {source_env}'s groups. "
              "Nothing was written."]
+    if unverified:
+        lines.append(f"       ({unverified}, so no tier there counts as written by an earlier promotion.)")
     if len(source_tiers) == len(dest_tiers):
         suggested = dict(group_map)
         for dev, target in zip(source_tiers, dest_tiers):
@@ -962,6 +1015,13 @@ def main():
     os.makedirs(dest_env_dir, exist_ok=True)
     with open(dest_path, "w") as f:
         f.write("\n".join(lines) + "\n")
+    if dest_deterministic:
+        # The tiers just written are the only ones the next promotion may
+        # replace without a group_map (see _uncovered_tier_groups).
+        from access_tier_groups import persisted_access_tier_groups
+
+        _write_promoted_tiers(dest_env_dir, source_env, map_groups(
+            persisted_access_tier_groups(cfg, Path(source_env_dir) / "env.auto.tfvars")))
 
     print(f"  Wrote {dest_path}")
     for src, dest in pairs.items():
