@@ -72,7 +72,7 @@ def test_invalid_auth_never_prints_secret(tmp_path):
     )
 
     assert result.returncode == 1
-    assert "fill in" in result.stderr
+    assert "is not valid HCL" in result.stderr
     assert secret not in result.stdout + result.stderr
     assert "Traceback" not in result.stdout + result.stderr
 

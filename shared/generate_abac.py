@@ -7108,8 +7108,12 @@ def main():
     args = parser.parse_args()
 
     auth_file = Path(args.auth_file)
-    from scripts.auth_configured import auth_configured
-    if not auth_configured(auth_file):
+    from scripts.auth_configured import AuthStatus, auth_status
+    auth_state = auth_status(auth_file)
+    if auth_state is AuthStatus.MALFORMED:
+        print(f"ERROR: {auth_file} is not valid HCL", file=sys.stderr)
+        sys.exit(1)
+    if auth_state is AuthStatus.INCOMPLETE:
         print(
             f"ERROR: fill in {auth_file} (workspace host, client ID, and client secret) before running generate",
             file=sys.stderr,

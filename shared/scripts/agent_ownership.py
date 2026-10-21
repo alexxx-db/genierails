@@ -161,10 +161,13 @@ def _api(env_dir: Path):
     """The workspace API client pinned to the env's auth.auto.tfvars."""
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.config import Config
-    from scripts.auth_configured import auth_configured
+    from scripts.auth_configured import AuthStatus, auth_status
 
     auth_path = env_dir / "auth.auto.tfvars"
-    if not auth_configured(auth_path):
+    status = auth_status(auth_path)
+    if status is AuthStatus.MALFORMED:
+        raise AgentError(f"{auth_path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
         raise AgentError(
             f"fill in {auth_path} (workspace host, client ID, and client secret) before reading a Genie agent"
         )
