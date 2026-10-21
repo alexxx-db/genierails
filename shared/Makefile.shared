@@ -1486,14 +1486,15 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 # both envs use one SP, so fill the destination's still-blank auth.auto.tfvars with
 # the source's account ID, client ID and secret, keeping the destination's host and
 # ID (scripts/prepare_destination_auth.py). It runs inside the promotion transaction.
-# Only REUSE_SOURCE_AUTH's own origin opens it (a shell variable is ignored). An
-# exported MAKEFLAGS also reports "command line", so the script also requires the
-# opt-in in a make's argv (this make's or a parent make's) and refuses otherwise.
+# Only REUSE_SOURCE_AUTH's own origin opens it, and only then does the recipe pass
+# --reuse: a shell variable is ignored. An exported MAKEFLAGS carrying it reports
+# "command line" too and counts as an opt-in (an anti-accident guard, not a
+# security boundary).
 _REUSE_SOURCE_AUTH = $(filter command line,$(origin REUSE_SOURCE_AUTH))
 override _PREPARE_DEST_AUTH = python3 "$(SHARED_ROOT)/scripts/prepare_destination_auth.py" \
 	--source "$(SOURCE_ENV_DIR)/auth.auto.tfvars" --dest "$$dest_env_dir/auth.auto.tfvars" \
 	--dest-env-file "$$dest_env_dir/env.auto.tfvars" --reuse "$(REUSE_SOURCE_AUTH)" \
-	--workspace-host "$(WORKSPACE_HOST)" --workspace-id "$(WORKSPACE_ID)" --require-make-command-line
+	--workspace-host "$(WORKSPACE_HOST)" --workspace-id "$(WORKSPACE_ID)"
 
 # A refused promotion changes nothing: _PROMOTION_TXN_BEGIN snapshots the trees
 # it writes (the destination env and the shared account layer) and, when the

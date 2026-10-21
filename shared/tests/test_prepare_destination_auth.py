@@ -298,14 +298,6 @@ def _contents(path):
     return ("link", os.readlink(path)) if path.is_symlink() else ("file", path.read_text())
 
 
-def test_opt_in_outside_any_make_command_line_is_refused(tmp_path):
-    result, dest = _run(tmp_path, "--reuse", "1", "--workspace-host", PROD_HOST, "--workspace-id", "222",
-                        "--require-make-command-line")
-
-    assert result.returncode == 1
-    assert "REUSE_SOURCE_AUTH=1 is not on the make command line" in result.stderr
-    assert dest.read_text() == TEMPLATE
-
 # Malformed source (or destination) files whose broken token is the secret: the
 # parser's text would echo it, so the message must be the fixed one.
 MALFORMED = {
@@ -454,17 +446,18 @@ def test_shell_opt_in_is_ignored_even_with_command_line_workspace(repo, tmp_path
     assert "REUSE_SOURCE_AUTH:" not in out
 
 
-def test_opt_in_from_an_exported_makeflags_is_refused(repo, tmp_path):
+def test_exported_makeflags_opt_in_counts_as_command_line(repo, tmp_path):
+    """Documented: make cannot tell MAKEFLAGS=REUSE_SOURCE_AUTH=1 from the argument, so it opts in.
+
+    The opt-in guards against a stale shell variable, not against whoever controls the environment.
+    """
     prod = _prod(repo)
-    (prod / "auth.auto.tfvars").write_text(TEMPLATE)
-    before = _state(repo)
 
     result = _make(repo, tmp_path, "promote-to", "ENV=prod", f"WORKSPACE_HOST={PROD_HOST}", "WORKSPACE_ID=222",
                    MAKEFLAGS="REUSE_SOURCE_AUTH=1")
 
     out = result.stdout + result.stderr
-    assert result.returncode != 0, out
-    assert "REUSE_SOURCE_AUTH=1 is not on the make command line" in out, out
-    assert "Refused: nothing was changed" in out, out
-    assert _state(repo) == before
+    assert result.returncode == 0, out
+    assert "REUSE_SOURCE_AUTH: filled" in out
+    assert hcl2.load((prod / "auth.auto.tfvars").open())["databricks_client_secret"] == SECRET
     assert SECRET not in out

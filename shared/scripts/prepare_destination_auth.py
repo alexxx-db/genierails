@@ -25,14 +25,16 @@ re-read and must be the same file (device, inode, size, mtime) with the same
 bytes, or nothing is written. (The replace itself is a rename, so a swap in the
 instant between that check and the rename is the one window left.)
 
-Inside make an exported MAKEFLAGS=REUSE_SOURCE_AUTH=1 looks exactly like the
-command-line variable (both report origin "command line"), so with
---require-make-command-line the opt-in also has to be in the argv of this
-process's make (or a parent make that invoked it): an exported MAKEFLAGS is in
-no make's argv and is refused.
+make runs this (and passes --reuse) only when REUSE_SOURCE_AUTH has origin
+"command line", so a stale REUSE_SOURCE_AUTH in the shell never reuses
+credentials. An exported MAKEFLAGS carrying REUSE_SOURCE_AUTH=1 counts as a
+command-line opt-in too: make reports the same origin and value for both and
+cannot tell them apart. The opt-in is a guard against accidental reuse, not a
+security boundary: whoever controls this process's environment can already
+read the source auth file.
 
   prepare_destination_auth.py --source <src auth> --dest <dest auth> [--dest-env-file <dest env.auto.tfvars>]
-      --reuse 1 [--workspace-host <host>] [--workspace-id <id>] [--require-make-command-line]
+      --reuse 1 [--workspace-host <host>] [--workspace-id <id>]
 """
 
 from __future__ import annotations
@@ -42,7 +44,6 @@ import errno
 import os
 import re
 import stat
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -55,9 +56,6 @@ CREDENTIAL_KEYS = ("databricks_account_id", "databricks_client_id", "databricks_
 REUSED_KEYS = (*CREDENTIAL_KEYS, "databricks_account_host")
 HOST, WORKSPACE_ID = "databricks_workspace_host", "databricks_workspace_id"
 PLACEHOLDERS = ("placeholder", "change_me", "changeme", "your_")
-
-
-OPT_IN = "REUSE_SOURCE_AUTH=1"
 
 
 class AuthError(Exception):
@@ -183,24 +181,6 @@ def _write(path: Path, text: str, validated: bytes, identity: tuple) -> None:
         raise
 
 
-def make_command_line_has_opt_in() -> bool:
-    """Whether a make among this process's ancestors has REUSE_SOURCE_AUTH=1 in its own argv."""
-    pid = os.getppid()
-    for _ in range(64):
-        if pid <= 1:
-            return False
-        result = subprocess.run(["ps", "-ww", "-o", "ppid=", "-o", "args=", "-p", str(pid)],
-                                capture_output=True, text=True)
-        fields = result.stdout.strip().split(None, 1)
-        if result.returncode != 0 or len(fields) != 2 or not fields[0].isdigit():
-            return False
-        tokens = fields[1].split()
-        if Path(tokens[0]).name in ("make", "gmake") and OPT_IN in tokens[1:]:
-            return True
-        pid = int(fields[0])
-    return False
-
-
 def prepare(source: Path, dest: Path, dest_env_file: Path | None, host: str, workspace_id: str) -> str:
     """Fill dest from source; return the line to print. Raises AuthError on refusal."""
     try:
@@ -275,16 +255,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reuse", default="")
     parser.add_argument("--workspace-host", default="")
     parser.add_argument("--workspace-id", default="")
-    parser.add_argument("--require-make-command-line", action="store_true")
     args = parser.parse_args(argv)
     if args.reuse != "1":
         flags = "WORKSPACE_HOST/WORKSPACE_ID only apply with REUSE_SOURCE_AUTH=1" if not args.reuse \
             else "REUSE_SOURCE_AUTH takes only 1"
         print(f"ERROR: {flags}; nothing was written.", file=sys.stderr)
-        return 1
-    if args.require_make_command_line and not make_command_line_has_opt_in():
-        print("ERROR: REUSE_SOURCE_AUTH=1 is not on the make command line (it came from an exported "
-              "MAKEFLAGS); pass it as a make argument. Nothing was written.", file=sys.stderr)
         return 1
     message = None
     try:
