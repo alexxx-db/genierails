@@ -9,7 +9,7 @@ The legacy flow remains available as ``--step all`` (or its individual steps):
 
   audit    -> scripts/audit_schema_drift.py            (== make audit-schema)
   delta    -> generate_abac.py --delta --auth-file ...  (== make generate-delta)
-  coverage -> validate_abac.py <config the delta wrote> (== make validate-generated / validate)
+  coverage -> validate_abac.py --coverage-gate <config the delta wrote> --env-name <env>
 
 The legacy scripts resolve config via relative paths from the environment
 directory (envs/<env>/), so this wrapper `chdir`s there once and shells out to
@@ -179,7 +179,7 @@ def _delta(env_dir: Path, auth_file: str, catalog: str = "") -> int:
 
 
 def _coverage(env_dir: Path) -> int:
-    """Validate the config layer the delta step actually writes to.
+    """Coverage-gate the config layer the delta step actually writes to.
 
     generate_abac.py --delta merges into generated/abac.auto.tfvars when it
     exists, otherwise into the split data_access/abac.auto.tfvars — so this
@@ -191,23 +191,23 @@ def _coverage(env_dir: Path) -> int:
     split_da = env_dir / "data_access" / "abac.auto.tfvars"
 
     if generated.exists():
-        cmd = [sys.executable, str(SHARED_ROOT / "validate_abac.py"), str(generated)]
+        config = generated
         masking = env_dir / "generated" / "masking_functions.sql"
-        if masking.exists():
-            cmd.append(str(masking))
-        return _run(cmd, cwd=env_dir)
-
-    if split_da.exists():
-        cmd = [sys.executable, str(SHARED_ROOT / "validate_abac.py"), str(split_da)]
+    elif split_da.exists():
+        config = split_da
         masking = env_dir / "data_access" / "masking_functions.sql"
-        if masking.exists():
-            cmd.append(str(masking))
-        return _run(cmd, cwd=env_dir)
+    else:
+        print(f"ERROR: coverage check found no ABAC config to validate in {env_dir} "
+              f"(looked for generated/abac.auto.tfvars and data_access/abac.auto.tfvars).",
+              file=sys.stderr)
+        return 1
 
-    print(f"ERROR: coverage check found no ABAC config to validate in {env_dir} "
-          f"(looked for generated/abac.auto.tfvars and data_access/abac.auto.tfvars).",
-          file=sys.stderr)
-    return 1
+    cmd = [sys.executable, str(SHARED_ROOT / "validate_abac.py"),
+           "--coverage-gate", str(config)]
+    if masking.exists():
+        cmd.append(str(masking))
+    cmd += ["--env-name", env_dir.name]
+    return _run(cmd, cwd=env_dir)
 
 
 def _release_steps(env: str, env_dir: Path) -> str:

@@ -1,0 +1,9 @@
+[31m╷[0m[0m
+[31m│[0m [0m[1m[31mError: [0m[0m[1mfailed to create data_classification_catalog_config[0m
+[31m│[0m [0m
+[31m│[0m [0m[0m  with module.data_access.databricks_data_classification_catalog_config.classification["example"],
+[31m│[0m [0m  on ../../modules/data_access/main.tf line 42, in resource "databricks_data_classification_catalog_config" "classification":
+[31m│[0m [0m  42: resource "databricks_data_classification_catalog_config" "classification" {
+[31m│[0m [0m
+[31m│[0m [0mUsage policy ID must not be empty.
+[31m╵[0m[0m
