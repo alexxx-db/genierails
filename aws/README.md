@@ -7,6 +7,12 @@
 - Your tables must already exist in Unity Catalog before running `make generate`
 - An AWS Databricks workspace with Unity Catalog enabled
 - A Databricks service principal with the roles below
+- Existing dev/prod catalogs. On a fresh metastore, the metastore owner or a
+  `CREATE CATALOG` holder creates them; see the shared
+  [prerequisites](../shared/docs/prerequisites.md#required-features).
+- For scripted classification on a fresh AWS workspace, a Workspace Admin
+  creates and binds the serverless budget/usage policy. Account Admin alone is
+  not sufficient for that operation.
 
 ### Which service principal roles do I need?
 

@@ -198,7 +198,7 @@ Credentials only. Never commit it.
 | `uc_tables` | list(string) | `[]` | Tables to govern beyond the agents' (`catalog.schema.table` or `catalog.schema.*`). The governance-only path sets only this. |
 | `uc_catalog` | string | `""` | Legacy prefix: makes a schema-relative `uc_tables` or `table_readers` entry fully qualified. |
 | `genie_only` | bool | `false` | Workspace root: skip account-level operations so the SP needs only Workspace Admin; `groups` must be empty and agent ACLs are skipped (self-service Genie). |
-| `serverless_usage_policy_id` | string | `""` | AWS test-automation workaround (provider issue #5985); leave empty. |
+| `serverless_usage_policy_id` | string | `""` | AWS provider issue #5985 workaround for scripted classification on a fresh workspace. Normally leave empty. If `make enable-classification` reports `Usage policy ID must not be empty`, a Workspace Admin (or *Serverless usage policy: Manager*) must create a serverless budget/usage policy bound to this workspace; Account Admin alone may get `missing CreateBudgetPolicyPermission`. Set this to that policy UUID in `auth.auto.tfvars`. |
 
 ### `env.auto.tfvars`: governance and access
 

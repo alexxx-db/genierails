@@ -7,6 +7,11 @@ This guide covers Azure-specific setup required before deploying GenieRails on A
 1. **Azure Subscription** with an active resource group
 2. **Azure AD App Registration** for Azure resource management (storage accounts, access connectors)
 3. **Databricks Account** on Azure with at least one workspace
+4. **Existing Unity Catalog catalogs** for dev and prod. On a fresh metastore,
+   the metastore owner or a principal with `CREATE CATALOG` creates them. If a
+   catalog is set to `ISOLATED`, explicitly bind it to its workspace; isolation
+   mode alone does not add a binding. See the shared
+   [prerequisites](../../shared/docs/prerequisites.md#required-features).
 
 ## Service Principal Setup
 
