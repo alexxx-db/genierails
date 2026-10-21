@@ -561,6 +561,7 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
     ref = (SHARED / "examples/dev_to_prod/REFERENCE.md").read_text()
     flow = readme[readme.index("## The whole flow"):readme.index("## Before you start")]
+    before = readme[readme.index("## Before you start"):readme.index("## Dev")]
     dev = readme[readme.index("## Dev"):readme.index("## Prod")]
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
 
@@ -573,12 +574,20 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     assert positions == sorted(positions)
     assert "Data classification" in flow
 
-    # Dev: commit (own repo) comes before generate, check and rehearse.
+    # Detailed walkthrough: rename before setup, then commit before generate/check/rehearse.
+    assert "git remote rename origin genierails" in before
+    step_1 = dev[dev.index("**1. Set up.**"):dev.index("**2. Commit it (own repo).**")]
     committed = dev[dev.index("**2. Commit it (own repo).**"):]
-    steps = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
-             "**4. Generate.**", "**5. Check.**", "make check ENV=dev", "**6. Rehearse.**"]
+    assert "make setup ENV=dev" in step_1
+    assert "git add .gitignore envs/" in committed
+    steps = ["git add .gitignore envs/", "**4. Generate.**", "**5. Check.**",
+             "make check ENV=dev", "**6. Rehearse.**"]
     positions = [committed.index(step) for step in steps]
     assert positions == sorted(positions)
+    detailed_positions = [readme.index("git remote rename origin genierails", readme.index("## Before you start")),
+                          readme.index("make setup ENV=dev", readme.index("## Dev")),
+                          readme.index("git add .gitignore envs/", readme.index("**2. Commit it (own repo).**"))]
+    assert detailed_positions == sorted(detailed_positions)
     assert "`make rehearse` and `make release-plan` don't run it" in dev
     assert "`verify-access` as its last gate (`_verify-access-gate`)" in dev
     assert "**Pass looks like:** `ALL EFFECTIVE`" in dev and "make verify-access ENV=dev" in dev

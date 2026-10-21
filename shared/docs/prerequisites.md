@@ -106,6 +106,22 @@ No VPN is required unless your Databricks workspace is on a private network. (`m
 - **SQL Warehouse** — serverless (auto-created) or existing warehouse
 - **Genie agents** — for the Genie agent governance workflow
 
+The normal GenieRails deployment path governs **existing catalogs**; `make
+apply` does not create them. Optional greenfield/demo setup tooling can create a
+catalog when explicitly selected. Otherwise, on a fresh metastore the
+metastore owner (or a principal granted metastore `CREATE CATALOG`) must create
+the dev and prod catalogs first. If the metastore has no storage root, do not
+use the Catalog REST create call with "Default Storage": that default is a UI
+choice, not a REST storage location. Open a SQL warehouse in the target
+workspace and run, for example, `CREATE CATALOG dev_finance;` and `CREATE
+CATALOG prod_finance;`, or create each catalog in Catalog Explorer.
+
+If you set a catalog's isolation mode to **ISOLATED**, also bind it explicitly
+to the workspace that must use it: Catalog Explorer → catalog → **Workspaces**
+→ assign the current workspace. Changing the isolation mode does not create
+that binding; without it the catalog is unreachable from every workspace,
+including the one where you changed the setting.
+
 </details>
 
 ---
@@ -190,23 +206,28 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
      --profile genierails-bootstrap
    ```
 
+   `databricks auth login` is an interactive browser login. Always give it an
+   explicit `--profile`; on a machine without a browser, use a supported
+   non-interactive authentication method instead of this command (otherwise it
+   waits for browser completion).
+
    The account login does not authenticate the caller to a workspace. Log in to each
    target workspace as well (use the actual dev and prod workspace URLs):
 
    ```bash
-   databricks auth login --host <dev-workspace-url>
-   databricks auth login --host <prod-workspace-url>
+   databricks auth login --host <dev-workspace-url> --profile genierails-dev
+   databricks auth login --host <prod-workspace-url> --profile genierails-prod
    ```
 
    ```bash
    # dev workspace + dev catalog: creates the SP (or reuses an existing one); a new secret is printed once, so save it
-   make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap ACCOUNT_ID=<id> WORKSPACE_ID=<dev-workspace-id> TARGET_CATALOG=<dev-catalog> YES=1
+   make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap WORKSPACE_PROFILE=genierails-dev ACCOUNT_ID=<id> WORKSPACE_ID=<dev-workspace-id> TARGET_CATALOG=<dev-catalog> YES=1
 
    # prod workspace + prod catalog: reuses the same SP (same default SP_NAME)
-   make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap ACCOUNT_ID=<id> WORKSPACE_ID=<prod-workspace-id> TARGET_CATALOG=<prod-catalog> YES=1
+   make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap WORKSPACE_PROFILE=genierails-prod ACCOUNT_ID=<id> WORKSPACE_ID=<prod-workspace-id> TARGET_CATALOG=<prod-catalog> YES=1
 
    # Or bootstrap both at once; catalog values align positionally with workspace IDs
-   make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap ACCOUNT_ID=<id> WORKSPACE_ID=<dev-workspace-id>,<prod-workspace-id> TARGET_CATALOG=<dev-catalog>,<prod-catalog> YES=1
+   make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap WORKSPACE_PROFILE=genierails-dev,genierails-prod ACCOUNT_ID=<id> WORKSPACE_ID=<dev-workspace-id>,<prod-workspace-id> TARGET_CATALOG=<dev-catalog>,<prod-catalog> YES=1
    ```
 
    Optional safer secret handling for a single workspace/env: add
