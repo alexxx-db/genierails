@@ -1048,4 +1048,7 @@ def test_a_legacy_layout_env_promotes_and_plans_exactly_as_before(tmp_path):
     after = _legacy_promotion(tmp_path / "after", SHARED, ROOT / "aws" / "Makefile")
 
     assert "dev/agents" not in " ".join(after) and "prod/agents" not in " ".join(after)
+    # The one addition since: the record of the tiers promote-to wrote (decision 8).
+    record = json.loads(after.pop("prod/generated/promoted_access_tiers.json"))
+    assert record["access_tier_groups"] == hcl2.loads(after["prod/env.auto.tfvars"].decode())["access_tier_groups"]
     assert after == before

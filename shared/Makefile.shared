@@ -266,10 +266,12 @@ _guard-data-access-config:
 # Fail fast while env.auto.tfvars still holds the template's <your-genie-space-id>.
 # Promote also checks its source env and, if it already exists, its destination.
 # Missing files pass, so ENV=account and not-yet-created envs are unaffected.
+# A promotion destination may keep its access_tier_groups placeholders: the
+# promotion writes its tiers from the source's, through its group_map.
 override _GENIE_PLACEHOLDER_GUARD = GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$(if $(and $(filter generate,$(MAKECMDGOALS)),$(or $(findstring --groups,$(GENERATE_ARGS)),$(findstring --create-groups,$(GENERATE_ARGS)))),1,0) python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
-	"$(SOURCE_ENV_DIR)/env.auto.tfvars" $(if $(DEST_ENV),"$(DEST_ENV_DIR)/env.auto.tfvars",)
-override _PROMOTE_TO_PLACEHOLDER_GUARD = python3 "$(SHARED_ROOT)/genie_space_placeholder.py" \
-	$(if $(_PROMOTE_TO_FROM),"$(CLOUD_ROOT)/envs/$(_PROMOTE_TO_FROM)/env.auto.tfvars",) "$(ENV_DIR)/env.auto.tfvars"
+	"$(SOURCE_ENV_DIR)/env.auto.tfvars"$(if $(DEST_ENV), && GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(DEST_ENV_DIR)/env.auto.tfvars",)
+override _PROMOTE_TO_PLACEHOLDER_GUARD = $(if $(_PROMOTE_TO_FROM),python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(CLOUD_ROOT)/envs/$(_PROMOTE_TO_FROM)/env.auto.tfvars" && ,) \
+	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars"
 
 _guard-genie-placeholder:
 	@$(_GENIE_PLACEHOLDER_GUARD)
@@ -327,7 +329,8 @@ _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
 setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@echo "=== Setup ($(ENV)) ==="
-	@python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
+	@allow=0; [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)" 2>/dev/null)" = promoted ] && allow=1; \
+	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$$allow python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
 	@gov_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 	role="$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" || exit 1; \
 	if python3 -c 'import sys,hcl2; c=hcl2.load(open(sys.argv[1])); raise SystemExit(0 if any(str(g).startswith("<") for g in c.get("access_tier_groups",[])) else 1)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then gov_only=0; fi; \
@@ -368,7 +371,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)"; \
 		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + $(ENV) workspace host & id"; \
 		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
-		if [ "$$det" = 1 ]; then echo "     Replace this env's access_tier_groups placeholders with $(ENV) IdP groups, most to least privileged."; fi; \
+		if [ "$$det" = 1 ]; then echo "     Where $(ENV)'s group names differ from $$src's, set group_map there (each $$src group = its $(ENV) group): promote-to writes this env's access_tier_groups from $$src's through it, so leave those placeholders."; fi; \
 		echo "  3. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
 		echo "  4. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \

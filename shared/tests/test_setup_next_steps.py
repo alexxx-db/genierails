@@ -258,6 +258,21 @@ def test_setup_stg_promoted_uses_the_promotion_banner_without_overwrite_or_rehea
     assert "cp ../shared/examples/dev_to_prod/env.auto.tfvars.example envs/stg/env.auto.tfvars" not in out
 
 
+@pytest.mark.parametrize("env", ["prod", "stg"])
+def test_setup_promoted_env_says_set_group_map_and_keeps_the_tier_placeholders(env, tmp_path):
+    """promote-to writes a promoted env's tiers from its source's through group_map."""
+    result = _make("aws", tmp_path, "setup", f"ENV={env}")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert (f"     Where {env}'s group names differ from dev's, set group_map there (each dev group = its {env} "
+            "group): promote-to writes this env's access_tier_groups from dev's through it, so leave those "
+            "placeholders.\n") in out, out
+    assert "Replace this env's access_tier_groups placeholders" not in out
+    assert "access_tier_groups placeholder" not in out  # no "Setup required" advice to replace them
+    cfg = hcl2.loads((tmp_path / "aws" / "envs" / env / "env.auto.tfvars").read_text())
+    assert cfg["access_tier_groups"] == ["<most-privileged-group>", "<least-privileged-group>"]
+
+
 def test_setup_stg_without_promote_from_uses_the_rehearsal_banner(tmp_path):
     env = tmp_path / "aws/envs/stg"
     env.mkdir(parents=True)
