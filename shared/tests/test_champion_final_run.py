@@ -784,7 +784,9 @@ def test_combined_apply_never_skips_data_access_before_workspace_can_run():
 def test_no_saved_plan_file_is_written_by_the_product():
     # A saved plan embeds prior state, which may still hold the legacy secret.
     # The exceptions are make release-plan and make account-plan (deterministic
-    # envs only), whose plans go to owner-only manifest dirs (release_gate.py).
+    # envs only), whose plans go to owner-only manifest dirs (release_gate.py),
+    # plus the account apply's temporary owner-only plan that is immediately
+    # checked for tag-policy deletions and applied, then removed by the EXIT trap.
     tf_out = r"(?<![-\w])-out[= ]\S*"  # Terraform's -out, not a script's --out
     assert not re.findall(tf_out, (SHARED / "scripts/terraform_layer.sh").read_text())
     makefile = (SHARED / "Makefile.shared").read_text()
@@ -792,12 +794,21 @@ def test_no_saved_plan_file_is_written_by_the_product():
     roots = roots[:roots.index("\n\n")]
     account_plan = makefile[makefile.index("\naccount-plan:"):]
     account_plan = account_plan[:account_plan.index("\n\n")]
-    allowed = re.findall(tf_out, account_plan) + re.findall(tf_out, roots)
+    apply_layer = makefile[makefile.index("\n_apply-layer:"):]
+    apply_layer = apply_layer[:apply_layer.index("\n\n")]
+    account_apply = apply_layer[apply_layer.index('elif [ "$$layer" = "account" ]; then'):]
+    account_apply = account_apply[:account_apply.index('elif [ "$$staged" = 1 ]; then')]
+    allowed = re.findall(tf_out, account_plan) + re.findall(tf_out, roots) + re.findall(tf_out, account_apply)
     assert re.findall(tf_out, makefile) == allowed
     assert re.findall(tf_out, roots) == ['-out="$$plan_dir/account.tfplan"',
                                          '-out="$$plan_dir/workspace.tfplan";']
     assert re.findall(tf_out, account_plan) == ['-out="$$plan_dir/account.tfplan";']
     assert "account-plan-dir" in account_plan
+    assert re.findall(tf_out, account_apply) == ['-out="$$account_plan_dir/account.tfplan"']
+    assert 'account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"' in account_apply
+    assert 'trap \'rm -rf "$$account_plan_dir"\' EXIT' in account_apply
+    assert "tag-policy-delete-guard" in account_apply
+    assert 'apply-plan -parallelism=1 "$$account_plan_dir/account.tfplan"' in account_apply
 
 
 @pytest.mark.parametrize("line, saved", [
@@ -815,6 +826,19 @@ def test_saved_plan_check_flags_terraform_out_but_not_a_script_out(monkeypatch, 
         with pytest.raises(AssertionError):
             test_no_saved_plan_file_is_written_by_the_product()
     else:
+        test_no_saved_plan_file_is_written_by_the_product()
+
+
+def test_saved_plan_check_flags_unexpected_makefile_terraform_out(monkeypatch, tmp_path):
+    layer = tmp_path / "scripts/terraform_layer.sh"
+    layer.parent.mkdir()
+    layer.write_text((SHARED / "scripts/terraform_layer.sh").read_text())
+    (tmp_path / "Makefile.shared").write_text(
+        (SHARED / "Makefile.shared").read_text()
+        + "\nleaky-plan:\n\tterraform plan -out=leaked.tfplan\n\n"
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SHARED", tmp_path)
+    with pytest.raises(AssertionError):
         test_no_saved_plan_file_is_written_by_the_product()
 
 

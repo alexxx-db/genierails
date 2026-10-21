@@ -78,7 +78,7 @@ def run(tmp_path, envs, target, env, *extra, stub_make=True):
 
 def applied(calls) -> list:
     """Calls that would apply something (anything past the bootstrap prerequisites)."""
-    boot = {"_guard-root", "_prepare-env", "_guard-genie-placeholder"}
+    boot = {"_guard-root", "_prepare-env", "_guard-genie-placeholder", "_bootstrap"}
     return [c for c in calls if not (c[0] == "make" and boot & set(c))]
 
 
