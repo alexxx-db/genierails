@@ -22,6 +22,7 @@ from tests.terraform_helpers import skip_if_providers_unavailable as _skip_if_pr
 from tests.terraform_helpers import tf as _tf  # noqa: E402
 import generate_abac
 from scripts import policy_generations as pg  # noqa: E402
+from tests.test_ci_apply_guard import APPLYING_TARGETS  # noqa: E402
 
 SHARED = Path(__file__).parents[1]
 MODULE_TF = SHARED / "modules/data_access/main.tf"
@@ -787,22 +788,56 @@ def _recipe(makefile: str, target: str) -> str:
     return body[: body.index("\n\n")]
 
 
+def _logical_makefile_lines(text: str) -> list[str]:
+    lines = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        lines.append((pending + line).strip())
+        pending = ""
+    if pending:
+        lines.append(pending.strip())
+    return lines
+
+
 def _assert_no_bootstrap_recipe_applies(makefile: str) -> None:
+    public_applying_targets = [
+        target for target in APPLYING_TARGETS if not target.startswith("_")
+    ]
+    public_apply_pattern = re.compile(
+        r"(?:\$\((?:MAKE)\)|\$\{(?:MAKE)\})"
+        r".*(?<![-\w])(?:"
+        + "|".join(re.escape(target) for target in public_applying_targets)
+        + r")(?![-\w])"
+    )
+    runner_apply_pattern = re.compile(
+        r"(?:ROOT_RUNNER|terraform_layer\.sh).*(?<![-\w])apply(?![-\w])"
+    )
     for target in ("_bootstrap", "_guarded-bootstrap"):
         recipe = _recipe(makefile, target)
-        assert "_apply-layer" not in recipe, f"{target} must not recurse into _apply-layer"
-        assert not re.search(r"\bterraform\s+apply\b", recipe), (
-            f"{target} must not run terraform apply"
-        )
-        assert not re.search(r"\bapply-plan\b", recipe), (
-            f"{target} must not run an apply-plan"
-        )
+        for line in _logical_makefile_lines(recipe):
+            assert "_apply-layer" not in line, f"{target} must not recurse into _apply-layer"
+            assert not re.search(r"\bterraform\s+apply\b", line), (
+                f"{target} must not run terraform apply"
+            )
+            assert not re.search(r"\bapply-plan\b", line), (
+                f"{target} must not run an apply-plan"
+            )
+            assert not runner_apply_pattern.search(line), (
+                f"{target} must not run ROOT_RUNNER/terraform_layer.sh apply: {line}"
+            )
+            assert not public_apply_pattern.search(line), (
+                f"{target} must not recurse into public apply target: {line}"
+            )
 
 
 def _assert_no_combined_bootstrap_apply_make_goals(makefile: str) -> None:
     recursive_lines = [
-        line.strip()
-        for line in makefile.splitlines()
+        line
+        for line in _logical_makefile_lines(makefile)
         if "$(MAKE)" in line or "$${MAKE}" in line
     ]
     for line in recursive_lines:
@@ -837,6 +872,8 @@ def test_makefile_bootstrap_recipes_cannot_hide_apply_side_doors():
     [
         ("_bootstrap", '\n\t@terraform apply -auto-approve'),
         ("_guarded-bootstrap", '\n\t@$(MAKE) --no-print-directory _apply-layer'),
+        ("_guarded-bootstrap", '\n\t@"$(ROOT_RUNNER)" account "$(ENV)" apply'),
+        ("_bootstrap", '\n\t@$(MAKE) --no-print-directory apply-account'),
     ],
 )
 def test_makefile_bootstrap_recipe_scan_flags_deliberate_apply_break(target, injected):
@@ -852,6 +889,17 @@ def test_makefile_combined_bootstrap_apply_goal_scan_flags_deliberate_break():
     broken = makefile.replace(
         '@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
         '@$(MAKE) --no-print-directory _bootstrap _apply-layer ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_no_combined_bootstrap_apply_make_goals(broken)
+
+
+def test_makefile_combined_bootstrap_apply_goal_scan_flags_backslash_break():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    broken = makefile.replace(
+        '@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
+        '@$(MAKE) --no-print-directory _bootstrap \\\n\t\t_apply-layer ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
     )
 
     with pytest.raises(AssertionError):
