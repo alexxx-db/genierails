@@ -349,6 +349,19 @@ exec /bin/rm "$@"
     assert "contains credentials" in result.stderr and "delete it" in result.stderr
 
 
+def test_apply_account_keeps_saved_plan_when_receipt_write_fails(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    plan = manifest.parent / "account.tfplan"
+    receipt_dir = rg.env_state(repo.cloud, "account") / "receipts" / "account"
+    receipt_dir.parent.mkdir(parents=True, exist_ok=True)
+    receipt_dir.write_text("blocks the receipt directory")
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode != 0
+    assert plan.exists()
+    assert not rg.account_receipts(repo.cloud, "account")
+
+
 def test_account_plan_refuses_dirty_checkout_before_planning(make, repo):
     (repo.cloud / "envs" / "account" / "env.auto.tfvars").write_text("manage_groups = false\n# local\n")
     result = make("account-plan", "account")
