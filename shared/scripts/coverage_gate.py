@@ -26,7 +26,10 @@
      policy journal moving from that generation and a snapshot that matches
      its fingerprint (and, for a legacy one, an adopted migration record), the
      mismatch fails as before. The result records the generation kept
-     (kept_from) and the governed columns the phase leaves untagged.
+     (kept_from) and the governed columns the phase leaves untagged. A first
+     deploy keeps nothing (kept_from empty), so its create render, which tags
+     no column yet, is validated against the treatment tags its switch
+     applies (pending_treatments) rather than as a vacuous pass.
   5. Ask Terraform for the fingerprint again and write the result to
      envs/<env>/$DATA_ACCESS_SUBDIR/.coverage_gate.json (data_access by default).
 
@@ -369,6 +372,12 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
       grant create (pg.plan_violations), so a column the refresh governs but
       the render doesn't tag (a new column before the switch) gains no
       reader through them.
+
+    A first deploy has no active generation (``old_fingerprint`` empty): its
+    create (or abandon) keeps no column tagged, which the journal must
+    record as a transition from nothing (first_deploy). Every governed
+    column is then uncovered in that phase, so a phase that opens access
+    refuses as above.
     """
     if str(SHARED_ROOT) not in sys.path:
         sys.path.insert(0, str(SHARED_ROOT))
@@ -379,17 +388,22 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
 
     if stage not in pg.KEEP_TAG_STAGES:
         raise GateError(f"the {stage} phase applies the desired values")
-    if not old_fingerprint:
-        raise GateError("no active generation is recorded for the phase to keep")
     try:
         journal = spa.load_journal(env_dir) or {}
-        snapshot = pg.load_snapshot(env_dir, old_fingerprint)
+        snapshot = pg.load_snapshot(env_dir, old_fingerprint) if old_fingerprint else None
         generation = pg.desired_generation(env_dir)
     except (spa.Refused, pg.StageError, OSError, ValueError) as exc:
         raise GateError(str(exc)) from exc
     target = generation["fingerprint"]
     transition = journal.get("transition") or {}
-    if journal.get("active") != old_fingerprint or transition.get("from") != old_fingerprint:
+    if not old_fingerprint:
+        if not first_deploy(journal, stage, target):
+            raise GateError("no active generation is recorded for the phase to keep, and the policy journal "
+                            f"records no first deploy of {target}")
+        if rebind_fingerprint:
+            raise GateError("a first deploy has no restore to re-point")
+        snapshot = {"tags": {}}
+    elif journal.get("active") != old_fingerprint or transition.get("from") != old_fingerprint:
         raise GateError(f"the policy journal records no transition from {old_fingerprint}")
     if rebind_fingerprint:
         if stage != "restore":
@@ -413,7 +427,7 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
                             f"principals moved: {'; '.join(problems[:3])}")
     elif stage != "abandon" and transition.get("to") != target:
         raise GateError(f"the policy journal records no transition from {old_fingerprint} to {target}")
-    if not pg.snapshot_intact(snapshot, old_fingerprint):
+    if old_fingerprint and not pg.snapshot_intact(snapshot, old_fingerprint):
         raise GateError(f"the snapshot of {old_fingerprint} doesn't match its fingerprint (edited since it was "
                         "recorded)")
 
@@ -432,6 +446,41 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
                         f"({', '.join(uncovered[:5])}), and this phase opens access; the refresh's columns must "
                         "all be covered")
     return desired, staged, {"kept_from": old_fingerprint, "uncovered_columns": uncovered}
+
+
+def first_deploy(journal: dict, stage: str, target: str) -> bool:
+    """Whether the journal records a first deploy of ``target`` that ``stage`` belongs to.
+
+    Nothing is active and the transition starts from nothing (the controller
+    found no live deterministic policy or treatment tag), and, but for
+    abandon, ends at the effective config's generation.
+    """
+    transition = (journal or {}).get("transition") or {}
+    return (not (journal or {}).get("active") and bool(transition) and not transition.get("from")
+            and (stage == "abandon" or transition.get("to") == target))
+
+
+def pending_treatments(env_dir: Path, staged: dict | None) -> list | None:
+    """The treatment tags a first deploy's create render is checked against, else None.
+
+    That render holds the generation's policies and functions but tags no
+    column (policy_generations.plan_stage: nothing is live to keep), so
+    checking its own tags would find nothing to cover ("vacuous") and report
+    every classified column as unprotected. It is checked instead against the
+    treatment tags the live refresh recorded, which its switch applies: every
+    column the switch will tag must have this render's policy and function,
+    and the untagged-column check runs as it will at the switch. The phase
+    opens no access (new SELECT and USE wait for grant, which checks the
+    switch's render).
+    """
+    if not staged or staged.get("stage") != "create" or staged.get("old_fingerprint") \
+            or staged.get("rebind_fingerprint") or staged.get("opens_access"):
+        return None
+    try:
+        desired, _, _ = staged_generation_assignments(env_dir, "create", "", bool(staged.get("keep_new_tags")))
+    except GateError:
+        return None
+    return [item for item in desired if _is_treatment(item)]
 
 
 def staged_kept_assignments(env_dir: Path, stage: str, old_fingerprint: str, keep_new_tags: bool = False,
@@ -505,7 +554,8 @@ def _live_refresh(env_dir: Path, tfvars: Path, staged: dict | None = None) -> tu
         if legacy:
             return refreshed_at, f"{mode}; {stage} keeps legacy generation {old}'s values", {}
         uncovered = facts["uncovered_columns"]
-        detail = f"{mode}; {stage} keeps generation {old}'s values (kept_from {old})"
+        detail = (f"{mode}; {stage} keeps generation {old}'s values (kept_from {old})" if old else
+                  f"{mode}; {stage} of a first deploy keeps no column tagged")
         if uncovered:
             detail += (f"; {len(uncovered)} column(s) the live refresh governs stay untagged in this phase, which "
                        f"opens no access ({', '.join(uncovered[:5])})")
@@ -787,6 +837,14 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
             "acknowledge_file": str(env_dir / "env.auto.tfvars"),
         }, handle)
         context = Path(handle.name)
+    pending = pending_treatments(env_dir, staged)
+    pending_file = None
+    if pending is not None:
+        print(f"  First deploy: the create phase tags no column yet; its policies and functions are checked "
+              f"against the {len(pending)} treatment tag(s) its switch applies")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(pending, handle)
+            pending_file = Path(handle.name)
     try:
         command = [
             sys.executable, str(VALIDATOR), "--coverage-gate", str(tfvars),
@@ -795,6 +853,8 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
             "--exposure-context", str(context),
             "--summary-label", f"coverage check (data_access:{env_name})",
         ]
+        if pending_file:
+            command += ["--pending-treatments", str(pending_file)]
         if verbose:
             command.append("--verbose")
         sys.stdout.flush()
@@ -804,6 +864,8 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
             return _failed(gate_path, record, inputs, env_name, str(exc))
     finally:
         context.unlink(missing_ok=True)
+        if pending_file:
+            pending_file.unlink(missing_ok=True)
 
     after = query_inputs(runner, env_name, layer_dir, flags, config_dir)
     if after["fingerprint"] != inputs["fingerprint"]:

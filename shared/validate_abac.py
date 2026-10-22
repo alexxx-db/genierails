@@ -1490,6 +1490,14 @@ def main():
              "detection with industry-specific identifier patterns. "
              "See shared/industries/.",
     )
+    parser.add_argument(
+        "--pending-treatments",
+        metavar="PATH",
+        help="With --coverage-gate: a JSON list of treatment tag assignments a staged render doesn't "
+             "carry yet (a first deploy's create, scripts/coverage_gate.py pending_treatments); they "
+             "replace its treatment tags, so its policies and functions are checked against the tags "
+             "its switch applies",
+    )
     parser.add_argument("--env-name", default="",
                         help="With --coverage-gate: name the env so a gap prints its fix commands.")
     parser.add_argument("--summary-label", default="",
@@ -1543,6 +1551,21 @@ def main():
         result.error(f"Failed to parse {tfvars_path}: {e}")
         result.print_report(args.summary_label, args.verbose)
         sys.exit(1)
+
+    if args.pending_treatments:
+        try:
+            pending = json.loads(Path(args.pending_treatments).read_text())
+            if not isinstance(pending, list):
+                raise ValueError("not a list")
+        except (OSError, ValueError) as e:
+            result.error(f"COVERAGE CHECK — unreadable pending treatments {args.pending_treatments}: {e}")
+            result.print_report(args.summary_label, args.verbose)
+            sys.exit(1)
+        tag_key = load_treatment_config().tag_key
+        cfg["tag_assignments"] = [
+            item for item in cfg.get("tag_assignments") or []
+            if not (item.get("entity_type") == "columns" and item.get("tag_key") == tag_key)
+        ] + pending
 
     # --- Parse SQL (optional) ---
     sql_functions: set[str] | None = None

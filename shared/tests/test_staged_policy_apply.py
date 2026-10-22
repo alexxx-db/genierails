@@ -52,8 +52,22 @@ DROP = ("terraform_data", "masking_functions_drop")
 WAIT = ("time_sleep", "wait_for_policy_enforcement")
 # Replaced, never updated in place (triggers_replace / triggers).
 REPLACED = {FUNCTIONS, WAIT}
-# Stages whose plans withhold new table SELECT (roots/data_access withhold_new_table_grants).
-WITHHOLD = {"create", "tighten", "switch", "restore", "retire", "abandon", "rebind"}
+
+
+def withholding_stages(local):
+    """The stages roots/data_access/main.tf lists in ``local`` (read from the real root)."""
+    text = open("@ROOT_MAIN@").read()
+    match = re.search(r"\n  " + local + r' = var\.governance_mode == "deterministic" && contains\(\[([^\]]*)\]', text)
+    return set(re.findall(r'"([a-z-]+)"', match.group(1))) if match else set()
+
+
+# Stages whose plans withhold new table SELECT, and new USE_CATALOG/USE_SCHEMA (the root's
+# withhold_new_table_grants and withhold_new_use_grants). FAKE_TF_NO_WITHHOLD_USE=1 plans USE
+# grants in every stage, as a root without withhold_new_use_grants (main before it) did.
+WITHHOLD = withholding_stages("withhold_new_table_grants")
+WITHHOLD_USE = set() if os.environ.get("FAKE_TF_NO_WITHHOLD_USE") == "1" else withholding_stages(
+    "withhold_new_use_grants")
+USE_GRANTS = ("catalog_access", "schema_access")
 # Optional: grants, the function redeploy and the enforcement wait. "gone" lists
 # "<resource>|<key>" grants the state records but Unity Catalog no longer has
 # (a deleted principal): Terraform's refresh drops them before planning.
@@ -132,10 +146,13 @@ def access_wanted(state, stage, masks):
     held = set(json.loads(var("held_access_grants") or "[]")) if stage == "rebind" else set()
     kept = set(json.loads(var("rebind_table_grants") or "[]")) if stage == "rebind" else set()
     applied = set(instances(state, ("databricks_grant", "table_access"))) | kept  # pre-refresh, like the root
+    applied_use = {f"{name}|{key}" for name in USE_GRANTS for key in instances(state, ("databricks_grant", name))}
     want = {}
     for entry in access["grants"]:
         name, key = entry.split("|", 1)
         if entry in held or (name == "table_access" and stage in WITHHOLD and key not in applied):
+            continue
+        if name in USE_GRANTS and stage in WITHHOLD_USE and entry not in applied_use:
             continue
         want.setdefault(("databricks_grant", name), {})[key] = {"principal": key.rsplit("|", 1)[-1]}
     sql = open(os.path.join(config_dir, "masking_functions.sql")).read()
@@ -209,7 +226,7 @@ elif command == "apply-plan":
     sys.exit(1 if fail else 0)
 else:
     sys.exit(f"unsupported {command}")
-'''
+'''.replace("@ROOT_MAIN@", str(SHARED / "roots" / "data_access" / "main.tf"))
 
 
 # -- the env -------------------------------------------------------------------
@@ -358,6 +375,7 @@ class Harness:
         self.agent_coverage_rc = 0
         monkeypatch.delenv("FAKE_TF_FAIL_APPLY", raising=False)
         monkeypatch.delenv("FAKE_TF_FAIL_PLAN", raising=False)
+        monkeypatch.delenv("FAKE_TF_NO_WITHHOLD_USE", raising=False)
 
     def controller(self) -> spa.Controller:
         return spa.Controller(self.env_dir, "dev", hook_dir=Path("/hooks"), verify_access_cmd="simulated",

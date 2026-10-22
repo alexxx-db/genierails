@@ -20,6 +20,11 @@ output "classification_auto_tag_configs" {
   }
 }
 
+output "catalog_grant_resource_keys" {
+  description = "Instantiated catalog grant resource keys."
+  value       = keys(databricks_grant.catalog_access)
+}
+
 output "schema_grant_resource_keys" {
   description = "Instantiated schema grant resource keys."
   value       = keys(databricks_grant.schema_access)
