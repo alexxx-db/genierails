@@ -27,7 +27,7 @@ So "expose last" isn't a policy you hope holds — there is simply no new or wid
 
 (So the `data_access` Terraform layer covers both *access* and *masking*; the `workspace` layer is the agent itself.)
 
-**One mask per column.** The single enforcement key is **`gr_treatment`** — GenieRails derives exactly **one** value per column from its `class.*` tags (strictest tag wins; a free-text column with multiple tags escalates to full redaction), so Unity Catalog's "only one mask may apply per column" rule is never violated.
+**One mask per column.** The single enforcement key is **`gr_treatment`** — GenieRails derives exactly **one** value per column from its `class.*` tags (strictest tag wins; a column whose tags need different partial formats, such as a free-text note tagged email, name and phone, is fully redacted), so Unity Catalog's "only one mask may apply per column" rule is never violated.
 
 **Why prod keeps the classifier's tags.** The Terraform resource that records tag assignments carries `ignore_changes = all` — a standard Terraform *lifecycle* setting meaning "once these exist, don't change or delete them." That lets the **classifier own the `class.*` tags** in prod: when a scan writes a tag, Terraform leaves it alone instead of reverting it. The classifier owns the tags; GenieRails owns the rules.
 

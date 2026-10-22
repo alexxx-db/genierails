@@ -292,6 +292,24 @@ def test_pass_records_terraforms_fingerprint_and_first_exposure(env_dir, stub_ru
     assert calls == [f"{env_dir / 'data_access'}|data_access prod console -var=business_access_enabled=true"] * 2
 
 
+def test_the_validator_gets_the_live_refreshs_column_classes(env_dir, stub_runner, stub_validator):
+    classes = {"cat.sch.notes.free_text": ["phone_number", "email_address"]}
+    cg.write_refresh_record(env_dir / cg.REFRESH_RELPATH, mode="full", ddl_path=env_dir / "ddl" / "_fetched.sql",
+                            config_path=env_dir / "data_access" / "abac.auto.tfvars", column_classes=classes)
+    assert cg.refresh_column_classes(env_dir) == {"cat.sch.notes.free_text": ["email_address", "phone_number"]}
+    runner, _log = stub_runner(_inputs())
+    record = stub_validator(0)
+    assert cg.run_gate(env_dir, "prod", runner, "", False) == 0
+    assert json.loads(record.read_text())["context"]["column_classes"] == {
+        "cat.sch.notes.free_text": ["email_address", "phone_number"]}
+    # No classes recorded (a ddl-only refresh, or an unreadable record): none passed.
+    _record_refresh(env_dir)
+    assert cg.run_gate(env_dir, "prod", runner, "", False) == 0
+    assert json.loads(record.read_text())["context"]["column_classes"] == {}
+    (env_dir / cg.REFRESH_RELPATH).write_text("{truncated")
+    assert cg.refresh_column_classes(env_dir) == {}
+
+
 def test_validation_failure_records_a_failed_gate(env_dir, stub_runner, stub_validator):
     runner, _log = stub_runner(_inputs())
     stub_validator(1)

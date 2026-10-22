@@ -1024,7 +1024,7 @@ def test_derive_out_dir_never_rewrites_committed_files(repo, monkeypatch):
     before = committed.read_text()
     seen = {}
 
-    def fake(config, auth, env, ddl_out=None, *, record_governed=True):
+    def fake(config, auth, env, ddl_out=None, *, record_governed=True, classes_out=None):
         seen.update(config=config, record_governed=record_governed)
         config.write_text(config.read_text() + "# derived from live tags\n")
         return 1

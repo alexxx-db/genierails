@@ -54,7 +54,7 @@ Governed set = top-level `uc_tables` ∪ tables of configured agents ∪ tables 
 
 For each table in the set:
 
-1. **Treatment per column** from its `class.*` tag through the mask library (section 2). Several classes on one column: the strictest treatment wins (protection order, section 6).
+1. **Treatment per column** from its `class.*` tag through the mask library (section 2). Several classes on one column: the strictest treatment wins (protection order, section 6). A string column whose classes keep different partial treatments (a free-text note tagged email, name and phone) gets `redact`, because no one partial format fits all of them, and no `column_overrides` or `treatment_versions` entry can give it a partial version. The coverage check reads the live `class.*` tags the live refresh recorded and blocks such a column unless it is `redact` or never raw.
 2. **One policy per catalog, treatment and masked tier** (section 3), using a fixed, caller-independent function.
 3. **Row filters** only where declared (section 4).
 4. **Coverage check:** every `class.*` tag needs a mapping (section 6).

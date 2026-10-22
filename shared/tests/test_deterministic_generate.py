@@ -222,6 +222,32 @@ def test_rerun_over_a_reviewed_draft_keeps_its_rules_and_is_stable(env_dir, monk
     assert (generated / "abac.auto.tfvars").read_text() == first
 
 
+def test_a_free_text_column_with_several_partial_classes_is_redacted_and_marked(env_dir, monkeypatch):
+    ddl = DDL.replace("  date_of_birth DATE\n);", "  date_of_birth DATE,\n  notes STRING\n);")
+    rows = TAG_ROWS + [("dev_fin", "payments", "customers", "notes", f"class.{name}", "")
+                       for name in ("email_address", "name", "phone_number")]
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_databricks",
+                        lambda refs, cfg: (ddl, [("dev_fin", "payments")]))
+    monkeypatch.setattr(generate_abac, "_fetch_live_classification_source",
+                        lambda *a, **k: ClassificationSource(tag_rows=rows))
+    _reviewed_draft(env_dir)
+
+    _generate(env_dir, monkeypatch)
+
+    tfvars = env_dir / "generated/abac.auto.tfvars"
+    first = tfvars.read_text()
+    values = {a["entity_name"]: a["tag_value"] for a in _treatments(hcl2.loads(first))}
+    assert values["dev_fin.payments.customers.notes"].startswith("redact__string__")
+    assert values["dev_fin.payments.customers.email"].startswith("email_partial__string__")
+    marker = ("# gr.classification_mixed_partial: dev_fin.payments.customers.notes"
+              "|email_partial,name_partial,phone_partial")
+    assert first.splitlines().count(marker) == 1
+    assert "classification_mixed_partial" not in first.replace(marker, "")
+
+    _generate(env_dir, monkeypatch)
+    assert tfvars.read_text() == first
+
+
 def test_dry_run_builds_no_prompt(env_dir, monkeypatch, capfd):
     with pytest.raises(SystemExit) as exc:
         _generate(env_dir, monkeypatch, "--dry-run")

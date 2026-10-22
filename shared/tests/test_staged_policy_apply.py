@@ -584,6 +584,31 @@ def test_treatment_change_creates_verifies_switches_verifies_and_keeps_the_old_g
                                    "superseded_by": journal["history"][-1]["run_id"]}]
 
 
+def test_a_mixed_free_text_column_moves_from_phone_partial_to_redact_without_dropping_live_masks(harness):
+    # Released before the fix: the alphabetical tie-break gave the note
+    # phone_partial (the same value a phone-only column gets).
+    old = released(harness, columns=("free_text",), classes=("phone_number",))
+    assert {v.split("__")[0] for v in old["tags"].values()} == {"phone_partial"}
+    old_functions = set(live_state(harness.env_dir)["functions"])
+    new = write_env(harness.env_dir, columns=("free_text",), classes=("email_address", "name", "phone_number"))
+    assert {v.split("__")[0] for v in new_value(old, new)} == {"redact"}
+    assert harness.apply() == 0
+    assert harness.calls == ["create", "inventory:create/restore", "verify-access:create",
+                             "switch", "inventory:switch", "verify-access:switch", "grant"]
+    # Nothing is dropped while either generation is live.
+    state = live_state(harness.env_dir)
+    assert harness.dropped == [] and old_functions <= set(state["functions"])
+    assert live_tags(state) == new["tags"]
+    assert harness.controller().confirm() == 0
+    harness.calls.clear()
+    assert harness.apply() == 0
+    assert "drop-functions" in harness.calls
+    # Only phone_partial's functions go, after a later confirmed release.
+    dropped = {f.rsplit(".", 1)[-1] for f in harness.dropped}
+    assert dropped and {f.split("__")[0] for f in dropped} == {"gr_mask_phone_partial"}
+    assert not dropped & {p["function_name"] for p in new["fgac_policies"]}
+
+
 def test_old_generation_retires_only_after_a_later_confirmed_release(harness):
     old = released(harness)
     new = write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
