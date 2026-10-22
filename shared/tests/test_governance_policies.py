@@ -206,6 +206,63 @@ def test_coverage_check_accepts_a_deterministic_model_and_still_blocks_gaps():
     assert any("missing a masking function" in error for error in missing.errors)
 
 
+NOTES = "cat.sch.notes.free_text"
+
+
+def _functions(model):
+    return {line.split("(", 1)[0].rsplit(" ", 1)[1]
+            for line in model.functions_sql.splitlines() if line.startswith("CREATE")}
+
+
+@pytest.mark.parametrize("classes", [
+    ["email_address", "name", "phone_number"], ["class.phone_number", "class.name", "class.email_address"],
+])
+def test_a_free_text_column_mixing_partial_classes_is_redacted_for_every_masked_tier(classes):
+    item = resolve_column(NOTES, classes, "STRING")
+    assert (item.treatment, item.partial, item.full, item.never_raw) == ("redact", "redacted", "redacted", False)
+    model = _model({NOTES: classes})
+    (value,) = model.tag_values
+    assert base_treatment(value) == "redact"
+    assert {p["function_name"] for p in model.fgac_policies} == {f"gr_mask_{value}_partial", f"gr_mask_{value}_full"}
+    # The partial tier sees [REDACTED], never a last-4 of the note.
+    assert "last4" not in item.partial_sql and "right(" not in item.partial_sql
+    assert item.partial_sql == item.full_sql
+    assert model.mixed_partial == [(NOTES, ["email_partial", "name_partial", "phone_partial"])]
+
+
+def test_mixed_partial_is_recorded_only_for_unreviewed_mixed_columns():
+    model = _model({NOTES: ["email_address", "phone_number"], "cat.sch.t.email": ["email_address"],
+                    "cat.sch.t.acct": ["bank_number", "iban_code"], "cat.sch.t.pin": ["email_address", "card_pin"]})
+    assert model.mixed_partial == [(NOTES, ["email_partial", "phone_partial"])]
+    assert base_treatment(model.columns["cat.sch.t.acct"].value) == "account_last4"
+    assert model.columns["cat.sch.t.pin"].never_raw
+    # A column_overrides entry is a reviewed decision for that one column.
+    reviewed = _model({NOTES: ["email_address", "phone_number"]},
+                      column_overrides={NOTES: {"treatment": "phone_partial"}})
+    assert reviewed.mixed_partial == [] and base_treatment(reviewed.tag_values[0]) == "phone_partial"
+
+
+def test_coverage_check_blocks_a_mixed_column_that_keeps_a_partial_treatment():
+    mixed = _model({NOTES: ["email_address", "name", "phone_number"]})
+    marker = f"# gr.classification_mixed_partial: {NOTES}|email_partial,name_partial,phone_partial\n"
+    good = ValidationResult()
+    validate_coverage_gate(apply_model({}, mixed), _functions(mixed), marker, good)
+    assert good.errors == []
+    # The pre-fix output: the alphabetical tie-break gave the note phone_partial.
+    leaky = _model({NOTES: ["phone_number"]})
+    bad = ValidationResult()
+    validate_coverage_gate(apply_model({}, leaky), _functions(leaky), marker, bad)
+    (error,) = bad.errors
+    assert "multi-class columns keeping a partial treatment" in error
+    assert NOTES in error and leaky.tag_values[0] in error and "expected redact" in error
+    # Never-raw and redacted treatments keep no partial version.
+    for classes in (["email_address", "name", "phone_number", "card_pin"], ["email_address", "us_ssn"]):
+        strict = _model({NOTES: classes})
+        result = ValidationResult()
+        validate_coverage_gate(apply_model({}, strict), _functions(strict), marker, result)
+        assert result.errors == [], classes
+
+
 ROOT = Path(__file__).resolve().parents[2]
 
 

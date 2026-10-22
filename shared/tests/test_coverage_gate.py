@@ -174,6 +174,41 @@ def test_coverage_gate_groups_unmapped_native_classification():
     assert "cat.sch.people.biometric" in result.errors[0]
 
 
+def _deterministic_gate(tmp_path, model):
+    """The coverage check over the tfvars write_deterministic_model writes for ``model``."""
+    import hcl2
+
+    tfvars = tmp_path / "abac.auto.tfvars"
+    tfvars.write_text("tag_assignments = []\nfgac_policies = []\n")
+    generate_abac.write_deterministic_model(tfvars, None, model)
+    functions = {line.split("(", 1)[0].rsplit(" ", 1)[1]
+                 for line in model.functions_sql.splitlines() if line.startswith("CREATE")}
+    result = ValidationResult()
+    validate_coverage_gate(hcl2.loads(tfvars.read_text()), functions, tfvars.read_text(), result)
+    return tfvars.read_text(), result
+
+
+def test_coverage_gate_blocks_a_multi_class_free_text_column_keeping_a_partial(tmp_path):
+    import dataclasses
+
+    from governance_policies import build_model
+
+    notes = "cat.sch.notes.free_text"
+    settings = {"access_tier_groups": ["raw", "regional", "masked"]}
+    model = build_model({notes: ["email_address", "name", "phone_number"]}, {notes: "STRING"}, settings,
+                        deployer_principal="deployer-sp")
+    text, passed = _deterministic_gate(tmp_path, model)
+    assert passed.errors == []
+    assert "# gr.classification_mixed_partial: cat.sch.notes.free_text|email_partial,name_partial,phone_partial" in text
+    # The same column given phone_partial, as the alphabetical tie-break did.
+    leaky = build_model({notes: ["phone_number"]}, {notes: "STRING"}, settings, deployer_principal="deployer-sp")
+    _text, failed = _deterministic_gate(tmp_path, dataclasses.replace(leaky, mixed_partial=model.mixed_partial))
+    (error,) = failed.errors
+    assert "multi-class columns keeping a partial treatment" in error
+    assert f"{notes} (classes keep email_partial, name_partial, phone_partial; gr_treatment phone_partial__string__" \
+        in error
+
+
 def test_coverage_gate_cli_exits_nonzero_for_classified_unprotected_column(tmp_path):
     tfvars = tmp_path / "abac.auto.tfvars"
     tfvars.write_text('''

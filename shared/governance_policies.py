@@ -30,10 +30,10 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deterministic_governance import NEVER_RAW_TREATMENTS
-from mask_library import load_library, resolve_class, sql_body, type_family, typed_body
+from mask_library import load_library, partial_treatments, resolve_class, sql_body, type_family, typed_body
 
 TAG_KEY = "gr_treatment"
 FAILSAFE_TREATMENT = "unmapped_redact"
@@ -43,6 +43,9 @@ TAG_POLICY_DESCRIPTION = (
 )
 SQL_MARKER = "-- === GenieRails deterministic mask library ==="
 UNMAPPED_MARKER = "# gr.classification_unmapped:"
+# A string column whose classes keep several different partial treatments;
+# the coverage check blocks it unless its gr_treatment has no partial version.
+MIXED_PARTIAL_MARKER = "# gr.classification_mixed_partial:"
 
 _VALUE_RE = re.compile(
     r"(?P<treatment>[a-z0-9_]+?)__(?P<type>[a-z0-9_]+)__(?P<generation>[0-9a-f]{8})"
@@ -424,6 +427,9 @@ class DeterministicModel:
     fgac_policies: list[dict]
     tag_values: list[str]
     functions_sql: str
+    # (column, its partial treatments) for every column without a
+    # column_overrides entry whose classes keep more than one.
+    mixed_partial: list[tuple[str, list[str]]] = field(default_factory=list)
 
 
 def normalize_column_overrides(
@@ -489,6 +495,7 @@ def build_model(
     known = {name for item in library["treatments"].values() for name in item["classes"]}
     columns: dict[str, ColumnTreatment] = {}
     unmapped: list[tuple[str, str]] = []
+    mixed_partial: list[tuple[str, list[str]]] = []
     missing_types = []
     for column in sorted(classes_by_column):
         classes = sorted({c.removeprefix("class.") for c in classes_by_column[column] if c})
@@ -502,6 +509,9 @@ def build_model(
             treatment_versions=settings.get("treatment_versions") or {},
             column_overrides=overrides,
         )
+        mixed = partial_treatments(classes, sql_type, library)
+        if len(mixed) > 1 and column.lower() not in overrides:
+            mixed_partial.append((column, sorted(mixed)))
     if missing_types:
         raise DeterministicGovernanceError(
             "no column type in the fetched DDL for classified column(s): " + ", ".join(missing_types)
@@ -526,6 +536,7 @@ def build_model(
         fgac_policies=policies,
         tag_values=sorted({item.value for item in columns.values()}),
         functions_sql=render_functions(columns),
+        mixed_partial=mixed_partial,
     )
 
 

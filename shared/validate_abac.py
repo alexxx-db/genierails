@@ -23,6 +23,7 @@ from tag_vocabulary import REGISTRY
 from governance_policies import (
     is_library_treatment_value, is_never_raw, parse_treatment_value,
 )
+from mask_library import load_library
 from treatment_derivation import load_treatment_config
 
 try:
@@ -551,6 +552,19 @@ def _check_unclassified_sensitive_columns(
         )
 
 
+def _keeps_partial_version(value: str) -> bool:
+    """Whether a deterministic string ``gr_treatment`` value has a partial (non-redacted) version."""
+    parsed = parse_treatment_value(value)
+    if not parsed or is_never_raw(value):
+        return False
+    item = load_library()["treatments"].get(parsed[0])
+    if item is None:
+        return True  # an adopted custom mask is its own partial version
+    if "STRING" not in item["types"]:
+        return False
+    return item.get("partial_by_type", {}).get("STRING", item.get("partial")) not in {"redacted", "null"}
+
+
 def validate_coverage_gate(
     cfg: dict,
     sql_functions: set[str] | None,
@@ -597,6 +611,20 @@ def validate_coverage_gate(
             re.MULTILINE,
         )
     ]
+    # A free-text column tagged email, name and phone has no partial version
+    # that is safe for all three (mask_library.resolve_class redacts it).
+    mixed_partial = []
+    for column, listed in re.findall(
+        r"^\s*#\s*gr\.classification_mixed_partial:\s*([^|\n]+)\|([^\n]+)$",
+        raw_tfvars,
+        re.MULTILINE,
+    ):
+        column, value = column.strip(), treatments.get(column.strip(), "")
+        if _keeps_partial_version(value):
+            mixed_partial.append(
+                f"{column} (classes keep {', '.join(listed.strip().split(','))}; "
+                f"gr_treatment {value} keeps a partial version; expected redact)"
+            )
     unprotected: list[str] = []
     missing_policies: set[str] = set()
     missing_functions: set[str] = set()
@@ -666,6 +694,7 @@ def validate_coverage_gate(
 
     groups = [
         ("detected tags with no mapping/rule", [f"{c} ({d})" for c, d in unmapped]),
+        ("multi-class columns keeping a partial treatment", mixed_partial),
         ("classified but unprotected columns", unprotected),
         ("treatments missing a column-mask policy", sorted(missing_policies)),
         ("treatments missing a masking function", sorted(missing_functions)),

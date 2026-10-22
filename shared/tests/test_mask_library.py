@@ -109,14 +109,38 @@ def test_strictest_wins():
 
 
 def test_strictest_wins_tie_break_is_order_independent():
-    # email (partial) and phone (last4) rank equally; the greater treatment name wins.
-    assert resolve_class(["email_address", "phone_number"], "STRING") == ("phone_partial", "last4", "redacted", False)
-    assert resolve_class(["phone_number", "email_address"], "STRING") == ("phone_partial", "last4", "redacted", False)
+    # email (partial) and phone (last4) keep different partial versions, and
+    # neither is safe for the other's values, so the column is redacted.
+    assert resolve_class(["email_address", "phone_number"], "STRING") == ("redact", "redacted", "redacted", False)
+    assert resolve_class(["phone_number", "email_address"], "STRING") == ("redact", "redacted", "redacted", False)
     # Two equally strong redacted treatments: still deterministic.
     assert resolve_class(["us_ssn", "passport"], "STRING")[0] == resolve_class(["passport", "us_ssn"], "STRING")[0] == "ssn"
     # A redacted never-raw treatment beats an equally strong ordinary one either way.
     assert resolve_class(["health_data", "card_pin"], "STRING")[0] == resolve_class(["card_pin", "health_data"], "STRING")[0] == "redact"
     assert resolve_class(["health_data", "card_pin"], "STRING")[3] is True
+
+
+@pytest.mark.parametrize("classes", [
+    ["email_address", "name", "phone_number"], ["phone_number", "name", "email_address"],
+    ["name", "email_address", "phone_number"], ["email_address", "ip_address"], ["credit_card", "phone_number"],
+])
+def test_a_column_mixing_partial_treatments_is_redacted(classes):
+    # A free-text note tagged email, name and phone: last4 of it would leak the
+    # note's length and its trailing characters (REFERENCE.md: escalates to full).
+    assert resolve_class(classes, "STRING") == ("redact", "redacted", "redacted", False)
+    assert resolve_class([f"class.{c}" for c in classes], "VARCHAR(200)")[:3] == ("redact", "redacted", "redacted")
+
+
+def test_mixing_partial_treatments_keeps_never_raw_and_one_partial_treatment_unchanged():
+    # Never-raw still wins and is still flagged, with or without several partials.
+    assert resolve_class(["email_address", "card_pin"], "STRING") == ("card_pin", "redacted", "redacted", True)
+    for classes in (["email_address", "name", "phone_number", "card_pin"],
+                    ["secret", "phone_number", "email_address"]):
+        assert resolve_class(classes, "STRING")[1:] == ("redacted", "redacted", True)
+    # One partial treatment for several classes keeps it.
+    assert resolve_class(["bank_number", "iban_code"], "STRING") == ("account_last4", "last4", "redacted", False)
+    # A redacted class already redacts; its treatment names the column as before.
+    assert resolve_class(["email_address", "us_ssn", "phone_number"], "STRING")[:3] == ("ssn", "redacted", "redacted")
 
 
 def test_unsupported_type_resolves_partial_to_full():

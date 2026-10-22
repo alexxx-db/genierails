@@ -2558,14 +2558,17 @@ def write_deterministic_model(tfvars_path: Path, sql_path: Path | None, model) -
     Every column mask and treatment fact is replaced; unmapped classes are
     recorded as ``gr.classification_unmapped`` markers, which the coverage
     check reports so they block new access while their column is redacted
-    for every tier by the fail-safe treatment.
+    for every tier by the fail-safe treatment. A column whose classes keep
+    several partial treatments gets a ``gr.classification_mixed_partial``
+    marker, so the coverage check blocks it if it ever keeps a partial version.
     """
     import hcl2
-    from governance_policies import UNMAPPED_MARKER, apply_model, replace_sql_library
+    from governance_policies import MIXED_PARTIAL_MARKER, UNMAPPED_MARKER, apply_model, replace_sql_library
 
     original = tfvars_path.read_text()
     updated_cfg = apply_model(hcl2.loads(original), model)
-    text = re.sub(rf"^\s*{re.escape(UNMAPPED_MARKER)}[^\n]*\n?", "", original, flags=re.MULTILINE)
+    text = re.sub(rf"^\s*(?:{re.escape(UNMAPPED_MARKER)}|{re.escape(MIXED_PARTIAL_MARKER)})[^\n]*\n?",
+                  "", original, flags=re.MULTILINE)
     for section, render in (
         ("tag_policies", _render_tag_policy_block),
         ("tag_assignments", _render_tag_assignment_block),
@@ -2576,6 +2579,8 @@ def write_deterministic_model(tfvars_path: Path, sql_path: Path | None, model) -
             text = text.rstrip() + f"\n\n{section} = [\n]\n"
         text = _replace_bracket_section(text, section, items)
     markers = [f"{UNMAPPED_MARKER} {column}|class.{semantic}" for column, semantic in model.unmapped]
+    markers += [f"{MIXED_PARTIAL_MARKER} {column}|{','.join(treatments)}"
+                for column, treatments in model.mixed_partial]
     if markers:
         text = "\n".join(markers) + "\n" + text
     changed = text != original

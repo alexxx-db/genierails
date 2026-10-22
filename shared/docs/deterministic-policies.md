@@ -18,6 +18,10 @@ Code: `governance_policies.py` (pure), `generate_abac.write_deterministic_model`
 ## What a governed column gets
 
 - The strictest of its classes through the mask library (`mask_library.json`).
+  A string column whose classes keep different partial treatments (a
+  free-text note tagged email, name and phone) gets `redact`, and a
+  `gr.classification_mixed_partial` marker makes the coverage check fail if
+  it ever keeps a partial version.
 - Any never-raw class (`card_security_code`, `card_pin`, `card_track_data`,
   `secret`) makes the column never raw.
 - Any class the library doesn't map makes it the fail-safe `unmapped_redact`:

@@ -27,7 +27,15 @@ of them gets the full version for every principal, including tier 1,
 `raw_exempt_principals` and the deployer SP, even when another class tag wins
 strictest-wins (`resolve_column_access` carries that flag into access). When several class tags occur on one column, the strongest
 partial treatment wins (`raw < partial < redacted/NULL`); a tie goes to the
-greater treatment name, so tag order never matters. Unsupported types receive
+greater treatment name, so tag order never matters. The exception is a string
+column whose classes keep two or more different partial treatments, such as a
+free-text note tagged `email_address`, `name` and `phone_number`: no one
+partial format is safe for all of them (a last-4 of the note leaks its length
+and its last characters), so the column gets `redact` and every masked tier
+sees `[REDACTED]`. The generated rules record such a column in a
+`gr.classification_mixed_partial` marker, and the coverage check fails if its
+`gr_treatment` still has a partial version. Several classes of one treatment
+(`bank_number` and `iban_code`) keep that treatment. Unsupported types receive
 the full version.
 
 No mask can fail a query. Numeric masks read the column only through

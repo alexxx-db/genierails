@@ -144,11 +144,28 @@ def resolve_class(classes: list[str], sql_type: str, library: dict | None = None
     """Resolve several class tags to (treatment, partial, full, never_raw).
 
     G17 strictest-wins: the strongest partial version wins; equal strength is
-    broken by the greatest treatment name so tag order never matters.
+    broken by the greatest treatment name so tag order never matters. A
+    string column whose classes keep two or more different partial
+    treatments (a free-text column tagged email, name and phone) has no
+    partial version that is safe for all of them, so it is redacted.
     """
     data = library or load_library()
+    candidates = _candidates(classes, sql_type, data)
+    if not candidates:
+        raise KeyError(f"no mask-library mapping for {classes!r}")
+    never_raw = any(candidate[1] in NEVER_RAW_TREATMENTS for candidate in candidates)
+    rank, treatment_name, partial, full = max(candidates)
+    if rank == _PARTIAL and len(partial_treatments(classes, sql_type, data)) > 1:
+        return "redact", "redacted", "redacted", never_raw
+    return treatment_name, partial, full, never_raw
+
+
+_PARTIAL, _REDACTED = 0, 1
+
+
+def _candidates(classes: list[str], sql_type: str, data: dict) -> list[tuple[int, str, str, str]]:
+    """(rank, treatment, partial, full) of every treatment mapping one of ``classes``."""
     family = type_family(sql_type)
-    order = {name: i for i, name in enumerate(data["protection_order"])}
     candidates = []
     for treatment_name, treatment in data["treatments"].items():
         for class_name in classes:
@@ -158,13 +175,21 @@ def resolve_class(classes: list[str], sql_type: str, library: dict | None = None
                 partial = treatment["full"]
             else:
                 partial = treatment.get("partial_by_type", {}).get(family, treatment.get("partial"))
-            rank = order["redacted"] if partial in {"redacted", "null"} else order["partial"]
+            rank = _REDACTED if partial in {"redacted", "null"} else _PARTIAL
             candidates.append((rank, treatment_name, partial, treatment["full"]))
-    if not candidates:
-        raise KeyError(f"no mask-library mapping for {classes!r}")
-    never_raw = any(candidate[1] in NEVER_RAW_TREATMENTS for candidate in candidates)
-    _, treatment_name, partial, full = max(candidates)
-    return treatment_name, partial, full, never_raw
+    return candidates
+
+
+def partial_treatments(classes: list[str], sql_type: str, library: dict | None = None) -> set[str]:
+    """The distinct treatments of ``classes`` that keep a partial version on a string column.
+
+    More than one means no partial version fits every class, so
+    resolve_class redacts the column.
+    """
+    if type_family(sql_type) != "STRING":
+        return set()
+    return {name for rank, name, _partial, _full in _candidates(classes, sql_type, library or load_library())
+            if rank == _PARTIAL}
 
 
 def resolve_column_access(classes: list[str], sql_type: str, *, library: dict | None = None, **precedence) -> AccessResolution:
