@@ -22,6 +22,7 @@ from tests.terraform_helpers import skip_if_providers_unavailable as _skip_if_pr
 from tests.terraform_helpers import tf as _tf  # noqa: E402
 import generate_abac
 from scripts import policy_generations as pg  # noqa: E402
+from tests.test_ci_apply_guard import APPLYING_TARGETS  # noqa: E402
 
 SHARED = Path(__file__).parents[1]
 MODULE_TF = SHARED / "modules/data_access/main.tf"
@@ -781,6 +782,152 @@ def test_combined_apply_never_skips_data_access_before_workspace_can_run():
     assert apply.index(data_access) < apply.index("LAYER=workspace")
 
 
+def _recipe(makefile: str, target: str) -> str:
+    start = makefile.index(f"\n{target}:")
+    body = makefile[start:]
+    return body[: body.index("\n\n")]
+
+
+def _logical_makefile_lines(text: str) -> list[str]:
+    lines = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        lines.append((pending + line).strip())
+        pending = ""
+    if pending:
+        lines.append(pending.strip())
+    return lines
+
+
+def _assert_no_bootstrap_recipe_applies(makefile: str) -> None:
+    public_applying_targets = [
+        target for target in APPLYING_TARGETS if not target.startswith("_")
+    ]
+    public_apply_pattern = re.compile(
+        r"(?:\$\((?:MAKE)\)|\$\{(?:MAKE)\})"
+        r".*(?<![-\w])(?:"
+        + "|".join(re.escape(target) for target in public_applying_targets)
+        + r")(?![-\w])"
+    )
+    runner_apply_pattern = re.compile(
+        r"(?:ROOT_RUNNER|terraform_layer\.sh).*(?<![-\w])apply(?![-\w])"
+    )
+    for target in ("_bootstrap", "_guarded-bootstrap"):
+        recipe = _recipe(makefile, target)
+        for line in _logical_makefile_lines(recipe):
+            assert "_apply-layer" not in line, f"{target} must not recurse into _apply-layer"
+            assert not re.search(r"\bterraform\s+apply\b", line), (
+                f"{target} must not run terraform apply"
+            )
+            assert not re.search(r"\bapply-plan\b", line), (
+                f"{target} must not run an apply-plan"
+            )
+            assert not runner_apply_pattern.search(line), (
+                f"{target} must not run ROOT_RUNNER/terraform_layer.sh apply: {line}"
+            )
+            assert not public_apply_pattern.search(line), (
+                f"{target} must not recurse into public apply target: {line}"
+            )
+
+
+def _assert_no_combined_bootstrap_apply_make_goals(makefile: str) -> None:
+    recursive_lines = [
+        line
+        for line in _logical_makefile_lines(makefile)
+        if "$(MAKE)" in line or "$${MAKE}" in line
+    ]
+    for line in recursive_lines:
+        has_bootstrap = re.search(r"(?<![-\w])_guarded-bootstrap(?![-\w])", line) or re.search(
+            r"(?<![-\w])_bootstrap(?![-\w])", line
+        )
+        has_apply_layer = re.search(r"(?<![-\w])_apply-layer(?![-\w])", line)
+        assert not (has_bootstrap and has_apply_layer), (
+            "recursive make must not combine bootstrap and apply goals: " + line
+        )
+
+
+def _assert_tag_policy_delete_guard_precedes_account_apply_plan(makefile: str) -> None:
+    apply_layer = _recipe(makefile, "_apply-layer")
+    account_apply = apply_layer[apply_layer.index('elif [ "$$layer" = "account" ]; then'):]
+    account_apply = account_apply[:account_apply.index('elif [ "$$staged" = 1 ]; then')]
+    assert "tag-policy-delete-guard" in account_apply
+    assert 'apply-plan -parallelism=1 "$$account_plan_dir/account.tfplan"' in account_apply
+    assert account_apply.index("tag-policy-delete-guard") < account_apply.index(
+        'apply-plan -parallelism=1 "$$account_plan_dir/account.tfplan"'
+    )
+
+
+def test_makefile_bootstrap_recipes_cannot_hide_apply_side_doors():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    _assert_no_bootstrap_recipe_applies(makefile)
+    _assert_no_combined_bootstrap_apply_make_goals(makefile)
+
+
+@pytest.mark.parametrize(
+    ("target", "injected"),
+    [
+        ("_bootstrap", '\n\t@terraform apply -auto-approve'),
+        ("_guarded-bootstrap", '\n\t@$(MAKE) --no-print-directory _apply-layer'),
+        ("_guarded-bootstrap", '\n\t@"$(ROOT_RUNNER)" account "$(ENV)" apply'),
+        ("_bootstrap", '\n\t@$(MAKE) --no-print-directory apply-account'),
+    ],
+)
+def test_makefile_bootstrap_recipe_scan_flags_deliberate_apply_break(target, injected):
+    makefile = (SHARED / "Makefile.shared").read_text()
+    broken = makefile.replace(_recipe(makefile, target), _recipe(makefile, target) + injected)
+
+    with pytest.raises(AssertionError):
+        _assert_no_bootstrap_recipe_applies(broken)
+
+
+def test_makefile_combined_bootstrap_apply_goal_scan_flags_deliberate_break():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    broken = makefile.replace(
+        '@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
+        '@$(MAKE) --no-print-directory _bootstrap _apply-layer ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_no_combined_bootstrap_apply_make_goals(broken)
+
+
+def test_makefile_combined_bootstrap_apply_goal_scan_flags_backslash_break():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    broken = makefile.replace(
+        '@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
+        '@$(MAKE) --no-print-directory _bootstrap \\\n\t\t_apply-layer ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"',
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_no_combined_bootstrap_apply_make_goals(broken)
+
+
+def test_account_apply_checks_tag_policy_deletes_before_apply_plan():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    _assert_tag_policy_delete_guard_precedes_account_apply_plan(makefile)
+
+
+def test_account_apply_order_check_flags_deliberate_guard_after_apply_break():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    guard = (
+        '$(_RELEASE_GATE) tag-policy-delete-guard --env-dir "$$env_dir" --env "$$target_env" '
+        '--show-json "$$account_plan_dir/account.json";'
+    )
+    apply = 'LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" apply-plan -parallelism=1 "$$account_plan_dir/account.tfplan";'
+    broken = makefile.replace(
+        f"\t\t{guard} \\\n\t\t{apply} \\",
+        f"\t\t{apply} \\\n\t\t{guard} \\",
+    )
+    assert broken != makefile
+
+    with pytest.raises(AssertionError):
+        _assert_tag_policy_delete_guard_precedes_account_apply_plan(broken)
+
+
 def test_no_saved_plan_file_is_written_by_the_product():
     # A saved plan embeds prior state, which may still hold the legacy secret.
     # The exceptions are make release-plan and make account-plan (deterministic
@@ -807,8 +954,7 @@ def test_no_saved_plan_file_is_written_by_the_product():
     assert re.findall(tf_out, account_apply) == ['-out="$$account_plan_dir/account.tfplan"']
     assert 'account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"' in account_apply
     assert 'trap \'rm -rf "$$account_plan_dir"\' EXIT' in account_apply
-    assert "tag-policy-delete-guard" in account_apply
-    assert 'apply-plan -parallelism=1 "$$account_plan_dir/account.tfplan"' in account_apply
+    _assert_tag_policy_delete_guard_precedes_account_apply_plan(makefile)
 
 
 @pytest.mark.parametrize("line, saved", [
