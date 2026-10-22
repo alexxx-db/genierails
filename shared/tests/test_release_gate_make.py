@@ -797,9 +797,9 @@ def test_rehearse_writes_a_receipt_and_reuses_it_without_reapplying(make, repo):
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        ((), ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="]),
+        ((), ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_PRE_GRANT="]),
         (("VERIFY_KEY_COLUMN=customer_id",),
-         ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=",
+         ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_PRE_GRANT=",
           "VERIFY_KEY_COLUMN=customer_id"]),
     ],
     ids=["autopick", "explicit-key"],

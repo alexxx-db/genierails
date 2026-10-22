@@ -947,7 +947,8 @@ def test_release_needs_no_key_and_proves_keys_before_applying(tmp_path, env_text
     # minimum, and the staged-verify inputs are cleared so none can redirect it.
     # The gate is _verify-access-gate's override, not a VERIFY_GATE=1 argument.
     gate = [c for c in calls if c.startswith("_verify-access-gate ENV=prod ")]
-    assert gate == ["_verify-access-gate ENV=prod VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE="], gate
+    assert gate == ["_verify-access-gate ENV=prod VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= "
+                    "VERIFY_PRE_GRANT="], gate
     assert not [c for c in calls if c.startswith("verify-access ENV=prod ")]
 
 
