@@ -237,7 +237,7 @@ done
   printf 'host=%s\n' "$INIT_LOCK_HOST"
   printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$INIT_LOCK_OWNER"
-echo "+ ${INIT_CMD[*]}"
+echo "+ ${INIT_CMD[*]}" >&2
 # The lock file is generated locally (gitignored), so an upgrade that adds a
 # provider (even one only a tests/ module declares) leaves it stale and the
 # read-only init refuses it. Inits are serialized above, so re-run it once
@@ -252,7 +252,7 @@ if ! init_output="$("${INIT_CMD[@]}" 2>&1)"; then
     awk '/^provider "/ { p = $2; gsub(/"/, "", p) } /^  version / { v = $3; gsub(/"/, "", v); print p " " v }' .terraform.lock.hcl
   }
   locked_before="$(_lock_providers)"
-  echo "+ ${WRITABLE_INIT_CMD[*]}"
+  echo "+ ${WRITABLE_INIT_CMD[*]}" >&2
   "${WRITABLE_INIT_CMD[@]}" >/dev/null
   _lock_providers | while read -r provider version; do
     case "$locked_before" in
@@ -405,7 +405,7 @@ case "$COMMAND" in
     CMD=(terraform state show "$@")
     ;;
   state-pull)
-    echo "+ terraform state pull"
+    echo "+ terraform state pull" >&2
     terraform state pull >&3
     exit $?
     ;;
@@ -438,7 +438,7 @@ case "$COMMAND" in
     ;;
 esac
 
-echo "+ ${CMD[*]}"
+echo "+ ${CMD[*]}" >&2
 if [ "$LAYER" = "data_access" ] && { [ "$COMMAND" = "plan" ] || [ "$COMMAND" = "apply" ]; }; then
   # Terraform's output passes through unchanged; a copy lets the note below
   # explain a plan whose only destroys replace terraform_data.masking_functions.

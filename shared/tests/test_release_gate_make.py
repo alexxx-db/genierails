@@ -119,11 +119,11 @@ class Make:
 
     def __call__(self, target: str, env: str, *extra: str, stub_make: bool = True, ci: bool = False,
                  stubs: dict[str, str] | None = None, environ_extra: dict[str, str] | None = None,
-                 cwd: Path | None = None):
+                 cwd: Path | None = None, root_runner: Path | None = None):
         env_dir = self.repo.cloud / "envs" / env
         args = ["make", "--no-print-directory", target, f"ENV={env}", f"ENV_DIR={env_dir}",
                 f"ACCOUNT_ENV_DIR={self.repo.cloud / 'envs' / 'account'}",
-                f"ROOT_RUNNER={self.stubs['runner']}", *extra]
+                f"ROOT_RUNNER={root_runner or self.stubs['runner']}", *extra]
         if stub_make:
             args.append(f"MAKE={self.make}")
         bin_dir = script_stubs.install(self.tmp / "stub-bin", self.script_stubs(stubs))
@@ -276,6 +276,53 @@ def test_account_plan_writes_an_immutable_manifest_from_clean_origin_main(make, 
     assert runner[1][:5] == ["runner", "account", "account", "show", "-json"]
     assert Path(runner[1][5]).name == "account.tfplan"
     assert not (manifest.parent / "account.show.json").exists()
+
+
+def test_real_layer_runner_keeps_account_plan_show_json_clean(tmp_path, repo):
+    """The real wrapper's diagnostics must not corrupt account-plan's JSON input."""
+    secret = "regression-client-secret-must-not-persist"
+    terraform = tmp_path / "terraform"
+    terraform.write_text(f'''#!/usr/bin/env python3
+import json, pathlib, sys
+args = sys.argv[1:]
+if args[:1] == ["plan"]:
+    out = next(a.split("=", 1)[1] for a in args if a.startswith("-out="))
+    pathlib.Path(out).write_text({secret!r})
+    sys.exit(2)
+if args[:2] == ["show", "-json"]:
+    print(json.dumps({{"variables": {{"databricks_client_secret": {{"value": {secret!r}}}}},
+                      "resource_changes": [{{"change": {{"actions": ["create"]}}}}]}}))
+''')
+    terraform.chmod(0o755)
+    make = Make(tmp_path, repo)
+    result = make("account-plan", "account", root_runner=ROOT / "shared/scripts/terraform_layer.sh",
+                  environ_extra={"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                         if "Manifest (immutable):" in line))
+    assert json.loads((manifest.parent / "account.summary.json").read_text())["resource_changes"] == {"create": 1}
+    assert "+ terraform show -json" in result.stderr
+    assert "+ terraform" not in result.stdout
+    assert secret not in "".join(p.read_text(errors="ignore") for p in manifest.parent.iterdir()
+                                 if p.name != "account.tfplan")
+
+
+def test_apply_account_deletes_the_secret_bearing_saved_plan(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    plan = manifest.parent / "account.tfplan"
+    os.chmod(plan, 0o600)
+    plan.write_text("persisted-client-secret")
+    data = json.loads(manifest.read_text())
+    os.chmod(manifest, 0o600)
+    data["plan"]["sha256"] = rg.sha256_file(plan)
+    manifest.write_text(json.dumps(data))
+    os.chmod(manifest, 0o400)
+    result = make("apply-account", "account", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not plan.exists()
+    assert "persisted-client-secret" not in "".join(
+        p.read_text(errors="ignore") for p in rg.env_state(repo.cloud, "account").rglob("*") if p.is_file())
 
 
 def test_account_plan_refuses_dirty_checkout_before_planning(make, repo):

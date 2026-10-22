@@ -98,7 +98,7 @@ def _state_path(env_dir: Path, state_dir: Path | None) -> Path:
 
 def _logged(result, command: str) -> list[str]:
     """The argv the runner ran (its "+ terraform <command> ..." line)."""
-    lines = [line for line in result.stdout.splitlines() if line.startswith(f"+ terraform {command} ")]
+    lines = [line for line in result.stderr.splitlines() if line.startswith(f"+ terraform {command} ")]
     assert lines, result.stdout + result.stderr
     return lines[-1][2:].split(" ")
 
@@ -189,7 +189,7 @@ def test_import_still_refuses_a_caller_setting_the_runners_variables(layer, tmp_
         (env_dir / "abac.auto.tfvars").unlink(missing_ok=True)
         assert result.returncode == 2, (form, result.stdout + result.stderr)
         assert f"sets {name}" in result.stderr and "set only by" in result.stderr, (form, result.stderr)
-        assert "+ terraform" not in result.stdout, form  # refused before terraform init
+        assert "+ terraform" not in result.stderr, form  # refused before terraform init
         assert state_path.read_bytes() == before, form
 
 
