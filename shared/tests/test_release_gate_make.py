@@ -320,9 +320,33 @@ def test_apply_account_deletes_the_secret_bearing_saved_plan(tmp_path, repo):
     os.chmod(manifest, 0o400)
     result = make("apply-account", "account", f"MANIFEST={manifest}")
     assert result.returncode == 0, result.stdout + result.stderr
+    assert rg.account_receipts(repo.cloud, "account")
     assert not plan.exists()
     assert "persisted-client-secret" not in "".join(
         p.read_text(errors="ignore") for p in rg.env_state(repo.cloud, "account").rglob("*") if p.is_file())
+
+
+def test_apply_account_records_success_when_saved_plan_deletion_fails(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    manifest = _account_planned(make)
+    plan = manifest.parent / "account.tfplan"
+    bin_dir = tmp_path / "delete-fail-bin"
+    bin_dir.mkdir()
+    rm = bin_dir / "rm"
+    rm.write_text(f'''#!/bin/sh
+if [ "$#" -eq 2 ] && [ "$1" = -f ] && [ "$2" = {shlex.quote(str(plan))} ]; then
+  exit 1
+fi
+exec /bin/rm "$@"
+''')
+    rm.chmod(0o755)
+    result = make("apply-account", "account", f"MANIFEST={manifest}",
+                  environ_extra={"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rg.account_receipts(repo.cloud, "account")
+    assert plan.exists()
+    assert str(plan) in result.stderr
+    assert "contains credentials" in result.stderr and "delete it" in result.stderr
 
 
 def test_account_plan_refuses_dirty_checkout_before_planning(make, repo):

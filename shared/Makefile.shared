@@ -942,8 +942,8 @@ _apply-account-locked:
 	echo "=== Apply saved plan (account) ==="; \
 	LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" apply-plan "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; \
 	rm -rf "$$apply_dir"; \
-	chmod 600 "$$plans/account.tfplan" && rm -f "$$plans/account.tfplan" || { echo "ERROR: account apply succeeded, but its secret-bearing saved plan could not be deleted: $$plans/account.tfplan" >&2; exit 1; }; \
 	$(_RELEASE_GATE) account-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	if ! rm -f "$$plans/account.tfplan"; then echo "WARNING: account apply succeeded and its receipt was written, but $$plans/account.tfplan contains credentials and could not be deleted; delete it." >&2; fi; \
 	echo ""; \
 	echo "=== Account apply complete ==="
 

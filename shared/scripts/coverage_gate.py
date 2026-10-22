@@ -534,7 +534,7 @@ def query_inputs(runner: Path, env_name: str, layer_dir: Path, flags: list[str],
             "terraform console could not evaluate the data_access gate inputs:\n"
             + (result.stderr or result.stdout).strip()
         )
-    # The runner echoes its commands to stdout; the value is the last line.
+    # The runner writes diagnostics to stderr, so stdout contains the value.
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     try:
         encoded = lines[-1]
