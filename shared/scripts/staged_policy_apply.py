@@ -20,7 +20,11 @@ verification, in this order:
    (``confirm``); never the generation this run switched away from.
 7. ``grant``: new SELECT (table_readers). Every phase above withholds new
    grants (``policy_stage``), so access opens only once its protection is
-   applied and verified.
+   applied and verified. verify-created and verify-switched therefore run
+   verify-access with ``GENIERAILS_VERIFY_PRE_GRANT=1``: each temporary test
+   principal itself (never a tier group) gets USE/SELECT on the tables it
+   checks, revoked when verify-access exits, so a tier's masks are checked
+   for real before its group can read anything.
 
 Two-phase release (rollout step 9). ``plan --out-dir D`` (make release-plan)
 saves the next phases' plans instead of applying them: it plans each remaining
@@ -98,6 +102,11 @@ VERIFY_PHASES = {
 # A failure here may leave columns on the new value or principals moved, so
 # the previous protection is restored before the run stops.
 RESTORE_ON_FAILURE = {"tighten", "verify-tightened", "switch", "verify-switched"}
+# Verify phases that run before the grant phase: the tier groups may not hold
+# USE/SELECT yet, so verify-access grants its own test principals temporary
+# access to the checked tables (GENIERAILS_VERIFY_PRE_GRANT). verify-rebound
+# runs after rebind-access re-created the lost grants and checks those.
+PRE_GRANT_VERIFY = {"verify-created", "verify-switched"}
 HISTORY_LIMIT = 20
 CI_MARKERS = ("TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI")
 
@@ -454,7 +463,8 @@ class Controller:
             print(f"ERROR: {phase} needs a verify-access command (--verify-access-cmd)", file=sys.stderr)
             return 2
         env = self._hook_env(t) | {"GENIERAILS_VERIFY_TFVARS": str(inputs[0]),
-                                   "GENIERAILS_VERIFY_ENV_FILE": str(inputs[1])}
+                                   "GENIERAILS_VERIFY_ENV_FILE": str(inputs[1]),
+                                   "GENIERAILS_VERIFY_PRE_GRANT": "1" if phase in PRE_GRANT_VERIFY else ""}
         return self.run_cmd(["/bin/sh", "-c", self.verify_access_cmd], env=env, check=False).returncode
 
     def _phase(self, t: dict, phase: str) -> int:
@@ -482,7 +492,16 @@ class Controller:
                             "policies": sorted(p["name"] for p in rendered.get("fgac_policies") or [])}
                 t.update(restoring=False, restore_failed=False, completed=["create"], restored=restored)
                 self._save(journal)
-                print("  The previous protection is back in place and verified live.")
+                kept = self._kept_new_columns(t)
+                if not t["from"]:
+                    print(f"  A first deploy has no previous protection to go back to: the restore keeps "
+                          f"generation {t['to']}'s masks and treatment tags on {len(kept)} column(s), verified "
+                          "live (fail-closed). No business USE or SELECT was granted.")
+                elif kept:
+                    print(f"  The previous protection is back in place and verified live; {len(kept)} newly "
+                          f"governed column(s) keep generation {t['to']}'s masks (fail-closed).")
+                else:
+                    print("  The previous protection is back in place and verified live.")
                 return True
         t["restore_failed"] = True
         self._save(journal)
@@ -495,9 +514,17 @@ class Controller:
         t.update(status="failed", failed_phase=phase, error=f"{phase} exited {rc}")
         self._save(journal)
         print(f"ERROR: policy phase {phase} failed (exit {rc}).", file=sys.stderr)
-        if phase in RESTORE_ON_FAILURE:
-            self._restore(journal, t)
+        restored = phase in RESTORE_ON_FAILURE and self._restore(journal, t)
         print(self.describe_transition(t), file=sys.stderr)
+        if restored:
+            try:
+                abandon = self._may_abandon(t, pg.desired_generation(self.env_dir))
+            except (pg.StageError, OSError, ValueError):
+                abandon = False
+            print(f"Next: fix what stopped it (above), then re-run the same command: it resumes run {t['run_id']} "
+                  f"after create ({_remaining(t)})."
+                  + (f" To drop the change instead, run make policy-abandon ENV={self.env_name}." if abandon else ""),
+                  file=sys.stderr)
         if phase == "create" and not t["switch_attempted"]:
             try:
                 abandon = self._may_abandon(t, pg.desired_generation(self.env_dir))
@@ -1249,11 +1276,42 @@ class Controller:
             lines.append("  live:      an abandon was applied but its live check failed; it is not abandoned")
         elif t["restore_failed"]:
             lines.append("  live:      a restore of the previous protection failed; the next run finishes it first")
+        elif t["restoring"]:
+            lines.append("  live:      a restore of the previous protection was interrupted; the next run finishes it "
+                         "first (every column carries the old or the new mask)")
         elif not t["switch_attempted"]:
             lines.append(f"  live:      the previous protection ({t['from'] or 'none'}); no column was retagged")
+        elif not t.get("restored") and not _pre_marker_restored(t):
+            lines.append(f"  live:      a switch to {t['to']} that wasn't rolled back: every column carries the old "
+                         f"or the new mask; the next run resumes at {t['current'] or t['failed_phase'] or 'switch'}")
         else:
-            lines.append(f"  live:      the previous protection ({t['from'] or 'none'}), restored")
+            kept = self._kept_new_columns(t)
+            after = (t.get("restored") or {}).get("after") or t["failed_phase"]
+            if not t["from"]:
+                lines.append(f"  live:      generation {t['to']}'s masks and treatment tags on {len(kept)} column(s), "
+                             f"kept by the restore after {after}: a first deploy has no previous protection "
+                             "(fail-closed; no business USE or SELECT is granted until the grant phase)")
+            elif kept:
+                lines.append(f"  live:      the previous protection ({t['from']}), restored after {after}; "
+                             f"{len(kept)} newly governed column(s) keep generation {t['to']}'s masks (fail-closed)")
+            else:
+                lines.append(f"  live:      the previous protection ({t['from']}), restored after {after}")
+            if kept:
+                lines.append(f"  next:      re-run the same command to resume ({_remaining(t)}); it can't be "
+                             "abandoned while columns keep its masks")
         return "\n".join(lines)
+
+    def _kept_new_columns(self, t: dict) -> list[str]:
+        """Columns a verified restore left on the change's value: newly governed, so kept masked."""
+        restored = t.get("restored") or {}
+        if not restored:
+            return []
+        try:
+            old = self._snapshot(t["from"]) if t["from"] else None
+        except (pg.StageError, OSError, ValueError):
+            old = None
+        old_tags = dict((old or {}).get("tags") or {})
+        return sorted(c for c, v in (restored.get("tags") or {}).items() if old_tags.get(c) != v)
 
     def _unfinished_message(self, t: dict, desired: dict) -> str:
         resume = f"re-run the same command at commit {t['commit'] or '?'} (generation {t['to']}) to resume it"
@@ -1346,6 +1404,10 @@ KEPT_NEW_COLUMNS = "keep the new generation's treatment"
 def _unabandonable(reason: str) -> str:
     return ("this change already retagged columns or moved principals; it can't be "
             f"abandoned ({reason}). Re-run the command that started it to resume it.")
+
+
+def _remaining(t: dict) -> str:
+    return " -> ".join(p for p in t["phases"] if p not in t["completed"])
 
 
 def _pre_marker_restored(t: dict) -> bool:

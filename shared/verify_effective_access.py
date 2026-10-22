@@ -1964,13 +1964,16 @@ class EffectiveAccessVerifier:
                 time.sleep(min(QUERY_PREFLIGHT_BACKOFF_SECONDS,
                                max(0.0, deadline - time.monotonic())))
 
-    def grant_outsider_table_access(
+    def grant_temporary_table_access(
         self, principal: TestPrincipal, tables: Sequence[str], *, revoke: bool = False,
     ) -> None:
-        """Temporarily grant/revoke the outsider access to only checked tables.
+        """Temporarily grant/revoke a test principal access to only checked tables.
 
-        These direct SQL grants deliberately never enter Terraform state.  The
-        caller always revokes them in its outermost ``finally`` block.
+        The out-of-tier probe always gets this; with ``pre_grant`` (a staged
+        verify before the grant phase opens business access) every test
+        principal does. The grantee is the test principal itself, never its
+        tier group. These direct SQL grants deliberately never enter Terraform
+        state.  The caller always revokes them in its outermost ``finally`` block.
         """
         self._guard()
         verb = "REVOKE" if revoke else "GRANT"
@@ -2014,7 +2017,7 @@ class EffectiveAccessVerifier:
                 failures.append(str(exc))
         if failures:
             raise RuntimeError(
-                f"failed to revoke {len(failures)} temporary outsider privilege(s): "
+                f"failed to revoke {len(failures)} temporary privilege(s): "
                 + "; ".join(failures)
             )
 
@@ -2380,6 +2383,7 @@ def verify_effective_access_live(
     admin_tier: str = DEFAULT_ADMIN_TIER,
     global_key: str = "",
     unsafe_by_table: Optional[Mapping[str, set[str]]] = None,
+    pre_grant: bool = False,
 ) -> EffectiveAccessReport:
     """Provision per-tier principals, run queries as each, and evaluate effects.
 
@@ -2387,6 +2391,13 @@ def verify_effective_access_live(
     and proven (see pick_table_key). A table with no provable key is always
     blocking (INCONCLUSIVE), so the run can't pass; the rest are verified with
     their keys.
+
+    ``pre_grant``: a staged verify that runs before the grant phase opens the
+    tier groups' USE and SELECT (scripts/staged_policy_apply.py). Each test
+    principal then gets temporary USE CATALOG/USE SCHEMA/SELECT on the checked
+    tables it reads, granted to the principal itself (never its tier group, so
+    masks still see only its group membership) and revoked on every exit
+    (temporary_table_access).
 
     Guarded: raises unless ``GENIERAILS_LIVE_VERIFY=1``.
     """
@@ -2439,6 +2450,7 @@ def verify_effective_access_live(
 
     report: Optional[EffectiveAccessReport] = None
     cleanup_error: Optional[BaseException] = None
+    granted: dict[str, list[str]] = {}
     try:
         resolved_groups = {}
         for tier in sorted(spec.principals):
@@ -2459,11 +2471,13 @@ def verify_effective_access_live(
             print(f"  Granting warehouse CAN_USE to test principal: {tier}")
             verifier.grant_warehouse_use(principal)
 
-        outsider = principals.get(OUT_OF_TIER_PRINCIPAL)
-        outsider_tables = sorted({check.table for check in spec.column_masks})
-        if outsider and outsider_tables:
-            print("  Granting temporary checked-table access to out-of-tier principal")
-            verifier.grant_outsider_table_access(outsider, outsider_tables)
+        for tier, tables in temporary_table_access(spec, principals, pre_grant=pre_grant).items():
+            print(f"  Granting temporary checked-table access to test principal: {tier}"
+                  if tier != OUT_OF_TIER_PRINCIPAL else
+                  "  Granting temporary checked-table access to out-of-tier principal")
+            # Recorded before the grant, so a grant that fails partway is still revoked.
+            granted[tier] = tables
+            verifier.grant_temporary_table_access(principals[tier], tables)
 
         # Newly-added group membership can take a short while to propagate.
         time.sleep(int(os.environ.get("GENIERAILS_VERIFY_PROPAGATION_SLEEP", "10")))
@@ -2659,21 +2673,20 @@ def verify_effective_access_live(
                 "not every row")
         return report
     finally:
-        outsider = principals.get(OUT_OF_TIER_PRINCIPAL)
-        outsider_tables = sorted({check.table for check in spec.column_masks})
-        if outsider and outsider_tables:
+        for tier, tables in granted.items():
+            grantee_principal = principals[tier]
             try:
-                verifier.grant_outsider_table_access(outsider, outsider_tables, revoke=True)
+                verifier.grant_temporary_table_access(grantee_principal, tables, revoke=True)
             except BaseException as exc:
                 cleanup_error = exc
                 privileges = ", ".join(f"USE CATALOG/USE SCHEMA/SELECT on {table}"
-                                       for table in outsider_tables)
-                grantee = quote_identifier(outsider.application_id)
-                catalogs = sorted({table_parts(table)[0] for table in outsider_tables})
-                schemas = sorted({table_parts(table)[:2] for table in outsider_tables})
+                                       for table in tables)
+                grantee = quote_identifier(grantee_principal.application_id)
+                catalogs = sorted({table_parts(table)[0] for table in tables})
+                schemas = sorted({table_parts(table)[:2] for table in tables})
                 manual_revokes = [
                     f"REVOKE SELECT ON TABLE {quote_table(table)} FROM {grantee}"
-                    for table in outsider_tables
+                    for table in tables
                 ]
                 manual_revokes.extend(
                     f"REVOKE USE SCHEMA ON SCHEMA {quote_identifier(catalog)}."
@@ -2684,17 +2697,18 @@ def verify_effective_access_live(
                     f"REVOKE USE CATALOG ON CATALOG {quote_identifier(catalog)} FROM {grantee}"
                     for catalog in catalogs
                 )
+                who = "outsider" if tier == OUT_OF_TIER_PRINCIPAL else f"test-principal ({tier})"
                 detail = (
-                    f"temporary outsider access was not fully revoked for service principal "
-                    f"{outsider.application_id}: {privileges}. Remove it manually with REVOKE "
+                    f"temporary {who} access was not fully revoked for service principal "
+                    f"{grantee_principal.application_id}: {privileges}. Remove it manually with REVOKE "
                     f"statements before retrying: {'; '.join(manual_revokes)}. Cause: {exc}"
                 )
                 print(f"  ERROR: {detail}", file=sys.stderr)
                 if report is not None:
                     report.results.append(CheckResult(
-                        "cleanup", outsider.application_id, FAIL, detail,
-                        {"principal": outsider.application_id,
-                         "tables_with_possible_access": outsider_tables},
+                        "cleanup", grantee_principal.application_id, FAIL, detail,
+                        {"principal": grantee_principal.application_id,
+                         "tables_with_possible_access": tables},
                     ))
         if not keep_principals:
             for tier, p in principals.items():
@@ -2707,6 +2721,32 @@ def verify_effective_access_live(
             raise RuntimeError(
                 f"verification cleanup failed after another error: {cleanup_error}"
             ) from cleanup_error
+
+
+def temporary_table_access(spec: VerificationSpec, principals: Mapping[str, Any], *,
+                           pre_grant: bool = False,
+                           admin_tier: str = DEFAULT_ADMIN_TIER) -> dict[str, list[str]]:
+    """Test principal -> the checked tables it gets temporary USE/SELECT on.
+
+    The out-of-tier probe is in no tier group, so it always gets every
+    mask-checked table. With ``pre_grant`` (a verify before the grant phase)
+    every other provisioned test principal gets the tables of the checks it
+    takes part in; the admin baseline and the tier groups never do.
+    """
+    out: dict[str, set[str]] = {}
+    if OUT_OF_TIER_PRINCIPAL in principals and spec.column_masks:
+        out[OUT_OF_TIER_PRINCIPAL] = {check.table for check in spec.column_masks}
+    if pre_grant:
+        for check in spec.column_masks:
+            involved = (set(dict(check.expected_tiers)) if check.expected_tiers else
+                        set(check.masked_principals) | set(check.unmasked_principals))
+            for tier in involved:
+                out.setdefault(tier, set()).add(check.table)
+        for check in spec.row_filters:
+            for tier in set(check.restricted_principals) | set(check.unrestricted_principals):
+                out.setdefault(tier, set()).add(check.table)
+    return {tier: sorted(tables) for tier, tables in sorted(out.items())
+            if tier != admin_tier and tier in principals}
 
 
 def pick_pairing_keys(
@@ -3202,6 +3242,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "row-pairing key per table) for tooling such as make rehearse/release.")
     p.add_argument("--print-spec", action="store_true",
                    help="Print the resolved spec and exit (no workspace needed).")
+    p.add_argument("--pre-grant-access", action="store_true",
+                   help="A staged verify before the grant phase (the controller sets it): give each "
+                        "test principal itself temporary USE CATALOG/USE SCHEMA/SELECT on the "
+                        "checked tables it reads, revoked on exit. Tier groups get nothing.")
     p.add_argument("--require-mask-checks", action="store_true",
                    help="Fail instead of skipping a mask check whose table has no provable "
                         "row-pairing key (make release: production masking must be proven).")
@@ -3463,7 +3507,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = verify_effective_access_live(
         spec, args.auth_file,
         warehouse_id=args.warehouse_id, keep_principals=args.keep_principals,
-        global_key=args.key_column, unsafe_by_table=unsafe,
+        global_key=args.key_column, unsafe_by_table=unsafe, pre_grant=args.pre_grant_access,
     )
     print(report.summary())
     write_result_file(args.result_file, report, spec)

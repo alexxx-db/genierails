@@ -815,6 +815,13 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
     write_json(stage_record_path(env_dir), record | {
         "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
+    if stage == "restore":
+        # What is live now: the previous generation, plus the change's masks on columns it newly governs.
+        kept = sorted(c for c, v in staged["rendered"]["tags"].items() if (old or {}).get("tags", {}).get(c) != v)
+        print(f"Policy stage restore: applied the previous protection ({old_fp or 'none'})"
+              + (f"; {len(kept)} newly governed column(s) keep generation {desired['fingerprint']}'s masks "
+                 "and treatment tags" if kept else ""))
+        return 0
     print(f"Policy stage {stage}: applied generation {desired['fingerprint']}"
           + (f" (retained {old['fingerprint']})" if old else ""))
     return 0

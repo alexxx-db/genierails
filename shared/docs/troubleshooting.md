@@ -31,6 +31,10 @@ By design, prod refresh rejects empty native results and unmapped `class.*` find
 
 Check the **coverage check**: business `SELECT` and Genie `CAN_RUN` are only granted when a recent coverage check has passed against live tags. Run `make coverage-gate` to see what is uncovered (or a sensitive-looking untagged column blocking first exposure), fix it, then re-run `make rehearse` (dev) or `make release ENV=prod`. `business_access_enabled` is deprecated and ignored; setting it does nothing.
 
+### First `make rehearse` fails at `verify-switched` with `INSUFFICIENT_PERMISSIONS ... USE CATALOG`
+
+Older GenieRails versions held the tier groups' `USE_CATALOG`, `USE_SCHEMA` and `SELECT` back until the grant phase but gave the verify-access test principals no temporary access, so every tier's query failed on a first deterministic deploy. The restore then kept the new masks and tags (fail-closed, nothing granted), and `make policy-status` called that "the previous protection (none), restored". Update GenieRails and re-run the same `make rehearse ENV=<env>`. It resumes the journalled run at `verify-created`, with the test principals now getting temporary access to the checked tables (always revoked), and finishes with `grant`. Don't use `make policy-abandon` here: it refuses, because it would drop masks that are live on every column. See "verify-access before the grant phase" in [deterministic-policies.md](deterministic-policies.md).
+
 ## Importing Existing Resources (Brownfield)
 
 If groups, tag policies, tag assignments, or FGAC policies already exist in Databricks, import them so Terraform can manage them without `already exists` errors:

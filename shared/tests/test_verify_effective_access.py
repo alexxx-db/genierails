@@ -1544,9 +1544,9 @@ class TestTemporaryWarehouseAccess:
         principal = VerificationPrincipal(
             "__out_of_tier__", "test-outsider", "01234567-89ab-cdef", "secret", "456")
 
-        verifier.grant_outsider_table_access(
+        verifier.grant_temporary_table_access(
             principal, ["cat.sales.customers", "cat.sales.customers"])
-        verifier.grant_outsider_table_access(
+        verifier.grant_temporary_table_access(
             principal, ["cat.sales.customers"], revoke=True)
 
         assert statements == [
@@ -1571,7 +1571,7 @@ class TestTemporaryWarehouseAccess:
         principal = VerificationPrincipal(
             "__out_of_tier__", "test-outsider", "app", "secret", "456")
         with pytest.raises(RuntimeError, match="failed to revoke 1"):
-            verifier.grant_outsider_table_access(
+            verifier.grant_temporary_table_access(
                 principal, ["cat.sales.customers"], revoke=True)
         assert len(statements) == 3
 
@@ -1903,7 +1903,8 @@ class TestTemporaryWarehouseAccess:
 
 class TestTieredLiveGrantLifecycle:
     @staticmethod
-    def _run(monkeypatch, tmp_path, *, revoke_error=None, keep=False, sample_error=None, log=None):
+    def _run(monkeypatch, tmp_path, *, revoke_error=None, keep=False, sample_error=None, log=None,
+             pre_grant=False):
         log = [] if log is None else log
         raw = {key: f"raw-{key}" for key in range(12)}
         partial = {key: f"partial-{key}" for key in range(12)}
@@ -1936,7 +1937,7 @@ class TestTieredLiveGrantLifecycle:
             def assert_query_capable(self, principal):
                 log.append(("preflight", principal.tier))
 
-            def grant_outsider_table_access(self, principal, tables, *, revoke=False):
+            def grant_temporary_table_access(self, principal, tables, *, revoke=False):
                 log.append(("revoke" if revoke else "grant", principal.tier, tuple(tables)))
                 if revoke and revoke_error:
                     raise revoke_error
@@ -1989,8 +1990,60 @@ class TestTieredLiveGrantLifecycle:
             "raw_group": ("raw_group",), "analyst": ("analyst",),
             "viewer": ("viewer",), OUT_OF_TIER_PRINCIPAL: ()})
         report = verify_effective_access_live(
-            spec, tmp_path / "auth.auto.tfvars", keep_principals=keep)
+            spec, tmp_path / "auth.auto.tfvars", keep_principals=keep,
+            **({"pre_grant": True} if pre_grant else {}))
         return report, log, spec
+
+    TIERS = ("raw_group", "analyst", "viewer", OUT_OF_TIER_PRINCIPAL)
+
+    def test_without_pre_grant_only_the_outsider_gets_temporary_access(self, monkeypatch, tmp_path):
+        report, log, _spec = self._run(monkeypatch, tmp_path)
+        assert report.passed
+        assert [entry for entry in log if entry[0] in ("grant", "revoke")] == [
+            ("grant", OUT_OF_TIER_PRINCIPAL, ("cat.sch.people",)),
+            ("revoke", OUT_OF_TIER_PRINCIPAL, ("cat.sch.people",))]
+
+    @pytest.mark.parametrize("keep", [False, True])
+    def test_pre_grant_gives_every_test_principal_access_before_it_queries_and_revokes_it(
+        self, monkeypatch, tmp_path, keep,
+    ):
+        report, log, _spec = self._run(monkeypatch, tmp_path, keep=keep, pre_grant=True)
+        assert report.passed
+        for tier in self.TIERS:
+            grant = ("grant", tier, ("cat.sch.people",))
+            revoke = ("revoke", tier, ("cat.sch.people",))
+            assert log.count(grant) == log.count(revoke) == 1, tier
+            assert log.index(("provision", tier)) < log.index(grant) < log.index(("preflight", tier))
+            assert log.index(grant) < log.index(revoke)
+            # Revoked before any principal is deleted (or kept).
+            assert all(log.index(revoke) < i for i, entry in enumerate(log) if entry[0] == "deprovision")
+        # Only the test principals themselves: never the admin baseline.
+        assert {entry[1] for entry in log if entry[0] in ("grant", "revoke")} == set(self.TIERS)
+
+    def test_pre_grant_access_is_revoked_after_an_error_and_an_interrupt(self, monkeypatch, tmp_path):
+        error_log = []
+        report, _unused, _spec = self._run(
+            monkeypatch, tmp_path, sample_error=RuntimeError("query failed"), log=error_log, pre_grant=True)
+        assert not report.passed
+        interrupt_log = []
+        with pytest.raises(KeyboardInterrupt):
+            self._run(monkeypatch, tmp_path, sample_error=KeyboardInterrupt("cancelled"), log=interrupt_log,
+                      pre_grant=True)
+        for log in (error_log, interrupt_log):
+            for tier in self.TIERS:
+                assert ("revoke", tier, ("cat.sch.people",)) in log, tier
+
+    def test_a_failed_pre_grant_revoke_fails_the_run_and_names_each_principal(self, monkeypatch, tmp_path):
+        report, log, _spec = self._run(
+            monkeypatch, tmp_path, keep=True, revoke_error=RuntimeError("revoke denied"), pre_grant=True)
+        assert not report.passed
+        # One failed revoke doesn't stop the others.
+        assert {entry[1] for entry in log if entry[0] == "revoke"} == set(self.TIERS)
+        failed = {result.target for result in report.results if result.kind == "cleanup" and result.status == FAIL}
+        assert failed == {f"app-{tier}" for tier in self.TIERS}
+        detail = next(r.detail for r in report.results if r.kind == "cleanup" and r.target == "app-analyst")
+        assert "temporary test-principal (analyst) access was not fully revoked" in detail
+        assert "REVOKE SELECT ON TABLE `cat`.`sch`.`people` FROM `app-analyst`" in detail
 
     @pytest.mark.parametrize("keep", [False, True])
     def test_live_flow_grants_then_revokes_outsider_even_when_principal_is_kept(
@@ -2250,3 +2303,82 @@ class TestResultChecks:
         ssn = next(c for c in self._write(tmp_path, report, spec)["checks"] if c["column"] == "ssn")
         assert ssn["principals"]["analyst"]["observed"] == "mismatch"
         assert ssn["principals"][DEFAULT_ADMIN_TIER]["observed"] == "unproven"
+
+
+# ---------------------------------------------------------------------------
+# temporary_table_access: who gets temporary USE/SELECT on which checked tables
+# ---------------------------------------------------------------------------
+class TestTemporaryTableAccess:
+    @staticmethod
+    def _spec():
+        from verify_effective_access import DEFAULT_ADMIN_TIER, OUT_OF_TIER_PRINCIPAL
+        people = ColumnMaskCheck(
+            table="cat.a.people", column="email", key_column="id", masked_principals=(), unmasked_principals=(),
+            expected_tiers=(("raw_group", "raw"), ("analyst", "partial"), (OUT_OF_TIER_PRINCIPAL, "full"),
+                            (DEFAULT_ADMIN_TIER, "raw")))
+        orders = ColumnMaskCheck(
+            table="other.b.orders", column="card", key_column="id",
+            masked_principals=("viewer",), unmasked_principals=("raw_group",))
+        return VerificationSpec(column_masks=[people, orders],
+                                row_filters=[RowFilterCheck("cat.a.visits", ("viewer",), ("raw_group",))])
+
+    @staticmethod
+    def _principals(*tiers):
+        return {tier: VerificationPrincipal(tier, f"test-{tier}", f"app-{tier}", "s", tier) for tier in tiers}
+
+    def test_without_pre_grant_only_the_outsider_gets_every_mask_checked_table(self):
+        from verify_effective_access import DEFAULT_ADMIN_TIER, OUT_OF_TIER_PRINCIPAL, temporary_table_access
+        principals = self._principals(DEFAULT_ADMIN_TIER, "raw_group", "analyst", "viewer", OUT_OF_TIER_PRINCIPAL)
+        assert temporary_table_access(self._spec(), principals) == {
+            OUT_OF_TIER_PRINCIPAL: ["cat.a.people", "other.b.orders"]}
+        assert temporary_table_access(self._spec(), self._principals("raw_group")) == {}
+
+    def test_pre_grant_gives_each_principal_only_the_tables_it_checks(self):
+        from verify_effective_access import DEFAULT_ADMIN_TIER, OUT_OF_TIER_PRINCIPAL, temporary_table_access
+        principals = self._principals(DEFAULT_ADMIN_TIER, "raw_group", "analyst", "viewer", OUT_OF_TIER_PRINCIPAL)
+        assert temporary_table_access(self._spec(), principals, pre_grant=True) == {
+            OUT_OF_TIER_PRINCIPAL: ["cat.a.people", "other.b.orders"],
+            "analyst": ["cat.a.people"],
+            "raw_group": ["cat.a.people", "cat.a.visits", "other.b.orders"],
+            "viewer": ["cat.a.visits", "other.b.orders"],
+        }
+
+    def test_an_unprovisioned_tier_gets_nothing(self):
+        from verify_effective_access import OUT_OF_TIER_PRINCIPAL, temporary_table_access
+        assert temporary_table_access(self._spec(), self._principals("analyst"), pre_grant=True) == {
+            "analyst": ["cat.a.people"]}
+        assert OUT_OF_TIER_PRINCIPAL not in temporary_table_access(self._spec(), {}, pre_grant=True)
+
+    def test_a_tier_principal_s_grants_name_the_principal_never_its_group(self, monkeypatch):
+        monkeypatch.setenv("GENIERAILS_LIVE_VERIFY", "1")
+        verifier = EffectiveAccessVerifier({"host": "h", "client_id": "c", "client_secret": "s"})
+        verifier._admin_ws = object()
+        statements = []
+        monkeypatch.setattr(verifier, "run_query", lambda _ws, sql: statements.append(sql))
+        principal = VerificationPrincipal("analyst", "genierails-verify-analyst", "app-9", "secret", "7")
+        verifier.grant_temporary_table_access(principal, ["cat.a.people"])
+        verifier.grant_temporary_table_access(principal, ["cat.a.people"], revoke=True)
+        assert statements == [
+            "GRANT USE CATALOG ON CATALOG `cat` TO `app-9`",
+            "GRANT USE SCHEMA ON SCHEMA `cat`.`a` TO `app-9`",
+            "GRANT SELECT ON TABLE `cat`.`a`.`people` TO `app-9`",
+            "REVOKE SELECT ON TABLE `cat`.`a`.`people` FROM `app-9`",
+            "REVOKE USE SCHEMA ON SCHEMA `cat`.`a` FROM `app-9`",
+            "REVOKE USE CATALOG ON CATALOG `cat` FROM `app-9`",
+        ]
+
+    @pytest.mark.parametrize("argv, expected", [([], False), (["--pre-grant-access"], True)])
+    def test_the_cli_flag_reaches_the_live_run(self, monkeypatch, tmp_path, argv, expected):
+        import verify_effective_access as vea
+        spec = tmp_path / "spec.json"
+        spec.write_text(json.dumps({"column_masks": [], "row_filters": [
+            {"table": "cat.a.people", "restricted_principals": ["viewer"], "unrestricted_principals": ["raw"]}]}))
+        seen = {}
+
+        def live(spec, auth_file, **kwargs):
+            seen.update(kwargs)
+            return vea.EffectiveAccessReport(results=[])
+
+        monkeypatch.setattr(vea, "verify_effective_access_live", live)
+        assert vea.main(["--spec", str(spec), "--auth-file", str(tmp_path / "auth"), "--live", *argv]) in (0, 1)
+        assert seen["pre_grant"] is expected
