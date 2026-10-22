@@ -16,6 +16,8 @@ git add .gitignore envs/ && git commit -m "Govern the first agent in dev" && git
 make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
 git add envs/ && git commit -m "Draft the rules" && git push
 make check ENV=dev          # read-only check of the committed files (rehearse doesn't run it)
+make account-plan           # first deploy: plan the shared account layer (gr_treatment tag policy) for approval
+make apply-account          # applies exactly that approved account manifest (rehearse refuses a non-empty account plan)
 make rehearse ENV=dev       # applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
 
 # prod (same for stg or any env)
@@ -100,10 +102,16 @@ make check ENV=dev
 A read-only check of what git tracks under `envs/`, in a scratch copy: validate, generated files current, validate-generated, the offline coverage check, mask tests and a structural plan. It is the PR check; `make rehearse` and `make release-plan` don't run it. It stops at the first failing step.
 
 **6. Rehearse.**
+On a fresh repo, apply the shared account layer first. `make rehearse` (like `make release`) only adds allowed treatment-tag values to it, and stops while the account plan has anything else to apply (`ERROR: account plan is non-empty`): on a first deploy, the `gr_treatment` tag policy (and the groups, with `manage_groups = true`). From a clean checkout at your pushed `origin/main`:
+```bash
+make account-plan           # saves the account plan and writes the account manifest to approve; changes nothing live
+make apply-account          # applies exactly that manifest
+```
+Run the pair again whenever a later `rehearse` or `release-plan` stops on a non-empty account plan. Then:
 ```bash
 make rehearse ENV=dev
 ```
-It applies in dev, then runs `verify-access` as its last gate (`_verify-access-gate`), querying as each test tier.
+It applies in dev, then runs `verify-access` as its last gate (`_verify-access-gate`), querying as each test tier. A first deploy applies in phases: the masking functions and policies first, then the column tags, then (once the masks are verified live) the tier groups' `USE_CATALOG`, `USE_SCHEMA` and `SELECT`; Genie `CAN_RUN` follows the SELECT. If it stops at the first phase, nothing is live yet: fix what it reports and re-run `make rehearse ENV=dev` (it resumes), or drop the change with `make policy-abandon ENV=dev`.
 **Pass looks like:** `ALL EFFECTIVE`: each test tier sees masked values, the authorized tier sees raw ones. To re-run only that proof later: `make verify-access ENV=dev`.
 You don't set a row-pairing key: it picks one per masked table (a single-column primary key, else an untagged id-like column such as `customer_id`) and proves it unique, non-null and unmasked. A deterministic env then prints the proven `verify_key_columns` line; committing it is optional and pins those keys. Only a table with no provable key needs `verify_key_columns` set ([how keys are picked](../../docs/effective-access-verification.md#how-genierails-picks-the-row-pairing-key)).
 

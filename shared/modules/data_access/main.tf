@@ -391,6 +391,9 @@ resource "databricks_grant" "terraform_sp_manage_catalog" {
   privileges = ["USE_CATALOG", "USE_SCHEMA", "SELECT", "EXECUTE", "MANAGE", "CREATE_FUNCTION", "APPLY_TAG"]
 }
 
+# New USE_CATALOG and USE_SCHEMA wait with new SELECT: a staged phase before
+# grant plans only those already applied (withhold_new_use_grants), so a
+# business group gets nothing on a catalog before its masks are live.
 resource "databricks_grant" "catalog_access" {
   for_each = {
     for key, pair in(var.governance_mode == "deterministic" ? tomap({
@@ -398,7 +401,7 @@ resource "databricks_grant" "catalog_access" {
       }) : tomap({
       for pair in setproduct(local.all_catalogs, local.access_principals) :
       "${pair[0]}|${pair[1]}" => { catalog = pair[0], group = pair[1] }
-    })) : key => pair if !contains(var.held_access_grants, "catalog_access|${key}")
+    })) : key => pair if !contains(var.held_access_grants, "catalog_access|${key}") && (!var.withhold_new_use_grants || contains(var.applied_use_grants, "catalog_access|${key}"))
   }
 
   provider   = databricks.workspace
@@ -418,7 +421,7 @@ resource "databricks_grant" "schema_access" {
       }) : tomap({
       for pair in setproduct(local.uc_schemas, local.access_principals) :
       "${pair[0]}|${pair[1]}" => { schema = pair[0], group = pair[1] }
-    })) : key => pair if !contains(var.held_access_grants, "schema_access|${key}")
+    })) : key => pair if !contains(var.held_access_grants, "schema_access|${key}") && (!var.withhold_new_use_grants || contains(var.applied_use_grants, "schema_access|${key}"))
   }
 
   provider   = databricks.workspace

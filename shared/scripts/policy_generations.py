@@ -80,9 +80,11 @@ Stages (every one keeps all retained generations' functions):
   generation used, once no live policy calls them.
 * ``grant``: last, once every phase above is applied and verified: re-apply
   the last stage's render with new SELECT allowed. Every earlier phase plans
-  ``policy_stage`` values that withhold new grants (grants already applied
-  stay), so access never opens before its protection is verified. Its plan
-  may change no policy or treatment tag.
+  ``policy_stage`` values that withhold new grants (business SELECT, and the
+  business groups' USE_CATALOG and USE_SCHEMA; grants already applied stay),
+  so access never opens before its protection is verified: a first deploy's
+  create plans only the policies, the functions and the deployer's own
+  grant. Its plan may change no policy or treatment tag.
 * ``rebind-protect`` and ``rebind-access`` (make policy-rebind): after a
   rolled-back switch, when principals the policies name were deleted and
   recreated (Unity Catalog then shows them as ``unknown``), re-apply the
@@ -572,6 +574,24 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
     the enforcement wait that a policy delete restarts and a path-only re-key
     of the masking functions (``masking_rekey``).
     """
+    return [text for _, text in classified_violations(plan, stage, allowed_policy_deletes, allowed_tag_deletes)]
+
+
+def violations_heading(stage: str, violations: list[tuple[str, str]]) -> str:
+    """The refusal's first line, naming what the plan does: creates as creates, destroys as destroys."""
+    kinds = {kind for kind, _ in violations}
+    parts = [text for kind, text in (
+        ("create", "creates business access before the grant phase"),
+        ("destroy", "destroys protected resources"),
+        ("change", f"makes changes the {stage} phase may not"),
+    ) if kind in kinds]
+    return f"ERROR: the {stage} plan {' and '.join(parts) or 'is refused'}; nothing was applied:"
+
+
+def classified_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
+                          allowed_tag_deletes=frozenset()) -> list[tuple[str, str]]:
+    """plan_violations, each as (kind, text): a business grant ``create``, a protected ``destroy``,
+    or another ``change`` the stage may not make."""
     problems = []
     for change in plan.get("resource_changes") or []:
         actions = (change.get("change") or {}).get("actions") or []
@@ -585,27 +605,33 @@ def plan_violations(plan: dict, stage: str, allowed_policy_deletes=frozenset(),
                 continue
             if masking_rekey(change):  # the one-time move of the paths out of state
                 continue
-            problems.append(f"{address}: {'/'.join(actions)} (abandon only deletes the unfinished change's policies)")
+            problems.append(("destroy" if "delete" in actions and _is_protected(address, rtype) else "change",
+                             f"{address}: {'/'.join(actions)} (abandon only deletes the unfinished change's policies)"))
             continue
         if ("create" in actions and rtype == "databricks_grant" and change.get("name") in BUSINESS_GRANTS
                 and stage in ("create", "tighten", "restore", "abandon")):
-            problems.append(f"{address}: business access is only granted after the switch")
+            problems.append(("create", f"{address}: {'/'.join(actions)} (a business grant: access opens only in "
+                                       "the grant phase, after the switch is verified)"))
         if stage == "grant" and rtype in ("databricks_policy_info", "databricks_entity_tag_assignment") \
                 and set(actions) - {"no-op", "read"}:
-            problems.append(f"{address}: {'/'.join(actions)} (the grant phase changes access only)")
+            problems.append(("destroy" if "delete" in actions else "change",
+                             f"{address}: {'/'.join(actions)} (the grant phase changes access only)"))
             continue
         if "delete" not in actions:
             continue
-        protected = rtype in PROTECTED_TYPES or any(address.endswith(t) for t in PROTECTED_TYPES if "." in t)
-        if not protected:
+        if not _is_protected(address, rtype):
             continue
         pure_delete = "create" not in actions
         if pure_delete and rtype == "databricks_policy_info" and key in allowed_policy_deletes:
             continue
         if pure_delete and rtype == "databricks_entity_tag_assignment" and key in allowed_tag_deletes:
             continue
-        problems.append(f"{address}: {'/'.join(actions)}")
+        problems.append(("destroy", f"{address}: {'/'.join(actions)}"))
     return problems
+
+
+def _is_protected(address: str, rtype: str) -> bool:
+    return rtype in PROTECTED_TYPES or any(address.endswith(t) for t in PROTECTED_TYPES if "." in t)
 
 
 def _runner(env_name: str, layer_dir: Path, *args: str, capture: bool = False) -> str:
@@ -770,12 +796,11 @@ def run_hook(stage: str, environ: dict | None = None) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         plan_file = Path(plan_out) if plan_out else Path(tmp) / f"{stage}.tfplan"
         plan = _plan_json(env_name, layer_dir, stage, plan_file)
-        problems = plan_violations(plan, stage, set(staged["allowed_policy_deletes"]),
-                                   set(staged["allowed_tag_deletes"]))
-        if problems:
-            print(f"ERROR: the {stage} plan destroys protected resources; nothing was applied:",
-                  file=sys.stderr)
-            for problem in problems:
+        violations = classified_violations(plan, stage, set(staged["allowed_policy_deletes"]),
+                                           set(staged["allowed_tag_deletes"]))
+        if violations:
+            print(violations_heading(stage, violations), file=sys.stderr)
+            for _, problem in violations:
                 print(f"  - {problem}", file=sys.stderr)
             return 1
         for note in rekey_notes(plan):

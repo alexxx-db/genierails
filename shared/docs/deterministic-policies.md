@@ -87,7 +87,7 @@ nothing for them.
 | `switch` | columns are retagged and principals take their new values |
 | `verify-switched` | live check again, and verify-access with the **new** tier settings |
 | `retire`, `verify-retired`, `drop-functions` | only for a generation an **earlier** release made obsolete and a successful release then confirmed: its policies leave, then the functions only it used are dropped once no live policy calls them |
-| `grant` | last, in every run: new `SELECT` from `table_readers`. Every earlier phase plans with new grants withheld (grants already applied stay), so access opens only after its protection is applied and verified; this plan may change no policy or tag |
+| `grant` | last, in every run: new `SELECT` from `table_readers`, with the readers' new `USE_CATALOG` and `USE_SCHEMA`. Every earlier phase plans with new grants withheld (grants already applied stay), so access opens only after its protection is applied and verified: a first deploy's `create` applies only the functions, the policies and the deployer's own grant, and its coverage check judges those against the treatment tags its `switch` applies. This plan may change no policy or tag |
 
 Before each apply the hook checks its render: every tagged value has a
 policy, and nobody gets two masks except principals a tier move is moving.

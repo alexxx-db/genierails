@@ -120,6 +120,16 @@ locals {
     if try(resource.module, "") == "module.data_access" && try(resource.mode, "") == "managed"
     && try(resource.type, "") == "databricks_grant" && try(resource.name, "") == "table_access"
   ]) : []
+  # Not bound to the deployment: USE alone exposes no data, and treating a
+  # copied state's USE grants as new would revoke them until the grant phase.
+  applied_use_grants = flatten([
+    for resource in try(local._own_state.resources, []) : [
+      for instance in try(resource.instances, []) : "${resource.name}|${tostring(instance.index_key)}"
+      if try(instance.status, "") != "tainted" && try(instance.deposed, "") == "" && try(instance.index_key, null) != null
+    ]
+    if try(resource.module, "") == "module.data_access" && try(resource.mode, "") == "managed"
+    && try(resource.type, "") == "databricks_grant" && contains(["catalog_access", "schema_access"], try(resource.name, ""))
+  ])
   applied_protection_fingerprint = local._state_is_for_us ? try(tostring(local._applied_record.protection_fingerprint), "") : ""
   applied_protection             = local._state_is_for_us ? try(local._applied_record.protection, null) : null
 }
@@ -166,6 +176,10 @@ locals {
   # New SELECT opens only in the grant phase, after every staged phase is
   # applied and verified (scripts/staged_policy_apply.py).
   withhold_new_table_grants = var.governance_mode == "deterministic" && contains(["create", "tighten", "switch", "restore", "retire", "abandon", "rebind"], var.policy_stage)
+  # New USE_CATALOG/USE_SCHEMA open with SELECT, in the grant phase. A rebind
+  # holds back exactly what it would create instead (held_access_grants): its
+  # access phase grants again the USE a deleted principal lost.
+  withhold_new_use_grants = var.governance_mode == "deterministic" && contains(["create", "tighten", "switch", "restore", "retire", "abandon"], var.policy_stage)
   staged_policy_violations = local._policy_stage_guarded ? concat(
     [for name, live in local._applied_mask_policies : "${name} removed" if !contains(keys(local._config_mask_policies), name)],
     [for name, live in local._applied_mask_policies : "${name} changes its function" if contains(keys(local._config_mask_policies), name) && try(local._config_mask_policies[name].function, "") != live.function],
@@ -613,6 +627,8 @@ module "data_access" {
   governance_mode                          = var.governance_mode
   table_readers                            = local.full_table_readers
   withhold_new_table_grants                = local.withhold_new_table_grants
+  applied_use_grants                       = local.applied_use_grants
+  withhold_new_use_grants                  = local.withhold_new_use_grants
   held_access_grants                       = var.policy_stage == "rebind" ? var.held_access_grants : []
   access_tier_groups                       = var.access_tier_groups
   raw_exempt_principals                    = var.raw_exempt_principals

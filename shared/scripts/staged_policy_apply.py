@@ -498,6 +498,14 @@ class Controller:
         if phase in RESTORE_ON_FAILURE:
             self._restore(journal, t)
         print(self.describe_transition(t), file=sys.stderr)
+        if phase == "create" and not t["switch_attempted"]:
+            try:
+                abandon = self._may_abandon(t, pg.desired_generation(self.env_dir))
+            except (pg.StageError, OSError, ValueError):
+                abandon = False
+            print(f"Next: fix what stopped it (above), then re-run the same command: it resumes run {t['run_id']} "
+                  "at create." + (f" To drop the change instead, run make policy-abandon ENV={self.env_name}."
+                                  if abandon else ""), file=sys.stderr)
         return 1
 
     def _finish(self, journal: dict, t: dict) -> None:
@@ -838,6 +846,17 @@ class Controller:
             return str(exc)
         return ""
 
+    def _nothing_applied(self, t: dict) -> bool:
+        """A first deploy whose data_access state holds no deterministic policy or treatment tag.
+
+        No generation was live before it (``from`` is empty) and it never
+        switched, so nothing it applied could protect or expose a column.
+        """
+        if t["from"] or t["retain"] or t["switch_attempted"]:
+            return False
+        live = live_from_state(_read_state(self.env_dir))
+        return not live["policies"] and not live["tags"]
+
     def _may_abandon(self, t: dict, desired: dict) -> bool:
         """Whether make policy-abandon would take ``t`` up, for the hints that offer it.
 
@@ -871,6 +890,16 @@ class Controller:
             moved = self._moved_treatments(t, desired)
             created = self._created_policies(t)
             print(f"=== Policy staged apply: abandoning run {t['run_id']} (generation {t['to']}) ===")
+            if self._nothing_applied(t):
+                # A first deploy that stopped before any policy or treatment tag was applied: there is
+                # nothing to delete, and an abandon plan against the empty state would only create.
+                journal["transition"] = None
+                journal["history"] = (journal.get("history") or [])[-(HISTORY_LIMIT - 1):] + [
+                    {"run_id": t["run_id"], "abandoned": t["to"], "at": _now(), "applied": False}]
+                self._save(journal)
+                print(f"Abandoned generation {t['to']}: run {t['run_id']} applied no policy or treatment tag "
+                      "(the data_access state holds none), so nothing was planned or applied; nothing is live.")
+                return 0
             # 1. A refreshed, saved plan of the abandon render; the hook refuses any change but
             #    deleting this change's policies (policy_generations.plan_violations).
             plan_dir = pg.ledger_dir(self.env_dir) / "abandon"

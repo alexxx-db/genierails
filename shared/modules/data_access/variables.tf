@@ -264,6 +264,18 @@ variable "held_access_grants" {
   description = "\"<grant resource>|<key>\" grants to leave out of this plan (catalog_access, schema_access, table_access, terraform_sp_manage_catalog). Set only in the first phase of make policy-rebind, so re-pointed protection is applied and checked live before the grants deleted principals lost are created again."
 }
 
+variable "applied_use_grants" {
+  type        = list(string)
+  default     = []
+  description = "\"catalog_access|<key>\" and \"schema_access|<key>\" grants the last apply made, from this layer's state. While withhold_new_use_grants is set, only these are planned."
+}
+
+variable "withhold_new_use_grants" {
+  type        = bool
+  default     = false
+  description = "Plan no new USE_CATALOG or USE_SCHEMA (grants already applied are kept). The root sets it for the staged policy phases before grant, so a business group's catalog and schema access opens with its SELECT, after the new protection is switched in and verified."
+}
+
 variable "withhold_new_table_grants" {
   type        = bool
   default     = false
