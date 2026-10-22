@@ -573,6 +573,10 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     positions = [flow.index(step) for step in order]
     assert positions == sorted(positions)
     assert "Data classification" in flow
+    assert (
+        "make setup ENV=prod         # set deployer_principal_id, catalog_map and group_map; "
+        "leave access_tier_groups placeholders"
+    ) in flow
 
     # Detailed walkthrough: rename before setup, then commit before generate/check/rehearse.
     assert "git remote rename origin genierails" in before

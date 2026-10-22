@@ -1560,6 +1560,66 @@ def test_write_auth_file_dry_run_refuses_filled_secret_before_api_calls(tmp_path
     account.service_principal_secrets.create.assert_not_called()
 
 
+def test_write_auth_file_dry_run_refuses_symlink_before_api_calls(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    target = tmp_path / "outside.auto.tfvars"
+    target.write_text('databricks_client_secret = ""\n')
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="symlink; refusing"):
+        bootstrap(
+            _cfg(auth_file=auth, dry_run=True),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+    assert "super-secret" not in target.read_text()
+    account.service_principals.list.assert_not_called()
+    account.service_principals.create.assert_not_called()
+    account.service_principal_secrets.create.assert_not_called()
+
+
+def test_write_auth_file_dry_run_refuses_symlink_parent_before_api_calls(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    env_dir = tmp_path / "envs/dev"
+    env_dir.parent.mkdir()
+    env_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="is a symlink; refusing"):
+        bootstrap(
+            _cfg(auth_file=env_dir / "auth.auto.tfvars", dry_run=True),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+    account.service_principals.list.assert_not_called()
+    account.service_principals.create.assert_not_called()
+    account.service_principal_secrets.create.assert_not_called()
+
+
+def test_write_auth_file_dry_run_refuses_unparseable_secret_before_api_calls(tmp_path):
+    account, _workspace, _workspace_factory, factory = _fake()
+    auth = tmp_path / "envs/dev/auth.auto.tfvars"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('databricks_client_secret = old-secret\n')
+    auth.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="unparseable secret assignment"):
+        bootstrap(
+            _cfg(auth_file=auth, dry_run=True),
+            client_factory=factory,
+            emit=MagicMock(),
+        )
+
+    account.service_principals.list.assert_not_called()
+    account.service_principals.create.assert_not_called()
+    account.service_principal_secrets.create.assert_not_called()
+
+
 def test_write_auth_file_refusal_tightens_existing_filled_secret(tmp_path, capsys):
     _account, _workspace, _workspace_factory, factory = _fake()
     auth = tmp_path / "envs/dev/auth.auto.tfvars"

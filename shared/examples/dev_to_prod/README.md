@@ -19,7 +19,7 @@ make check ENV=dev          # read-only check of the committed files (rehearse d
 make rehearse ENV=dev       # applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
 
 # prod (same for stg or any env)
-make setup ENV=prod         # set deployer_principal_id and groups; replace the seeded catalog_map line
+make setup ENV=prod         # set deployer_principal_id, catalog_map and group_map; leave access_tier_groups placeholders
 make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
 git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git push
