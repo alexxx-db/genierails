@@ -1,8 +1,10 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import generate_abac
+from governance_policies import build_model
 from treatment_derivation import derive_treatment_model, load_treatment_config
 from validate_abac import ValidationResult, validate_coverage_gate
 
@@ -366,6 +368,37 @@ def _cli(tmp_path, tfvars, sql, context):
          "--ddl", str(tfvars.parents[1] / "ddl" / "_fetched.sql"), "--exposure-context", str(path)],
         text=True, capture_output=True,
     )
+
+
+def test_cli_blocks_a_mixed_column_whose_marker_was_deleted(tmp_path):
+    """The live refresh's classes reach the real validator through the exposure context."""
+    notes = "cat.sch.notes.free_text"
+    settings = {"access_tier_groups": ["raw", "regional", "masked"]}
+    leaky = build_model({notes: ["phone_number"]}, {notes: "STRING"}, settings, deployer_principal="deployer-sp")
+    mixed = build_model({notes: ["email_address", "name", "phone_number"]}, {notes: "STRING"}, settings,
+                        deployer_principal="deployer-sp")
+    layer = tmp_path / "prod" / "data_access"
+    layer.mkdir(parents=True)
+    tfvars, sql = layer / "abac.auto.tfvars", layer / "masking_functions.sql"
+    context = json.dumps({"column_classes": {notes: ["class.email_address", "class.name", "class.phone_number"]}})
+    # Only this check is asserted: the bare config fails the CLI's other checks too.
+    for model, blocked in ((leaky, True), (mixed, False)):
+        tfvars.write_text("tag_assignments = []\nfgac_policies = []\n")
+        sql.write_text("")
+        generate_abac.write_deterministic_model(tfvars, sql, model)
+        # A hand edit (or an older generate) leaves no marker.
+        tfvars.write_text("".join(line for line in tfvars.read_text().splitlines(keepends=True)
+                                  if "classification_mixed_partial" not in line))
+        result = _cli(tmp_path, tfvars, sql, context)
+        assert ("multi-class columns keeping a partial treatment" in result.stdout) is blocked, result.stdout
+        assert (f"{notes} (classes keep email_partial, name_partial, phone_partial" in result.stdout) is blocked
+
+
+def test_cli_refuses_malformed_column_classes(tmp_path):
+    tfvars, sql = _cli_env(tmp_path, None)
+    result = _cli(tmp_path, tfvars, sql, json.dumps({"column_classes": {"cat.sch.t.c": "class.email_address"}}))
+    assert result.returncode == 1
+    assert "column_classes must map columns to lists of strings" in result.stdout
 
 
 def test_cli_blocks_first_exposure_on_the_split_data_access_config(tmp_path):

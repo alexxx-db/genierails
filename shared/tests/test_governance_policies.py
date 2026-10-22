@@ -230,16 +230,42 @@ def test_a_free_text_column_mixing_partial_classes_is_redacted_for_every_masked_
     assert model.mixed_partial == [(NOTES, ["email_partial", "name_partial", "phone_partial"])]
 
 
-def test_mixed_partial_is_recorded_only_for_unreviewed_mixed_columns():
+def test_mixed_partial_is_recorded_for_every_mixed_column():
     model = _model({NOTES: ["email_address", "phone_number"], "cat.sch.t.email": ["email_address"],
                     "cat.sch.t.acct": ["bank_number", "iban_code"], "cat.sch.t.pin": ["email_address", "card_pin"]})
     assert model.mixed_partial == [(NOTES, ["email_partial", "phone_partial"])]
+    assert model.overridden_mixed == []
     assert base_treatment(model.columns["cat.sch.t.acct"].value) == "account_last4"
     assert model.columns["cat.sch.t.pin"].never_raw
-    # A column_overrides entry is a reviewed decision for that one column.
-    reviewed = _model({NOTES: ["email_address", "phone_number"]},
-                      column_overrides={NOTES: {"treatment": "phone_partial"}})
-    assert reviewed.mixed_partial == [] and base_treatment(reviewed.tag_values[0]) == "phone_partial"
+
+
+@pytest.mark.parametrize("override", [
+    {"treatment": "phone_partial"}, {"treatment": "email_partial", "partial": "partial"},
+    {"partial": "last4"}, {"treatment": "ssn", "partial": "last4"},
+])
+def test_an_override_never_gives_a_mixed_column_a_partial_version(override):
+    # Regression (PR #223 review): a phone_partial override kept the note's last 4.
+    classes = ["email_address", "name", "phone_number"]
+    item = resolve_column(NOTES, classes, "STRING", column_overrides={NOTES: override})
+    assert (item.treatment, item.partial, item.full, item.never_raw) == ("redact", "redacted", "redacted", False)
+    assert item.partial_sql == item.full_sql
+    model = _model({NOTES: classes}, column_overrides={NOTES: override})
+    assert base_treatment(model.tag_values[0]) == "redact"
+    assert model.mixed_partial == [(NOTES, ["email_partial", "name_partial", "phone_partial"])]
+    assert model.overridden_mixed == [NOTES]
+
+
+def test_an_override_to_redact_or_never_raw_is_kept_on_a_mixed_column():
+    classes = ["email_address", "phone_number"]
+    kept = _model({NOTES: classes}, column_overrides={NOTES: {"treatment": "redact"}})
+    assert base_treatment(kept.tag_values[0]) == "redact" and kept.overridden_mixed == []
+    pin = resolve_column(NOTES, classes, "STRING", column_overrides={NOTES: {"treatment": "card_pin"}})
+    assert pin.treatment == "card_pin" and pin.never_raw
+    # treatment_versions of a redacted class can't open a mixed column either.
+    item = resolve_column(NOTES, ["email_address", "us_ssn", "phone_number"], "STRING",
+                          treatment_versions={"ssn": {"partial": "last4"}})
+    assert (item.treatment, item.partial) == ("redact", "redacted")
+    assert resolve_column("c.s.t.ssn", ["us_ssn"], "STRING", treatment_versions={"ssn": {"partial": "last4"}}).partial == "last4"
 
 
 def test_coverage_check_blocks_a_mixed_column_that_keeps_a_partial_treatment():
@@ -255,12 +281,59 @@ def test_coverage_check_blocks_a_mixed_column_that_keeps_a_partial_treatment():
     (error,) = bad.errors
     assert "multi-class columns keeping a partial treatment" in error
     assert NOTES in error and leaky.tag_values[0] in error and "expected redact" in error
-    # Never-raw and redacted treatments keep no partial version.
-    for classes in (["email_address", "name", "phone_number", "card_pin"], ["email_address", "us_ssn"]):
-        strict = _model({NOTES: classes})
-        result = ValidationResult()
-        validate_coverage_gate(apply_model({}, strict), _functions(strict), marker, result)
-        assert result.errors == [], classes
+    # A never-raw treatment keeps no partial version.
+    strict = _model({NOTES: ["email_address", "name", "phone_number", "card_pin"]})
+    result = ValidationResult()
+    validate_coverage_gate(apply_model({}, strict), _functions(strict), marker, result)
+    assert result.errors == []
+    # Any other treatment on a mixed column is blocked, even one redacted by
+    # default: treatment_versions could give ssn last4 (the generator gives redact).
+    ssn = _model({NOTES: ["email_address", "us_ssn"]})
+    result = ValidationResult()
+    validate_coverage_gate(apply_model({}, ssn), _functions(ssn), marker, result)
+    assert any("expected redact" in error for error in result.errors)
+
+
+LIVE = {NOTES: ["class.email_address", "class.name", "class.phone_number"]}
+
+
+def _hand_edited(classes=("phone_number",)):
+    """A config whose note carries phone_partial and no marker (deleted or never written)."""
+    leaky = _model({NOTES: list(classes)})
+    return apply_model({}, leaky), _functions(leaky), leaky.tag_values[0]
+
+
+def test_coverage_check_judges_a_mixed_column_from_its_live_classes_without_the_marker():
+    # Regression (PR #223 review): deleting the marker hid the mixed column.
+    cfg, functions, value = _hand_edited()
+    blocked = ValidationResult()
+    validate_coverage_gate(cfg, functions, "", blocked, exposure={"column_classes": LIVE})
+    (error,) = blocked.errors
+    assert "multi-class columns keeping a partial treatment" in error
+    assert f"{NOTES} (classes keep email_partial, name_partial, phone_partial; gr_treatment {value}" in error
+    # Column names from UC may differ in case from the config.
+    upper = ValidationResult()
+    validate_coverage_gate(cfg, functions, "", upper, exposure={"column_classes": {NOTES.upper(): LIVE[NOTES]}})
+    assert len(upper.errors) == 1
+    # The live classes of a single-format column don't block it.
+    single = ValidationResult()
+    validate_coverage_gate(cfg, functions, "", single,
+                           exposure={"column_classes": {NOTES: ["class.phone_number"]}})
+    assert single.errors == []
+    # The generated (redacted) model passes on the same live classes.
+    good = _model({NOTES: LIVE[NOTES]})
+    passed = ValidationResult()
+    validate_coverage_gate(apply_model({}, good), _functions(good), "", passed, exposure={"column_classes": LIVE})
+    assert passed.errors == []
+
+
+def test_coverage_check_blocks_an_overridden_mixed_column_from_its_live_classes():
+    # The pre-fix output of a phone_partial override: no marker, phone_partial.
+    cfg, functions, value = _hand_edited()
+    assert value.startswith("phone_partial__string__")
+    result = ValidationResult()
+    validate_coverage_gate(cfg, functions, "", result, exposure={"column_classes": LIVE})
+    assert any(NOTES in error and "expected redact" in error for error in result.errors)
 
 
 ROOT = Path(__file__).resolve().parents[2]

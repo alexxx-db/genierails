@@ -254,8 +254,14 @@ def tag_assignments_digest(assignments: list) -> str:
     return hashlib.sha256("\n".join(keys).encode()).hexdigest()
 
 
-def write_refresh_record(path: Path, *, mode: str, ddl_path: Path, config_path: Path | None) -> None:
-    """Record a successful live refresh (written by derive_assignments.py)."""
+def write_refresh_record(path: Path, *, mode: str, ddl_path: Path, config_path: Path | None,
+                         column_classes: dict | None = None) -> None:
+    """Record a successful live refresh (written by derive_assignments.py).
+
+    ``column_classes`` (a deterministic env's live class.* tags per column)
+    lets the coverage check judge each column from its classes, not from
+    what the config says about them.
+    """
     record = {
         "version": REFRESH_VERSION,
         "mode": mode,
@@ -266,7 +272,18 @@ def write_refresh_record(path: Path, *, mode: str, ddl_path: Path, config_path: 
         record["tag_assignments_sha256"] = tag_assignments_digest(
             _load_tfvars(config_path).get("tag_assignments") or []
         )
+    if column_classes:
+        record["column_classes"] = {column: sorted(classes) for column, classes in sorted(column_classes.items())}
     write_result(path, record)
+
+
+def refresh_column_classes(env_dir: Path) -> dict:
+    """The live class.* tags per column the last live refresh recorded ({} if none)."""
+    try:
+        classes = json.loads((env_dir / REFRESH_RELPATH).read_text()).get("column_classes") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}  # _live_refresh fails the gate on a missing or unreadable record
+    return classes if isinstance(classes, dict) else {}
 
 
 def staged_migration_assignments(env_dir: Path, stage: str, old_fingerprint: str,
@@ -785,6 +802,7 @@ def run_gate(env_dir: Path, env_name: str, runner: Path, apply_flags: str, verbo
             "first_exposure_tables": first,
             "acknowledged_columns": inputs["acknowledged_columns"],
             "acknowledge_file": str(env_dir / "env.auto.tfvars"),
+            "column_classes": refresh_column_classes(env_dir),
         }, handle)
         context = Path(handle.name)
     try:

@@ -572,6 +572,29 @@ def test_successful_refresh_records_what_it_read(tmp_path, monkeypatch):
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", written["refreshed_at"])
 
 
+def test_deterministic_refresh_records_live_classes_and_redacts_an_overridden_mixed_column(
+        tmp_path, monkeypatch, capsys):
+    config, auth, env = _deterministic(tmp_path, monkeypatch, [
+        ("prod", "sales", "customers", "email", f"class.{name}", "")
+        for name in ("email_address", "name", "phone_number")
+    ])
+    env.write_text(DETERMINISTIC_ENV + 'column_overrides = { "prod.sales.customers.email" = { treatment = "phone_partial" } }\n')
+    record = tmp_path / "generated" / ".live_refresh.json"
+    assert MODULE.main([
+        "--config", str(config), "--auth-file", str(auth), "--env-file", str(env),
+        "--write-ddl", str(tmp_path / "ddl" / "_fetched.sql"), "--refresh-record", str(record),
+    ]) == 0
+    text = config.read_text()
+    values = {a["entity_name"]: a["tag_value"] for a in hcl2.loads(text)["tag_assignments"]
+              if a["tag_key"] == "gr_treatment"}
+    assert values["prod.sales.customers.email"].startswith("redact__string__")
+    assert "# gr.classification_mixed_partial: prod.sales.customers.email|email_partial,name_partial,phone_partial" in text
+    assert 'column_overrides["prod.sales.customers.email"] is not applied' in capsys.readouterr().err
+    # The coverage check reads the column's classes from here, not from the config.
+    assert json.loads(record.read_text())["column_classes"] == {
+        "prod.sales.customers.email": ["email_address", "name", "phone_number"]}
+
+
 def test_failed_refresh_removes_the_previous_record(tmp_path, monkeypatch):
     config, auth, env = _files(tmp_path)
     record = tmp_path / "generated" / ".live_refresh.json"

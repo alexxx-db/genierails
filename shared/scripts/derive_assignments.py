@@ -31,7 +31,7 @@ from generate_abac import (  # noqa: E402
     scope_ddl_to_footprint,
     write_deterministic_model,
 )
-from governance_policies import TAG_KEY, DeterministicGovernanceError  # noqa: E402
+from governance_policies import TAG_KEY, DeterministicGovernanceError, mixed_override_warning  # noqa: E402
 from treatment_derivation import (  # noqa: E402
     collapse_sensitivity_assignments,
     derive_treatment_model,
@@ -165,11 +165,13 @@ def refresh_ddl_only(auth_path: Path, env_path: Path, ddl_out: Path) -> None:
 
 def derive_assignments(
     config_path: Path, auth_path: Path, env_path: Path, ddl_out: Path | None = None,
-    *, record_governed: bool = True,
+    *, record_governed: bool = True, classes_out: dict | None = None,
 ) -> int:
     """Atomically replace only the promoted config's tag_assignments section.
 
     With ``ddl_out``, also refresh the fetched DDL the coverage check reads.
+    ``classes_out`` receives a deterministic env's live class.* tags per
+    column, which the live-refresh record keeps for the coverage check.
     ``record_governed=False`` (a runtime overlay, scripts/runtime_overlay.py)
     leaves the committed governed-table record alone; deployed tags keep the
     tables governed once applied.
@@ -201,6 +203,8 @@ def derive_assignments(
     if runtime.get("governance_mode", "legacy") == "deterministic":
         ddl_text = (ddl_out.read_text() if ddl_out is not None
                     else fetched_ddl_text(table_refs, runtime, footprint))
+        if classes_out is not None:
+            classes_out.update(native.classes_by_column())
         return _derive_deterministic(config_path, env_path, runtime, native, ddl_text,
                                      record_governed=record_governed)
 
@@ -288,6 +292,8 @@ def _derive_deterministic(config_path: Path, env_path: Path, runtime: dict, nati
         print(f"WARNING: {column} has unmapped class.{semantic}; redacted for every tier "
               "and new access is blocked until it is mapped (make scaffold-treatments)",
               file=sys.stderr)
+    for column in model.overridden_mixed:
+        print(f"WARNING: {mixed_override_warning(column)}", file=sys.stderr)
     if record_governed:
         record(env_path.parent, model.tag_assignments, TAG_KEY)
     write_deterministic_model(config_path, config_path.with_name("masking_functions.sql"), model)
@@ -336,9 +342,10 @@ def main(argv: list[str] | None = None) -> int:
             refresh_ddl_only(Path(args.auth_file), Path(args.env_file), args.write_ddl)
             message = f"Refreshed live DDL ({args.write_ddl}); tag_assignments were not changed."
         else:
+            classes: dict = {}
             count = derive_assignments(
                 config, Path(args.auth_file), Path(args.env_file), ddl_out=args.write_ddl,
-                record_governed=args.out_dir is None,
+                record_governed=args.out_dir is None, classes_out=classes,
             )
             message = f"Derived {count} gr_treatment assignment(s); reviewed rules were not changed."
         if args.refresh_record:
@@ -347,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode="ddl" if args.ddl_only else "full",
                 ddl_path=args.write_ddl,
                 config_path=None if args.ddl_only else config,
+                column_classes=None if args.ddl_only else classes,
             )
     except (RuntimeError, NativeClassificationRequiredError, FootprintError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

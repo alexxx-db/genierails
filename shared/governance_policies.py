@@ -46,6 +46,7 @@ UNMAPPED_MARKER = "# gr.classification_unmapped:"
 # A string column whose classes keep several different partial treatments;
 # the coverage check blocks it unless its gr_treatment has no partial version.
 MIXED_PARTIAL_MARKER = "# gr.classification_mixed_partial:"
+MIXED_PARTIAL_TREATMENT = "redact"
 
 _VALUE_RE = re.compile(
     r"(?P<treatment>[a-z0-9_]+?)__(?P<type>[a-z0-9_]+)__(?P<generation>[0-9a-f]{8})"
@@ -203,6 +204,33 @@ def base_treatment(value: str) -> str:
     return parsed[0] if parsed else value
 
 
+def mixed_override_warning(column: str) -> str:
+    return (f'column_overrides["{column}"] is not applied: the column\'s class.* tags keep several partial '
+            "treatments, so it is redacted for every masked tier. Remove the extra class.* tag, or override "
+            "it to redact or a never-raw treatment")
+
+
+def keeps_string_partial(value: str) -> bool:
+    """Whether a deterministic string value may have a partial version (not redact, not never raw)."""
+    parsed = parse_treatment_value(value)
+    return bool(parsed and parsed[1] == "string" and parsed[0] != MIXED_PARTIAL_TREATMENT
+                and not is_never_raw(value))
+
+
+def mixed_partial_problem(value: str, classes: Sequence[str], library: dict | None = None) -> list[str]:
+    """The partial treatments a string column's ``classes`` mix, if its value keeps one.
+
+    Empty when the value is fine: not a deterministic string value, the
+    ``redact`` treatment, never raw, or classes that keep at most one partial
+    treatment (resolve_column gives every mixed column redact or never-raw).
+    """
+    if not keeps_string_partial(value):
+        return []
+    names = sorted({c.removeprefix("class.") for c in classes if c})
+    mixed = partial_treatments(names, "STRING", library or load_library())
+    return sorted(mixed) if len(mixed) > 1 else []
+
+
 def is_never_raw(value: str) -> bool:
     treatment = base_treatment(value)
     return treatment in NEVER_RAW_TREATMENTS or treatment == FAILSAFE_TREATMENT
@@ -234,7 +262,10 @@ def resolve_column(
     The strictest class wins (mask_library.resolve_class). Any never-raw class
     makes the whole column never raw, and a class the library doesn't map
     makes it the fail-safe never-raw redaction (every tier, including tier 1,
-    since an unknown class may be one that must never be raw).
+    since an unknown class may be one that must never be raw). A string
+    column whose classes keep several partial treatments is ``redact`` (unless
+    never raw) whatever ``column_overrides`` or ``treatment_versions`` say:
+    no one partial format is safe for all of its classes.
     """
     data = library or load_library()
     exact_type = normalize_sql_type(sql_type)
@@ -272,6 +303,8 @@ def resolve_column(
     if not never_raw:
         version = (treatment_versions or {}).get(treatment, {}).get("partial")
         partial = override.get("partial", version or partial)
+        if len(partial_treatments(names, exact_type, data)) > 1:
+            treatment, partial, full = MIXED_PARTIAL_TREATMENT, "redacted", "redacted"
     # An adopted custom mask's partial version is named after it.
     custom = None if never_raw else (data.get("custom_bodies") or {}).get(partial, {}).get(family)
     return ColumnTreatment(treatment, exact_type, partial or full, full, never_raw, custom)
@@ -427,9 +460,11 @@ class DeterministicModel:
     fgac_policies: list[dict]
     tag_values: list[str]
     functions_sql: str
-    # (column, its partial treatments) for every column without a
-    # column_overrides entry whose classes keep more than one.
+    # (column, its partial treatments) for every column whose classes keep
+    # more than one; such a column is redacted (resolve_column).
     mixed_partial: list[tuple[str, list[str]]] = field(default_factory=list)
+    # The mixed columns whose column_overrides entry asked for something else.
+    overridden_mixed: list[str] = field(default_factory=list)
 
 
 def normalize_column_overrides(
@@ -496,6 +531,7 @@ def build_model(
     columns: dict[str, ColumnTreatment] = {}
     unmapped: list[tuple[str, str]] = []
     mixed_partial: list[tuple[str, list[str]]] = []
+    overridden_mixed: list[str] = []
     missing_types = []
     for column in sorted(classes_by_column):
         classes = sorted({c.removeprefix("class.") for c in classes_by_column[column] if c})
@@ -510,8 +546,12 @@ def build_model(
             column_overrides=overrides,
         )
         mixed = partial_treatments(classes, sql_type, library)
-        if len(mixed) > 1 and column.lower() not in overrides:
+        if len(mixed) > 1:
             mixed_partial.append((column, sorted(mixed)))
+            rule = overrides.get(column.lower()) or {}
+            item = columns[column]
+            if rule.get("treatment", item.treatment) != item.treatment or rule.get("partial", item.partial) != item.partial:
+                overridden_mixed.append(column)
     if missing_types:
         raise DeterministicGovernanceError(
             "no column type in the fetched DDL for classified column(s): " + ", ".join(missing_types)
@@ -537,6 +577,7 @@ def build_model(
         tag_values=sorted({item.value for item in columns.values()}),
         functions_sql=render_functions(columns),
         mixed_partial=mixed_partial,
+        overridden_mixed=overridden_mixed,
     )
 
 

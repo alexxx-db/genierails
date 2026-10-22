@@ -32,9 +32,13 @@ column whose classes keep two or more different partial treatments, such as a
 free-text note tagged `email_address`, `name` and `phone_number`: no one
 partial format is safe for all of them (a last-4 of the note leaks its length
 and its last characters), so the column gets `redact` and every masked tier
-sees `[REDACTED]`. The generated rules record such a column in a
-`gr.classification_mixed_partial` marker, and the coverage check fails if its
-`gr_treatment` still has a partial version. Several classes of one treatment
+sees `[REDACTED]`, even beside a redacted class. `column_overrides` and
+`treatment_versions` can't change that: an override to anything but `redact`
+or a never-raw treatment is not applied, and generate and the live refresh
+print a warning naming the column. The coverage check reads each column's
+live `class.*` tags from the live refresh and fails if a mixed column's
+`gr_treatment` is anything but `redact` or never raw; it also checks the
+`gr.classification_mixed_partial` markers in the generated rules. Several classes of one treatment
 (`bank_number` and `iban_code`) keep that treatment. Unsupported types receive
 the full version.
 

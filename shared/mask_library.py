@@ -147,16 +147,17 @@ def resolve_class(classes: list[str], sql_type: str, library: dict | None = None
     broken by the greatest treatment name so tag order never matters. A
     string column whose classes keep two or more different partial
     treatments (a free-text column tagged email, name and phone) has no
-    partial version that is safe for all of them, so it is redacted.
+    partial version that is safe for all of them, so it is ``redact``
+    unless a never-raw class names it.
     """
     data = library or load_library()
     candidates = _candidates(classes, sql_type, data)
     if not candidates:
         raise KeyError(f"no mask-library mapping for {classes!r}")
     never_raw = any(candidate[1] in NEVER_RAW_TREATMENTS for candidate in candidates)
-    rank, treatment_name, partial, full = max(candidates)
-    if rank == _PARTIAL and len(partial_treatments(classes, sql_type, data)) > 1:
-        return "redact", "redacted", "redacted", never_raw
+    _rank, treatment_name, partial, full = max(candidates)
+    if not never_raw and len(partial_treatments(classes, sql_type, data)) > 1:
+        return "redact", "redacted", "redacted", False
     return treatment_name, partial, full, never_raw
 
 

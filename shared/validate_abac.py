@@ -21,9 +21,9 @@ from pathlib import Path
 
 from tag_vocabulary import REGISTRY
 from governance_policies import (
-    is_library_treatment_value, is_never_raw, parse_treatment_value,
+    is_library_treatment_value, is_never_raw, keeps_string_partial, mixed_partial_problem,
+    parse_treatment_value,
 )
-from mask_library import load_library
 from treatment_derivation import load_treatment_config
 
 try:
@@ -455,7 +455,8 @@ def load_exposure_context(path: Path) -> dict:
 
     ``first_exposure_tables`` are tables about to be granted SELECT that the
     data_access state doesn't grant yet; ``acknowledged_columns`` come from
-    ``coverage_acknowledged_columns``. Anything malformed raises ValueError.
+    ``coverage_acknowledged_columns``; ``column_classes`` are the live class.*
+    tags per column from the last live refresh. Anything malformed raises ValueError.
     """
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
@@ -467,6 +468,11 @@ def load_exposure_context(path: Path) -> dict:
             raise ValueError(f"exposure context {key} must be a list of strings")
         context[key] = value
     context["acknowledge_file"] = str(data.get("acknowledge_file") or "env.auto.tfvars")
+    classes = data.get("column_classes", {})
+    if not isinstance(classes, dict) or not all(
+            isinstance(v, list) and all(isinstance(c, str) for c in v) for v in classes.values()):
+        raise ValueError("exposure context column_classes must map columns to lists of strings")
+    context["column_classes"] = classes
     return context
 
 
@@ -552,17 +558,14 @@ def _check_unclassified_sensitive_columns(
         )
 
 
-def _keeps_partial_version(value: str) -> bool:
-    """Whether a deterministic string ``gr_treatment`` value has a partial (non-redacted) version."""
-    parsed = parse_treatment_value(value)
-    if not parsed or is_never_raw(value):
-        return False
-    item = load_library()["treatments"].get(parsed[0])
-    if item is None:
-        return True  # an adopted custom mask is its own partial version
-    if "STRING" not in item["types"]:
-        return False
-    return item.get("partial_by_type", {}).get("STRING", item.get("partial")) not in {"redacted", "null"}
+def _gate_library(env_dir: Path | None) -> dict:
+    """The env's effective mask library: its adopted custom masks and tag_treatments added."""
+    from governance_policies import with_tag_treatments
+    from scripts.custom_masks import effective_library
+
+    env_file = env_dir / "env.auto.tfvars" if env_dir is not None else None
+    tag_treatments = parse_tfvars(env_file).get("tag_treatments") if env_file and env_file.is_file() else None
+    return with_tag_treatments(effective_library(env_dir), tag_treatments)
 
 
 def validate_coverage_gate(
@@ -612,18 +615,35 @@ def validate_coverage_gate(
         )
     ]
     # A free-text column tagged email, name and phone has no partial version
-    # that is safe for all three (mask_library.resolve_class redacts it).
+    # that is safe for all three, so it must be redact or never raw. Its
+    # classes come from the live refresh (exposure context column_classes),
+    # so a hand edit of the config can't hide one; the marker generate
+    # writes is checked too, for runs without a live refresh.
+    marked = {
+        column.strip().lower(): listed.strip().split(",")
+        for column, listed in re.findall(
+            r"^\s*#\s*gr\.classification_mixed_partial:\s*([^|\n]+)\|([^\n]+)$",
+            raw_tfvars,
+            re.MULTILINE,
+        )
+    }
+    live_classes = {column.lower(): classes for column, classes in ((exposure or {}).get("column_classes") or {}).items()}
     mixed_partial = []
-    for column, listed in re.findall(
-        r"^\s*#\s*gr\.classification_mixed_partial:\s*([^|\n]+)\|([^\n]+)$",
-        raw_tfvars,
-        re.MULTILINE,
-    ):
-        column, value = column.strip(), treatments.get(column.strip(), "")
-        if _keeps_partial_version(value):
+    library = None
+    if live_classes:
+        try:
+            library = _gate_library(env_dir)
+        except Exception as exc:  # noqa: BLE001 - an unreadable env library blocks
+            mixed_partial.append(f"the env's mask library (custom masks, tag_treatments) can't be read: {exc}")
+    for column, value in sorted(treatments.items()):
+        if not keeps_string_partial(value):
+            continue
+        mixed = mixed_partial_problem(value, live_classes.get(column.lower(), []), library) if library else []
+        mixed = mixed or marked.get(column.lower(), [])
+        if mixed:
             mixed_partial.append(
-                f"{column} (classes keep {', '.join(listed.strip().split(','))}; "
-                f"gr_treatment {value} keeps a partial version; expected redact)"
+                f"{column} (classes keep {', '.join(mixed)}; gr_treatment {value} keeps a partial "
+                "version; expected redact. Re-run make generate, or remove the extra class.* tag)"
             )
     unprotected: list[str] = []
     missing_policies: set[str] = set()

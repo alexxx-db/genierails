@@ -139,8 +139,10 @@ def test_mixing_partial_treatments_keeps_never_raw_and_one_partial_treatment_unc
         assert resolve_class(classes, "STRING")[1:] == ("redacted", "redacted", True)
     # One partial treatment for several classes keeps it.
     assert resolve_class(["bank_number", "iban_code"], "STRING") == ("account_last4", "last4", "redacted", False)
-    # A redacted class already redacts; its treatment names the column as before.
-    assert resolve_class(["email_address", "us_ssn", "phone_number"], "STRING")[:3] == ("ssn", "redacted", "redacted")
+    # Mixed partial classes are redact even beside a redacted class, so no
+    # treatment_versions entry for that class (ssn = last4) can open them.
+    assert resolve_class(["email_address", "us_ssn", "phone_number"], "STRING") == ("redact", "redacted", "redacted", False)
+    assert resolve_class(["email_address", "us_ssn"], "STRING")[:3] == ("ssn", "redacted", "redacted")
 
 
 def test_unsupported_type_resolves_partial_to_full():

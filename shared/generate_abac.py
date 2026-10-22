@@ -8592,6 +8592,9 @@ Before you apply, tune for your business roles, security requirements, and Genie
         for column, semantic in model.unmapped:
             print(f"  WARNING: {column} has unmapped class.{semantic}; redacted for every tier "
                   "and new access is blocked until it is mapped (make scaffold-treatments)")
+        from governance_policies import mixed_override_warning
+        for column in model.overridden_mixed:
+            print(f"  WARNING: {mixed_override_warning(column)}")
 
     # Genie mode: skip validation — the output intentionally has no groups/ABAC sections
     # and validate_abac.py would incorrectly report "groups is missing".
