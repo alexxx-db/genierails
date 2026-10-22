@@ -59,6 +59,13 @@ For each table in the set:
 3. **Row filters** only where declared (section 4).
 4. **Coverage check:** every `class.*` tag needs a mapping (section 6).
 
+Compatibility limit: the live class record is `generated/.live_refresh.json`
+(`column_classes`). DDL-only envs and records written before this field existed
+fall back to the generate marker comment, and a hand-edited record could hide
+one of the classes. Use the normal `apply`/`rehearse` path in dev, or
+`release-plan`/`release`/`maintain` in prod, to regenerate it from live
+`class.*` tags before the gate; never hand-edit the record.
+
 Same inputs give the same output. Adding an agent whose tables are already governed changes nothing in governance.
 
 ## 2. The mask library
