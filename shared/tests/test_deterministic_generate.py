@@ -222,6 +222,46 @@ def test_rerun_over_a_reviewed_draft_keeps_its_rules_and_is_stable(env_dir, monk
     assert (generated / "abac.auto.tfvars").read_text() == first
 
 
+def test_generate_is_byte_stable_after_id_only_agent_is_captured(env_dir, monkeypatch):
+    """The capture written after a fresh make generate must not change its rerun."""
+    env_file = env_dir / "env.auto.tfvars"
+    env_file.write_text(ENV.replace(
+        f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
+        "",
+    ))
+    agents = env_dir / "agents"
+    agents.mkdir()
+    (agents / f"{AGENT}.auto.tfvars").write_text(
+        f'genie_space_id = "{SPACE_ID}"\nacl_groups = {json.dumps(TIERS)}\n'
+    )
+    calls = []
+
+    def fetch(space_id, cfg, quick_check_only=False):
+        calls.append(space_id)
+        return (
+            list(TABLES), generate_abac.parse_genie_config_from_serialized_space(SERIALIZED),
+            AGENT, True,
+        )
+
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", fetch)
+
+    _generate(env_dir, monkeypatch)
+    tfvars = env_dir / "generated/abac.auto.tfvars"
+    first = tfvars.read_bytes()
+
+    # This is the side effect of make generate's import-new step, which runs
+    # after generate_abac on the first invocation; make also records the
+    # governed table set before returning.
+    (agents / f"{AGENT}.space.json").write_text(SERIALIZED + "\n")
+    (env_dir / "generated/governed_tables.json").write_text(
+        json.dumps({"tables": TABLES}) + "\n"
+    )
+    _generate(env_dir, monkeypatch)
+
+    assert tfvars.read_bytes() == first
+    assert calls == [SPACE_ID], "a captured agent must not add another Genie API read"
+
+
 def test_a_free_text_column_with_several_partial_classes_is_redacted_and_marked(env_dir, monkeypatch):
     ddl = DDL.replace("  date_of_birth DATE\n);", "  date_of_birth DATE,\n  notes STRING\n);")
     rows = TAG_ROWS + [("dev_fin", "payments", "customers", "notes", f"class.{name}", "")

@@ -2626,26 +2626,44 @@ def write_deterministic_draft(
     sql_path = out_dir / "masking_functions.sql"
     reviewed = tfvars_path.read_text() if tfvars_path.exists() else ""
     text = reviewed or DETERMINISTIC_DRAFT_HEADER
+    reviewed_cfg = hcl2.loads(reviewed) if reviewed else {}
+    if api_genie_configs:
+        keep_reviewed_genie_content(tfvars_path, api_genie_configs)
+    config_changed = (
+        mode == "governance"
+        or bool(api_genie_configs)
+        and (reviewed_cfg.get("genie_space_configs") or {}) != api_genie_configs
+    )
     if mode == "genie":
         text = strip_abac_for_genie_mode(text)
-    # Tool-owned blocks are re-appended in a fixed order, so a re-run over
-    # this function's own output leaves the file unchanged.
-    owned = ["groups", "genie_space_id_to_name"]
-    if mode == "governance" or api_genie_configs:
+    # Replaced tool-owned blocks are appended in a fixed order. An unchanged
+    # groups block stays in place so preserved blocks cannot reorder it.
+    mapping_changed = (reviewed_cfg.get("genie_space_id_to_name") or {}) != genie_space_id_to_name
+    owned = ["genie_space_id_to_name"] if mapping_changed else []
+    if config_changed:
         owned.append("genie_space_configs")
     for key in owned:
         text = remove_hcl_top_level_block(text, key)
-    text = _ID_TO_NAME_COMMENT_RE.sub("", _IMPORTED_GENIE_COMMENT_RE.sub("", text)).rstrip() + "\n"
+    if config_changed:
+        text = _IMPORTED_GENIE_COMMENT_RE.sub("", text)
+    if mapping_changed:
+        text = _ID_TO_NAME_COMMENT_RE.sub("", text)
+    text = text.rstrip() + "\n"
     if mode != "genie":
-        reviewed_groups = (hcl2.loads(reviewed).get("groups") or {}) if reviewed else {}
+        reviewed_groups = reviewed_cfg.get("groups") or {}
         groups = {
             name: {"description": str((reviewed_groups.get(name) or {}).get("description") or "")}
             for name in group_names
         }
-        text += "\ngroups = " + _render_value(groups) + "\n"
+        # Keep an unchanged block where it is. Moving it after a preserved
+        # Genie block makes a no-input-change rerun differ from the first run.
+        if reviewed_groups != groups:
+            text = remove_hcl_top_level_block(text, "groups")
+            text = text.rstrip() + "\n\ngroups = " + _render_value(groups) + "\n"
     if mode != "governance":
         text = inject_imported_genie_config(
-            text, tfvars_path, api_genie_configs, genie_space_id_to_name,
+            text, tfvars_path, api_genie_configs if config_changed else {},
+            genie_space_id_to_name if mapping_changed else {},
         )
     tfvars_path.write_text(text.rstrip() + "\n")
 
@@ -7505,6 +7523,11 @@ def main():
                             sys.exit(1)
                         api_genie_configs[effective_name] = genie_cfg
                 else:
+                    # Captured agents are deliberately not read from the API.
+                    # Their merged settings still carry the canonical name,
+                    # so reconstruct the tool-owned identity map locally.
+                    if space_id:
+                        genie_space_id_to_name[space_id] = space_name
                     all_space_tables.extend(space_tables)
 
                 for table in exposed_tables:
