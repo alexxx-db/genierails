@@ -65,12 +65,16 @@ class FakeUnityCatalog:
         self.seen: dict[tuple[str, str], str] = {}  # (tier, column) -> the mask it got ("raw" when none)
         self.leak: set[str] = set()  # tiers whose mask the fake drops (a broken policy)
         self.interrupt = ""  # tier whose query is interrupted (Ctrl-C)
+        self.killed = False  # the verify-access process dies before its cleanup: its REVOKEs never run
 
     def execute(self, sql: str) -> None:
         self.statements.append(sql)
         verb, privilege, _, securable, _, grantee = STATEMENT.match(sql).groups()
         entry = (grantee, privilege, securable.replace("`", ""))
-        (self.direct.add if verb == "GRANT" else self.direct.discard)(entry)
+        if verb == "GRANT":
+            self.direct.add(entry)
+        elif not self.killed:
+            self.direct.discard(entry)
 
     def _can(self, app: str, privilege: str, securable: str) -> bool:
         if app == ADMIN or (app, privilege, securable) in self.direct:
@@ -198,7 +202,7 @@ class LiveVerify(Recording):
             rc = vea.main(cli)
         except KeyboardInterrupt:
             rc = 130  # the shell's exit status for an interrupted verify-access
-        self.verifies.append({"stage": stage, "rc": rc, "pre_grant": env.get("GENIERAILS_VERIFY_PRE_GRANT"),
+        self.verifies.append({"killed": self.uc.killed, "stage": stage, "rc": rc, "pre_grant": env.get("GENIERAILS_VERIFY_PRE_GRANT"),
                               "business": before & BUSINESS, "grantees": set(self.uc.grantees_while_reading),
                               "left": set(self.uc.direct), "seen": dict(self.uc.seen)})
         assert grant_keys(live_state(self.env_dir)) == before, "verify-access changed a Terraform grant"
@@ -214,8 +218,9 @@ def harness(tmp_path, monkeypatch):
     h = LiveVerify(env_dir, monkeypatch, tmp_path)
     yield h
     assert not h.invariant_problems, h.invariant_problems
-    # Every temporary grant is revoked when verify-access exits, whatever the outcome.
-    assert [v["left"] for v in h.verifies] == [set()] * len(h.verifies)
+    # Every temporary grant is revoked when verify-access exits, whatever the outcome (short of a kill).
+    assert [v["left"] for v in h.verifies if not v.get("killed")] == [set()] * len([
+        v for v in h.verifies if not v.get("killed")])
 
 
 def mixed(h, tmp_path, monkeypatch) -> dict:
@@ -411,3 +416,74 @@ def test_a_det_to_det_change_verifies_the_same_way_and_leaves_the_tier_grants_al
     assert all(s.rsplit("`", 2)[1].startswith("app-") for s in harness.uc.statements)
     assert grant_keys(live_state(harness.env_dir)) == granted
     assert harness.journal()["active"] == new["fingerprint"]
+
+
+# -- (4) a pre-grant verify killed before its cleanup -------------------------------------------------
+def _killed_then_granted(h, tmp_path, monkeypatch) -> list[str]:
+    """A first deploy whose verify-switched was SIGKILLed after its reads: its direct grants stay.
+
+    The controller saw it pass, so grant ran; the inputs a post-grant verify-access (rehearse's gate) uses.
+    """
+    mixed(h, tmp_path, monkeypatch)
+    h.uc.killed = True
+    assert h.apply() == 0
+    h.uc.killed = False
+    left = {grantee for grantee, _, _ in h.uc.direct}
+    assert left == PRINCIPALS  # what the killed run never revoked
+    t = {"from": "", "to": h.journal()["active"], "tier_move": False}
+    tfvars, env_file = h.controller().verification_inputs(t, ("switch",))
+    h.uc.statements.clear()
+    return ["--from-tfvars", str(tfvars), "--env-file", str(env_file), "--key-column", "id", "--require-mask-checks",
+            "--gate", "--auth-file", str(h.auth), "--live"]
+
+
+def _drop_group_grant(h, key: str) -> None:
+    path = h.env_dir / "data_access" / "terraform.tfstate"
+    state = json.loads(path.read_text())
+    for resource in state["resources"]:
+        if resource["type"] == "databricks_grant":
+            resource["instances"] = [i for i in resource["instances"] if f"{resource['name']}|{i['index_key']}" != key]
+    path.write_text(json.dumps(state))
+
+
+def test_a_post_grant_verify_revokes_a_killed_run_s_grants_and_reads_through_the_groups(harness, tmp_path,
+                                                                                         monkeypatch, capsys):
+    cli = _killed_then_granted(harness, tmp_path, monkeypatch)
+    harness.uc.grantees_while_reading = set()
+    assert vea.main(cli) == 0, capsys.readouterr()
+    # Every leftover grant was revoked before any read; only the out-of-tier probe (in no group) read
+    # through a direct grant, and it was revoked again on exit.
+    assert harness.uc.grantees_while_reading == {f"app-{vea.OUT_OF_TIER_PRINCIPAL}"}
+    assert harness.uc.direct == set()
+    first_grant = next(i for i, sql in enumerate(harness.uc.statements) if sql.startswith("GRANT"))
+    assert {sql.rsplit("`", 2)[1] for sql in harness.uc.statements[:first_grant]} == PRINCIPALS
+    assert all(sql.startswith("REVOKE") for sql in harness.uc.statements[:first_grant])
+
+
+def test_a_post_grant_verify_fails_when_a_tier_group_lacks_its_real_grant_despite_leftovers(harness, tmp_path,
+                                                                                            monkeypatch, capsys):
+    cli = _killed_then_granted(harness, tmp_path, monkeypatch)
+    _drop_group_grant(harness, "table_access|cat.sch.t|regional")
+    capsys.readouterr()
+    assert vea.main(cli) == 1
+    out = capsys.readouterr()
+    assert "User does not have SELECT on Table 'cat.sch.t'" in out.out + out.err
+    assert harness.uc.direct == set()
+
+
+def test_a_leftover_grant_that_can_t_be_revoked_refuses_the_post_grant_verify(harness, tmp_path, monkeypatch):
+    cli = _killed_then_granted(harness, tmp_path, monkeypatch)
+    real = harness.uc.execute
+
+    def revoke_denied(sql):
+        if sql.startswith("REVOKE") and "app-regional" in sql and not harness.uc.grantees_while_reading:
+            raise RuntimeError("PERMISSION_DENIED")
+        real(sql)
+
+    harness.uc.grantees_while_reading = set()
+    harness.uc.seen = {}
+    monkeypatch.setattr(harness.uc, "execute", revoke_denied)
+    with pytest.raises(RuntimeError, match="refusing to verify: test principal app-regional"):
+        vea.main(cli)
+    # Refused before any grant or read.
+    assert harness.uc.seen == {} and not [sql for sql in harness.uc.statements if sql.startswith("GRANT")]

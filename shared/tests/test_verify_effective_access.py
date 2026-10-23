@@ -1904,8 +1904,9 @@ class TestTemporaryWarehouseAccess:
 class TestTieredLiveGrantLifecycle:
     @staticmethod
     def _run(monkeypatch, tmp_path, *, revoke_error=None, keep=False, sample_error=None, log=None,
-             pre_grant=False):
+             pre_grant=False, cleanup_error=None):
         log = [] if log is None else log
+        granted = set()
         raw = {key: f"raw-{key}" for key in range(12)}
         partial = {key: f"partial-{key}" for key in range(12)}
         full = {key: "[R]" for key in range(12)}
@@ -1938,9 +1939,14 @@ class TestTieredLiveGrantLifecycle:
                 log.append(("preflight", principal.tier))
 
             def grant_temporary_table_access(self, principal, tables, *, revoke=False):
-                log.append(("revoke" if revoke else "grant", principal.tier, tuple(tables)))
-                if revoke and revoke_error:
+                # A revoke before the principal's first grant is the cleanup of earlier runs' leftovers.
+                kind = "grant" if not revoke else "revoke" if principal.tier in granted else "cleanup"
+                log.append((kind, principal.tier, tuple(tables)))
+                granted.add(principal.tier) if kind == "grant" else None
+                if kind == "revoke" and revoke_error:
                     raise revoke_error
+                if kind == "cleanup" and cleanup_error:
+                    raise cleanup_error
 
             def deprovision_principal(self, principal):
                 log.append(("deprovision", principal.tier))
@@ -2020,6 +2026,28 @@ class TestTieredLiveGrantLifecycle:
         # Only the test principals themselves: never the admin baseline.
         assert {entry[1] for entry in log if entry[0] in ("grant", "revoke")} == set(self.TIERS)
 
+    @pytest.mark.parametrize("pre_grant", [False, True])
+    def test_every_run_first_revokes_what_a_killed_run_left_on_each_principal(self, monkeypatch, tmp_path, pre_grant):
+        report, log, _spec = self._run(monkeypatch, tmp_path, pre_grant=pre_grant)
+        assert report.passed
+        first_grant = min(i for i, entry in enumerate(log) if entry[0] == "grant")
+        first_query = min(log.index(("preflight", tier)) for tier in self.TIERS)
+        for tier in self.TIERS:
+            cleanup = ("cleanup", tier, ("cat.sch.people",))
+            assert log.count(cleanup) == 1, tier
+            assert log.index(("provision", tier)) < log.index(cleanup) < first_grant < first_query
+        assert not [entry for entry in log if entry[0] == "cleanup" and entry[1] == DEFAULT_ADMIN_TIER]
+
+    @pytest.mark.parametrize("pre_grant", [False, True])
+    def test_a_leftover_grant_that_can_t_be_revoked_refuses_the_run(self, monkeypatch, tmp_path, pre_grant):
+        log = []
+        with pytest.raises(RuntimeError, match=r"refusing to verify: test principal app-\S+ .* earlier run"):
+            self._run(monkeypatch, tmp_path, cleanup_error=RuntimeError("revoke denied"), log=log,
+                      pre_grant=pre_grant)
+        # Nothing was granted or queried, and the principals were still deleted.
+        assert not [entry for entry in log if entry[0] in ("grant", "preflight")]
+        assert {entry[1] for entry in log if entry[0] == "deprovision"} == set(self.TIERS)
+
     def test_pre_grant_access_is_revoked_after_an_error_and_an_interrupt(self, monkeypatch, tmp_path):
         error_log = []
         report, _unused, _spec = self._run(
@@ -2085,6 +2113,9 @@ class TestTieredLiveGrantLifecycle:
 
             def assert_query_capable(self, principal):
                 raise RuntimeError("test principal not query-capable: entitlement disabled")
+
+            def grant_temporary_table_access(self, principal, tables, *, revoke=False):
+                pass
 
             def deprovision_principal(self, principal):
                 deleted.append(principal.tier)

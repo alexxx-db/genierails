@@ -2471,6 +2471,11 @@ def verify_effective_access_live(
             print(f"  Granting warehouse CAN_USE to test principal: {tier}")
             verifier.grant_warehouse_use(principal)
 
+        # A run killed before its finally (SIGKILL, a host crash) leaves its direct grants on these
+        # fixed-name principals, which the next run reuses; a post-grant gate would then read through
+        # them instead of the tier group's own grants. So every run revokes them first, or refuses.
+        revoke_stale_table_access(verifier, spec, principals)
+
         for tier, tables in temporary_table_access(spec, principals, pre_grant=pre_grant).items():
             print(f"  Granting temporary checked-table access to test principal: {tier}"
                   if tier != OUT_OF_TIER_PRINCIPAL else
@@ -2721,6 +2726,35 @@ def verify_effective_access_live(
             raise RuntimeError(
                 f"verification cleanup failed after another error: {cleanup_error}"
             ) from cleanup_error
+
+
+def checked_tables(spec: VerificationSpec) -> list[str]:
+    return sorted({check.table for check in spec.column_masks} | {check.table for check in spec.row_filters})
+
+
+def revoke_stale_table_access(verifier: "EffectiveAccessVerifier", spec: VerificationSpec,
+                              principals: Mapping[str, Any], admin_tier: str = DEFAULT_ADMIN_TIER) -> None:
+    """Revoke any direct USE/SELECT a test principal holds on the checked tables, before it is used.
+
+    Only an earlier run that never reached its cleanup leaves such grants (a
+    reused principal keeps its application ID). Revoking one that isn't held
+    changes nothing. A revoke that fails refuses the run before any grant or
+    query, so no check can read through a leftover grant.
+    """
+    tables = checked_tables(spec)
+    if not tables:
+        return
+    for tier, principal in sorted(principals.items()):
+        if tier == admin_tier:
+            continue
+        print(f"  Revoking any direct checked-table access left on test principal: {tier}")
+        try:
+            verifier.grant_temporary_table_access(principal, tables, revoke=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"refusing to verify: test principal {principal.application_id} ({tier}) may still hold "
+                f"direct USE/SELECT on {', '.join(tables)} from an earlier run that didn't clean up, and "
+                f"revoking it failed: {exc}") from exc
 
 
 def temporary_table_access(spec: VerificationSpec, principals: Mapping[str, Any], *,

@@ -106,6 +106,12 @@ principal by its group membership alone and a tier that sees the wrong value
 still fails. The grants never enter Terraform state and are revoked when
 verify-access exits, also after a failure, Ctrl-C, `SIGTERM` or `SIGHUP`; a
 revoke that fails fails the run and prints the `REVOKE` statements to run.
+A run killed before that cleanup (`SIGKILL`, a host crash) can't revoke them,
+and the next run reuses the same test principals. So every verify-access,
+before and after `grant`, first revokes any direct `USE CATALOG`, `USE SCHEMA`
+and `SELECT` each test principal holds on the checked tables, before it
+grants or reads anything, and refuses to run if a revoke fails. A post-grant
+check therefore reads only through the tier groups' own grants.
 `verify-rebound` doesn't get them: it checks the grants `rebind-access` put
 back. After the staged apply, `rehearse` and `release` run verify-access once
 more without them, so the tier groups' own grants are checked too.

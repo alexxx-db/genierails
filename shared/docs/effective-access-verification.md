@@ -111,7 +111,10 @@ The supported mechanism is therefore a set of **dedicated test principals**:
   `GENIERAILS_VERIFY_PRE_GRANT=1`): temporary `USE CATALOG`, `USE SCHEMA` and
   `SELECT` on the checked tables it reads, granted to the service principal
   itself, never to its tier group, and revoked when the run exits (the
-  out-of-tier probe always gets these),
+  out-of-tier probe always gets these). Every run first revokes any such
+  direct access a test principal still holds on the checked tables (left by
+  a run that was killed before its cleanup), and refuses to run if that
+  fails,
 - each authenticating with **its own OAuth credentials** (`client_id` /
   `client_secret`) so it runs the query as itself.
 
