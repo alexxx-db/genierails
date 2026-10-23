@@ -892,6 +892,7 @@ account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/
 	$(MAKE) --no-print-directory _guard-account-config || exit 1; \
 	prov="$$(mktemp)"; \
 	$(_RELEASE_GATE) account-provenance --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
+	$(call _ENV_LOCK,account-plan); \
 	plan_dir="$$($(_RELEASE_GATE) account-plan-dir --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)")" || { rm -f "$$prov"; exit 1; }; \
 	cp "$$prov" "$$plan_dir/provenance.json"; rm -f "$$prov"; \
 	echo "=== Saved plan (account) ==="; \

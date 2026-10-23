@@ -1369,6 +1369,7 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     for path in plan_dir.rglob("*"):
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)
+    drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
 
 
@@ -1594,6 +1595,7 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)  # the manifest dir appears complete or not at all
     _set_current(cloud_dir_of(env_dir), env, manifest_id, created)  # supersedes the previous manifest
+    drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
 
 
@@ -1630,8 +1632,13 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
     # A released manifest's saved plans were deleted after its receipt (drop_saved_plans):
     # check_releasable below reports it as released, not as missing its plans.
     released = released_by(cloud_dir_of(env_dir), env, manifest["id"])
+    current = current_manifest_id(cloud_dir_of(env_dir), env)
+    superseded = current is not None and current != manifest["id"]
     for root, path, digest in _saved_plans(manifest_path, manifest):
-        if released and not path.exists():
+        # Successful releases and newer manifests deliberately remove these.
+        # Preserve the stronger released/superseded refusal below rather than
+        # misreporting the expected cleanup as drift.
+        if (released or superseded) and not path.exists():
             continue
         if not path.is_file() or sha256_file(path) != digest:
             drift.append(f"the saved {root} plan {path} changed or is missing")
@@ -1672,6 +1679,45 @@ def _saved_plans(manifest_path: Path, manifest: Mapping) -> list[tuple[str, Path
              for root in ("account", "workspace") if manifest["plans"][root].get("file")]
     return plans + [("data_access", plan_dir / "data_access" / step["file"], step.get("sha256"))
                     for step in manifest["plans"]["data_access"].get("steps") or [] if step.get("file")]
+
+
+def drop_superseded_saved_plans(env_dir: Path, env: str, current_path: Path) -> list[Path]:
+    """Delete only the credential-bearing plans superseded by ``current_path``.
+
+    The caller has completed the new immutable manifest and holds the env lock,
+    so an older unreceipted manifest cannot be entering apply concurrently.
+    Manifests and all non-plan audit records remain append-only.
+    """
+    env_dir, current_path = Path(env_dir), Path(current_path)
+    current = _read_json(current_path) or {}
+    kind = current.get("kind")
+    cloud_dir = cloud_dir_of(env_dir)
+    left = []
+    for manifest_path in sorted(manifests_dir(cloud_dir, env).glob("*/manifest.json")):
+        if manifest_path == current_path:
+            continue
+        manifest = _read_json(manifest_path)
+        if not manifest or manifest.get("kind") != kind or manifest.get("env") != env:
+            continue
+        manifest_id = str(manifest.get("id") or "")
+        if kind == "release-manifest":
+            if released_by(cloud_dir, env, manifest_id):
+                continue
+            paths = [path for _, path, _ in _saved_plans(manifest_path, manifest)]
+        elif kind == "account-manifest":
+            if account_manifest_used(cloud_dir, env, manifest_id):
+                continue
+            entry = manifest.get("plan") or {}
+            paths = [manifest_path.parent / entry["file"]] if entry.get("file") else []
+        else:
+            continue
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                print(f"WARNING: superseded saved plan could not be deleted: {path}", file=sys.stderr)
+                left.append(path)
+    return left
 
 
 def drop_saved_plans(env_dir: Path, env: str, manifest_path: Path) -> list[Path]:
