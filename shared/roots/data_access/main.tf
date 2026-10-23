@@ -222,6 +222,13 @@ variable "env_dir" {
   type = string
 }
 
+# Consumed by GenieRails validation/generation; accepted here because the
+# shared env.auto.tfvars is also passed to this root.
+variable "deployer_principal_id" {
+  type    = string
+  default = ""
+}
+
 # Set only by scripts/terraform_layer.sh, to a staged policy phase's render
 # (generated/.runtime/data_access); empty means env_dir's masking_functions.sql.
 variable "masking_sql_file" {

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Terraform state can contain credentials and resource secrets. Make every
+# file this runner creates owner-only regardless of the caller's umask.
+umask 077
+
 if [ "$#" -lt 3 ]; then
   echo "Usage: $0 <layer> <env> <command> [args...]" >&2
   exit 1
@@ -64,6 +68,7 @@ if [ "$USE_STATE_LAYOUT" = 1 ] || [ -f "$STATE_ENV_DIR/.state-moved" ]; then
   STATE_BASE="$(python3 "$SCRIPT_DIR/state_layout.py" layer-dir --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")" || exit 2
 fi
 mkdir -p "$STATE_BASE"
+python3 "$SCRIPT_DIR/state_file_permissions.py" "$STATE_BASE"
 
 if [ ! -d "$ROOT_DIR" ]; then
   echo "Missing Terraform root: $ROOT_DIR" >&2

@@ -383,6 +383,8 @@ def _check(args) -> None:
         print(f"  STRUCTURAL plan: envs/{env} as committed, against EMPTY state (no remote state is "
               "configured). It shows every resource as new and proves the config plans; it is not the "
               "change a release would make. Live tags are not re-read, so new SELECT grants show as withheld.")
+        print("  INFO: Genie CAN_RUN withheld in this empty-state pre-release plan is expected; ordinary "
+              "plans and applies still fail when CAN_RUN is unexpectedly withheld.")
         scratch.add_credentials(env)
         # The structural plan doesn't re-read live tags (a plan applies nothing;
         # the gate withholds new grants), so it hands the plan the one-time
@@ -392,7 +394,8 @@ def _check(args) -> None:
         token = mint(scratch.envs / env)
         try:
             if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token),
-                                                             "CLASSIFICATION_READ_ONLY": "1"}) != 0:
+                                                             "CLASSIFICATION_READ_ONLY": "1",
+                                                             "TF_VAR_expected_pre_release_withholding": "true"}) != 0:
                 raise CheckFailed("plan")
         finally:
             token.unlink(missing_ok=True)
