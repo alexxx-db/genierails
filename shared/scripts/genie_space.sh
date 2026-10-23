@@ -909,6 +909,10 @@ revoke_genie_acls() {
     echo "No Genie CAN_RUN groups to revoke."
     return 0
   fi
+  if [[ -z "${LAYER_ENV_DIR:-}" ]]; then
+    echo "ERROR: LAYER_ENV_DIR is required to load the env auth file for Genie ACL revocation; refusing ambient credentials." >&2
+    exit 1
+  fi
   load_layer_auth || exit 1
   local workspace_url="${DATABRICKS_HOST%/}"
   local space_id="${GENIE_SPACE_OBJECT_ID:-}"
@@ -972,6 +976,10 @@ print(json.dumps({"access_control_list": kept}))
 }
 
 trash_genie_space() {
+  if [[ -z "${LAYER_ENV_DIR:-}" ]]; then
+    echo "ERROR: LAYER_ENV_DIR is required to load the env auth file before trashing a Genie agent; refusing ambient credentials." >&2
+    exit 1
+  fi
   load_layer_auth || exit 1
 
   local auth_host="${DATABRICKS_HOST%/}"

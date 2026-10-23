@@ -12,6 +12,32 @@ ROOT = Path(__file__).parents[2]
 RUNNER = ROOT / "shared" / "scripts" / "terraform_layer.sh"
 
 
+def test_direct_workspace_runner_exports_default_layer_env_dir(tmp_path):
+    env_dir = tmp_path / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    log = tmp_path / "layer-env.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    terraform = bin_dir / "terraform"
+    terraform.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$LAYER_ENV_DIR\" >> \"{log}\"\n"
+    )
+    terraform.chmod(0o755)
+    env = os.environ.copy()
+    env.pop("LAYER_ENV_DIR", None)
+    env["ENVS_DIR"] = str(tmp_path / "envs")
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+
+    result = subprocess.run(
+        [RUNNER, "workspace", "dev", "plan"],
+        text=True, capture_output=True, env=env,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.read_text().splitlines() == [str(env_dir), str(env_dir)]
+
+
 def test_caller_var_override_follows_repo_tfvars(tmp_path):
     env_dir = tmp_path / "env"
     env_dir.mkdir()

@@ -127,8 +127,14 @@ def test_destroy_unmanages_title_adopted_agent_without_delete(tmp_path):
     )
     assert result.returncode == 0
     before = len((tmp_path / "calls.jsonl").read_text().splitlines())
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://target"\n'
+        'databricks_client_id = "selected-client"\n'
+        'databricks_client_secret = "selected-secret"\n'
+    )
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
            "CALLS": str(tmp_path / "calls.jsonl"), "PAGES": "[]",
+           "LAYER_ENV_DIR": str(tmp_path),
            "DATABRICKS_HOST": "https://target", "DATABRICKS_TOKEN": "token",
            "DATABRICKS_CLIENT_ID": "selected-client",
            "DATABRICKS_CLIENT_SECRET": "selected-secret",
@@ -151,8 +157,14 @@ def test_migration_id_file_adopt_remains_created_and_trash_deletes(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (tmp_path / ".genie_adopted_finance").exists()
     before = len((tmp_path / "calls.jsonl").read_text().splitlines())
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://target"\n'
+        'databricks_client_id = "selected-client"\n'
+        'databricks_client_secret = "selected-secret"\n'
+    )
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
            "CALLS": str(tmp_path / "calls.jsonl"), "PAGES": "[]",
+           "LAYER_ENV_DIR": str(tmp_path),
            "DATABRICKS_HOST": "https://target", "DATABRICKS_TOKEN": "token",
            "DATABRICKS_CLIENT_ID": "selected-client",
            "DATABRICKS_CLIENT_SECRET": "selected-secret",
@@ -508,4 +520,33 @@ def test_destroy_actions_refuse_without_layer_sp(command, auth_text, tmp_path):
                             capture_output=True, text=True)
     assert result.returncode != 0
     assert "fill in" in result.stderr
+    assert not called.exists()
+
+
+@pytest.mark.parametrize("command", ["revoke-acls", "trash"])
+def test_destroy_actions_refuse_ambient_sp_without_layer_env(command, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    called = tmp_path / "curl-called"
+    fake = bin_dir / "curl"
+    fake.write_text(f"#!/bin/sh\ntouch {called}\nexit 99\n")
+    fake.chmod(0o755)
+    id_file = tmp_path / ".genie_space_id_sales"
+    id_file.write_text("space-1\n")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "DATABRICKS_HOST": "https://wrong-env.example",
+        "DATABRICKS_CLIENT_ID": "wrong-client",
+        "DATABRICKS_CLIENT_SECRET": "wrong-secret",
+        "GENIE_ID_FILE": str(id_file),
+        "GENIE_SPACE_OBJECT_ID": "space-1",
+        "GENIE_REVOKE_GROUPS_CSV": "analysts",
+    }
+    env.pop("LAYER_ENV_DIR", None)
+    result = subprocess.run(["bash", str(SCRIPT), command], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "LAYER_ENV_DIR is required" in result.stderr
+    assert "refusing ambient credentials" in result.stderr
     assert not called.exists()
