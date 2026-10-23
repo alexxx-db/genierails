@@ -925,7 +925,8 @@ def keep_reviewed_genie_content_from_config(
 _IMPORTED_GENIE_COMMENT_RE = re.compile(
     r"^# (?:genie_space_configs parsed verbatim from the existing Genie agent|"
     r"Edit here to manage space config as code;|"
-    r"Empty entries are placeholders for agents defined in agents/)[^\n]*\n", re.MULTILINE,
+    r"Empty entries are placeholders for agents defined in agents/|"
+    r"Empty entries for agents the Genie API returned no config for)[^\n]*\n", re.MULTILINE,
 )
 
 
@@ -934,10 +935,12 @@ def genie_config_summary(names, sources: dict[str, str] | None) -> list[str]:
 
     ``sources`` maps a space name to "api" (read from the Genie API this run),
     "reviewed" (the API returned no config, so the reviewed entry was kept) or
-    "placeholder" (an empty entry for an agents/ file agent). Unlisted names
-    are "api".
+    "placeholder" (an empty entry for an agents/ file agent) or "unread" (an
+    empty entry for an agent the API returned no config for, whose reviewed
+    config is empty or belongs to another genie_space_id). Unlisted names are
+    "api".
     """
-    groups: dict[str, list[str]] = {"api": [], "reviewed": [], "placeholder": []}
+    groups: dict[str, list[str]] = {"api": [], "reviewed": [], "placeholder": [], "unread": []}
     for name in names:
         groups[(sources or {}).get(name, "api")].append(name)
     labels = {
@@ -945,6 +948,8 @@ def genie_config_summary(names, sources: dict[str, str] | None) -> list[str]:
         "reviewed": "Kept reviewed genie_space_configs (Genie API returned no config) for",
         "placeholder": "Wrote empty genie_space_configs placeholders "
                        "(content stays in agents/) for",
+        "unread": "Wrote empty genie_space_configs (Genie API returned no config; "
+                  "make apply pushes nothing) for",
     }
     return [f"  {labels[k]}: {', '.join(v)}" for k, v in groups.items() if v]
 _ID_TO_NAME_COMMENT_RE = re.compile(
@@ -978,12 +983,11 @@ def inject_imported_genie_config(
                 + ", ".join(kept_genie_fields)
             )
         hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_configs")
-        placeholders = [
-            name for name in api_genie_configs
-            if (sources or {}).get(name) == "placeholder"
-        ]
+        kinds = {name: (sources or {}).get(name, "api") for name in api_genie_configs}
+        placeholders = [name for name, kind in kinds.items() if kind == "placeholder"]
+        unread = [name for name, kind in kinds.items() if kind == "unread"]
         injected_hcl = "\n"
-        if len(placeholders) < len(api_genie_configs):
+        if len(placeholders) + len(unread) < len(api_genie_configs):
             injected_hcl += (
                 "# genie_space_configs parsed verbatim from the existing Genie agent(s).\n"
                 "# Edit here to manage space config as code; make apply pushes changes back.\n"
@@ -994,6 +998,11 @@ def inject_imported_genie_config(
                 "# Empty entries are placeholders for agents defined in agents/; their config "
                 "stays with the agent (agents/<agent>.space.json once captured) and make apply "
                 "pushes nothing for them.\n"
+            )
+        if unread:
+            injected_hcl += (
+                "# Empty entries for agents the Genie API returned no config for are filled "
+                "by the next make generate that reads them; make apply pushes nothing for them.\n"
             )
         injected_hcl += format_genie_space_configs_hcl(api_genie_configs)
         injected_hcl = restore_reviewed_genie_text(
@@ -7544,12 +7553,13 @@ def main():
                 api_genie_configs[name] = config
                 genie_config_sources[name] = source
 
-            reviewed_genie_configs: dict | None = None
+            reviewed_genie: tuple[dict, dict] | None = None
 
-            def reviewed_genie_config(name: str) -> dict | None:
-                nonlocal reviewed_genie_configs
-                if reviewed_genie_configs is None:
-                    reviewed_genie_configs = {}
+            def reviewed_genie_config(name: str) -> tuple[dict | None, list[str]]:
+                """The reviewed entry for ``name`` and the IDs generated/ binds it to."""
+                nonlocal reviewed_genie
+                if reviewed_genie is None:
+                    reviewed_genie = ({}, {})
                     reviewed_path = out_dir / "abac.auto.tfvars"
                     if reviewed_path.is_file():
                         import hcl2
@@ -7557,13 +7567,17 @@ def main():
                             parsed = hcl2.loads(reviewed_path.read_text())
                         except Exception:
                             parsed = {}
-                        configs = parsed.get("genie_space_configs") or {}
-                        if isinstance(configs, list):
-                            configs = configs[0] if configs else {}
-                        if isinstance(configs, dict):
-                            reviewed_genie_configs = configs
-                entry = reviewed_genie_configs.get(name)
-                return entry if isinstance(entry, dict) else None
+                        loaded = []
+                        for key in ("genie_space_configs", "genie_space_id_to_name"):
+                            value = parsed.get(key) or {}
+                            if isinstance(value, list):
+                                value = value[0] if value else {}
+                            loaded.append(value if isinstance(value, dict) else {})
+                        reviewed_genie = (loaded[0], loaded[1])
+                configs, id_to_name = reviewed_genie
+                entry = configs.get(name)
+                bound_ids = sorted(i for i, n in id_to_name.items() if n == name)
+                return (entry if isinstance(entry, dict) else None), bound_ids
 
             for space in genie_spaces_cfg:
                 space_tables = space.get("uc_tables") or []
@@ -7629,10 +7643,39 @@ def main():
                         add_genie_config(effective_name, {}, "placeholder")
                     elif genie_cfg:
                         add_genie_config(effective_name, genie_cfg)
-                    elif (reviewed_entry := reviewed_genie_config(effective_name)) is not None:
+                    else:
                         # A failed or empty fetch keeps the reviewed config, so neither
-                        # {} nor (legacy) the model's draft replaces it.
-                        add_genie_config(effective_name, reviewed_entry, "reviewed")
+                        # {} nor (legacy) the model's draft replaces it, but only when
+                        # generated/ binds that config to this genie_space_id.
+                        reviewed_entry, bound_ids = reviewed_genie_config(effective_name)
+                        if reviewed_entry is not None and space_id in bound_ids:
+                            add_genie_config(
+                                effective_name, reviewed_entry,
+                                "reviewed" if reviewed_entry else "unread",
+                            )
+                            print(
+                                f"  WARNING: Genie API returned no config for agent "
+                                f"{effective_name!r} (genie_space_id={space_id!r}); "
+                                + ("kept its reviewed genie_space_configs from generated/. "
+                                   if reviewed_entry else
+                                   "its genie_space_configs entry stays empty. ")
+                                + "If this repeats, check that the space still exists and "
+                                "that the deployer can read it, then re-run make generate."
+                            )
+                        elif reviewed_entry is not None:
+                            # The reviewed config belongs to another space (the ID
+                            # changed, or a same-name agent replaced it). An empty
+                            # entry is pushed nowhere; a model draft would be.
+                            add_genie_config(effective_name, {}, "unread")
+                            old = ", ".join(repr(i) for i in bound_ids) or "no genie_space_id"
+                            print(
+                                f"  WARNING: Genie API returned no config for agent "
+                                f"{effective_name!r} (genie_space_id={space_id!r}), and its "
+                                f"reviewed genie_space_configs in generated/ belongs to {old}; "
+                                "not reusing it. Wrote an empty entry (make apply pushes "
+                                "nothing for it). Check that the space exists and the "
+                                "deployer can read it, then re-run make generate."
+                            )
                 else:
                     # Captured agents are deliberately not read from the API.
                     # Only their canonical identity is written to generated/;

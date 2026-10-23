@@ -492,10 +492,14 @@ def test_failed_fetch_keeps_reviewed_inline_agent_config_in_both_modes(
     assert hcl2.loads(second.decode())["genie_space_configs"] == reviewed
     assert second == first
     assert "Injected genie_space_configs from the Genie API for: Alpha" in first_out
+    second_out = capsys.readouterr().out
+    assert "Kept reviewed genie_space_configs (Genie API returned no config) for: Alpha" in second_out
+    # A persistent failure names the agent and space and says what to check.
     assert (
-        "Kept reviewed genie_space_configs (Genie API returned no config) for: Alpha"
-        in capsys.readouterr().out
-    )
+        f"WARNING: Genie API returned no config for agent 'Alpha' "
+        f"(genie_space_id='{CAPTURE_IDS['Alpha']}'); kept its reviewed genie_space_configs "
+        "from generated/. If this repeats, check that the space still exists"
+    ) in second_out
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
@@ -532,6 +536,65 @@ def test_failed_fetch_keeps_reviewed_config_while_another_agent_changes(
         "Alpha": {"instructions": "Alpha instr."},
         "Beta": {"instructions": "Beta edited instr."},
     }
+
+
+def _inline_agents_env(fake, agents):
+    env_file = fake.env / "env.auto.tfvars"
+    base = env_file.read_text().split("genie_spaces = ", 1)[0]
+    entries = ", ".join(
+        f'{{ name = "{name}", genie_space_id = "{space_id}", '
+        f'uc_tables = {json.dumps(TABLES)}, acl_groups = {json.dumps(TIERS)} }}'
+        for name, space_id in agents
+    )
+    env_file.write_text(base + f"genie_spaces = [{entries}]\n")
+
+
+NEW_SPACE_ID = "01cccccccccccccc"
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        ([("Alpha", CAPTURE_IDS["Alpha"])], [("Alpha", CAPTURE_IDS["Beta"])]),
+        (
+            [("Alpha", CAPTURE_IDS["Alpha"]), ("Beta", CAPTURE_IDS["Beta"])],
+            [("Alpha", NEW_SPACE_ID)],
+        ),
+    ],
+    ids=["id-changed", "same-name-replacement"],
+)
+def test_failed_fetch_never_reuses_another_spaces_reviewed_config(
+    tmp_path, monkeypatch, capsys, legacy, before, after,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=legacy)
+    _inline_agents_env(fake, before)
+    first, _ = fake.generate()
+    assert hcl2.loads(first.decode())["genie_space_configs"]["Alpha"] == {
+        "instructions": "Alpha instr."
+    }
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_genie_space",
+        lambda *args, **kwargs: ([], {}, "", False),
+    )
+    _inline_agents_env(fake, after)
+    second, _ = fake.generate()
+    out = capsys.readouterr().out
+    cfg = hcl2.loads(second.decode())
+
+    new_id = after[0][1]
+    assert cfg["genie_space_configs"] == {"Alpha": {}}
+    assert cfg["genie_space_id_to_name"] == {new_id: "Alpha"}
+    assert "Alpha instr." not in second.decode()
+    assert (
+        f"WARNING: Genie API returned no config for agent 'Alpha' "
+        f"(genie_space_id='{new_id}'), and its reviewed genie_space_configs in "
+        f"generated/ belongs to '{CAPTURE_IDS['Alpha']}'; not reusing it."
+    ) in out
+    # A persisting failure leaves the empty entry byte-stable.
+    assert fake.generate()[0] == second
 
 
 def test_file_agent_placeholder_comment_and_log_name_the_placeholder(
