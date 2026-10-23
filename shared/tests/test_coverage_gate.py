@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import generate_abac
+import pytest
 from governance_policies import apply_model, build_model
 from treatment_derivation import derive_treatment_model, load_treatment_config
 from validate_abac import ValidationResult, validate_coverage_gate
@@ -219,7 +220,7 @@ def test_single_class_free_text_partial_is_advisory_without_changing_exit_status
         "cat.sch.t.remarks": ["email_address", "phone_number"],
     }
     model = build_model(classes, {name: "STRING" for name in classes}, settings)
-    cfg = apply_model({}, model)
+    cfg = apply_model({}, model) | settings
     result = ValidationResult()
     functions = {line.split("(", 1)[0].rsplit(" ", 1)[1]
                  for line in model.functions_sql.splitlines() if line.startswith("CREATE")}
@@ -231,6 +232,70 @@ def test_single_class_free_text_partial_is_advisory_without_changing_exit_status
     assert "cat.sch.t.notes" in advisory
     assert "cat.sch.t.phone" not in advisory
     assert "cat.sch.t.remarks" not in advisory
+
+
+@pytest.mark.parametrize("settings", [
+    {"treatment_versions": {"phone_partial": {"partial": "redacted"}}},
+    {"column_overrides": {"cat.sch.t.notes": {"partial": "redacted"}}},
+    {"column_overrides": {"cat.sch.t.notes": {"treatment": "redact"}}},
+])
+def test_coverage_advisory_uses_the_effective_partial_tier(settings):
+    config = {"access_tier_groups": ["raw", "regional", "masked"]} | settings
+    model = build_model({"cat.sch.t.notes": ["phone_number"]},
+                        {"cat.sch.t.notes": "STRING"}, config)
+    result = ValidationResult()
+    functions = {line.split("(", 1)[0].rsplit(" ", 1)[1]
+                 for line in model.functions_sql.splitlines() if line.startswith("CREATE")}
+    validate_coverage_gate(apply_model({}, model) | config, functions, "", result)
+    assert result.passed and not result.warnings
+
+
+def test_coverage_gate_cli_reads_escaped_free_text_comment_and_keeps_compact_pass(tmp_path):
+    env = tmp_path / "envs" / "dev"
+    generated = env / "generated"
+    (env / "ddl").mkdir(parents=True)
+    generated.mkdir()
+    settings = {"access_tier_groups": ["raw", "regional", "masked"]}
+    (env / "env.auto.tfvars").write_text(
+        'governance_mode = "deterministic"\n'
+        'deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"\n'
+        'access_tier_groups = ["raw", "regional", "masked"]\n'
+    )
+    (env / "ddl" / "_fetched.sql").write_text(
+        "CREATE TABLE cat.sch.t (details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc');\n"
+    )
+    model = build_model({"cat.sch.t.details": ["phone_number"]},
+                        {"cat.sch.t.details": "STRING"}, settings)
+    tfvars = generated / "abac.auto.tfvars"
+    tfvars.write_text('''
+groups = { raw = { description = "" }, regional = { description = "" }, masked = { description = "" } }
+tag_policies = []
+tag_assignments = []
+fgac_policies = []
+group_members = {}
+genie_space_configs = []
+''')
+    sql = generated / "masking_functions.sql"
+    generate_abac.write_deterministic_model(tfvars, sql, model)
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).parents[1] / "validate_abac.py"),
+         "--coverage-gate", str(tfvars), str(sql), "--summary-label", "coverage-gate"],
+        text=True, capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "COVERAGE ADVISORY (non-blocking)" in completed.stdout
+    assert "cat.sch.t.details" in completed.stdout
+
+
+def test_advisory_only_summary_keeps_the_one_line_pass(capsys):
+    result = ValidationResult()
+    result.ok("coverage complete")
+    result.warn("COVERAGE ADVISORY (non-blocking) — review cat.sch.t.details")
+    result.print_report("coverage-gate")
+    assert capsys.readouterr().out.splitlines() == [
+        "coverage-gate: [WARN] COVERAGE ADVISORY (non-blocking) — review cat.sch.t.details",
+        "coverage-gate: PASS (1 checks)",
+    ]
 
 
 def test_coverage_gate_cli_exits_nonzero_for_classified_unprotected_column(tmp_path):

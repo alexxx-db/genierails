@@ -23,6 +23,7 @@ from tag_vocabulary import REGISTRY
 from governance_policies import (
     column_comments_from_ddl, free_text_partial_columns, is_library_treatment_value,
     is_never_raw, keeps_string_partial, mixed_partial_problem, parse_treatment_value,
+    treatment_value_column,
 )
 from treatment_derivation import load_treatment_config
 
@@ -74,7 +75,12 @@ class ValidationResult:
         return len(self.errors) == 0
 
     def print_report(self, summary_label: str = "", verbose: bool = False):
-        if summary_label and self.passed and not self.warnings and not verbose:
+        advisory_only = self.warnings and all(
+            warning.startswith("COVERAGE ADVISORY") for warning in self.warnings
+        )
+        if summary_label and self.passed and not verbose and (not self.warnings or advisory_only):
+            for warning in self.warnings:
+                print(f"{summary_label}: [WARN] {warning}")
             print(f"{summary_label}: PASS ({len(self.info)} checks)")
             return
         width = 60
@@ -713,7 +719,18 @@ def validate_coverage_gate(
         ddl_columns, set(source_columns) | set(treatments), result, exposure,
     )
 
-    free_text_partial = free_text_partial_columns(treatments, ddl_comments)
+    advisory_library = library
+    if advisory_library is None:
+        try:
+            advisory_library = _gate_library(env_dir)
+        except Exception as exc:  # noqa: BLE001 - advisory only; coverage errors above still decide the exit
+            result.warn(f"COVERAGE ADVISORY skipped: the env's mask library can't be read: {exc}")
+    resolved_treatments = {
+        column: item for column, value in treatments.items()
+        if advisory_library is not None
+        and (item := treatment_value_column(column, value, cfg, advisory_library)) is not None
+    }
+    free_text_partial = free_text_partial_columns(resolved_treatments, ddl_comments)
     if free_text_partial:
         result.warn(
             "COVERAGE ADVISORY (non-blocking) — STRING columns whose name/comment suggests free text "
@@ -1253,8 +1270,8 @@ def validate_fgac_policies(
 
     # Detect unsafe tag/function mismatches, especially heterogeneous contact collapse.
     # Deterministic function names are content-addressed and do not exist in
-    # FUNCTION_EXPECTED_CATEGORIES.  Its equivalent safety checks live in the
-    # deterministic coverage gate, including the free-text partial advisory.
+    # FUNCTION_EXPECTED_CATEGORIES.  #223's blocking mixed-partial coverage
+    # gate is the replacement; the free-text partial advisory is informational.
     deterministic_category_skip = cfg.get("governance_mode") == "deterministic"
     assignments_by_tag: dict[tuple[str, str], list[dict]] = {}
     for ta in assignments:

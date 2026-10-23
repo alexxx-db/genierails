@@ -8809,7 +8809,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
         # Warning-only name/comment heuristic; generated values stay unchanged.
         from governance_policies import column_comments_from_ddl, free_text_partial_columns
         advisory = free_text_partial_columns(
-            {column: item.value for column, item in model.columns.items()},
+            model.columns,
             column_comments_from_ddl(ddl_text),
         )
         for column in advisory:

@@ -20,19 +20,44 @@ TIERS = ["raw", "regional", "masked"]
 
 
 def test_free_text_partial_heuristic_is_advisory_and_centralized():
-    models = {
-        "cat.sch.t.notes": _model({"cat.sch.t.notes": ["phone_number"]}),
-        "cat.sch.t.phone": _model({"cat.sch.t.phone": ["phone_number"]}),
-        "cat.sch.t.remarks": _model({"cat.sch.t.remarks": ["email_address", "phone_number"]}),
-        "cat.sch.t.details": _model({"cat.sch.t.details": ["phone_number"]}),
+    classes = {
+        "cat.sch.t.notes": ["phone_number"],
+        "cat.sch.t.phone": ["phone_number"],
+        "cat.sch.t.remarks": ["email_address", "phone_number"],
+        "cat.sch.t.details": ["phone_number"],
+        "cat.sch.t.message": ["card_pin"],
+        "cat.sch.t.memo": ["compensation"],
+        "cat.sch.t.text": ["us_ssn"],
     }
-    treatments = {name: model.columns[name].value for name, model in models.items()}
+    types = {name: "STRING" for name in classes} | {"cat.sch.t.memo": "BIGINT"}
+    model = _model(classes, types)
     comments = column_comments_from_ddl(
-        "CREATE TABLE cat.sch.t (details STRING COMMENT 'free text supplied by the customer');"
+        "CREATE TABLE cat.sch.t (\n"
+        " details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc',\n"
+        " phone STRING COMMENT 'Mobile phone used for text messages'\n"
+        ");"
     )
-    assert free_text_partial_columns(treatments, comments) == ["cat.sch.t.details", "cat.sch.t.notes"]
-    assert models["cat.sch.t.notes"].columns["cat.sch.t.notes"].partial == "last4"
-    assert base_treatment(treatments["cat.sch.t.remarks"]) == "redact"
+    assert comments == {
+        "cat.sch.t.details": "Customer's free text, e.g. (a > b), etc",
+        "cat.sch.t.phone": "Mobile phone used for text messages",
+    }
+    assert column_types_from_ddl(
+        "CREATE TABLE cat.sch.t (details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc');"
+    ) == {"cat.sch.t.details": "STRING"}
+    assert free_text_partial_columns(model.columns, comments) == ["cat.sch.t.details", "cat.sch.t.notes"]
+    assert model.columns["cat.sch.t.notes"].partial == "last4"
+    assert base_treatment(model.columns["cat.sch.t.remarks"].value) == "redact"
+
+
+@pytest.mark.parametrize("settings", [
+    {"treatment_versions": {"phone_partial": {"partial": "redacted"}}},
+    {"column_overrides": {"cat.sch.t.notes": {"partial": "redacted"}}},
+    {"column_overrides": {"cat.sch.t.notes": {"treatment": "redact"}}},
+])
+def test_free_text_advisory_clears_when_the_effective_partial_tier_is_fully_redacted(settings):
+    model = _model({"cat.sch.t.notes": ["phone_number"]}, **settings)
+    assert free_text_partial_columns(model.columns) == []
+    assert model.columns["cat.sch.t.notes"].partial_sql == model.columns["cat.sch.t.notes"].full_sql
 
 
 def _model(classes, types=None, **settings):
