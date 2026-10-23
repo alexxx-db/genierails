@@ -91,11 +91,14 @@ DOC_ORDER = [
      ["`promote-to`", "push to `origin/main`", "`make rehearse ENV=dev` on that commit",
       "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
     ("shared/examples/dev_to_prod/REFERENCE.md", "Deterministic envs (`governance_mode = \"deterministic\"`) never",
-     ["`make promote-to ENV=prod`", "commit and push", "`make rehearse ENV=dev` again", "`make release-plan ENV=prod`",
-      "`make release ENV=prod`"]),
+     ["`make generate ENV=dev`", "`make check ENV=dev`", "`make promote-to ENV=prod`", "`make check ENV=prod`",
+      "commit and push", "`make rehearse ENV=dev` again", "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
+    ("shared/examples/dev_to_prod/REFERENCE.md", "A new kind of mask is a custom mask:",
+     ["`make adopt-custom-mask ENV=dev TREATMENT=custom_<name>`", "`tag_treatments`", "then the same steps"]),
+    ("shared/examples/dev_to_prod/REFERENCE.md", "Later legacy `make generate ENV=dev` runs keep the mask",
+     ["It refuses a deterministic env and writes nothing", "map the class or adopt a custom mask"]),
     ("shared/examples/dev_to_prod/REFERENCE.md", "- Then `make rehearse ENV=dev`, `make promote-to ENV=prod`",
-     ["`make promote-to ENV=prod`", "push to `origin/main`", "`make rehearse ENV=dev` again",
-      "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
+     ["`make promote-to ENV=prod`", "`make release ENV=prod`", "legacy envs have no `release-plan`"]),
     ("REFERENCE.md", "| `make release-plan` |",
      ["a passing clean rehearsal of HEAD in the env's source env, its `promote_from` (default `dev`)"]),
     ("README.md", "promote the *rules* to prod", ["release a rehearsed commit", *PLAN]),
@@ -412,11 +415,12 @@ def test_every_coverage_gap_fix_prints_the_readme_recovery_sequence(tmp_path, ca
     fix = "\n".join(coverage_fix.fix_lines("prod", prod, [("ppay.s.t.loyalty", "class.loyalty_id")]))
     assert f"then {builder}" in fix
     assert re.findall(MAKE_STEP, fix.split("then ", 1)[1]) == readme
-    # materialize-treatment writes generated/ itself, which a deterministic generate would replace.
-    materialize = "\n".join(coverage_fix.materialize_lines("prod", prod, ["generic_partial"]))
-    assert f"then {coverage_fix.recovery_steps('prod', 'dev', 'envs/dev/generated/', generate=False)}" in materialize
-    assert re.findall(MAKE_STEP, materialize.split("then ", 1)[1]) == [
-        step for step in readme if step != "make generate ENV=dev"]
+    # A missing mask is fixed by mapping too: a deterministic generate replaces a materialized one.
+    mask = "\n".join(coverage_fix.materialize_lines("prod", prod, ["generic_partial"]))
+    assert "make materialize-treatment" not in mask
+    assert "make adopt-custom-mask ENV=dev TREATMENT=custom_<name>" in mask
+    assert f"then {builder}" in mask
+    assert re.findall(MAKE_STEP, mask.split("then ", 1)[1]) == readme
 
 
 def test_an_unpromoted_envs_coverage_gap_fix_generates_checks_and_rehearses_itself(tmp_path, capsys, monkeypatch):

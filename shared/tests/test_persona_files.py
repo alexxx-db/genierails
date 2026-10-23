@@ -575,24 +575,39 @@ def test_the_coverage_gap_fix_points_deterministic_envs_at_tag_treatments(tmp_pa
     assert "shared/treatment_config.json" not in text
 
 
-def test_the_missing_mask_fix_rehearses_the_promotion_commit_before_release_plan(tmp_path):
+def test_the_missing_mask_fix_in_a_deterministic_env_maps_or_adopts_never_materializes(tmp_path):
     _scaffold_env(tmp_path, "dev", DEV_ENV)
     prod = _scaffold_env(tmp_path, "prod", PROD_ENV)
     text = "\n".join(coverage_fix.materialize_lines("prod", prod, ["generic_partial"]))
+    assert "make materialize-treatment" not in text
+    assert "make scaffold-treatments ENV=prod TREATMENT=<mask-library treatment>" in text
+    assert "make adopt-custom-mask ENV=dev TREATMENT=custom_<name>" in text
+    assert "tag_treatments (or column_overrides) in envs/dev/env.auto.tfvars" in text
     after_promote = text[text.index("make promote-to ENV=prod"):]
     assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
 
 
-def test_materialize_in_a_deterministic_prod_points_at_release_plan_after_the_promotion_rehearse(tmp_path):
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_materialize_refuses_a_deterministic_env_and_writes_nothing(tmp_path, capsys, env):
     from scripts import materialize_treatment
 
-    _scaffold_env(tmp_path, "dev", DEV_ENV)
-    prod = _scaffold_env(tmp_path, "prod", PROD_ENV)
+    dirs = {"dev": _scaffold_env(tmp_path, "dev", DEV_ENV), "prod": _scaffold_env(tmp_path, "prod", PROD_ENV)}
+    before = {p: p.read_bytes() for p in (tmp_path / "envs").rglob("*") if p.is_file()}
     with pytest.raises(ValueError) as refused:
-        materialize_treatment.source_env_dir(tmp_path / "envs", "prod", prod)
-    after_promote = str(refused.value)[str(refused.value).index("make promote-to ENV=prod"):]
-    steps = ["commit and push envs/prod/", "make rehearse ENV=dev", "make release-plan ENV=prod", "make release ENV=prod"]
-    assert [after_promote.index(step) for step in steps] == sorted(after_promote.index(step) for step in steps)
+        materialize_treatment.source_env_dir(tmp_path / "envs", env, dirs[env])
+    message = str(refused.value)
+    assert f"materialize-treatment is legacy-only and {env} is deterministic; nothing was written" in message
+    assert "make materialize-treatment" not in message
+    assert "make adopt-custom-mask ENV=dev TREATMENT=custom_<name>" in message
+    shutil.copy2(SHARED / "treatment_config.json", tmp_path / "treatment_config.json")
+    for extra in (["--envs-dir", str(tmp_path / "envs")], []):  # make's call, and a direct one
+        assert materialize_treatment.main([
+            "--tfvars", str(dirs[env] / "generated" / "abac.auto.tfvars"),
+            "--sql", str(dirs[env] / "generated" / "masking_functions.sql"),
+            "--treatment-config", str(tmp_path / "treatment_config.json"), "--treatment", "redact",
+            "--env-dir", str(dirs[env]), "--env-name", env, *extra]) == 1
+        assert "is deterministic; nothing was written" in capsys.readouterr().err
+    assert {p: p.read_bytes() for p in (tmp_path / "envs").rglob("*") if p.is_file()} == before
     assert materialize_treatment.release_steps(tmp_path / "legacy", "dev", "prod") == "make release ENV=prod"
 
 
