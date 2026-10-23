@@ -394,6 +394,21 @@ def test_cli_blocks_a_mixed_column_whose_marker_was_deleted(tmp_path):
         assert (f"{notes} (classes keep email_partial, name_partial, phone_partial" in result.stdout) is blocked
 
 
+def test_docs_name_the_mixed_partial_class_record_compatibility_limit():
+    root = Path(__file__).parents[2]
+    docs = [
+        root / "shared/docs/deterministic-policies.md",
+        root / "shared/docs/design/deterministic-governance.md",
+        root / "shared/examples/dev_to_prod/REFERENCE.md",
+    ]
+    for path in docs:
+        text = path.read_text()
+        assert "Compatibility limit" in text
+        assert "generated/.live_refresh.json" in text
+        assert "column_classes" in text
+        assert "never hand-edit" in text
+
+
 def test_cli_refuses_malformed_column_classes(tmp_path):
     tfvars, sql = _cli_env(tmp_path, None)
     result = _cli(tmp_path, tfvars, sql, json.dumps({"column_classes": {"cat.sch.t.c": "class.email_address"}}))

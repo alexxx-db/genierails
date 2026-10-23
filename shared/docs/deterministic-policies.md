@@ -23,6 +23,13 @@ Code: `governance_policies.py` (pure), `generate_abac.write_deterministic_model`
   `column_overrides` entry for it is applied only if it is `redact` or
   never raw. The coverage check judges it from the live `class.*` tags the
   live refresh recorded (and the `gr.classification_mixed_partial` marker).
+  Compatibility limit: the live class record is
+  `generated/.live_refresh.json` (`column_classes`). DDL-only envs and
+  records written before this check recorded `column_classes` fall back to the
+  generate marker, and a hand-edited class record could let a partial mask
+  through. Run a live refresh through the normal `make apply`/`make rehearse`
+  path (or `make release-plan`, `make release`, `make maintain`) so the gate
+  uses live class tags, and never hand-edit the live-refresh record.
 - Any never-raw class (`card_security_code`, `card_pin`, `card_track_data`,
   `secret`) makes the column never raw.
 - Any class the library doesn't map makes it the fail-safe `unmapped_redact`:

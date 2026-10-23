@@ -29,6 +29,14 @@ So "expose last" isn't a policy you hope holds — there is simply no new or wid
 
 **One mask per column.** The single enforcement key is **`gr_treatment`** — GenieRails derives exactly **one** value per column from its `class.*` tags (strictest tag wins; a column whose tags need different partial formats, such as a free-text note tagged email, name and phone, is fully redacted), so Unity Catalog's "only one mask may apply per column" rule is never violated.
 
+Compatibility limit: the coverage gate reads multi-class free-text escalation
+from the live-refresh class record, `generated/.live_refresh.json`
+(`column_classes`). DDL-only envs and pre-#223 records fall back to the
+generate marker comment, and a hand-edited record could let a partial mask
+through. Run a live refresh through the normal `make apply`/`make rehearse`
+path (or `make release-plan`, `make release`, `make maintain`) so the gate
+uses live `class.*` tags; never hand-edit the record.
+
 **Why prod keeps the classifier's tags.** The Terraform resource that records tag assignments carries `ignore_changes = all` — a standard Terraform *lifecycle* setting meaning "once these exist, don't change or delete them." That lets the **classifier own the `class.*` tags** in prod: when a scan writes a tag, Terraform leaves it alone instead of reverting it. The classifier owns the tags; GenieRails owns the rules.
 
 ---
