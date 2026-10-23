@@ -600,7 +600,8 @@ class Controller:
                 plan_file = out_dir / f"{len(steps):02d}-{phase}.tfplan"
                 env = self._hook_env(t) | {PLAN_OUT_ENV: str(plan_file)} | ({PLAN_BASIS_ENV: basis} if basis else {})
                 print(f"=== Policy phase {phase} ({self.env_name}): saving its plan ===", flush=True)
-                rc = self.run_cmd([str(self.hook_dir / APPLY_PHASES[phase])], env=env, check=False).returncode
+                with _owner_only(plan_file):
+                    rc = self.run_cmd([str(self.hook_dir / APPLY_PHASES[phase])], env=env, check=False).returncode
                 if rc:
                     print(f"ERROR: planning policy phase {phase} failed (exit {rc}); nothing was applied.",
                           file=sys.stderr)
@@ -909,9 +910,11 @@ class Controller:
             for stale in (plan_file, pg.sidecar_path(plan_file)):
                 stale.unlink(missing_ok=True)
             env = self._hook_env(t) | {pg.PLAN_OUT_ENV: str(plan_file)}
-            if self.run_cmd([str(self.hook_dir / "abandon")], env=env, check=False).returncode:
+            with _owner_only(plan_file):
+                rc = self.run_cmd([str(self.hook_dir / "abandon")], env=env, check=False).returncode
+            if rc:
+                _drop_plans(plan_file)  # refused: it can never be applied
                 raise Refused("the abandon plan was refused or couldn't be made (see above); nothing was applied")
-            os.chmod(plan_file, 0o600)  # it carries the deployer's credentials
             planned = _sha256(plan_file)
             side = pg.load_sidecar(plan_file)
             if (side.get("stage"), side.get("desired"), side.get("old")) != ("abandon", t["to"], t["from"]):
@@ -1111,8 +1114,8 @@ class Controller:
 
         kept = plan_dir / f"{t['run_id']}-held-{planned[:16]}.tfplan"
         if not kept.exists():
-            shutil.copyfile(plan_file, kept)
-            os.chmod(kept, 0o600)
+            with _owner_only(kept):
+                shutil.copyfile(plan_file, kept)
         grants = sorted(pg.saved_plan_variables(self.env_dir, self.env_name, kept).get("held_access_grants") or [])
         if grants != sorted(pg.load_sidecar(plan_file).get("held") or []) or _sha256(kept) != planned:
             raise Refused(f"the saved rebind-protect plan {plan_file} doesn't hold back what its record says; "
@@ -1144,10 +1147,12 @@ class Controller:
         plan_file = plan_dir / f"{t['run_id']}-{stage}.tfplan"
         for stale in (plan_file, pg.sidecar_path(plan_file)):
             stale.unlink(missing_ok=True)
-        if self.run_cmd([str(self.hook_dir / stage)], env=env | {pg.PLAN_OUT_ENV: str(plan_file)},
-                        check=False).returncode:
+        with _owner_only(plan_file):
+            rc = self.run_cmd([str(self.hook_dir / stage)], env=env | {pg.PLAN_OUT_ENV: str(plan_file)},
+                              check=False).returncode
+        if rc:
+            _drop_plans(plan_file)  # refused: it can never be applied
             return None, ""
-        os.chmod(plan_file, 0o600)  # it carries the deployer's credentials
         planned = _sha256(plan_file)
         side = pg.load_sidecar(plan_file)
         if (side.get("stage"), side.get("desired"), side.get("old"), side.get("rebind")) != (
@@ -1385,6 +1390,21 @@ def _sha256(path: Path) -> str:
     import hashlib
 
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+@contextmanager
+def _owner_only(plan: Path):
+    """Write a saved plan owner-only from creation (umask 077), and owner-only afterwards whatever the writer returned.
+
+    A saved plan carries the deployer's credentials; the hook may write it and then refuse it.
+    """
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+        if plan.exists():
+            os.chmod(plan, 0o600)
 
 
 def _drop_plans(*plans: Path) -> None:

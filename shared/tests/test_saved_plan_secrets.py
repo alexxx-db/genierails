@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,8 +23,10 @@ from scripts import release_gate as rg
 from scripts import staged_policy_apply as spa
 from tests.test_policy_rebind import CI_MARKERS, deleted_principals
 from tests.test_release_gate import Repo
-from tests.test_release_gate_make import CLASSIFICATION_IMPORT, Make, _planned
-from tests.test_staged_policy_apply import Harness, _rolled_back_switch, write_env
+from tests.test_release_gate_make import CLASSIFICATION_IMPORT, ROOT, Make, _planned
+from tests.test_staged_policy_apply import (
+    Harness, _new_value_column, _retag_live, _rolled_back_switch, released, write_env,
+)
 
 SECRET = "fake-deployer-client-secret-must-not-persist"
 
@@ -79,6 +82,31 @@ def _secret_files(repo: Repo) -> list[Path]:
 
 def _owner_only(path: Path) -> bool:
     return not stat.S_IMODE(path.stat().st_mode) & 0o077
+
+
+def _plan_modes(h, *, fail: bool = False, chmod: int | None = None) -> dict[str, int]:
+    """Record each saved plan's mode as its hook returns (before the controller acts on the result).
+
+    ``fail`` makes every planning hook return 1 after it wrote its plan, as one refusing its plan does;
+    ``chmod`` makes the hook set the plan's mode itself (a writer that ignores the umask).
+    """
+    modes = {}
+    real_run = h.run
+
+    def run(argv, env=None, check=False):
+        result = real_run(argv, env=env, check=check)
+        out = (env or {}).get(pg.PLAN_OUT_ENV)
+        if out:
+            if chmod is not None and Path(out).exists():
+                os.chmod(out, chmod)
+            if Path(out).exists():
+                modes[Path(out).name] = stat.S_IMODE(Path(out).stat().st_mode)
+            if fail:
+                result.returncode = 1
+        return result
+
+    h.run = run
+    return modes
 
 
 # -- make release ---------------------------------------------------------------------
@@ -275,3 +303,85 @@ def test_a_failed_rebind_keeps_its_saved_plans_owner_only(harness):
     assert _rebind_plans(harness) == []
     assert harness.controller().abandon() == 0
     assert not list((pg.ledger_dir(harness.env_dir) / "abandon").glob("*.tfplan"))
+
+
+# -- owner-only from creation, whatever the plan writer returns -------------------------
+def test_a_refused_abandon_plan_is_owner_only_when_written_and_then_deleted(harness):
+    old, failed = _rolled_back_switch(harness)
+    column, value = _new_value_column(old, failed)
+    _retag_live(harness.env_dir, column, value)  # the abandon hook plans, then refuses its plan
+    harness.live_check = "real"
+    run_id = harness.journal()["transition"]["run_id"]
+    harness.calls.clear()
+    modes = _plan_modes(harness)
+    with pytest.raises(spa.Refused, match="abandon plan was refused"):
+        harness.controller().abandon()
+    assert harness.calls == ["abandon:plan"]
+    assert modes == {f"{run_id}.tfplan": 0o600}  # written, and owner-only as the hook returned
+    assert not list((pg.ledger_dir(harness.env_dir) / "abandon").glob("*.tfplan"))
+
+
+def test_a_refused_rebind_plan_is_owner_only_when_written_and_then_deleted(harness):
+    old, failed, _ = deleted_principals(harness)
+    column = next(iter(old["tags"]))
+    _retag_live(harness.env_dir, column, failed["tags"][column])  # the protect plan is refused
+    harness.live_check = "real"
+    run_id = harness.journal()["transition"]["run_id"]
+    modes = _plan_modes(harness)
+    with pytest.raises(spa.Refused, match="rebind-protect plan was refused"):
+        harness.controller().rebind()
+    assert harness.calls == ["rebind-protect:plan"]
+    assert modes == {f"{run_id}-rebind-protect.tfplan": 0o600}
+    assert _rebind_plans(harness) == []
+
+
+def test_a_saved_phase_plan_is_owner_only_even_when_its_hook_fails(harness, tmp_path):
+    released(harness)
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    modes = _plan_modes(harness, fail=True)
+    out = tmp_path / "plan"
+    assert harness.controller().plan(out) == 1
+    assert modes and set(modes.values()) == {0o600}
+    assert all(_owner_only(p) for p in out.glob("*.tfplan"))
+
+
+def test_a_saved_phase_plan_a_writer_left_world_readable_is_made_owner_only(harness, tmp_path):
+    released(harness)
+    write_env(harness.env_dir, versions={"email_partial": {"partial": "redacted"}})
+    _plan_modes(harness, fail=True, chmod=0o644)
+    out = tmp_path / "plan"
+    assert harness.controller().plan(out) == 1
+    plans = list(out.glob("*.tfplan"))
+    assert plans and all(_owner_only(p) for p in plans)
+
+
+def test_every_makefile_plan_writer_runs_under_umask_077():
+    """Each ``terraform plan -out=`` in the recipes writes the plan owner-only from creation."""
+    text = (ROOT / "shared" / "Makefile.shared").read_text()
+    writers = [line for line in text.splitlines() if " plan " in line and "-out=" in line]
+    assert len(writers) == 4
+    assert all("(umask 077; " in line for line in writers), [w for w in writers if "(umask 077; " not in w]
+
+
+MODE_RUNNER = """#!{python}
+import os, stat, sys
+from pathlib import Path
+args = sys.argv[1:]
+out = next((a.split("=", 1)[1] for a in args if a.startswith("-out=")), "")
+if len(args) >= 3 and args[2] == "plan" and out:
+    Path(out).write_text("databricks_client_secret = {secret}")
+    Path({log!r}).write_text(oct(stat.S_IMODE(os.stat(out).st_mode)))
+    sys.exit(1)  # planning failed after the plan was written
+sys.exit(0)
+"""
+
+
+def test_a_failed_account_plan_wrote_its_plan_owner_only(tmp_path, repo):
+    log = tmp_path / "plan-mode.txt"
+    runner = tmp_path / "mode-runner"
+    runner.write_text(MODE_RUNNER.format(python=sys.executable, secret=SECRET, log=str(log)))
+    runner.chmod(0o755)
+    result = Make(tmp_path, repo)("account-plan", "account", root_runner=runner)
+    assert result.returncode != 0 and "planning failed" in result.stderr
+    assert log.read_text() == "0o600"
+    assert not _secret_files(repo)  # the failed plan's dir is removed
