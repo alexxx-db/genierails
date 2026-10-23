@@ -73,6 +73,15 @@ class _Tags:
         hidden = _usage().get("invisible", [])
         return [TagPolicy(k, [Value(v) for v in vals]) for k, vals in live.items() if k not in hidden]
 
+    def get_tag_policy(self, tag_key):
+        global LISTS
+        LISTS += 1
+        live = json.load(open(STATE))
+        if os.environ.get("FAKE_CONCURRENT") == "before" and LISTS == 2:
+            live[tag_key] = sorted(set(live[tag_key]) | {"other_writer"})
+            json.dump(live, open(STATE, "w"))
+        return TagPolicy(tag_key, [Value(v) for v in live[tag_key]])
+
     def update_tag_policy(self, tag_key, tag_policy, update_mask):
         global UPDATES
         UPDATES += 1
@@ -81,6 +90,10 @@ class _Tags:
         race = os.environ.get("FAKE_CONCURRENT")
         if race == "after" and UPDATES == 1:
             live[tag_key] = sorted((set(live[tag_key]) - {"new_value"}) | {"other_writer"})
+        elif race == "after_remove_foreign" and UPDATES == 1:
+            live[tag_key] = sorted(set(live[tag_key]) - {"retired_by_hand"})
+        elif race == "named_readd" and UPDATES == 1:
+            live[tag_key] = sorted(set(live[tag_key]) | {"retired_by_hand"})
         elif race == "exhaust":
             live[tag_key] = sorted((set(live[tag_key]) - {"new_value"}) | {"other_writer_" + str(UPDATES)})
         json.dump(live, open(STATE, "w"))
@@ -350,6 +363,30 @@ def test_add_only_concurrent_writer_loses_no_values_and_readds_its_own(tmp_path,
     if direction == "after":
         assert "concurrent tag-policy update detected" in result.stdout
         assert repo.wrote() == ["gr_treatment", "gr_treatment"]
+    else:
+        assert repo.wrote() == ["gr_treatment"]
+
+
+def test_concurrent_removal_of_foreign_value_is_not_readded(tmp_path):
+    repo = Repo(tmp_path, LIVE)
+    repo.race("after_remove_foreign")
+    result = repo.script()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert repo.live()["gr_treatment"] == ["email_partial__string__0a1b2c3d", "new_value"]
+    assert repo.wrote() == ["gr_treatment"]
+
+
+def test_named_removal_readded_after_patch_fails_without_retrying_delete(tmp_path):
+    repo = Repo(tmp_path, {"gr_treatment": [
+        "email_partial__string__0a1b2c3d", "new_value", "retired_by_hand",
+    ]})
+    repo.race("named_readd")
+    result = repo.script("--remove", "gr_treatment:retired_by_hand", "--warehouse-id", "wh")
+    assert result.returncode == 1
+    assert "named removal became stale after the usage check" in result.stdout
+    assert "no retry was attempted" in result.stdout
+    assert "retired_by_hand" in repo.live()["gr_treatment"]
+    assert repo.wrote() == ["gr_treatment"]
 
 
 def test_add_only_concurrent_writer_retry_exhaustion_fails_clearly(tmp_path):
@@ -358,7 +395,7 @@ def test_add_only_concurrent_writer_retry_exhaustion_fails_clearly(tmp_path):
     result = repo.script()
     assert result.returncode == 1
     assert "concurrent tag-policy updates did not converge after 3 attempts" in result.stdout
-    assert "missing intended values=['new_value']" in result.stdout
+    assert "missing desired values=['new_value']" in result.stdout
     assert repo.wrote() == ["gr_treatment"] * 3
 
 
