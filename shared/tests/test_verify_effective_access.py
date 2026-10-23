@@ -2709,6 +2709,112 @@ def test_never_raw_mask_proof_of_a_caller_dependent_function_is_inconclusive(mon
     assert proof.status == INCONCLUSIVE and "caller-independent" in proof.detail
 
 
+# Masks that return the constant for both fixed probes (and for the sampled
+# value 123) but leak an unprobed input such as 999 raw: every one is built
+# only from allowlisted builtins, so only the body's structure gives it away.
+_PROBES = "'genierails-never-raw-probe-a', 'genierails-never-raw-probe-b'"
+LEAKING_NEVER_RAW_BODIES = {
+    "case-in": f"CASE WHEN value IN ({_PROBES}, '123') THEN '[REDACTED]' ELSE value END",
+    "case-not-in": f"CASE WHEN value NOT IN ({_PROBES}, '123') THEN value ELSE '[REDACTED]' END",
+    "comparison": "CASE WHEN value = '999' THEN value ELSE '[REDACTED]' END",
+    "comparison-after-null-passthrough": (
+        "CASE WHEN value IS NULL THEN NULL WHEN value <> '999' THEN '[REDACTED]' ELSE value END"),
+    "function-call": "CASE WHEN length(value) = 3 AND value <> '123' THEN value ELSE '[REDACTED]' END",
+    "call-in-null-test": "CASE WHEN nullif(value, '999') IS NULL THEN value ELSE '[REDACTED]' END",
+    "concat": f"concat('[REDACTED]', CASE WHEN value IN ({_PROBES}, '123') THEN '' ELSE value END)",
+    "pipe-concat": "'[REDACTED]' || CASE WHEN value = '999' THEN value ELSE '' END",
+    "if": "if(value = '999', value, '[REDACTED]')",
+    "coalesce": "coalesce(nullif(value, '999'), value)",
+    "null-test-is-not-the-whole-condition": (
+        "CASE WHEN value IS NULL OR value = '999' THEN value ELSE '[REDACTED]' END"),
+    "wrapped": f"CAST((CASE WHEN value IN ({_PROBES}, '123') THEN '[REDACTED]' ELSE value END) AS STRING)",
+}
+
+
+def _leaking_probe(values):
+    """What a leaking body returns for the two fixed probes: the constant."""
+    return ["[REDACTED]" for _ in values]
+
+
+@pytest.mark.parametrize("body", list(LEAKING_NEVER_RAW_BODIES.values()), ids=list(LEAKING_NEVER_RAW_BODIES))
+def test_never_raw_mask_proof_of_an_argument_dependent_body_is_inconclusive(monkeypatch, body):
+    from verify_effective_access import fixed_point_function_problem, never_raw_structure_problem
+
+    # Each body passes the caller-independence allowlist and the probes ...
+    assert fixed_point_function_problem(
+        routine_body="SQL", external_language="SQL", is_deterministic="YES", sql_data_access="CONTAINS_SQL",
+        definition=body, parameters=["value"]) == ""
+    assert "depend on its argument" in never_raw_structure_problem(body, "value")
+    fake = _FakeCatalogSql()
+    fake.routines["gr_mask_card_security_code__string__1a2b3c4d_full"] = (body, "STRING")
+    fake.probe = _leaking_probe
+    proof = _live_verifier(monkeypatch, fake).never_raw_mask_proof(ADMIN_PRINCIPAL, _cvv_check(), [_cvv_policy()])
+    # ... but is not proven constant, so the column can't PASS even when every
+    # sampled read shows only the constant.
+    assert proof.status == INCONCLUSIVE and "depend on its argument" in proof.detail, proof
+    assert not [sql for sql in fake.sql if sql.startswith("SELECT `cat`")]
+    result = _cvv_eval(never_raw_proof=proof)
+    assert result.status == INCONCLUSIVE and "depend on its argument" in result.detail
+
+
+@pytest.mark.parametrize("body", [
+    REDACT_BODY,
+    "CASE WHEN value IS NULL THEN NULL ELSE '[REDACTED]' END",
+    "CASE WHEN value IS NOT NULL THEN '[REDACTED]' END",
+    "CASE WHEN Value is   null THEN CAST(NULL AS STRING) ELSE '[REDACTED]' END",
+    "'[REDACTED]'",
+    "CAST(NULL AS DATE)",
+    "TRY_CAST((CAST(NULL AS DECIMAL(38, 9))) AS DECIMAL(38, 9))",
+])
+def test_never_raw_structure_allows_only_a_null_test_of_the_argument(body):
+    from verify_effective_access import never_raw_structure_problem
+
+    assert never_raw_structure_problem(body, "VALUE") == ""
+    # A body that never names the parameter is a constant.
+    assert never_raw_structure_problem(body, "other_arg") == ""
+
+
+@pytest.mark.parametrize(("body", "parameter"), [
+    ("CASE WHEN value IS NULL THEN value ELSE '[REDACTED]' END", "value"),
+    ("CASE WHEN null IS NULL THEN NULL ELSE '[REDACTED]' END", "null"),
+    ("CASE WHEN value IS NULL", "value"),
+    ("CASE WHEN value IS NOT NULL", "value"),
+    ("'[REDACTED]' /* unterminated", "value"),
+    ("", "value"),
+    (None, "value"),
+    (REDACT_BODY, ""),
+])
+def test_never_raw_structure_fails_closed(body, parameter):
+    from verify_effective_access import never_raw_structure_problem
+
+    assert never_raw_structure_problem(body, parameter)
+
+
+def test_every_shipped_never_raw_body_is_proven_argument_independent():
+    from deterministic_governance import NEVER_RAW_TREATMENTS
+    from mask_library import load_library, sql_body
+    from verify_effective_access import fixed_point_function_problem, never_raw_structure_problem
+
+    library = load_library()
+    checked = 0
+    for name in NEVER_RAW_TREATMENTS:
+        treatment = library["treatments"][name]
+        for family in treatment["types"]:
+            sql_type = {"NUMERIC": "DECIMAL(10,2)"}.get(family, family)
+            body = sql_body(treatment["full"], sql_type)
+            assert never_raw_structure_problem(body, "value") == "", (name, body)
+            caller_problem = fixed_point_function_problem(
+                routine_body="SQL", external_language="SQL", is_deterministic="YES",
+                sql_data_access="CONTAINS_SQL", definition=body, parameters=["value"])
+            # The allowlist reads DECIMAL(p, s) as a call, so a NUMERIC
+            # never-raw column stays INCONCLUSIVE (fail closed); the rest pass.
+            assert (caller_problem == "") == (family != "NUMERIC"), (name, body, caller_problem)
+            checked += 1
+    assert checked >= 4
+    # The live cvv column's function body is the one these tests' fake serves.
+    assert sql_body(library["treatments"]["card_security_code"]["full"], "STRING") == REDACT_BODY
+
+
 def test_function_equivalence_compares_the_live_definitions(monkeypatch):
     fake = _FakeCatalogSql()
     verifier = _live_verifier(monkeypatch, fake)

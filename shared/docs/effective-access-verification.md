@@ -44,9 +44,16 @@ distinguishing row, and each gets a live proof instead:
   included, so there is no raw value to compare against. The admin proves the
   one live mask on the column is the configured function for all account
   users with no exception (otherwise FAIL), and that the function is
-  caller-independent (as for fixed points; otherwise INCONCLUSIVE). It also
-  proves the function maps two distinct probe values to one constant
-  (otherwise FAIL). Every principal, the admin baseline included, must then
+  caller-independent (as for fixed points; otherwise INCONCLUSIVE). The
+  function's body must also be proven not to depend on its argument: the
+  argument may appear only as a whole CASE condition `WHEN value IS NULL
+  THEN` (or `IS NOT NULL`), so the output reveals at most whether the value is
+  NULL. Any other use (a comparison, `IN`, a function call, a concatenation,
+  returning it) is INCONCLUSIVE, because sample values can't rule out an input
+  the body singles out. The library's never-raw bodies (`CASE WHEN value IS
+  NULL THEN NULL ELSE '[REDACTED]' END`, `CAST(NULL AS ...)`) satisfy this. As
+  a sanity check the admin also maps two distinct probe values through the
+  function and requires one constant (otherwise FAIL). Every principal, the admin baseline included, must then
   read only that constant, or NULL where the baseline reads NULL, on rows the
   baseline also read. Any other value (a raw leak, the wrong constant, a
   dropped mask) is a FAIL.

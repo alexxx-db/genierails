@@ -561,8 +561,10 @@ class NeverRawProof:
     """What the admin proved about a never-raw column's live mask.
 
     ``status`` PASS: the one live mask is the configured caller-independent
-    function, applied to all account users with no exception, and it maps
-    distinct probe values to the single masked ``constant``.
+    function, applied to all account users with no exception, whose body is
+    proven not to depend on its argument beyond NULL
+    (never_raw_structure_problem), and it maps distinct probe values to the
+    single masked ``constant`` (a sanity check, not the proof).
     """
     status: str
     detail: str = ""
@@ -584,6 +586,41 @@ def never_raw_probes(data_type: str) -> tuple[str, ...]:
     if not re.fullmatch(r"[A-Za-z_]+(\(\s*\d+\s*(,\s*\d+\s*)?\))?", data_type or ""):
         return ()
     return _NEVER_RAW_PROBES.get(data_type.split("(")[0].upper(), ())
+
+
+def never_raw_structure_problem(definition: Any, parameter: Any) -> str:
+    """Why a never-raw mask's body isn't proven to ignore its argument ("" when it is). Pure.
+
+    Probes can't prove this: a body can single out any value it likes
+    (``CASE WHEN value IN (<probes>, '999') ...``). Instead the parameter may
+    appear only as the whole condition of a CASE branch, ``WHEN p IS NULL
+    THEN`` or ``WHEN p IS NOT NULL THEN``; anywhere else (a comparison, IN,
+    a call, a concatenation, a THEN/ELSE result) → a problem. A WHEN
+    condition ends at its THEN, so that branch tests only whether the
+    argument is NULL, and every other token is argument-free: the output
+    depends on nothing but the argument's nullness, which the caller's own
+    read of NULL already shows. The rest of the body (no UDFs, nothing
+    caller- or session-dependent) is fixed_point_function_problem's job.
+    """
+    from sql_tokenizer import SqlTokenizeError, sql_tokens
+
+    name = str(parameter or "").strip().lower()
+    if not isinstance(definition, str) or not definition.strip() or not name:
+        return "the never-raw mask function's definition or parameter could not be read"
+    try:
+        tokens = sql_tokens(definition)
+    except SqlTokenizeError as exc:
+        return f"the never-raw mask function's definition could not be parsed ({exc})"
+    for i, token in enumerate(tokens):
+        if token != name:
+            continue
+        after = tokens[i + 1:i + 5]
+        if i and tokens[i - 1] == "when" and (after[:3] == ["is", "null", "then"]
+                                              or after == ["is", "not", "null", "then"]):
+            continue
+        return (f"the never-raw mask function's output may depend on its argument {name} (it is used other than "
+                f"as WHEN {name} IS [NOT] NULL THEN), so a constant output is not proven")
+    return ""
 
 
 def never_raw_constant_problem(probes: Sequence[str], outputs: Sequence[Any]) -> str:
@@ -2461,7 +2498,9 @@ class EffectiveAccessVerifier:
         for all account users without exception, or the function doesn't map
         distinct probe values to one constant; INCONCLUSIVE when the function
         isn't proven caller-independent (fixed_point_function_problem), so the
-        admin's probe might not be what a tier gets.
+        admin's probe might not be what a tier gets, or its body isn't proven
+        to ignore its argument (never_raw_structure_problem), since probes
+        alone can't rule out a value the body singles out.
         """
         self._guard()
         if len({check.mask_function.lower(), check.partial_function.lower(), check.full_function.lower()}) != 1:
@@ -2478,6 +2517,9 @@ class EffectiveAccessVerifier:
             sql_data_access=data_access, definition=definition, parameters=[name for name, _t in params])
         if problem:
             return NeverRawProof(INCONCLUSIVE, f"the mask function is not proven caller-independent: {problem}")
+        problem = never_raw_structure_problem(definition, params[0][0])
+        if problem:
+            return NeverRawProof(INCONCLUSIVE, problem)
         data_type = params[0][1]
         probes = never_raw_probes(data_type)
         if not probes:
