@@ -146,11 +146,21 @@ def live_policy_lister(
     credentials, SDK missing, any API/auth error, or no answer within timeout.
     """
     client = None
+    unavailable_reason = ""
     unavailable = auth_path is None or not auth_path.is_file()
-    if not unavailable:
+    if auth_path is not None:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from auth_configured import auth_configured
-        unavailable = not auth_configured(auth_path)
+        from auth_configured import AuthStatus, auth_status
+        status = auth_status(auth_path)
+        unavailable = status is not AuthStatus.CONFIGURED
+        if status is AuthStatus.UNREADABLE:
+            unavailable_reason = f"{auth_path} can't be read"
+        elif status is AuthStatus.MALFORMED:
+            unavailable_reason = f"{auth_path} is not valid HCL"
+        elif status is AuthStatus.INCOMPLETE:
+            unavailable_reason = (
+                f"fill in {auth_path} (workspace host, client ID, and client secret)"
+            )
 
     def fetch(catalog: str) -> set[str]:
         nonlocal client
@@ -172,8 +182,11 @@ def live_policy_lister(
         }
 
     def list_names(catalog: str) -> set[str] | None:
-        nonlocal unavailable
+        nonlocal unavailable, unavailable_reason
         if unavailable:
+            if unavailable_reason:
+                print(f"WARNING: {unavailable_reason}; skipping live policy lookup.", file=sys.stderr)
+                unavailable_reason = ""
             return None
         # The SDK's own timeouts don't bound auth discovery against an
         # unreachable host, so cap the whole call; promote must not hang.

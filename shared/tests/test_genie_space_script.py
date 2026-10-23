@@ -80,8 +80,11 @@ else:
     if sp:
         env.update({"DATABRICKS_CLIENT_ID": "selected-client",
                     "DATABRICKS_CLIENT_SECRET": "selected-secret"})
+    command = (["bash", str(SCRIPT), "create"] if sp else
+               ["bash", str(SCRIPT), "create", "https://target", "token"])
     result = subprocess.run(
-        ["bash", str(SCRIPT), "create"], env=env, capture_output=True, text=True
+        command,
+        env=env, capture_output=True, text=True
     )
     recorded = [json.loads(line) for line in calls.read_text().splitlines()]
     return result, id_file, recorded
@@ -127,6 +130,8 @@ def test_destroy_unmanages_title_adopted_agent_without_delete(tmp_path):
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
            "CALLS": str(tmp_path / "calls.jsonl"), "PAGES": "[]",
            "DATABRICKS_HOST": "https://target", "DATABRICKS_TOKEN": "token",
+           "DATABRICKS_CLIENT_ID": "selected-client",
+           "DATABRICKS_CLIENT_SECRET": "selected-secret",
            "GENIE_ID_FILE": str(id_file)}
     destroyed = subprocess.run(["bash", str(SCRIPT), "trash"], env=env,
                                capture_output=True, text=True)
@@ -149,6 +154,8 @@ def test_migration_id_file_adopt_remains_created_and_trash_deletes(tmp_path):
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
            "CALLS": str(tmp_path / "calls.jsonl"), "PAGES": "[]",
            "DATABRICKS_HOST": "https://target", "DATABRICKS_TOKEN": "token",
+           "DATABRICKS_CLIENT_ID": "selected-client",
+           "DATABRICKS_CLIENT_SECRET": "selected-secret",
            # Even the old bypass name must not suppress the production DELETE.
            "GENIE_ID_FILE": str(id_file), "GENIERAILS_TERRAFORM_TEST": "1"}
     destroyed = subprocess.run(["bash", str(SCRIPT), "trash"], env=env,
@@ -171,7 +178,7 @@ fi
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_HOST": "https://target", "DATABRICKS_TOKEN": "token",
            "GENIE_SPACE_OBJECT_ID": "space", "GENIE_GROUPS_CSV": "configured"}
-    result = subprocess.run(["bash", str(SCRIPT), "set-acls"], env=env,
+    result = subprocess.run(["bash", str(SCRIPT), "set-acls", "https://target", "token"], env=env,
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Changing configured Genie access: group:configured [Configured Team] (CAN_MANAGE -> CAN_RUN)" in result.stdout
@@ -201,7 +208,7 @@ fi
            "DATABRICKS_TOKEN": "token", "GENIE_SPACE_OBJECT_ID": "adopted-space",
            "GENIE_GROUPS_CSV": "", "GENIE_CONFIGURED_GROUPS_CSV": "configured",
            "GENIE_ALLOW_EMPTY_ACL": "1"}
-    result = subprocess.run(["bash", str(SCRIPT), "set-acls"], env=env,
+    result = subprocess.run(["bash", str(SCRIPT), "set-acls", "https://target", "token"], env=env,
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Removing configured Genie access: group:configured [Configured Team] (CAN_RUN) — not granted: CAN_RUN withheld until the agent access checks pass" in result.stdout
@@ -220,12 +227,12 @@ if echo " $* " | grep -q " PUT "; then printf '{{}}\\n200'; else printf '{{"mess
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_HOST": "https://target", "DATABRICKS_TOKEN": "token",
            "GENIE_SPACE_OBJECT_ID": "space", "GENIE_GROUPS_CSV": "configured"}
-    refused = subprocess.run(["bash", str(SCRIPT), "set-acls"], env=env,
+    refused = subprocess.run(["bash", str(SCRIPT), "set-acls", "https://target", "token"], env=env,
                              capture_output=True, text=True)
     assert refused.returncode != 0
     assert "refusing authoritative PUT" in refused.stderr
     assert " PUT " not in f" {calls.read_text()} "
-    forced = subprocess.run(["bash", str(SCRIPT), "set-acls"],
+    forced = subprocess.run(["bash", str(SCRIPT), "set-acls", "https://target", "token"],
                             env={**env, "GENIE_ACL_FORCE": "1"}, capture_output=True, text=True)
     assert forced.returncode == 0, forced.stdout + forced.stderr
     assert "GENIE_ACL_FORCE=1" in forced.stderr
@@ -242,8 +249,11 @@ def test_adopted_id_is_used_by_normal_config_and_acl_updates(tmp_path):
         "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
         "CALLS": str(tmp_path / "calls.jsonl"),
         "PAGES": "[]",
-        "DATABRICKS_HOST": "https://target",
-        "DATABRICKS_TOKEN": "token",
+            "DATABRICKS_HOST": "https://target",
+            "DATABRICKS_TOKEN": "token",
+            "DATABRICKS_CLIENT_ID": "selected-client",
+            "DATABRICKS_CLIENT_SECRET": "selected-secret",
+            "GENIE_EXPLICIT_TOKEN": "token",
         "GENIE_ID_FILE": str(id_file),
         "GENIE_TABLES_CSV": "cat.schema.table",
         "GENIE_TITLE": title,
@@ -347,6 +357,9 @@ printf '%s' {json.dumps(json.dumps({"serialized_space": serialized}))}
     (bin_dir / "curl").chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_HOST": "https://ws", "DATABRICKS_TOKEN": "t",
+           "DATABRICKS_CLIENT_ID": "selected-client",
+           "DATABRICKS_CLIENT_SECRET": "selected-secret",
+           "GENIE_EXPLICIT_TOKEN": "t",
            "GENIE_SPACE_OBJECT_ID": "01abc", "GENIE_TABLES_CSV": ""}
 
     result = subprocess.run(["bash", str(SCRIPT), "update-config"], env=env,
@@ -387,6 +400,9 @@ else:
         "PATCH_BODY": str(patch_body),
         "DATABRICKS_HOST": "https://target",
         "DATABRICKS_TOKEN": "token",
+        "DATABRICKS_CLIENT_ID": "selected-client",
+        "DATABRICKS_CLIENT_SECRET": "selected-secret",
+        "GENIE_EXPLICIT_TOKEN": "token",
         "GENIE_ID_FILE": str(id_file),
         "GENIE_TABLES_CSV": "cat.schema.table",
         "GENIE_WAREHOUSE_ID": "configured-warehouse",
@@ -407,3 +423,89 @@ def test_update_config_title_adopted_agent_ignores_created_default_warehouse(tmp
 def test_update_config_non_adopted_agent_sends_explicit_per_space_warehouse(tmp_path):
     body = _update_config_warehouse_body(tmp_path, adopted=False, explicit=True)
     assert body["warehouse_id"] == "configured-warehouse"
+
+
+@pytest.mark.parametrize("command", ["revoke-acls", "trash"])
+def test_destroy_actions_load_layer_auth_and_ignore_ambient(command, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls.jsonl"
+    fake = bin_dir / "curl"
+    fake.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+url = next((arg for arg in reversed(args) if arg.startswith("http")), "")
+method = args[args.index("-X") + 1] if "-X" in args else "GET"
+with open(os.environ["CALLS"], "a") as handle:
+    handle.write(json.dumps({"method": method, "url": url, "args": args}) + "\n")
+if url.endswith("/oidc/v1/token"):
+    print('{"access_token":"selected-sp-token"}')
+    print("200")
+elif method == "GET":
+    print('{"access_control_list":[]}')
+    print("200")
+else:
+    print("{}")
+    print("200")
+''')
+    fake.chmod(0o755)
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.write_text(
+        'databricks_workspace_host = "https://selected.example"\n'
+        'databricks_client_id = "selected-client"\n'
+        'databricks_client_secret = "selected-secret"\n'
+    )
+    id_file = tmp_path / ".genie_space_id_sales"
+    id_file.write_text("space-1\n")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "CALLS": str(calls),
+        "LAYER_ENV_DIR": str(tmp_path),
+        "DATABRICKS_HOST": "https://wrong-env.example",
+        "DATABRICKS_TOKEN": "wrong-env-token",
+        "DATABRICKS_CONFIG_PROFILE": "wrong",
+        "DATABRICKS_CONFIG_FILE": str(tmp_path / "wrong.cfg"),
+        "GENIE_ID_FILE": str(id_file),
+        "GENIE_SPACE_OBJECT_ID": "space-1",
+        "GENIE_REVOKE_GROUPS_CSV": "analysts",
+    }
+    result = subprocess.run(["bash", str(SCRIPT), command], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+    api_calls = [call for call in recorded if "/api/2.0/" in call["url"]]
+    assert api_calls
+    assert all(call["url"].startswith("https://selected.example/") for call in api_calls)
+    assert all("Authorization: Bearer selected-sp-token" in call["args"] for call in api_calls)
+    assert "wrong-env" not in calls.read_text()
+
+
+@pytest.mark.parametrize("command", ["revoke-acls", "trash"])
+@pytest.mark.parametrize("auth_text", [None, '# empty\n'])
+def test_destroy_actions_refuse_without_layer_sp(command, auth_text, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    called = tmp_path / "curl-called"
+    fake = bin_dir / "curl"
+    fake.write_text(f"#!/bin/sh\ntouch {called}\nexit 99\n")
+    fake.chmod(0o755)
+    if auth_text is not None:
+        (tmp_path / "auth.auto.tfvars").write_text(auth_text)
+    id_file = tmp_path / ".genie_space_id_sales"
+    id_file.write_text("space-1\n")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LAYER_ENV_DIR": str(tmp_path),
+        "DATABRICKS_HOST": "https://wrong-env.example",
+        "DATABRICKS_TOKEN": "wrong-env-token",
+        "GENIE_ID_FILE": str(id_file),
+        "GENIE_SPACE_OBJECT_ID": "space-1",
+        "GENIE_REVOKE_GROUPS_CSV": "analysts",
+    }
+    result = subprocess.run(["bash", str(SCRIPT), command], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "fill in" in result.stderr
+    assert not called.exists()

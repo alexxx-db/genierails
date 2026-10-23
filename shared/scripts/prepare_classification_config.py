@@ -15,6 +15,7 @@ if str(SHARED_ROOT) not in sys.path:
 
 from scripts.footprint import FootprintError, resolve_footprint
 from scripts.auth_configured import workspace_client as WorkspaceClient
+from scripts.auth_configured import AuthStatus, auth_status
 
 
 def _load(path: Path) -> dict:
@@ -36,6 +37,27 @@ def _value(config: dict, key: str) -> str:
     if isinstance(value, list):
         value = value[0] if value else ""
     return str(value).strip()
+
+
+def _load_auth(path: Path) -> dict:
+    status = auth_status(path)
+    if status is AuthStatus.UNREADABLE:
+        raise RuntimeError(f"{path} can't be read") from None
+    if status is AuthStatus.MALFORMED:
+        raise RuntimeError(f"{path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
+        raise RuntimeError(
+            f"fill in {path} (workspace host, client ID, and client secret)"
+        ) from None
+    try:
+        with path.open() as handle:
+            return hcl2.load(handle)
+    except OSError:
+        raise RuntimeError(f"{path} can't be read") from None
+    except UnicodeError:
+        raise RuntimeError(f"{path} is not valid HCL") from None
+    except Exception:
+        raise RuntimeError(f"{path} is not valid HCL") from None
 
 
 def _auto_tag_configs(remote) -> list[dict[str, str]]:
@@ -69,7 +91,6 @@ def main() -> int:
     read_only = "--read-only" in sys.argv[2:]
     env_dir = Path(sys.argv[1]).resolve()
     config = _load(env_dir / "env.auto.tfvars")
-    auth = _load(env_dir / "auth.auto.tfvars")
     auto_tagging_setting = config.get("enable_auto_tagging")
     if auto_tagging_setting is not None and not isinstance(auto_tagging_setting, bool):
         print(
@@ -87,6 +108,13 @@ def main() -> int:
             "classification_existing_auto_tag_configs = {}\n"
         )
         return 0
+
+    auth_path = env_dir / "auth.auto.tfvars"
+    try:
+        auth = _load_auth(auth_path)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     try:
         tables = resolve_footprint(env_dir)
@@ -117,10 +145,14 @@ def main() -> int:
         if workspace_id
         else None
     )
-    client = WorkspaceClient(
-        auth_file=env_dir / "auth.auto.tfvars",
-        custom_headers=routing_headers,
-    )
+    try:
+        client = WorkspaceClient(
+            auth_file=auth_path,
+            custom_headers=routing_headers,
+        )
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     existing: dict[str, list[str]] = {}
     existing_auto_tags: dict[str, list[dict[str, str]]] = {}
     all_schemas: set[str] = set()

@@ -136,6 +136,17 @@ def _discover_from_genie_api(space_id: str, auth_path: Path | None) -> tuple[str
     if auth_path is None:
         return "", []
 
+    from scripts.auth_configured import AuthStatus, auth_status
+    status = auth_status(auth_path)
+    if status is AuthStatus.UNREADABLE:
+        raise RuntimeError(f"{auth_path} can't be read") from None
+    if status is AuthStatus.MALFORMED:
+        raise RuntimeError(f"{auth_path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
+        raise RuntimeError(
+            f"fill in {auth_path} (workspace host, client ID, and client secret)"
+        ) from None
+
     try:
         from scripts.auth_configured import workspace_client
         w = workspace_client(
@@ -421,10 +432,6 @@ def main():
             if status is AuthStatus.MALFORMED:
                 print(f"ERROR: {auth_path} is not valid HCL; nothing was written.")
                 sys.exit(1)
-            if status is AuthStatus.INCOMPLETE:
-                print(f"ERROR: fill in {auth_path} (workspace host, client ID, and client secret); "
-                      "nothing was written.")
-                sys.exit(1)
             selected_auth_path = Path(auth_path)
             break
 
@@ -474,8 +481,13 @@ def main():
             space["uc_tables"] = uc_tables
 
         if space_id and not pure and (not name or not uc_tables):
+            lookup_auth = selected_auth_path or Path(source_env_dir) / "auth.auto.tfvars"
             print(f"  Querying Genie agent {space_id} for name/tables...")
-            api_title, api_tables = _discover_from_genie_api(space_id, selected_auth_path)
+            try:
+                api_title, api_tables = _discover_from_genie_api(space_id, lookup_auth)
+            except RuntimeError as exc:
+                print(f"ERROR: {exc}; nothing was written.")
+                sys.exit(1)
             if not name and api_title:
                 space["name"] = api_title
                 print(f"  Discovered name: {api_title}")

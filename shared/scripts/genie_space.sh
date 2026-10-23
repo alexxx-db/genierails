@@ -19,9 +19,9 @@
 #
 # Authentication (in order of precedence):
 #   1. Explicit token argument, for direct/manual invocation only
-#   2. DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET (Service Principal OAuth M2M)
-#   3. Ambient DATABRICKS_TOKEN, for direct/manual invocation only; SP wins
-#      - Requires DATABRICKS_HOST to be set for token endpoint
+#   2. Service Principal OAuth M2M: Terraform-passed credentials for create/
+#      update/set-acls, or $LAYER_ENV_DIR/auth.auto.tfvars for destroy actions
+# Ambient DATABRICKS_TOKEN/profile/config/host values are never used.
 #
 # Configuration:
 #   GENIE_GROUPS_CSV     Required for create/set-acls. Comma-separated group names.
@@ -60,11 +60,16 @@
 
 set -e
 
-# Workspace apply is pinned to the env's SP credentials. Never let an ambient
-# PAT or CLI profile override credentials passed by Terraform.
-unset DATABRICKS_CONFIG_PROFILE DATABRICKS_CONFIG_FILE
-if [[ -n "${DATABRICKS_CLIENT_ID:-}" || -n "${DATABRICKS_CLIENT_SECRET:-}" ]]; then
-  unset DATABRICKS_TOKEN
+# A host passed alongside both Terraform SP values is explicit. Everything
+# else may be ambient shell/CLI state and must never select a workspace.
+EXPLICIT_SP_HOST=""
+if [[ -n "${DATABRICKS_CLIENT_ID:-}" && -n "${DATABRICKS_CLIENT_SECRET:-}" ]]; then
+  EXPLICIT_SP_HOST="${DATABRICKS_HOST:-}"
+fi
+unset DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_CONFIG_PROFILE DATABRICKS_CONFIG_FILE
+if [[ -n "$EXPLICIT_SP_HOST" ]]; then
+  DATABRICKS_HOST="$EXPLICIT_SP_HOST"
+  export DATABRICKS_HOST
 fi
 
 UA_HEADER="User-Agent: genierails/0.1.0"
@@ -74,7 +79,7 @@ usage() {
   echo "       $0 set-acls [workspace_url] [token] [space_id]"
   echo "       $0 revoke-acls"
   echo "       $0 trash"
-  echo "  Or set DATABRICKS_HOST + DATABRICKS_TOKEN (or DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET)"
+  echo "  Or set DATABRICKS_HOST + DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET"
   echo "  For create: set GENIE_WAREHOUSE_ID; for set-acls: set GENIE_SPACE_OBJECT_ID"
   exit 1
 }
@@ -134,11 +139,6 @@ resolve_token() {
     echo "Using Service Principal OAuth M2M authentication..." >&2
     get_sp_token "$workspace_url" "$DATABRICKS_CLIENT_ID" "$DATABRICKS_CLIENT_SECRET"
     return $?
-  fi
-
-  if [[ -n "${DATABRICKS_TOKEN:-}" ]]; then
-    echo "$DATABRICKS_TOKEN"
-    return 0
   fi
 
   echo "No authentication found. Pass a token explicitly or set DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET." >&2
@@ -578,7 +578,7 @@ update_genie_config() {
   fi
 
   local token
-  token=$(resolve_token "$workspace_url" "") || exit 1
+  token=$(resolve_token "$workspace_url" "${GENIE_EXPLICIT_TOKEN:-}") || exit 1
 
   local space_id=""
 
@@ -878,12 +878,24 @@ load_layer_auth() {
       GENIE_ID_FILE="${GENIERAILS_GENIE_ID_DIR:-${LAYER_ENV_DIR}}/${GENIE_ID_BASENAME}"
     fi
     local auth_tfvars="${LAYER_ENV_DIR}/auth.auto.tfvars"
-    if [[ -f "$auth_tfvars" ]]; then
-      DATABRICKS_HOST=$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("databricks_workspace_host", ""))' "$auth_tfvars")
-      DATABRICKS_CLIENT_ID=$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("databricks_client_id", ""))' "$auth_tfvars")
-      DATABRICKS_CLIENT_SECRET=$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("databricks_client_secret", ""))' "$auth_tfvars")
-      export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET
+    local helper="$(cd "$(dirname "$0")" && pwd)/auth_configured.py"
+    local status=0
+    if python3 "$helper" "$auth_tfvars"; then
+      status=0
+    else
+      status=$?
     fi
+    case "$status" in
+      0) ;;
+      1) echo "ERROR: fill in ${auth_tfvars} (workspace host, client ID, and client secret)." >&2; return 1 ;;
+      2) echo "ERROR: ${auth_tfvars} is not valid HCL." >&2; return 1 ;;
+      3) echo "ERROR: ${auth_tfvars} can't be read." >&2; return 1 ;;
+      *) echo "ERROR: could not validate ${auth_tfvars}." >&2; return 1 ;;
+    esac
+    DATABRICKS_HOST=$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1]))["databricks_workspace_host"])' "$auth_tfvars")
+    DATABRICKS_CLIENT_ID=$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1]))["databricks_client_id"])' "$auth_tfvars")
+    DATABRICKS_CLIENT_SECRET=$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1]))["databricks_client_secret"])' "$auth_tfvars")
+    export DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET
   fi
 }
 
@@ -897,7 +909,7 @@ revoke_genie_acls() {
     echo "No Genie CAN_RUN groups to revoke."
     return 0
   fi
-  load_layer_auth
+  load_layer_auth || exit 1
   local workspace_url="${DATABRICKS_HOST%/}"
   local space_id="${GENIE_SPACE_OBJECT_ID:-}"
   if [[ -z "$space_id" && -n "${GENIE_ID_FILE:-}" && -f "${GENIE_ID_FILE}" ]]; then
@@ -913,7 +925,7 @@ revoke_genie_acls() {
     exit 1
   fi
   local token
-  token=$(resolve_token "$workspace_url" "") || exit 1
+  token=$(resolve_token "$workspace_url" "${GENIE_EXPLICIT_TOKEN:-}") || exit 1
 
   local path="/api/2.0/permissions/genie/${space_id}"
   local response http_code body
@@ -960,7 +972,7 @@ print(json.dumps({"access_control_list": kept}))
 }
 
 trash_genie_space() {
-  load_layer_auth
+  load_layer_auth || exit 1
 
   local auth_host="${DATABRICKS_HOST%/}"
   local expected_host="${GENIE_EXPECTED_HOST:-}"
@@ -1001,7 +1013,7 @@ trash_genie_space() {
   fi
 
   local token
-  if ! token=$(resolve_token "$workspace_url" ""); then
+  if ! token=$(resolve_token "$workspace_url" "${GENIE_EXPLICIT_TOKEN:-}"); then
     echo "ERROR: Cannot authenticate to Genie agent host ${workspace_url} with credentials from current auth host ${auth_host}." >&2
     exit 1
   fi

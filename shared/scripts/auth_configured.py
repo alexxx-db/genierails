@@ -15,6 +15,19 @@ class AuthStatus(Enum):
     UNREADABLE = "unreadable"
 
 
+def _configured(config: dict, name: str) -> bool:
+    raw = config.get(name, "")
+    if not isinstance(raw, str):
+        return False
+    value = raw.strip()
+    normalized = value.lower().replace("-", "_").replace(" ", "_")
+    placeholders = ("placeholder", "change_me", "changeme", "your_client_id",
+                    "your_client_secret", "your_workspace_host")
+    return bool(value) and "<" not in value and ">" not in value and not any(
+        marker in normalized for marker in placeholders
+    )
+
+
 def auth_status(path: Path) -> AuthStatus:
     try:
         with path.open() as handle:
@@ -29,19 +42,7 @@ def auth_status(path: Path) -> AuthStatus:
         # Never let parser text (which can echo credential fragments) propagate.
         return AuthStatus.MALFORMED
 
-    def configured(name: str) -> bool:
-        raw = config.get(name, "")
-        if not isinstance(raw, str):
-            return False
-        value = raw.strip()
-        normalized = value.lower().replace("-", "_").replace(" ", "_")
-        placeholders = ("placeholder", "change_me", "changeme", "your_client_id",
-                        "your_client_secret", "your_workspace_host")
-        return bool(value) and "<" not in value and ">" not in value and not any(
-            marker in normalized for marker in placeholders
-        )
-
-    return AuthStatus.CONFIGURED if all(configured(name) for name in (
+    return AuthStatus.CONFIGURED if all(_configured(config, name) for name in (
         "databricks_workspace_host", "databricks_client_id", "databricks_client_secret"
     )) else AuthStatus.INCOMPLETE
 
@@ -76,6 +77,12 @@ def workspace_client(auth_file: Path, **kwargs):
 
 def oauth_config(config: dict, **kwargs):
     """Build an OAuth-M2M SDK Config from already validated auth values."""
+    required = ("databricks_workspace_host", "databricks_client_id",
+                "databricks_client_secret")
+    if not isinstance(config, dict) or not all(_configured(config, name) for name in required):
+        raise RuntimeError(
+            "fill in auth.auto.tfvars (workspace host, client ID, and client secret)"
+        ) from None
     from databricks.sdk.config import Config
     return Config(
         host=config["databricks_workspace_host"].strip(),

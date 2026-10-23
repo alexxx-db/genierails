@@ -104,6 +104,11 @@ def test_client_uses_only_selected_env_auth(script, tmp_path, monkeypatch):
     }
     assert "https://wrong-env.example" not in repr(captured)
     assert "wrong-env-token" not in repr(captured)
+    if script in {"audit_schema_drift", "evidence_report"}:
+        expected_product = "genierails-evidence" if script == "evidence_report" else "genierails"
+        assert captured["product"] == expected_product
+        expected_version = "1.0" if script == "evidence_report" else "0.1.0"
+        assert captured["product_version"] == expected_version
 
 
 @pytest.mark.parametrize("script", [
@@ -113,16 +118,20 @@ def test_client_uses_only_selected_env_auth(script, tmp_path, monkeypatch):
     "sync_tag_policies", "wait_for_tag_policies", "remap_generated_config",
     "remap_env_config", "prepare_classification_config",
 ])
-def test_empty_auth_refuses_before_any_client(script, tmp_path, monkeypatch):
+def test_empty_auth_refuses_before_any_client(script, tmp_path, monkeypatch, capsys):
     auth = tmp_path / "auth.auto.tfvars"
     auth.write_text("# empty\n")
     created = []
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda **kwargs: created.append(kwargs))
+    message = ""
     try:
         _invoke(script, auth, monkeypatch)
-    except (RuntimeError, custom_masks.Refused, SystemExit, ValueError):
-        pass
+    except (RuntimeError, custom_masks.Refused, SystemExit, ValueError) as exc:
+        message = str(exc)
+    captured = capsys.readouterr()
+    message += captured.out + captured.err
     assert created == []
+    assert "fill in" in message
 
 
 @pytest.mark.parametrize("script", [
@@ -130,8 +139,10 @@ def test_empty_auth_refuses_before_any_client(script, tmp_path, monkeypatch):
     "sync_tag_policies", "wait_for_tag_policies", "remap_generated_config",
     "remap_env_config", "prepare_classification_config",
 ])
-@pytest.mark.parametrize("variant", ["malformed", "non-string", "unreadable"])
-def test_other_unusable_auth_never_creates_client(script, variant, tmp_path, monkeypatch):
+@pytest.mark.parametrize("variant", ["malformed", "non-string", "placeholder", "unreadable"])
+def test_other_unusable_auth_never_creates_client(
+    script, variant, tmp_path, monkeypatch, capsys
+):
     auth = tmp_path / "auth.auto.tfvars"
     if variant == "malformed":
         auth.write_text('databricks_client_secret = "unterminated\n')
@@ -140,12 +151,27 @@ def test_other_unusable_auth_never_creates_client(script, variant, tmp_path, mon
             'databricks_workspace_host = "https://selected.example"\n'
             'databricks_client_id = ["a"]\n'
             'databricks_client_secret = "selected-secret"\n')
+    elif variant == "placeholder":
+        auth.write_text(
+            'databricks_workspace_host = "https://selected.example"\n'
+            'databricks_client_id = "<client-id>"\n'
+            'databricks_client_secret = "selected-secret"\n')
     else:
         auth.mkdir()
     created = []
     monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda **kwargs: created.append(kwargs))
+    message = ""
     try:
         _invoke(script, auth, monkeypatch)
-    except (BaseException,):
-        pass
+    except (RuntimeError, custom_masks.Refused, SystemExit, ValueError) as exc:
+        message = str(exc)
+    captured = capsys.readouterr()
+    message += captured.out + captured.err
     assert created == []
+    expected = {
+        "malformed": "not valid HCL",
+        "non-string": "fill in",
+        "placeholder": "fill in",
+        "unreadable": "can't be read",
+    }[variant]
+    assert expected in message

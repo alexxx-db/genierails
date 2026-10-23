@@ -393,12 +393,12 @@ def load_credentials(auth_file: str, host: str) -> None:
     path = Path(auth_file)
     from scripts.auth_configured import AuthStatus, auth_status
     status = auth_status(path)
-    if not path.exists():
-        fail(f"credentials file not found: {auth_file}")
     if status is AuthStatus.UNREADABLE:
         fail(f"{auth_file} can't be read")
     if status is AuthStatus.MALFORMED:
         fail(f"{auth_file} is not valid HCL")
+    if status is AuthStatus.INCOMPLETE:
+        fail(f"fill in {auth_file} (workspace host, client ID, and client secret)")
     import hcl2
 
     try:
@@ -416,9 +416,6 @@ def load_credentials(auth_file: str, host: str) -> None:
         if not isinstance(raw, str):
             fail(f"fill in {auth_file} (workspace host, client ID, and client secret)")
         values[key] = raw.strip()
-    for key, value in values.items():
-        if not value:
-            fail(f"{auth_file} has no value for {key}")
     file_host = values["databricks_workspace_host"].rstrip("/")
     if file_host != host.rstrip("/"):
         fail(

@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         auth = load_auth(env_dir)
         host = str(auth.get("databricks_workspace_host", "")).rstrip("/")
     except Exception as exc:
-        print(f"ERROR: cannot read {env_dir / 'auth.auto.tfvars'} ({type(exc).__name__}); nothing was applied.")
+        print(f"ERROR: {exc}; nothing was applied.", file=sys.stderr)
         return 1
 
     out(f"=== Genie adoption preflight ({env_dir.name}): {len(legacy)} legacy agent(s) on {host} ===")
