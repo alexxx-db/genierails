@@ -1437,7 +1437,10 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
 
     # The deployer SP the policies exempt is the committed one, never
     # auth.auto.tfvars, so validation needs no credentials.
-    for key in ("access_tier_groups", "raw_exempt_principals", "deployer_principal_id"):
+    for key in (
+        "access_tier_groups", "raw_exempt_principals", "deployer_principal_id",
+        "treatment_versions", "column_overrides",
+    ):
         if key not in merged and key in env_cfg:
             merged[key] = env_cfg[key]
     if env_path is not None and not env_parse_failed:

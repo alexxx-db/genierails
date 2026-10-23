@@ -286,24 +286,6 @@ def normalize_sql_type(sql_type: str) -> str:
     )
 
 
-def _resolved_partial(
-    treatment: str, exact_type: str, library: dict, *, never_raw: bool,
-    treatment_versions: Mapping[str, Mapping[str, str]] | None = None,
-    override: Mapping[str, str] | None = None,
-) -> tuple[str, str, str | None]:
-    """Resolve the effective partial/full versions exactly once for all callers."""
-    item = library["treatments"][treatment]
-    family = type_family(exact_type)
-    partial = (item.get("partial_by_type", {}).get(family, item.get("partial"))
-               if family in item["types"] else item["full"])
-    full = item["full"]
-    if not never_raw:
-        version = (treatment_versions or {}).get(treatment, {}).get("partial")
-        partial = (override or {}).get("partial", version or partial)
-    custom = None if never_raw else (library.get("custom_bodies") or {}).get(partial, {}).get(family)
-    return partial or full, full, custom
-
-
 def partial_tier_exposes_fragment(item: ColumnTreatment) -> bool:
     """Whether a middle tier sees something weaker than the full mask."""
     return (item.sql_type == "STRING" and not item.never_raw
@@ -324,13 +306,26 @@ def treatment_value_column(
     exact_type = f"DECIMAL({decimal.group(1)},{decimal.group(2)})" if decimal else token_types.get(type_token)
     if not exact_type or treatment not in library["treatments"]:
         return None
-    override = dict(normalize_column_overrides(settings.get("column_overrides")).get(column.lower()) or {})
-    never_raw = is_never_raw(value)
-    partial, full, custom = _resolved_partial(
-        treatment, exact_type, library, never_raw=never_raw,
-        treatment_versions=settings.get("treatment_versions") or {}, override=override,
-    )
-    return ColumnTreatment(treatment, exact_type, partial, full, never_raw, custom)
+    configured = dict(normalize_column_overrides(settings.get("column_overrides")).get(column.lower()) or {})
+    configured["treatment"] = treatment
+    classes = list(library["treatments"][treatment].get("classes") or [])
+    if not classes:
+        classes = [next(c for item in library["treatments"].values() for c in item.get("classes", []))]
+    candidates = [configured]
+    # Mixed-class resolution deliberately forces redact/redacted after applying
+    # versions.  Try that unchanged resolver outcome as well; the value hash
+    # identifies which effective behavior the generated column actually uses.
+    if treatment == MIXED_PARTIAL_TREATMENT:
+        candidates.append({"treatment": treatment, "partial": "redacted"})
+    for override in candidates:
+        item = resolve_column(
+            column, classes, exact_type, library=library,
+            treatment_versions=settings.get("treatment_versions") or {},
+            column_overrides={column.lower(): override},
+        )
+        if item.value == value:
+            return item
+    return None
 
 
 def resolve_column(
@@ -351,6 +346,7 @@ def resolve_column(
     """
     data = library or load_library()
     exact_type = normalize_sql_type(sql_type)
+    family = type_family(exact_type)
     names = sorted({c.removeprefix("class.") for c in classes if c})
     known = {name for item in data["treatments"].values() for name in item["classes"]}
     override = dict((column_overrides or {}).get(column.lower()) or {})
@@ -370,6 +366,9 @@ def resolve_column(
                 f'column_overrides["{column}"].treatment names {treatment!r}, '
                 "which the mask library does not ship"
             )
+        partial = (item.get("partial_by_type", {}).get(family, item.get("partial"))
+                   if family in item["types"] else item["full"])
+        full = item["full"]
         never_raw = never_raw or treatment in NEVER_RAW_TREATMENTS
     if never_raw and treatment not in NEVER_RAW_TREATMENTS:
         # Name the column after its never-raw class, so every reader of the
@@ -378,15 +377,13 @@ def resolve_column(
             name for name, item in data["treatments"].items()
             if name in NEVER_RAW_TREATMENTS and set(names) & set(item["classes"])
         )
-    mixed_partial = False
     if not never_raw:
+        version = (treatment_versions or {}).get(treatment, {}).get("partial")
+        partial = override.get("partial", version or partial)
         if len(partial_treatments(names, exact_type, data)) > 1:
             treatment, partial, full = MIXED_PARTIAL_TREATMENT, "redacted", "redacted"
-            mixed_partial = True
-    partial, full, custom = _resolved_partial(
-        treatment, exact_type, data, never_raw=never_raw,
-        treatment_versions=treatment_versions, override={} if mixed_partial else override,
-    )
+    # An adopted custom mask's partial version is named after it.
+    custom = None if never_raw else (data.get("custom_bodies") or {}).get(partial, {}).get(family)
     return ColumnTreatment(treatment, exact_type, partial or full, full, never_raw, custom)
 
 

@@ -250,7 +250,20 @@ def test_coverage_advisory_uses_the_effective_partial_tier(settings):
     assert result.passed and not result.warnings
 
 
-def test_coverage_gate_cli_reads_escaped_free_text_comment_and_keeps_compact_pass(tmp_path):
+@pytest.mark.parametrize(("settings", "env_extra", "warned"), [
+    ({}, "", True),
+    (
+        {"treatment_versions": {"phone_partial": {"partial": "redacted"}}},
+        'treatment_versions = { phone_partial = { partial = "redacted" } }\n', False,
+    ),
+    (
+        {"column_overrides": {"cat.sch.t.details": {"partial": "redacted"}}},
+        'column_overrides = { "cat.sch.t.details" = { partial = "redacted" } }\n', False,
+    ),
+])
+def test_coverage_gate_cli_reads_env_mask_settings_and_escaped_comment(
+    tmp_path, settings, env_extra, warned,
+):
     env = tmp_path / "envs" / "dev"
     generated = env / "generated"
     (env / "ddl").mkdir(parents=True)
@@ -260,12 +273,14 @@ def test_coverage_gate_cli_reads_escaped_free_text_comment_and_keeps_compact_pas
         'governance_mode = "deterministic"\n'
         'deployer_principal_id = "d0000000-0000-0000-0000-00000000d001"\n'
         'access_tier_groups = ["raw", "regional", "masked"]\n'
+        + env_extra
     )
     (env / "ddl" / "_fetched.sql").write_text(
         "CREATE TABLE cat.sch.t (details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc');\n"
     )
     model = build_model({"cat.sch.t.details": ["phone_number"]},
-                        {"cat.sch.t.details": "STRING"}, settings)
+                        {"cat.sch.t.details": "STRING"},
+                        {"access_tier_groups": ["raw", "regional", "masked"]} | settings)
     tfvars = generated / "abac.auto.tfvars"
     tfvars.write_text('''
 groups = { raw = { description = "" }, regional = { description = "" }, masked = { description = "" } }
@@ -283,8 +298,8 @@ genie_space_configs = []
         text=True, capture_output=True,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "COVERAGE ADVISORY (non-blocking)" in completed.stdout
-    assert "cat.sch.t.details" in completed.stdout
+    assert ("COVERAGE ADVISORY (non-blocking)" in completed.stdout) is warned
+    assert ("cat.sch.t.details" in completed.stdout) is warned
 
 
 def test_advisory_only_summary_keeps_the_one_line_pass(capsys):

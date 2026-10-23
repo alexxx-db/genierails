@@ -310,6 +310,48 @@ def test_an_override_to_redact_or_never_raw_is_kept_on_a_mixed_column():
     assert resolve_column("c.s.t.ssn", ["us_ssn"], "STRING", treatment_versions={"ssn": {"partial": "last4"}}).partial == "last4"
 
 
+@pytest.mark.parametrize("partial", ["raw", "last4"])
+def test_redact_treatment_versions_cannot_open_a_mixed_column(partial):
+    item = resolve_column(
+        NOTES, ["email_address", "name", "phone_number"], "STRING",
+        treatment_versions={"redact": {"partial": partial}},
+    )
+    assert (item.value, item.partial, item.full) == (
+        "redact__string__df6fec27", "redacted", "redacted",
+    )
+    assert item.partial_sql == item.full_sql
+
+
+@pytest.mark.parametrize(("never_raw", "other", "expected"), [
+    ("card_security_code", "date_of_birth", "card_security_code__string__0ede9584"),
+    ("card_security_code", "medical_date", "card_security_code__string__0ede9584"),
+    ("card_security_code", "compensation", "card_security_code__string__0ede9584"),
+    ("card_security_code", "credit_score", "card_security_code__string__0ede9584"),
+    ("card_pin", "date_of_birth", "card_pin__string__9f963477"),
+    ("card_pin", "medical_date", "card_pin__string__9f963477"),
+    ("card_pin", "compensation", "card_pin__string__9f963477"),
+    ("card_pin", "credit_score", "card_pin__string__9f963477"),
+    ("card_track_data", "date_of_birth", "card_track_data__string__666ff6e2"),
+    ("card_track_data", "medical_date", "card_track_data__string__666ff6e2"),
+    ("card_track_data", "compensation", "card_track_data__string__666ff6e2"),
+    ("card_track_data", "credit_score", "card_track_data__string__666ff6e2"),
+])
+def test_resolve_column_keeps_main_values_for_never_raw_pairs(never_raw, other, expected):
+    item = resolve_column("cat.sch.t.c", [never_raw, other], "STRING")
+    assert item.value == expected
+    assert item.never_raw and item.partial == item.full == "null"
+
+
+@pytest.mark.parametrize(("sql_type", "expected"), [
+    ("DATE", "card_pin__date__70193ac9"),
+    ("BIGINT", "card_pin__bigint__c61464db"),
+    ("DECIMAL(12,2)", "card_pin__decimal_12_2__0542eeb4"),
+])
+def test_resolve_column_pins_never_raw_date_and_numeric_values(sql_type, expected):
+    item = resolve_column("cat.sch.t.c", ["card_pin", "date_of_birth"], sql_type)
+    assert item.value == expected and item.never_raw
+
+
 def test_coverage_check_blocks_a_mixed_column_that_keeps_a_partial_treatment():
     mixed = _model({NOTES: ["email_address", "name", "phone_number"]})
     marker = f"# gr.classification_mixed_partial: {NOTES}|email_partial,name_partial,phone_partial\n"
