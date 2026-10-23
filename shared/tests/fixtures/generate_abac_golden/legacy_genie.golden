@@ -1,5 +1,5 @@
 ### EXIT 0
-### OUTPUT 2601
+### OUTPUT 2602
 ============================================================
   ABAC Configuration Generator
   Mode: genie — Genie configs only (no ABAC, no masking SQL)
@@ -37,7 +37,7 @@
   [genie mode] Stripped ABAC sections from output (groups, tag_policies, tag_assignments, fgac_policies)
   [genie mode] Tip: set genie_only = true in env.auto.tfvars for least-privilege SP access (Workspace Admin only)
   [auto-strip] Removed flat legacy Genie fields from multi-space draft
-  Injected genie_space_configs for configured agents: Payments Agent
+  Injected genie_space_configs from the Genie API for: Payments Agent
   abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars
   NOTE: Genie ACL for 'Payments Agent' not derived yet (this draft has no access policies); the next full `make generate` derives it.
   Per-agent config: generated/spaces/payments_agent/abac.auto.tfvars

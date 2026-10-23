@@ -466,6 +466,272 @@ def test_transient_api_failure_keeps_reviewed_inline_agent_config(env_dir, monke
     }
 
 
+@pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
+def test_failed_fetch_keeps_reviewed_inline_agent_config_in_both_modes(
+    tmp_path, monkeypatch, capsys, legacy,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=legacy)
+    env_file = fake.env / "env.auto.tfvars"
+    env_file.write_text(
+        env_file.read_text()
+        + f'genie_spaces = [{{ name = "Alpha", genie_space_id = "{CAPTURE_IDS["Alpha"]}", '
+        f'uc_tables = {json.dumps(TABLES)}, acl_groups = {json.dumps(TIERS)} }}]\n'
+    )
+    first, first_calls = fake.generate()
+    reviewed = hcl2.loads(first.decode())["genie_space_configs"]
+    assert reviewed == {"Alpha": {"instructions": "Alpha instr."}}
+    first_out = capsys.readouterr().out
+
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_genie_space",
+        lambda *args, **kwargs: ([], {}, "", False),
+    )
+    second, _ = fake.generate()
+
+    # Legacy used to keep the model's draft here instead of the reviewed import.
+    assert hcl2.loads(second.decode())["genie_space_configs"] == reviewed
+    assert second == first
+    assert "Injected genie_space_configs from the Genie API for: Alpha" in first_out
+    second_out = capsys.readouterr().out
+    assert "Kept reviewed genie_space_configs (Genie API returned no config) for: Alpha" in second_out
+    # A persistent failure names the agent and space and says what to check.
+    assert (
+        f"WARNING: Genie API returned no config for agent 'Alpha' "
+        f"(genie_space_id='{CAPTURE_IDS['Alpha']}'); kept its reviewed genie_space_configs "
+        "from generated/. If this repeats, check that the space still exists"
+    ) in second_out
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
+def test_failed_fetch_keeps_reviewed_config_while_another_agent_changes(
+    tmp_path, monkeypatch, legacy,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=legacy)
+    env_file = fake.env / "env.auto.tfvars"
+    entries = ", ".join(
+        f'{{ name = "{name}", genie_space_id = "{CAPTURE_IDS[name]}", '
+        f'uc_tables = {json.dumps(TABLES)}, acl_groups = {json.dumps(TIERS)} }}'
+        for name in ("Alpha", "Beta")
+    )
+    env_file.write_text(env_file.read_text() + f"genie_spaces = [{entries}]\n")
+    fake.generate()
+
+    def fetch(space_id, cfg, quick_check_only=False):
+        if space_id == CAPTURE_IDS["Alpha"]:
+            return [], {}, "", False
+        return (
+            list(TABLES),
+            generate_abac.parse_genie_config_from_serialized_space(
+                _captured_serialized("Beta edited")
+            ),
+            "Beta",
+            True,
+        )
+
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", fetch)
+    second, _ = fake.generate()
+
+    # Beta's changed config rewrites the block; Alpha's must not become {}.
+    assert hcl2.loads(second.decode())["genie_space_configs"] == {
+        "Alpha": {"instructions": "Alpha instr."},
+        "Beta": {"instructions": "Beta edited instr."},
+    }
+
+
+def _inline_agents_env(fake, agents):
+    env_file = fake.env / "env.auto.tfvars"
+    base = env_file.read_text().split("genie_spaces = ", 1)[0]
+    entries = ", ".join(
+        f'{{ name = "{name}", genie_space_id = "{space_id}", '
+        f'uc_tables = {json.dumps(TABLES)}, acl_groups = {json.dumps(TIERS)} }}'
+        for name, space_id in agents
+    )
+    env_file.write_text(base + f"genie_spaces = [{entries}]\n")
+
+
+NEW_SPACE_ID = "01cccccccccccccc"
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        ([("Alpha", CAPTURE_IDS["Alpha"])], [("Alpha", CAPTURE_IDS["Beta"])]),
+        (
+            [("Alpha", CAPTURE_IDS["Alpha"]), ("Beta", CAPTURE_IDS["Beta"])],
+            [("Alpha", NEW_SPACE_ID)],
+        ),
+    ],
+    ids=["id-changed", "same-name-replacement"],
+)
+def test_failed_fetch_never_reuses_another_spaces_reviewed_config(
+    tmp_path, monkeypatch, capsys, legacy, before, after,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=legacy)
+    _inline_agents_env(fake, before)
+    first, _ = fake.generate()
+    assert hcl2.loads(first.decode())["genie_space_configs"]["Alpha"] == {
+        "instructions": "Alpha instr."
+    }
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_genie_space",
+        lambda *args, **kwargs: ([], {}, "", False),
+    )
+    _inline_agents_env(fake, after)
+    second, _ = fake.generate()
+    out = capsys.readouterr().out
+    cfg = hcl2.loads(second.decode())
+
+    new_id = after[0][1]
+    assert cfg["genie_space_configs"] == {"Alpha": {}}
+    assert cfg["genie_space_id_to_name"] == {new_id: "Alpha"}
+    assert "Alpha instr." not in second.decode()
+    assert (
+        f"WARNING: Genie API returned no config for agent 'Alpha' "
+        f"(genie_space_id='{new_id}'), and its reviewed genie_space_configs in "
+        f"generated/ belongs to '{CAPTURE_IDS['Alpha']}'; not reusing it."
+    ) in out
+    # A persisting failure leaves the empty entry byte-stable.
+    assert fake.generate()[0] == second
+
+
+REVIEWED_FIELDS = {
+    "benchmarks": [{"question": "reviewed q", "sql": "SELECT 1"}],
+    "sql_filters": [{
+        "sql": "amount > 0", "display_name": "positive", "comment": "c", "instruction": "i",
+    }],
+}
+
+
+def _add_reviewed_fields(fake, name, *, drop_mapping=False):
+    """A reviewer's benchmark and SQL snippet on ``name`` in generated/."""
+    path = fake.env / "generated/abac.auto.tfvars"
+    text = path.read_text()
+    configs = hcl2.loads(text)["genie_space_configs"]
+    configs[name] = {**configs[name], **REVIEWED_FIELDS}
+    text = generate_abac.remove_hcl_top_level_block(text, "genie_space_configs")
+    if drop_mapping:
+        text = generate_abac.remove_hcl_top_level_block(text, "genie_space_id_to_name")
+    path.write_text(
+        text.rstrip() + "\n\n" + generate_abac.format_genie_space_configs_hcl(configs) + "\n"
+    )
+
+
+def _fetch_as(space_name):
+    def fetch(space_id, cfg, quick_check_only=False):
+        return (
+            list(TABLES),
+            generate_abac.parse_genie_config_from_serialized_space(
+                _captured_serialized(space_name)
+            ),
+            space_name,
+            True,
+        )
+    return fetch
+
+
+def _failed_fetch(*args, **kwargs):
+    return [], {}, "", False
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
+@pytest.mark.parametrize(
+    "new_id, drop_mapping, fetch, expected",
+    [
+        # Same space: the reviewed benchmark and snippet stay, fetched or not.
+        (CAPTURE_IDS["Alpha"], False, _failed_fetch,
+         {"instructions": "Alpha instr.", **REVIEWED_FIELDS}),
+        (CAPTURE_IDS["Alpha"], False, _fetch_as("Alpha"),
+         {"instructions": "Alpha instr.", **REVIEWED_FIELDS}),
+        # Another space, or no recorded ID: nothing of the old entry survives.
+        (CAPTURE_IDS["Beta"], False, _failed_fetch, {}),
+        (CAPTURE_IDS["Beta"], False, _fetch_as("Beta"), {"instructions": "Beta instr."}),
+        (CAPTURE_IDS["Alpha"], True, _failed_fetch, {}),
+        (CAPTURE_IDS["Alpha"], True, _fetch_as("Alpha"), {"instructions": "Alpha instr."}),
+    ],
+    ids=[
+        "same-id-failed", "same-id-fetched", "id-changed-failed", "id-changed-fetched",
+        "no-mapping-failed", "no-mapping-fetched",
+    ],
+)
+def test_reviewed_benchmarks_and_snippets_follow_the_genie_space_id(
+    tmp_path, monkeypatch, legacy, new_id, drop_mapping, fetch, expected,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=legacy)
+    _inline_agents_env(fake, [("Alpha", CAPTURE_IDS["Alpha"])])
+    fake.generate()
+    _add_reviewed_fields(fake, "Alpha", drop_mapping=drop_mapping)
+
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", fetch)
+    _inline_agents_env(fake, [("Alpha", new_id)])
+    second, _ = fake.generate()
+    cfg = hcl2.loads(second.decode())
+
+    # {} has no benchmarks/instructions/description/sample_questions, so
+    # Terraform's existing_spaces_with_config skips it: apply pushes nothing.
+    assert cfg["genie_space_configs"] == {"Alpha": expected}
+    assert cfg["genie_space_id_to_name"] == {new_id: "Alpha"}
+    if not expected or expected.get("instructions") == "Beta instr." or drop_mapping:
+        assert "reviewed q" not in second.decode()
+    assert fake.generate()[0] == second
+
+
+@pytest.mark.parametrize(
+    "new_id, expected",
+    [
+        (CAPTURE_IDS["Alpha"], {"instructions": "Alpha instr.", **REVIEWED_FIELDS}),
+        (CAPTURE_IDS["Beta"], {}),
+    ],
+    ids=["same-id", "id-changed"],
+)
+def test_legacy_semantic_retry_keeps_the_same_agent_config(
+    tmp_path, monkeypatch, capsys, new_id, expected,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=True)
+    _inline_agents_env(fake, [("Alpha", CAPTURE_IDS["Alpha"])])
+    fake.generate()
+    _add_reviewed_fields(fake, "Alpha")
+
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", _failed_fetch)
+    _inline_agents_env(fake, [("Alpha", new_id)])
+    real_check = generate_abac.post_generate_semantic_check
+    checks = []
+
+    def fail_once(*args, **kwargs):
+        checks.append(1)
+        if len(checks) == 1:
+            return ["forced semantic failure"], []
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(generate_abac, "post_generate_semantic_check", fail_once)
+    # The retry path has none of the first attempt's model-output cleanup.
+    from tests import test_generate_abac_golden as golden
+    retry_response = golden.MODEL_RESPONSE.replace("-- the model's SQL habit\n", "")
+    monkeypatch.setattr(generate_abac, "call_with_retries", lambda *a, **k: retry_response)
+    second, _ = fake.generate()
+
+    assert "Re-generating with LLM" in capsys.readouterr().out
+    # The retry's model draft replaces neither the reviewed nor the empty entry.
+    assert hcl2.loads(second.decode())["genie_space_configs"] == {"Alpha": expected}
+
+
+def test_file_agent_placeholder_comment_and_log_name_the_placeholder(
+    tmp_path, monkeypatch, capsys,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=True)
+    fake.add("Alpha")
+    first, _ = fake.generate()
+    out = capsys.readouterr().out
+
+    assert "make apply pushes changes back" not in first.decode()
+    assert "Empty entries are placeholders for agents defined in agents/" in first.decode()
+    assert "Wrote empty genie_space_configs placeholders (content stays in agents/) for: Alpha" in out
+    assert "Injected genie_space_configs from the Genie API" not in out
+    assert fake.generate()[0] == first
+
+
 def test_recapturing_agent_content_does_not_change_generated(tmp_path, monkeypatch):
     fake = _CaptureGenerateEnv(tmp_path, monkeypatch)
     fake.add("Alpha")
