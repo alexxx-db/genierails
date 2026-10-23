@@ -149,7 +149,8 @@ _is_own_env_dir = { [ -n "$(GENIERAILS_CLOUD_DIR)" ] && _own=$$(CDPATH= cd -P "$
 # exist in the checkout's own envs/<name>, so the cleanup runs only where
 # _is_own_env_dir holds. Anywhere else the dir is still scaffolded (missing
 # dirs, symlinks and tfvars are created), nothing is deleted, and one line
-# notes any leftovers kept.
+# notes any leftovers kept. Every step fails the target (|| exit 1): a half-made
+# env dir must never reach setup's next-steps banner.
 _prepare-env:
 	@envs="$(ENV)"; \
 	if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$(ENV)" != "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -163,7 +164,7 @@ _prepare-env:
 		else \
 			env_dir="$(CLOUD_ROOT)/envs/$$env_name"; \
 		fi; \
-		mkdir -p "$$env_dir"; \
+		mkdir -p "$$env_dir" || exit 1; \
 		owned=; \
 		if $(call _is_own_env_dir,"$$env_dir","$$env_name"); then owned=1; fi; \
 		leftovers="$$env_dir/*.tf $$env_dir/*.py $$env_dir/ABAC_PROMPT.md $$env_dir/scripts"; \
@@ -179,54 +180,53 @@ _prepare-env:
 			done; \
 		fi; \
 		if [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-			if [ -n "$$owned" ]; then rm -rf "$$env_dir/ddl" "$$env_dir/generated" "$$env_dir/$(DATA_ACCESS_SUBDIR)"; fi; \
+			if [ -n "$$owned" ]; then rm -rf "$$env_dir/ddl" "$$env_dir/generated" "$$env_dir/$(DATA_ACCESS_SUBDIR)" || exit 1; fi; \
 		else \
-			mkdir -p "$$env_dir/ddl" "$$env_dir/generated"; \
+			mkdir -p "$$env_dir/ddl" "$$env_dir/generated" || exit 1; \
 			gov_dir="$$env_dir/$(DATA_ACCESS_SUBDIR)"; \
-			mkdir -p "$$gov_dir"; \
+			mkdir -p "$$gov_dir" || exit 1; \
 			if [ -L "$$gov_dir/auth.auto.tfvars" ] && [ ! -e "$$gov_dir/auth.auto.tfvars" ]; then \
 				echo "ERROR: $$gov_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 			fi; \
 			if [ ! -e "$$gov_dir/auth.auto.tfvars" ] && [ ! -L "$$gov_dir/auth.auto.tfvars" ]; then \
-				ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars"; \
+				ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars" || exit 1; \
 			fi; \
 			if [ -L "$$gov_dir/env.auto.tfvars" ] && [ ! -e "$$gov_dir/env.auto.tfvars" ]; then \
 				echo "ERROR: $$gov_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 			fi; \
 			if [ ! -e "$$gov_dir/env.auto.tfvars" ] && [ ! -L "$$gov_dir/env.auto.tfvars" ]; then \
-				ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars"; \
+				ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 		fi; \
 		if [ -n "$$owned" ]; then \
-			rm -f "$$env_dir"/*.tf; \
-			rm -f "$$env_dir"/*.py "$$env_dir"/ABAC_PROMPT.md; \
-			rm -rf "$$env_dir/scripts"; \
+			rm -f "$$env_dir"/*.tf "$$env_dir"/*.py "$$env_dir"/ABAC_PROMPT.md || exit 1; \
+			rm -rf "$$env_dir/scripts" || exit 1; \
 		fi; \
 		if [ -L "$$env_dir/auth.auto.tfvars" ] && [ ! -e "$$env_dir/auth.auto.tfvars" ]; then \
 			echo "ERROR: $$env_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 		fi; \
 		if [ ! -e "$$env_dir/auth.auto.tfvars" ] && [ ! -L "$$env_dir/auth.auto.tfvars" ]; then \
 			if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars"; \
+				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars" || exit 1; \
 			else \
-				python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example"; \
+				python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" || exit 1; \
 			fi; \
 		else \
-			python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example"; \
+			python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" || exit 1; \
 		fi; \
 		if [ -L "$$env_dir/env.auto.tfvars" ] && [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
 			echo "ERROR: $$env_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 		fi; \
 		if [ ! -e "$$env_dir/env.auto.tfvars" ] && [ ! -L "$$env_dir/env.auto.tfvars" ]; then \
-			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars"; \
+			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars" || exit 1; \
 			if [ "$$env_name" = "$(ACCOUNT_ENV)" ] || [ "$${_SEED_PROMOTION_SETTINGS:-1}" = 0 ]; then \
-				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars"; \
+				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 			if [ "$${_SEED_PROMOTION_SETTINGS:-1}" != 0 ] && [ "$$env_name" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" != "$(DEFAULT_ENV)" ]; then \
-				printf '\n# Promotion source and catalog renames; replace both catalog placeholders.\npromote_from = "$(DEFAULT_ENV)"\ncatalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }\n' "$$env_name" >> "$$env_dir/env.auto.tfvars"; \
+				printf '\n# Promotion source and catalog renames; replace both catalog placeholders.\npromote_from = "$(DEFAULT_ENV)"\ncatalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }\n' "$$env_name" >> "$$env_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 			if [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-				printf "\n# Consume IdP-synced groups by default; set true for demo/greenfield creation.\nmanage_groups = false\n" >> "$$env_dir/env.auto.tfvars"; \
+				printf "\n# Consume IdP-synced groups by default; set true for demo/greenfield creation.\nmanage_groups = false\n" >> "$$env_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 		fi; \
 	done

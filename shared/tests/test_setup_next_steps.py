@@ -243,6 +243,51 @@ def test_setup_with_a_malformed_env_file_warns_and_prints_only_safe_generic_step
     assert "Version control:" in result.stdout
 
 
+def _shared_without(tmp_path, *missing):
+    """A copy of shared/ (without tests/) missing the given files, for SHARED_ROOT."""
+    import shutil
+
+    shared = tmp_path / "shared-copy"
+    shutil.copytree(SHARED_ROOT, shared, symlinks=True,
+                    ignore=shutil.ignore_patterns("tests", "__pycache__", ".terraform"))
+    for name in missing:
+        (shared / name).unlink()
+    return shared
+
+
+@pytest.mark.parametrize("env_text", [None, MALFORMED], ids=["no-env-file", "malformed-env-file"])
+def test_setup_fails_when_bootstrap_cannot_write_the_auth_file(env_text, tmp_path):
+    """Only the banner's role lookup may fall back; a failed bootstrap step fails setup."""
+    shared = _shared_without(tmp_path, "auth.auto.tfvars.example")
+    cloud_root = tmp_path / "aws"
+    env_dir = cloud_root / "envs/dev"
+    if env_text is not None:
+        env_dir.mkdir(parents=True)
+        (env_dir / "env.auto.tfvars").write_text(env_text)
+
+    result = subprocess.run(
+        ["make", "--no-print-directory", "setup", "ENV=dev", f"CLOUD_ROOT={cloud_root}", f"SHARED_ROOT={shared}"],
+        cwd=ROOT / "aws", text=True, capture_output=True, env=_clean_env())
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert not (env_dir / "auth.auto.tfvars").exists()
+    assert "environment ready" not in out
+    assert "Next steps" not in out
+    assert "Version control:" not in out
+    assert not (cloud_root / ".gitignore").exists()
+
+
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_setup_with_every_template_present_still_exits_zero(env, tmp_path):
+    result = _make("aws", tmp_path, "setup", f"ENV={env}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARNING" not in result.stderr
+    assert (tmp_path / "aws/envs" / env / "auth.auto.tfvars").is_file()
+    assert "Workspace environment ready:" in result.stdout and "Next steps" in result.stdout
+
+
 def test_setup_legacy_dev_banner_commits_and_checks_but_skips_the_account_manifest(tmp_path):
     """A legacy-only checkout applies the account layer itself; its rehearse saves the proven keys."""
     env_dir = tmp_path / "aws/envs/dev"
