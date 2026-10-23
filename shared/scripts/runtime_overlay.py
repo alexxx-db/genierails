@@ -258,6 +258,12 @@ def build_kept_names(env_dir: Path, *, state_keys=None, live_names=None) -> dict
     from remap_generated_config import live_policy_lister, read_state_policy_keys
 
     env_dir = Path(env_dir)
+    # A catalog mapped to itself (S2) is refused before the overlay is touched.
+    from scripts.saved_settings import env_identity_catalog_map_error
+
+    identity = env_identity_catalog_map_error(env_dir / "env.auto.tfvars")
+    if identity:
+        raise OverlayError(identity)
     if not ensure(env_dir):
         return {}
     catalog_map = _catalog_map(env_dir)

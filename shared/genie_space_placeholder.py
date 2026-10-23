@@ -7,8 +7,14 @@ Real Genie agent IDs and group names never contain angle brackets, so any
 ``<...>`` value is an unfilled placeholder that would otherwise surface later as
 a confusing API error. Each env file's agents/*.auto.tfvars are checked with it.
 
+It also refuses a catalog_map that maps a catalog to itself unless the env sets
+allow_identity_catalog_map = true (scripts/saved_settings.py, finding S2), so
+every command behind this guard refuses a hand-edited identity map.
+--promotion-destination skips that check: promote-to and promote validate the
+map they are about to write (CATALOG_MAP= may replace the saved one).
+
 Usage:
-    python genie_space_placeholder.py <path/to/env.auto.tfvars> [<more env files>...]
+    python genie_space_placeholder.py [--advice] [--promotion-destination] <path/to/env.auto.tfvars> [<more env files>...]
 """
 
 import os
@@ -108,7 +114,8 @@ def placeholder_error(config: dict, path: Path, *, allow_access_tier_placeholder
 
 def main() -> int:
     advice = "--advice" in sys.argv[1:]
-    paths = [Path(arg) for arg in sys.argv[1:] if arg != "--advice"]
+    destination = "--promotion-destination" in sys.argv[1:]
+    paths = [Path(arg) for arg in sys.argv[1:] if arg not in ("--advice", "--promotion-destination")]
     for path in paths:
         if path.is_file() and len(re.findall(r"(?m)^\s*catalog_map\s*=", path.read_text())) > 1:
             print(f"ERROR: {_display_path(path)}: catalog_map is set twice; keep one", file=sys.stderr)
@@ -126,6 +133,11 @@ def main() -> int:
                 config, path,
                 allow_access_tier_placeholders=os.environ.get("GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS") == "1",
             )
+        if not error and not destination and path.is_file() and re.search(r"(?m)^\s*catalog_map\s*=", path.read_text()):
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from scripts.saved_settings import env_identity_catalog_map_error
+
+            error = env_identity_catalog_map_error(path) or None
         if error:
             if advice:
                 print(f"  Setup required: {error}")

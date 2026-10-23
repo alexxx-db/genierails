@@ -12,7 +12,8 @@ import sys
 import hcl2
 import pytest
 
-from scripts import remap_env_config, saved_settings, validate_catalog_map
+import genie_space_placeholder
+from scripts import remap_env_config, runtime_overlay, saved_settings, staged_policy_apply, validate_catalog_map
 from tests.test_champion_command_simplify import (  # noqa: F401  (promote_cloud is a fixture)
     _env_cfg,
     _promotion_settings,
@@ -189,3 +190,56 @@ def test_remap_env_config_keeps_only_the_destination_opt_in(tmp_path, monkeypatc
     (dest / "env.auto.tfvars").write_text('uc_tables = ["paycat.s.t"]\n' + OPT_IN)
     remap_env_config.main()
     assert hcl2.loads((dest / "env.auto.tfvars").read_text())["allow_identity_catalog_map"] is True
+
+
+def test_promote_to_command_line_map_replaces_a_saved_identity_map(promote_cloud):
+    """The guard leaves a promotion destination's saved map to promote-to, so CATALOG_MAP= can fix it."""
+    _promotion_settings(promote_cloud.envs, 'promote_from = "dev"\ncatalog_map = { "paycat" = "paycat" }\n')
+
+    result = promote_cloud("promote-to", "ENV=prod", "CATALOG_MAP=paycat=ppay")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _env_cfg(promote_cloud.envs, "prod")["catalog_map"] == {"paycat": "ppay"}
+
+
+@pytest.mark.parametrize("catalog_map", [
+    '{ "paycat" = "paycat" }',
+    '"ppay=other,paycat=paycat"',  # the legacy string
+    '{ "paycat" = "paycat", "bad name" = "x" }',  # otherwise invalid: still refused
+])
+def test_env_file_check_reads_the_map_leniently(tmp_path, catalog_map, capsys):
+    env_file = tmp_path / "prod" / "env.auto.tfvars"
+    env_file.parent.mkdir()
+    env_file.write_text(f"catalog_map = {catalog_map}\n")
+
+    assert "maps a catalog to itself (paycat=paycat)" in saved_settings.env_identity_catalog_map_error(env_file)
+    assert saved_settings.main(["identity-check", "--env-file", str(env_file)]) == 1
+    assert "maps a catalog to itself" in capsys.readouterr().err
+    env_file.write_text(f"catalog_map = {catalog_map}\n" + OPT_IN)
+    assert saved_settings.env_identity_catalog_map_error(env_file) == ""
+
+
+def test_the_shared_guard_refuses_except_for_a_promotion_destination(tmp_path, monkeypatch):
+    env_file = tmp_path / "prod" / "env.auto.tfvars"
+    env_file.parent.mkdir()
+    env_file.write_text('catalog_map = { "paycat" = "paycat" }\n')
+
+    monkeypatch.setattr(sys, "argv", ["genie_space_placeholder.py", str(env_file)])
+    assert genie_space_placeholder.main() == 1
+    monkeypatch.setattr(sys, "argv", ["genie_space_placeholder.py", "--promotion-destination", str(env_file)])
+    assert genie_space_placeholder.main() == 0
+
+
+def test_the_staged_controller_and_the_overlay_refuse_before_writing(tmp_path, capsys):
+    prod = tmp_path / "envs" / "prod"
+    prod.mkdir(parents=True)
+    (prod / "env.auto.tfvars").write_text(
+        'governance_mode = "deterministic"\ncatalog_map = { "paycat" = "paycat" }\n')
+    before = sorted(p.name for p in prod.rglob("*"))
+
+    for command in ("run", "plan", "apply-saved", "confirm", "abandon", "rebind"):
+        assert staged_policy_apply.main([command, "--env-dir", str(prod), "--env-name", "prod"]) == 1, command
+        assert "maps a catalog to itself (paycat=paycat)" in capsys.readouterr().err
+    with pytest.raises(runtime_overlay.OverlayError, match=r"maps a catalog to itself \(paycat=paycat\)"):
+        runtime_overlay.build_kept_names(prod, state_keys=set(), live_names=lambda c: set())
+    assert sorted(p.name for p in prod.rglob("*")) == before

@@ -10,6 +10,8 @@ promote-resolve pick the source env and catalog map for make promote-to from
                 FROM / CATALOG_MAP, else the destination's saved promote_from /
                 catalog_map; prints "<source> <map>".
 promote-save    after a successful promote-to, save them in the destination.
+identity-check  refuse an env whose catalog_map maps a catalog to itself, unless
+                it sets allow_identity_catalog_map = true (finding S2).
 
 Writes replace the setting in place (or append it), leave every other line
 untouched, and are atomic; nothing is ever written into the source env.
@@ -354,6 +356,36 @@ def identity_catalog_map_error(pairs: dict[str, str], dest_cfg: dict, setting: s
     )
 
 
+def env_identity_catalog_map_error(env_file: Path) -> str:
+    """identity_catalog_map_error for the catalog_map an env's env.auto.tfvars holds.
+
+    The guard every command that can use a destination's catalog_map runs (plan,
+    apply, import, rehearse, release-plan, release, the staged controller and the
+    runtime overlay), so a hand-edited map is refused like a promoted one. Pairs
+    are read leniently (no validation, <...> placeholders skipped): a map that is
+    otherwise invalid still can't slip an identity entry through.
+    """
+    env_file = Path(env_file)
+    if not env_file.is_file() or not re.search(r"(?m)^\s*catalog_map\s*=", env_file.read_text()):
+        return ""
+    try:
+        config = _load(env_file)
+    except ValueError as exc:
+        return str(exc)
+    raw = config.get("catalog_map")
+    if isinstance(raw, list):  # hcl2 may wrap a map in a list
+        raw = raw[0] if raw else {}
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, str):
+        items = [pair.partition("=")[::2] for pair in raw.split(",") if "=" in pair]
+    else:
+        items = []
+    pairs = {str(src).strip(): str(dest).strip() for src, dest in items
+             if not any(char in str(src) + str(dest) for char in "<>")}
+    return identity_catalog_map_error(pairs, config, f"catalog_map in {display_path(env_file)}", env_file)
+
+
 def validate_source_catalogs(source_dir: Path, catalog_map: str, env_file: Path) -> None:
     from scripts.footprint import FootprintError, resolve_footprint
     from genie_space_placeholder import placeholder_error
@@ -532,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("--envs-dir", type=Path, required=True)
     resolve.add_argument("--from", dest="source", default="")
     resolve.add_argument("--catalog-map", default="")
+    identity = sub.add_parser("identity-check", help="refuse a catalog_map that maps a catalog to itself")
+    identity.add_argument("--env-file", type=Path, required=True)
     save = sub.add_parser("promote-save")
     save.add_argument("--env-file", type=Path, required=True)
     save.add_argument("--from", dest="source", required=True)
@@ -542,6 +576,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.report_only:
             return report_verify_keys(args.env_file, args.value, args.result_file)
         return save_verify_key(args.env_file, args.value, args.result_file)
+    if args.command == "identity-check":
+        error = env_identity_catalog_map_error(args.env_file)
+        if error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "promote-save":
         return save_promote(args.env_file, args.source, args.catalog_map)
     try:

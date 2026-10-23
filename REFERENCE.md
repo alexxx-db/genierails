@@ -234,7 +234,7 @@ The settings the rules above depend on are explained in more depth, with the rul
 | Setting | Type | Default | Meaning |
 |---|---|---|---|
 | `promote_from` | string | `""` | In the destination env: the env `promote-to` promotes from. No resource reads it. |
-| `catalog_map` | any (map, or the legacy `"a=b,c=d"` string) | `{}` | In the destination env: source-to-destination catalog renames for `promote-to`. A catalog mapped to itself (`"paycat" = "paycat"`) is refused before anything is written: on a shared metastore the destination's state would adopt the source's masks, and a later retire in the source would drop them. No resource reads it. |
+| `catalog_map` | any (map, or the legacy `"a=b,c=d"` string) | `{}` | In the destination env: source-to-destination catalog renames for `promote-to`. A catalog mapped to itself (`"paycat" = "paycat"`) is refused before anything is written, by `promote-to` and by every command that uses the env (`plan`, `apply`, `import`, `maintain`, `release-plan`, `release`, and `rehearse` of its source), even when the file was edited by hand: on a shared metastore the destination's state would adopt the source's masks, and a later retire in the source would drop them. No resource reads it. |
 | `allow_identity_catalog_map` | bool | `false` | In the destination env, only when it and the source use **separate metastores**: `true` lets `catalog_map` map a catalog to itself. Only the boolean `true` in the destination's own file counts (no command-line flag; never copied from the source); `promote-to` keeps it. No resource reads it. |
 | `ai_helper_endpoint` | string | `""` | In `envs/dev`: the model serving endpoint the AI helpers call. Governance never reads it. |
 

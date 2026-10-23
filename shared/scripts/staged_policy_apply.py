@@ -1504,6 +1504,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, help="plan: where the saved phase plans go")
     parser.add_argument("--plan-dir", type=Path, help="apply-saved: the saved phase plans to apply")
     args = parser.parse_args(argv)
+    if args.command not in ("status", "describe"):
+        # A hand-edited catalog_map that maps a catalog to itself (S2) is refused
+        # before anything is planned or applied, however this is reached.
+        from scripts.saved_settings import env_identity_catalog_map_error
+
+        error = env_identity_catalog_map_error(args.env_dir / "env.auto.tfvars")
+        if error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
     controller = Controller(
         args.env_dir, args.env_name, hook_dir=args.hook_dir, verify_access_cmd=args.verify_access_cmd,
         inventory_cmd=shlex.split(args.inventory_cmd) if args.inventory_cmd else None,

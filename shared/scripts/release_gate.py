@@ -367,6 +367,24 @@ def promotion_targets(cloud_dir: Path, source: str) -> list[str]:
     return targets
 
 
+def identity_check(env_dir: Path, env: str) -> None:
+    """Refuse when ENV or an env promoted from it maps a catalog to itself (S2).
+
+    A rehearsal receipt vouches for the commit for every promotion target, so a
+    hand-edited target catalog_map is refused before the rehearsal locks or applies.
+    """
+    from scripts.saved_settings import env_identity_catalog_map_error
+
+    env_dir = Path(env_dir)
+    cloud_dir = cloud_dir_of(env_dir)
+    files = [env_dir / "env.auto.tfvars"] + [
+        cloud_dir / "envs" / target / "env.auto.tfvars" for target in promotion_targets(cloud_dir, env)]
+    for env_file in files:
+        error = env_identity_catalog_map_error(env_file)
+        if error:
+            raise Refused(error)
+
+
 def promoted_digest(cloud_dir: Path, makefile: Path, make: str, target: str) -> tuple[str | None, str]:
     """What promote-to ENV=<target> writes, from the committed files alone (a scratch copy)."""
     from scripts.check_env import CheckFailed, Scratch
@@ -1942,6 +1960,7 @@ def main(argv: list[str] | None = None) -> int:
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
     command("env-role")
+    command("identity-check")
     command("legacy-guard").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
     try:
@@ -2063,6 +2082,8 @@ def main(argv: list[str] | None = None) -> int:
             legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":
             print(env_role(args.env_dir))
+        elif args.command == "identity-check":
+            identity_check(args.env_dir, args.env)
         elif args.command == "maintain-check":
             last = maintain_check(args.env_dir, args.env)
             print(f"maintain: HEAD is the last released commit {last['commit'][:12]} (digests match).")

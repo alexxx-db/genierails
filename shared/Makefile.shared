@@ -270,10 +270,14 @@ _guard-data-access-config:
 # Missing files pass, so ENV=account and not-yet-created envs are unaffected.
 # A promotion destination may keep its access_tier_groups placeholders: the
 # promotion writes its tiers from the source's, through its group_map.
+# It also refuses a catalog_map that maps a catalog to itself unless the env
+# sets allow_identity_catalog_map = true (finding S2): plan, apply, import,
+# rehearse, release-plan, release and maintain all run it first. A promotion
+# destination skips that part; promote-to/promote validate the map they write.
 override _GENIE_PLACEHOLDER_GUARD = GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$(if $(and $(filter generate,$(MAKECMDGOALS)),$(or $(findstring --groups,$(GENERATE_ARGS)),$(findstring --create-groups,$(GENERATE_ARGS)))),1,0) python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
-	"$(SOURCE_ENV_DIR)/env.auto.tfvars"$(if $(DEST_ENV), && GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(DEST_ENV_DIR)/env.auto.tfvars",)
+	"$(SOURCE_ENV_DIR)/env.auto.tfvars"$(if $(DEST_ENV), && GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --promotion-destination "$(DEST_ENV_DIR)/env.auto.tfvars",)
 override _PROMOTE_TO_PLACEHOLDER_GUARD = $(if $(_PROMOTE_TO_FROM),python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(CLOUD_ROOT)/envs/$(_PROMOTE_TO_FROM)/env.auto.tfvars" && ,) \
-	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars"
+	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --promotion-destination "$(ENV_DIR)/env.auto.tfvars"
 
 _guard-genie-placeholder:
 	@$(_GENIE_PLACEHOLDER_GUARD)
@@ -760,6 +764,8 @@ _refresh-live-ddl: _guarded-bootstrap _guard-workspace-target
 # table names), and an explicit VERIFY_KEY_COLUMN as verify_key_column when
 # passing mask checks were paired by it. A partial run saves nothing.
 override _SAVED_SETTINGS = python3 "$(SHARED_ROOT)/scripts/saved_settings.py"
+# The guard's identity catalog_map check, for internal targets the guard doesn't front.
+override _IDENTITY_MAP_CHECK = $(_SAVED_SETTINGS) identity-check --env-file "$(ENV_DIR)/env.auto.tfvars"
 override _VERIFY_RESULT = $(ENV_DIR)/generated/.verify_access.json
 override _SAVE_VERIFY_KEY = $(_SAVED_SETTINGS) verify-key --env-file "$(ENV_DIR)/env.auto.tfvars" --value "$(strip $(VERIFY_KEY_COLUMN))" --result-file "$(_VERIFY_RESULT)" \
 	$$([ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ] && echo --report-only)
@@ -979,6 +985,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 			echo "rehearse: ENV=$(ENV) is promoted (promote_from is set): rehearse its source env, then make release-plan ENV=$(ENV) and make release ENV=$(ENV)." >&2; \
 			exit 1; \
 		fi; \
+		$(_RELEASE_GATE) identity-check --env-dir "$(ENV_DIR)" --env "$(ENV)" || exit 1; \
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
@@ -1225,7 +1232,7 @@ override _SAVED_GRANT_CHANGES = python3 -c 'import json,sys; print(int(any(s.get
 # when that phase's grant opens SELECT the agent coverage check still lacks,
 # the workspace waits for the next release-plan (CAN_RUN only after SELECT).
 _release-plan-roots:
-	@set -e; $(_DRY_RUN_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
+	@set -e; $(_DRY_RUN_GUARD); $(_IDENTITY_MAP_CHECK); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
 	echo "=== Saved plan (account) ==="; \
 	set +e; (umask 077; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null); status=$$?; set -e; \
 	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: account plan failed." >&2; exit 1; fi; \
@@ -1286,6 +1293,7 @@ _release-plan-roots:
 _release-manifest: _guard-not-ci-apply
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
+	$(_IDENTITY_MAP_CHECK) || exit 1; \
 	export GENIERAILS_RERUN_TARGET=release; \
 	$(_DEPLOYER_CHECK) "make release" || exit 1; \
 	if [ -z "$(strip $(MANIFEST))" ]; then \
