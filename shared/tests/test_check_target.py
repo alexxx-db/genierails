@@ -62,7 +62,8 @@ def _b64(value):
 
 
 # Answers the coverage check's and CAN_RUN check's terraform console queries
-# like an empty state would, and logs every plan; no provider ever runs.
+# like an empty state would, and logs every plan (noting the structural-check
+# variable terraform_layer.sh adds only for check's one-use token); no provider ever runs.
 FAKE_TERRAFORM = f"""#!/bin/sh
 case "$1" in
   console)
@@ -70,7 +71,10 @@ case "$1" in
       */data_access) echo '{_b64({"fingerprint": "f", "grant_tables": [], "acknowledged_columns": [], "needs_gate": False, "new_grants": []})}' ;;
       *) echo '{_b64({"groups": {}, "blocker": "no state", "widening": {}, "missing": {}, "applied": {}})}' ;;
     esac ;;
-  plan) echo "plan $(basename "$PWD")" >> "$FAKE_TF_LOG"; echo "FAKE PLAN" ;;
+  plan)
+    expected=""
+    for arg in "$@"; do [ "$arg" = "-var=expected_pre_release_withholding=true" ] && expected=" expected-withholding"; done
+    echo "plan $(basename "$PWD")$expected" >> "$FAKE_TF_LOG"; echo "FAKE PLAN" ;;
 esac
 exit 0
 """
@@ -191,7 +195,8 @@ def test_check_passes_on_a_clean_generated_tree_and_writes_nothing(repo, tmp_pat
     assert "--- check 5/6: mask-library unit tests ---" in out and " passed in " in out
     assert "=== make check ENV=dev: passed ===" in out
     assert "applying targets cannot run in CI" not in out
-    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access", "plan workspace"]
+    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access",
+                                                                  "plan workspace expected-withholding"]
     _assert_read_only(repo, before)
     assert _git(repo, "status", "--porcelain") == ""
 
