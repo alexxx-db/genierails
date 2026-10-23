@@ -4,13 +4,22 @@ import json
 import os
 import subprocess
 
+import pytest
+
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "genie_space.sh"
 
 
+@pytest.fixture(autouse=True)
+def _clear_inherited_service_principal(monkeypatch):
+    """PAT-oriented cases must not inherit a developer or CI OAuth login."""
+    monkeypatch.delenv("DATABRICKS_CLIENT_ID", raising=False)
+    monkeypatch.delenv("DATABRICKS_CLIENT_SECRET", raising=False)
+
+
 def _create_with_fake_api(
     tmp_path, pages, title='Finance "北"', list_status=200, raw_list_body="",
-    existing_status=404,
+    existing_status=404, sp=False,
 ):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -24,7 +33,9 @@ method = args[args.index("-X") + 1] if "-X" in args else "GET"
 with open(os.environ["CALLS"], "a") as f:
     f.write(json.dumps({"method": method, "url": url, "args": args}) + "\n")
 status, body = 200, {}
-if method == "GET" and url.endswith("/api/2.0/genie/spaces"):
+if method == "POST" and url.endswith("/oidc/v1/token"):
+    status, body = 200, {"access_token": "selected-sp-token"}
+elif method == "GET" and url.endswith("/api/2.0/genie/spaces"):
     status = int(os.environ.get("LIST_STATUS", "200"))
     pages = json.loads(os.environ["PAGES"])
     token = ""
@@ -66,11 +77,23 @@ else:
         "GENIE_WAREHOUSE_ID": "warehouse",
         "GENIE_TITLE": title,
     }
+    if sp:
+        env.update({"DATABRICKS_CLIENT_ID": "selected-client",
+                    "DATABRICKS_CLIENT_SECRET": "selected-secret"})
     result = subprocess.run(
         ["bash", str(SCRIPT), "create"], env=env, capture_output=True, text=True
     )
     recorded = [json.loads(line) for line in calls.read_text().splitlines()]
     return result, id_file, recorded
+
+
+def test_service_principal_ignores_ambient_pat_and_profile(tmp_path):
+    result, _id_file, calls = _create_with_fake_api(tmp_path, [{"spaces": []}], sp=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    api_calls = [call for call in calls if "/api/2.0/" in call["url"]]
+    assert api_calls
+    assert all("Authorization: Bearer selected-sp-token" in call["args"] for call in api_calls)
+    assert all("Authorization: Bearer token" not in call["args"] for call in api_calls)
 
 
 def test_create_posts_only_when_exact_title_is_absent(tmp_path):

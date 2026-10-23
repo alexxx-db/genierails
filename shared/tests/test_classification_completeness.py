@@ -89,8 +89,8 @@ def test_result_paging_deadline_raises_timeout_not_name_error(tmp_path, monkeypa
         result=SimpleNamespace(data_array=[]),
         manifest=SimpleNamespace(total_chunk_count=2), statement_id="id")
     execution = SimpleNamespace(execute_statement=lambda **kwargs: statement)
-    monkeypatch.setitem(sys.modules, "databricks.sdk", SimpleNamespace(
-        WorkspaceClient=lambda **kwargs: SimpleNamespace(statement_execution=execution)))
+    monkeypatch.setattr("scripts.auth_configured.workspace_client",
+                        lambda *_args, **_kwargs: SimpleNamespace(statement_execution=execution))
     monkeypatch.setitem(sys.modules, "databricks.sdk.service.sql", SimpleNamespace(
         StatementState=SimpleNamespace(SUCCEEDED=succeeded, FAILED="f", CANCELED="c", CLOSED="x")))
     with pytest.raises(TimeoutError, match="paging exceeded its deadline"):

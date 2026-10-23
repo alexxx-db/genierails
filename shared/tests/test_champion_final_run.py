@@ -443,7 +443,7 @@ printf '{{}}\\n200'
            "DATABRICKS_HOST": "https://ws", "DATABRICKS_TOKEN": "t",
            "GENIE_ID_FILE": str(id_file), "GENIE_TABLES_CSV": "cat.s.t",
            "GENIE_WAREHOUSE_ID": "wh", "GENIE_TITLE": "Agent"}
-    result = subprocess.run(["bash", str(GENIE_SCRIPT), "create"], env=env,
+    result = subprocess.run(["bash", str(GENIE_SCRIPT), "create", "https://ws", "t"], env=env,
                             capture_output=True, text=True, timeout=60)
     posts = [c for c in calls.read_text().splitlines() if " POST " in f" {c} "] if calls.exists() else []
     return result, posts, id_file
@@ -582,6 +582,7 @@ def test_state_loss_apply_adopts_existing_title_instead_of_posting(tmp_path):
     calls = tmp_path / "curl.log"
     (bin_dir / "curl").write_text(f'''#!/bin/bash
 echo "$*" >> {calls}
+if [[ "$*" == *"/oidc/v1/token"* ]]; then printf '{{"access_token":"sp-token"}}\\n200'; exit 0; fi
 if [[ " $* " == *" POST "* ]]; then printf '{{"space_id":"duplicate"}}\\n201'; exit 0; fi
 if [[ " $* " == *"/api/2.0/genie/spaces"* ]]; then
   printf '{{"spaces":[{{"space_id":"existing-by-title","title":"Agent"}}]}}\\n200'; exit 0
@@ -622,7 +623,8 @@ printf '{{}}\\n200'
     apply = _tf(root, "apply", "-input=false", "-auto-approve", *var_args, env=env)
     assert apply.returncode == 0, apply.stdout + apply.stderr
     assert (tmp_path / ".genie_space_id_agent").read_text().strip() == "existing-by-title"
-    assert not any(" POST " in f" {line} " for line in calls.read_text().splitlines())
+    assert not any(" POST " in f" {line} " and "/oidc/v1/token" not in line
+                   for line in calls.read_text().splitlines())
 
 
 # ── Adoption required during the migration (missing ID / 404 / auth) ────────
@@ -706,6 +708,7 @@ def _run_strict_create(tmp_path: Path, get_code: str, *, write_id: bool = True,
     calls = tmp_path / "curl.log"
     (bin_dir / "curl").write_text(f"""#!/bin/bash
 echo "$*" >> {calls}
+if [[ "$*" == *"/oidc/v1/token"* ]]; then printf '{{"access_token":"sp-token"}}\\n200'; exit 0; fi
 if [[ " $* " == *" POST "* ]]; then printf '{{"space_id":"01dupe"}}\\n200'; exit 0; fi
 if [[ " $* " == *"/api/2.0/genie/spaces/"* ]]; then printf '{get_code}'; exit 0; fi
 printf '{{}}\\n200'
@@ -713,13 +716,15 @@ printf '{{}}\\n200'
     (bin_dir / "curl").chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_HOST": HOST, "DATABRICKS_TOKEN": "t",
+           "DATABRICKS_CLIENT_ID": "selected-client",
+           "DATABRICKS_CLIENT_SECRET": "selected-secret",
            "GENIE_ID_FILE": str(env_dir / f".genie_space_id_{KEY}"),
            "GENIE_TABLES_CSV": "cat.s.t", "GENIE_WAREHOUSE_ID": "wh", "GENIE_TITLE": "Agent",
            **(extra_env or {})}
     result = subprocess.run(["bash", str(GENIE_SCRIPT), "create"], env=env,
                             capture_output=True, text=True, timeout=60)
     log = calls.read_text().splitlines() if calls.exists() else []
-    return result, [c for c in log if " POST " in f" {c} "], env_dir
+    return result, [c for c in log if " POST " in f" {c} " and "/oidc/v1/token" not in c], env_dir
 
 
 @pytest.mark.parametrize("code", ["404", "401", "403", "500"])
@@ -1022,7 +1027,10 @@ def test_migration_with_missing_id_file_fails_and_creates_nothing(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     calls = tmp_path / "curl.log"
-    (bin_dir / "curl").write_text(f'#!/bin/bash\necho "$*" >> {calls}\nprintf \'{{"space_id":"01dupe"}}\\n200\'\n')
+    (bin_dir / "curl").write_text(
+        f'#!/bin/bash\necho "$*" >> {calls}\n'
+        'if [[ "$*" == *"/oidc/v1/token"* ]]; then printf \'{"access_token":"sp-token"}\\n200\'; exit 0; fi\n'
+        'printf \'{"space_id":"01dupe"}\\n200\'\n')
     (bin_dir / "curl").chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_TOKEN": "t", "TF_IN_AUTOMATION": "1"}
@@ -1036,7 +1044,10 @@ def test_migration_with_missing_id_file_fails_and_creates_nothing(tmp_path):
         apply = _tf(env_dir, "apply", "-input=false", "-auto-approve", *tfvars, env=env)
         assert apply.returncode != 0
         assert "Adoption required" in apply.stdout + apply.stderr
-    assert not calls.exists() or " POST " not in f" {calls.read_text()} "
+    assert not calls.exists() or not any(
+        " POST " in f" {line} " and "/oidc/v1/token" not in line
+        for line in calls.read_text().splitlines()
+    )
     assert not (env_dir / f".genie_space_id_{KEY}").exists()
     assert not (env_dir / "trash.log").exists()
     assert gap.marker_for(env_dir, KEY).exists()

@@ -21,8 +21,10 @@ def auth_status(path: Path) -> AuthStatus:
             config = hcl2.load(handle)
     except FileNotFoundError:
         return AuthStatus.INCOMPLETE
-    except (OSError, UnicodeError):
+    except OSError:
         return AuthStatus.UNREADABLE
+    except UnicodeError:
+        return AuthStatus.MALFORMED
     except Exception:
         # Never let parser text (which can echo credential fragments) propagate.
         return AuthStatus.MALFORMED
@@ -62,20 +64,26 @@ def workspace_client(auth_file: Path, **kwargs):
     try:
         with path.open() as handle:
             config = hcl2.load(handle)
-    except (OSError, UnicodeError):
+    except OSError:
         raise RuntimeError(f"{path} can't be read") from None
+    except UnicodeError:
+        raise RuntimeError(f"{path} is not valid HCL") from None
     except Exception:
         raise RuntimeError(f"{path} is not valid HCL") from None
     from databricks.sdk import WorkspaceClient
+    return WorkspaceClient(config=oauth_config(config, **kwargs))
+
+
+def oauth_config(config: dict, **kwargs):
+    """Build an OAuth-M2M SDK Config from already validated auth values."""
     from databricks.sdk.config import Config
-    sdk_config = Config(
+    return Config(
         host=config["databricks_workspace_host"].strip(),
         client_id=config["databricks_client_id"].strip(),
         client_secret=config["databricks_client_secret"].strip(),
         auth_type="oauth-m2m",
         **kwargs,
     )
-    return WorkspaceClient(config=sdk_config)
 
 
 if __name__ == "__main__":

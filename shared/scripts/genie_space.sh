@@ -18,8 +18,9 @@
 #   trash         Move a Genie agent to trash. Reads space_id from GENIE_ID_FILE.
 #
 # Authentication (in order of precedence):
-#   1. DATABRICKS_TOKEN (PAT) - if set, used directly
+#   1. Explicit token argument, for direct/manual invocation only
 #   2. DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET (Service Principal OAuth M2M)
+#   3. Ambient DATABRICKS_TOKEN, for direct/manual invocation only; SP wins
 #      - Requires DATABRICKS_HOST to be set for token endpoint
 #
 # Configuration:
@@ -58,6 +59,13 @@
 # =============================================================================
 
 set -e
+
+# Workspace apply is pinned to the env's SP credentials. Never let an ambient
+# PAT or CLI profile override credentials passed by Terraform.
+unset DATABRICKS_CONFIG_PROFILE DATABRICKS_CONFIG_FILE
+if [[ -n "${DATABRICKS_CLIENT_ID:-}" || -n "${DATABRICKS_CLIENT_SECRET:-}" ]]; then
+  unset DATABRICKS_TOKEN
+fi
 
 UA_HEADER="User-Agent: genierails/0.1.0"
 
@@ -112,7 +120,7 @@ get_sp_token() {
   echo "$token"
 }
 
-# ---------- Resolve token: use DATABRICKS_TOKEN or get from SP credentials ----------
+# ---------- Resolve token: explicit argument or SP credentials ----------
 resolve_token() {
   local workspace_url="$1"
   local explicit_token="$2"
@@ -122,18 +130,18 @@ resolve_token() {
     return 0
   fi
 
-  if [[ -n "${DATABRICKS_TOKEN:-}" ]]; then
-    echo "$DATABRICKS_TOKEN"
-    return 0
-  fi
-
   if [[ -n "${DATABRICKS_CLIENT_ID:-}" && -n "${DATABRICKS_CLIENT_SECRET:-}" ]]; then
     echo "Using Service Principal OAuth M2M authentication..." >&2
     get_sp_token "$workspace_url" "$DATABRICKS_CLIENT_ID" "$DATABRICKS_CLIENT_SECRET"
     return $?
   fi
 
-  echo "No authentication found. Set DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET." >&2
+  if [[ -n "${DATABRICKS_TOKEN:-}" ]]; then
+    echo "$DATABRICKS_TOKEN"
+    return 0
+  fi
+
+  echo "No authentication found. Pass a token explicitly or set DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET." >&2
   return 1
 }
 

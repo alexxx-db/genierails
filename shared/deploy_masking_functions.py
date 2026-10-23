@@ -28,11 +28,13 @@ import argparse
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from masking_sql_blocks import extract_function_name, parse_sql_blocks
 
 PRODUCT_NAME = "genierails"
 PRODUCT_VERSION = "0.1.0"
+_AUTH_FILE: Path | None = None
 
 REQUIRED_PACKAGES = {"databricks-sdk": "databricks.sdk"}
 
@@ -219,7 +221,10 @@ def _cleanup_drop_permissions(
 
 
 def deploy(sql_file: str, warehouse_id: str) -> None:
-    w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+    from scripts.auth_configured import workspace_client
+    if _AUTH_FILE is None:
+        raise RuntimeError("masking auth file was not loaded")
+    w = workspace_client(_AUTH_FILE, product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
 
     with open(sql_file) as f:
         sql_text = f.read()
@@ -290,7 +295,10 @@ def deploy(sql_file: str, warehouse_id: str) -> None:
 
 
 def drop(sql_file: str, warehouse_id: str) -> None:
-    w = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
+    from scripts.auth_configured import workspace_client
+    if _AUTH_FILE is None:
+        raise RuntimeError("masking auth file was not loaded")
+    w = workspace_client(_AUTH_FILE, product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
 
     with open(sql_file) as f:
         sql_text = f.read()
@@ -381,8 +389,16 @@ def load_credentials(auth_file: str, host: str) -> None:
             f"  ({', '.join(AUTH_KEYS)}). Fix that file and re-run the make target."
         )
 
-    if not os.path.isfile(auth_file):
+    global _AUTH_FILE
+    path = Path(auth_file)
+    from scripts.auth_configured import AuthStatus, auth_status
+    status = auth_status(path)
+    if not path.exists():
         fail(f"credentials file not found: {auth_file}")
+    if status is AuthStatus.UNREADABLE:
+        fail(f"{auth_file} can't be read")
+    if status is AuthStatus.MALFORMED:
+        fail(f"{auth_file} is not valid HCL")
     import hcl2
 
     try:
@@ -394,7 +410,12 @@ def load_credentials(auth_file: str, host: str) -> None:
         # Reported outside the handler with no parser text, which can echo a
         # malformed secret (also via __context__).
         fail(f"{auth_file} is not valid HCL")
-    values = {key: str(auth.get(key) or "").strip() for key in AUTH_KEYS}
+    values = {}
+    for key in AUTH_KEYS:
+        raw = auth.get(key, "")
+        if not isinstance(raw, str):
+            fail(f"fill in {auth_file} (workspace host, client ID, and client secret)")
+        values[key] = raw.strip()
     for key, value in values.items():
         if not value:
             fail(f"{auth_file} has no value for {key}")
@@ -407,6 +428,7 @@ def load_credentials(auth_file: str, host: str) -> None:
     os.environ["DATABRICKS_HOST"] = file_host
     os.environ["DATABRICKS_CLIENT_ID"] = values["databricks_client_id"]
     os.environ["DATABRICKS_CLIENT_SECRET"] = values["databricks_client_secret"]
+    _AUTH_FILE = path
 
 
 def _refuse(problem: str) -> None:

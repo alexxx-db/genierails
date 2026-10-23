@@ -39,8 +39,16 @@ def _str(value) -> str:
 
 def _load_auth() -> dict:
     auth_path = WORK_DIR / "auth.auto.tfvars"
-    if not auth_path.exists():
-        return {}
+    from auth_configured import AuthStatus, auth_status
+    status = auth_status(auth_path)
+    if status is AuthStatus.UNREADABLE:
+        raise SystemExit(f"ERROR: {auth_path} can't be read") from None
+    if status is AuthStatus.MALFORMED:
+        raise SystemExit(f"ERROR: {auth_path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
+        raise SystemExit(
+            f"ERROR: fill in {auth_path} (workspace host, client ID, and client secret)"
+        ) from None
     try:
         cfg = _load_hcl(auth_path)
     except Exception:
@@ -55,7 +63,7 @@ def _load_auth() -> dict:
         "databricks_client_secret": "DATABRICKS_CLIENT_SECRET",
     }
     for tfvar_key, env_key in mapping.items():
-        val = _str(cfg.get(tfvar_key, ""))
+        val = cfg.get(tfvar_key, "").strip()
         if val:
             os.environ[env_key] = val
     return cfg
@@ -169,12 +177,10 @@ def main() -> int:
         )
         return 1
 
-    from databricks.sdk import WorkspaceClient
+    from auth_configured import workspace_client
 
-    w = WorkspaceClient(
-        host=host,
-        client_id=client_id or None,
-        client_secret=client_secret or None,
+    w = workspace_client(
+        WORK_DIR / "auth.auto.tfvars",
         product="genierails",
         product_version="0.1.0",
     )

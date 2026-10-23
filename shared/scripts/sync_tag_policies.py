@@ -57,8 +57,16 @@ def retained_deterministic_values(key: str, current_values: set[str]) -> set[str
 def _load_auth():
     """Read auth.auto.tfvars and return config dict + set SDK env vars."""
     auth_path = WORK_DIR / "auth.auto.tfvars"
-    if not auth_path.exists():
-        return {}
+    from auth_configured import AuthStatus, auth_status
+    status = auth_status(auth_path)
+    if status is AuthStatus.UNREADABLE:
+        raise SystemExit(f"ERROR: {auth_path} can't be read") from None
+    if status is AuthStatus.MALFORMED:
+        raise SystemExit(f"ERROR: {auth_path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
+        raise SystemExit(
+            f"ERROR: fill in {auth_path} (workspace host, client ID, and client secret)"
+        ) from None
     try:
         import hcl2
     except ImportError:
@@ -84,10 +92,7 @@ def _load_auth():
         "databricks_client_secret": "DATABRICKS_CLIENT_SECRET",
     }
     for tfvar_key, env_key in mapping.items():
-        val = cfg.get(tfvar_key, "")
-        if isinstance(val, list):
-            val = val[0] if val else ""
-        val = (val or "").strip()
+        val = cfg.get(tfvar_key, "").strip()
         if val:
             os.environ[env_key] = val
 
@@ -366,22 +371,20 @@ def main(argv=None):
         return
     auth_cfg = _load_auth()
 
-    # Get auth token via SDK's config.authenticate()
-    from databricks.sdk import WorkspaceClient
+    # Get auth token from the env-pinned OAuth client.
+    from auth_configured import workspace_client
     from databricks.sdk.service.tags import TagPolicy, Value
     host = _str(auth_cfg.get("databricks_workspace_host", ""))
     client_id = _str(auth_cfg.get("databricks_client_id", ""))
     client_secret = _str(auth_cfg.get("databricks_client_secret", ""))
 
-    w = WorkspaceClient(
-        host=host or None,
-        client_id=client_id or None,
-        client_secret=client_secret or None,
+    w = workspace_client(
+        WORK_DIR / "auth.auto.tfvars",
         product="genierails",
         product_version="0.1.0",
     )
     token = w.config.authenticate()  # {'Authorization': 'Bearer ...'}
-    base = (host or os.environ.get("DATABRICKS_HOST", "")).rstrip("/")
+    base = host.rstrip("/")
     if not base:
         print("  [WARN] No workspace host found; skipping tag policy sync")
         return

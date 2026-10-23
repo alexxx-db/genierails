@@ -555,14 +555,11 @@ def configure_databricks_env(auth_cfg: dict):
 
 def databricks_config(auth_cfg: dict | None = None, **kwargs):
     """Build an SDK Config pinned to auth.auto.tfvars, never ambient auth."""
-    from databricks.sdk.config import Config
+    from scripts.auth_configured import oauth_config
 
     auth = auth_cfg if auth_cfg is not None else _ACTIVE_DATABRICKS_AUTH
-    return Config(
-        host=str(auth.get("databricks_workspace_host") or "").strip(),
-        client_id=str(auth.get("databricks_client_id") or "").strip(),
-        client_secret=str(auth.get("databricks_client_secret") or "").strip(),
-        auth_type="oauth-m2m",
+    return oauth_config(
+        auth,
         product=PRODUCT_NAME,
         product_version=PRODUCT_VERSION,
         **kwargs,

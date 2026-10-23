@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import hcl2
-from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
 
 SHARED_ROOT = Path(__file__).resolve().parent.parent
@@ -15,6 +14,7 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 from scripts.footprint import FootprintError, resolve_footprint
+from scripts.auth_configured import workspace_client as WorkspaceClient
 
 
 def _load(path: Path) -> dict:
@@ -118,9 +118,7 @@ def main() -> int:
         else None
     )
     client = WorkspaceClient(
-        host=_value(auth, "databricks_workspace_host"),
-        client_id=_value(auth, "databricks_client_id"),
-        client_secret=_value(auth, "databricks_client_secret"),
+        auth_file=env_dir / "auth.auto.tfvars",
         custom_headers=routing_headers,
     )
     existing: dict[str, list[str]] = {}

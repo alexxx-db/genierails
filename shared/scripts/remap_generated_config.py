@@ -150,33 +150,19 @@ def live_policy_lister(
     if not unavailable:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from auth_configured import auth_configured
-
         unavailable = not auth_configured(auth_path)
 
     def fetch(catalog: str) -> set[str]:
         nonlocal client
         if client is None:
-            import hcl2
-            from databricks.sdk import WorkspaceClient
-            from databricks.sdk.core import Config
-
-            try:
-                auth = hcl2.loads(auth_path.read_text())
-            except Exception:
-                auth = None
-            if auth is None:
-                # Raised outside the handler with no parser text, which can echo a
-                # malformed secret (also via __context__).
-                raise RuntimeError(f"{auth_path} is not valid HCL") from None
-            client = WorkspaceClient(config=Config(
-                host=auth["databricks_workspace_host"],
-                client_id=auth["databricks_client_id"],
-                client_secret=auth.get("databricks_client_secret"),
+            from auth_configured import workspace_client
+            client = workspace_client(
+                auth_path,
                 http_timeout_seconds=30,
                 retry_timeout_seconds=60,
                 product="genierails",
                 product_version="0.1.0",
-            ))
+            )
         return {
             policy.name
             for policy in client.policies.list_policies(

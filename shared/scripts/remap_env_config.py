@@ -128,22 +128,18 @@ def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_column
     return result
 
 
-def _discover_from_genie_api(space_id: str, auth_cfg: dict) -> tuple[str, list[str]]:
+def _discover_from_genie_api(space_id: str, auth_path: Path | None) -> tuple[str, list[str]]:
     """Query Genie agent API to get name and tables.
 
     Returns (space_title, table_identifiers).
     """
-    host = _str(auth_cfg.get("databricks_workspace_host", ""))
-    client_id = _str(auth_cfg.get("databricks_client_id", ""))
-    client_secret = _str(auth_cfg.get("databricks_client_secret", ""))
-
-    if not host or not client_id:
+    if auth_path is None:
         return "", []
 
     try:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient(
-            host=host, client_id=client_id, client_secret=client_secret,
+        from scripts.auth_configured import workspace_client
+        w = workspace_client(
+            auth_path,
             product="genierails", product_version="0.1.0",
         )
         resp = w.api_client.do(
@@ -411,21 +407,25 @@ def main():
         sys.exit(1)
 
     # Load source auth for API queries
-    auth_cfg = {}
+    selected_auth_path = None
     for auth_path in [
         os.path.join(source_env_dir, "auth.auto.tfvars"),
         os.path.join(source_env_dir, "..", "auth.auto.tfvars"),
     ]:
         if os.path.exists(auth_path):
-            try:
-                auth_cfg = hcl2.load(open(auth_path))
-            except Exception:
-                auth_cfg = None
-            if auth_cfg is None:
-                # Reported outside the handler with no parser text, which can echo a
-                # malformed secret (also via __context__).
+            from scripts.auth_configured import AuthStatus, auth_status
+            status = auth_status(Path(auth_path))
+            if status is AuthStatus.UNREADABLE:
+                print(f"ERROR: {auth_path} can't be read; nothing was written.")
+                sys.exit(1)
+            if status is AuthStatus.MALFORMED:
                 print(f"ERROR: {auth_path} is not valid HCL; nothing was written.")
                 sys.exit(1)
+            if status is AuthStatus.INCOMPLETE:
+                print(f"ERROR: fill in {auth_path} (workspace host, client ID, and client secret); "
+                      "nothing was written.")
+                sys.exit(1)
+            selected_auth_path = Path(auth_path)
             break
 
     # Resolve canonical names before matching discovered table attribution.
@@ -475,7 +475,7 @@ def main():
 
         if space_id and not pure and (not name or not uc_tables):
             print(f"  Querying Genie agent {space_id} for name/tables...")
-            api_title, api_tables = _discover_from_genie_api(space_id, auth_cfg)
+            api_title, api_tables = _discover_from_genie_api(space_id, selected_auth_path)
             if not name and api_title:
                 space["name"] = api_title
                 print(f"  Discovered name: {api_title}")
