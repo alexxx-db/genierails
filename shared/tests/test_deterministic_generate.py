@@ -597,6 +597,126 @@ def test_failed_fetch_never_reuses_another_spaces_reviewed_config(
     assert fake.generate()[0] == second
 
 
+REVIEWED_FIELDS = {
+    "benchmarks": [{"question": "reviewed q", "sql": "SELECT 1"}],
+    "sql_filters": [{
+        "sql": "amount > 0", "display_name": "positive", "comment": "c", "instruction": "i",
+    }],
+}
+
+
+def _add_reviewed_fields(fake, name, *, drop_mapping=False):
+    """A reviewer's benchmark and SQL snippet on ``name`` in generated/."""
+    path = fake.env / "generated/abac.auto.tfvars"
+    text = path.read_text()
+    configs = hcl2.loads(text)["genie_space_configs"]
+    configs[name] = {**configs[name], **REVIEWED_FIELDS}
+    text = generate_abac.remove_hcl_top_level_block(text, "genie_space_configs")
+    if drop_mapping:
+        text = generate_abac.remove_hcl_top_level_block(text, "genie_space_id_to_name")
+    path.write_text(
+        text.rstrip() + "\n\n" + generate_abac.format_genie_space_configs_hcl(configs) + "\n"
+    )
+
+
+def _fetch_as(space_name):
+    def fetch(space_id, cfg, quick_check_only=False):
+        return (
+            list(TABLES),
+            generate_abac.parse_genie_config_from_serialized_space(
+                _captured_serialized(space_name)
+            ),
+            space_name,
+            True,
+        )
+    return fetch
+
+
+def _failed_fetch(*args, **kwargs):
+    return [], {}, "", False
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["deterministic", "legacy"])
+@pytest.mark.parametrize(
+    "new_id, drop_mapping, fetch, expected",
+    [
+        # Same space: the reviewed benchmark and snippet stay, fetched or not.
+        (CAPTURE_IDS["Alpha"], False, _failed_fetch,
+         {"instructions": "Alpha instr.", **REVIEWED_FIELDS}),
+        (CAPTURE_IDS["Alpha"], False, _fetch_as("Alpha"),
+         {"instructions": "Alpha instr.", **REVIEWED_FIELDS}),
+        # Another space, or no recorded ID: nothing of the old entry survives.
+        (CAPTURE_IDS["Beta"], False, _failed_fetch, {}),
+        (CAPTURE_IDS["Beta"], False, _fetch_as("Beta"), {"instructions": "Beta instr."}),
+        (CAPTURE_IDS["Alpha"], True, _failed_fetch, {}),
+        (CAPTURE_IDS["Alpha"], True, _fetch_as("Alpha"), {"instructions": "Alpha instr."}),
+    ],
+    ids=[
+        "same-id-failed", "same-id-fetched", "id-changed-failed", "id-changed-fetched",
+        "no-mapping-failed", "no-mapping-fetched",
+    ],
+)
+def test_reviewed_benchmarks_and_snippets_follow_the_genie_space_id(
+    tmp_path, monkeypatch, legacy, new_id, drop_mapping, fetch, expected,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=legacy)
+    _inline_agents_env(fake, [("Alpha", CAPTURE_IDS["Alpha"])])
+    fake.generate()
+    _add_reviewed_fields(fake, "Alpha", drop_mapping=drop_mapping)
+
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", fetch)
+    _inline_agents_env(fake, [("Alpha", new_id)])
+    second, _ = fake.generate()
+    cfg = hcl2.loads(second.decode())
+
+    # {} has no benchmarks/instructions/description/sample_questions, so
+    # Terraform's existing_spaces_with_config skips it: apply pushes nothing.
+    assert cfg["genie_space_configs"] == {"Alpha": expected}
+    assert cfg["genie_space_id_to_name"] == {new_id: "Alpha"}
+    if not expected or expected.get("instructions") == "Beta instr." or drop_mapping:
+        assert "reviewed q" not in second.decode()
+    assert fake.generate()[0] == second
+
+
+@pytest.mark.parametrize(
+    "new_id, expected",
+    [
+        (CAPTURE_IDS["Alpha"], {"instructions": "Alpha instr.", **REVIEWED_FIELDS}),
+        (CAPTURE_IDS["Beta"], {}),
+    ],
+    ids=["same-id", "id-changed"],
+)
+def test_legacy_semantic_retry_keeps_the_same_agent_config(
+    tmp_path, monkeypatch, capsys, new_id, expected,
+):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch, legacy=True)
+    _inline_agents_env(fake, [("Alpha", CAPTURE_IDS["Alpha"])])
+    fake.generate()
+    _add_reviewed_fields(fake, "Alpha")
+
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", _failed_fetch)
+    _inline_agents_env(fake, [("Alpha", new_id)])
+    real_check = generate_abac.post_generate_semantic_check
+    checks = []
+
+    def fail_once(*args, **kwargs):
+        checks.append(1)
+        if len(checks) == 1:
+            return ["forced semantic failure"], []
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(generate_abac, "post_generate_semantic_check", fail_once)
+    # The retry path has none of the first attempt's model-output cleanup.
+    from tests import test_generate_abac_golden as golden
+    retry_response = golden.MODEL_RESPONSE.replace("-- the model's SQL habit\n", "")
+    monkeypatch.setattr(generate_abac, "call_with_retries", lambda *a, **k: retry_response)
+    second, _ = fake.generate()
+
+    assert "Re-generating with LLM" in capsys.readouterr().out
+    # The retry's model draft replaces neither the reviewed nor the empty entry.
+    assert hcl2.loads(second.decode())["genie_space_configs"] == {"Alpha": expected}
+
+
 def test_file_agent_placeholder_comment_and_log_name_the_placeholder(
     tmp_path, monkeypatch, capsys,
 ):

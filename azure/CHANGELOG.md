@@ -114,10 +114,14 @@
   its `genie_space_id` (check that the space exists and the deployer can read
   it). Before, a legacy env took the model's draft for that agent, and either
   mode wrote `{}` for it when another agent's config changed in the same run.
-  The reviewed entry is reused only while `generated/` maps it to the same
-  `genie_space_id`: after an ID change or a same-name replacement the entry is
-  written empty (`make apply` pushes nothing for it) and the warning names the
-  old and new IDs. The comment above
+  The reviewed entry, and on a successful read its reviewed benchmarks and
+  SQL snippets, are reused only while `generated/`'s `genie_space_id_to_name`
+  maps the agent to the same `genie_space_id`. After an ID change, a same-name
+  replacement or with no recorded ID, nothing of the old entry is kept: a
+  failed read writes it empty (`make apply` pushes nothing for it) and the
+  warning names the old and new IDs. A legacy semantic-check retry now
+  re-imports the same agent config instead of taking the retry's model draft.
+  The comment above
   `genie_space_configs` and the generate log now say which entries came from
   the Genie API, which reviewed entries were kept, and which are empty
   placeholders for `agents/` files. **Upgrade:** none.
