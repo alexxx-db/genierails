@@ -902,6 +902,13 @@ def keep_reviewed_genie_content(path: Path, fresh: dict[str, dict]) -> list[str]
         existing = _load_tfvars(path, "reviewed Genie config", strict=True)
     except (ValueError, OSError):
         return []
+    return keep_reviewed_genie_content_from_config(existing, fresh)
+
+
+def keep_reviewed_genie_content_from_config(
+    existing: dict, fresh: dict[str, dict],
+) -> list[str]:
+    """Parsed-config variant used when the caller already loaded the draft."""
     existing_spaces = existing.get("genie_space_configs") or {}
     kept = []
     for name, config in fresh.items():
@@ -2627,18 +2634,24 @@ def write_deterministic_draft(
     reviewed = tfvars_path.read_text() if tfvars_path.exists() else ""
     text = reviewed or DETERMINISTIC_DRAFT_HEADER
     reviewed_cfg = hcl2.loads(reviewed) if reviewed else {}
+    kept_genie_fields = []
     if api_genie_configs:
-        keep_reviewed_genie_content(tfvars_path, api_genie_configs)
+        kept_genie_fields = keep_reviewed_genie_content_from_config(
+            reviewed_cfg, api_genie_configs
+        )
+    desired_mapping = {} if mode == "governance" else genie_space_id_to_name
     config_changed = (
         mode == "governance"
-        or bool(api_genie_configs)
-        and (reviewed_cfg.get("genie_space_configs") or {}) != api_genie_configs
+        or (
+            bool(api_genie_configs)
+            and (reviewed_cfg.get("genie_space_configs") or {}) != api_genie_configs
+        )
     )
     if mode == "genie":
         text = strip_abac_for_genie_mode(text)
     # Replaced tool-owned blocks are appended in a fixed order. An unchanged
     # groups block stays in place so preserved blocks cannot reorder it.
-    mapping_changed = (reviewed_cfg.get("genie_space_id_to_name") or {}) != genie_space_id_to_name
+    mapping_changed = (reviewed_cfg.get("genie_space_id_to_name") or {}) != desired_mapping
     owned = ["genie_space_id_to_name"] if mapping_changed else []
     if config_changed:
         owned.append("genie_space_configs")
@@ -2663,8 +2676,20 @@ def write_deterministic_draft(
     if mode != "governance":
         text = inject_imported_genie_config(
             text, tfvars_path, api_genie_configs if config_changed else {},
-            genie_space_id_to_name if mapping_changed else {},
+            desired_mapping if mapping_changed else {},
         )
+        if api_genie_configs and not config_changed:
+            if reviewed_cfg:
+                print(f"  Loaded reviewed Genie config from: {tfvars_path}")
+            if kept_genie_fields:
+                print(
+                    "  Kept reviewed Genie benchmarks/snippets: "
+                    + ", ".join(kept_genie_fields)
+                )
+            print(
+                "  Injected genie_space_configs from Genie API for: "
+                + ", ".join(api_genie_configs)
+            )
     tfvars_path.write_text(text.rstrip() + "\n")
 
     if mode != "governance":
@@ -7460,8 +7485,13 @@ def main():
             # A captured agent's config and tables are in git
             # (agents/<agent>.space.json); its live config is never imported
             # into generated/, so agent content stays out of governance files.
-            from agent_files import captured_names
-            captured_agents = captured_names(auth_file.parent)
+            from agent_files import capture_path, load_all
+            captured_by_id = {
+                agent["genie_space_id"]: agent
+                for agent in load_all(auth_file.parent)
+                if agent["genie_space_id"]
+                and capture_path(auth_file.parent, agent["name"]).is_file()
+            }
 
             for space in genie_spaces_cfg:
                 space_tables = space.get("uc_tables") or []
@@ -7471,8 +7501,9 @@ def main():
                 space_name = space.get("name") or space_id
                 agent_name = space_name
                 exposed_tables = list(space_tables)
+                captured_agent = captured_by_id.get(space_id)
 
-                if space_id and space_name not in captured_agents:
+                if space_id and captured_agent is None:
                     # Always query the API for existing spaces to get config.
                     # Tables are also discovered here if uc_tables is not set.
                     # When uc_tables IS set, use quick_check_only to skip long
@@ -7514,20 +7545,29 @@ def main():
                     else:
                         all_space_tables.extend(space_tables)
 
-                    if genie_cfg:
-                        if effective_name in api_genie_configs:
-                            print(
-                                "ERROR: Multiple Genie spaces resolve to the same canonical "
-                                f"name {effective_name!r}. Set distinct names."
-                            )
-                            sys.exit(1)
-                        api_genie_configs[effective_name] = genie_cfg
+                    if effective_name in api_genie_configs:
+                        print(
+                            "ERROR: Multiple Genie spaces resolve to the same canonical "
+                            f"name {effective_name!r}. Set distinct names."
+                        )
+                        sys.exit(1)
+                    api_genie_configs[effective_name] = genie_cfg
                 else:
                     # Captured agents are deliberately not read from the API.
-                    # Their merged settings still carry the canonical name,
-                    # so reconstruct the tool-owned identity map locally.
+                    # Rebuild their imported config and canonical identity from
+                    # the checked-in agent files instead.
                     if space_id:
                         genie_space_id_to_name[space_id] = space_name
+                    if captured_agent is not None:
+                        capture = capture_path(auth_file.parent, captured_agent["name"])
+                        try:
+                            captured_payload = json.loads(capture.read_text())
+                        except (OSError, json.JSONDecodeError) as exc:
+                            print(f"ERROR: Could not read captured Genie agent {capture}: {exc}")
+                            return 1
+                        api_genie_configs[space_name] = parse_genie_config_from_serialized_space(
+                            json.dumps(captured_payload)
+                        )
                     all_space_tables.extend(space_tables)
 
                 for table in exposed_tables:
