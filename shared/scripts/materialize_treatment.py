@@ -252,13 +252,13 @@ def source_env_dir(envs_dir: Path, env: str, env_dir: Path) -> Path:
 def refuse_deterministic(env_dir: Path, env: str) -> None:
     """materialize-treatment is legacy-only: a deterministic generate derives every column mask from
     tag_treatments and replaces the rest, so a materialized mask would never reach a release."""
-    from scripts.coverage_fix import _deterministic, deterministic_mask_lines, promote_source
+    from scripts.coverage_fix import _deterministic, deterministic_mask_lines
 
     if _deterministic(env_dir):
         raise ValueError(
             f"materialize-treatment is legacy-only and {env} is deterministic; nothing was written. "
             "A deterministic env derives every column mask from tag_treatments, and make generate "
-            "replaces any other.\n" + "\n".join(deterministic_mask_lines(env, env_dir, promote_source(env_dir))))
+            "replaces any other.\n" + "\n".join(deterministic_mask_lines(env, env_dir)))
 
 
 def release_steps(env_dir: Path | None, source: str, dest: str) -> str:

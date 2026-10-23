@@ -522,7 +522,7 @@ def test_scaffold_in_a_promoted_env_writes_the_env_it_is_promoted_from(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert hcl2.loads((dev / "env.auto.tfvars").read_text())["tag_treatments"] == {"class.loyalty_id": "redact"}
     assert (prod / "env.auto.tfvars").read_bytes() == prod_before, "promote-to owns prod's copy"
-    assert "promote-to ENV=prod carries tag_treatments to prod." in result.stdout
+    assert "promote-to carries tag_treatments from envs/dev to prod." in result.stdout
     # release-plan needs the promotion on origin/main and a dev rehearsal of that same commit.
     after = result.stdout[result.stdout.index("make promote-to ENV=prod"):]
     steps = ["commit and push envs/prod/", "make rehearse ENV=dev on that commit", "make release-plan ENV=prod",

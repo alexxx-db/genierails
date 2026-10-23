@@ -646,19 +646,41 @@ def test_scaffold_in_prod_refuses_a_custom_mask_dev_has_not_adopted(envs, monkey
     assert (dev / "env.auto.tfvars").read_bytes() == dev_before
 
 
-def test_scaffold_names_promote_to_when_the_mapping_env_is_not_dev(envs, monkeypatch):
+def test_scaffold_through_a_promoted_chain_maps_in_dev_with_devs_custom_masks(envs, monkeypatch):
+    """uat <- staging <- dev: promote-to rewrites staging's tag_treatments, so the mapping goes to dev."""
     from scripts import scaffold_treatments
 
-    uat = envs / "uat"
+    dev, staging, uat = envs / "dev", envs / "staging", envs / "uat"
     uat.mkdir()
-    (uat / "env.auto.tfvars").write_text((envs / "dev" / "env.auto.tfvars").read_text() + 'promote_from = "staging"\n')
-    _write_mask(envs / "dev")
+    (uat / "env.auto.tfvars").write_text((dev / "env.auto.tfvars").read_text() + 'promote_from = "staging"\n')
+    staging_before = (staging / "env.auto.tfvars").read_bytes()
     monkeypatch.setattr(scaffold_treatments, "_offline_markers", lambda _p: [(COLUMN, "class.postcode", "postcode")])
     with pytest.raises(ValueError, match=re.escape(
-            f"not adopted in envs/staging/custom_masks/, where this mapping goes. Adopt it in dev "
-            f"(make adopt-custom-mask ENV=dev TREATMENT={NAME}) and promote it to staging with "
-            f"make promote-to ENV=staging first")):
+            f"It is not adopted in envs/dev/custom_masks/, where this mapping goes. "
+            f"Adopt it first: make adopt-custom-mask ENV=dev TREATMENT={NAME}")):
         scaffold_treatments.map_deterministic(uat / "generated" / "abac.auto.tfvars", uat, NAME)
+    _write_mask(dev)
+    result = scaffold_treatments.map_deterministic(uat / "generated" / "abac.auto.tfvars", uat, NAME)
+    assert result["target"] == dev and f'"class.postcode" = "{NAME}"' in (dev / "env.auto.tfvars").read_text()
+    assert (staging / "env.auto.tfvars").read_bytes() == staging_before
+
+
+def test_scaffold_from_a_root_other_than_dev_refuses_custom_masks_it_can_never_get(envs, monkeypatch):
+    """qa has no promote_from: adopt-custom-mask runs only in dev, and nothing carries dev's masks to qa."""
+    from scripts import scaffold_treatments
+
+    qa, rel = envs / "qa", envs / "rel"
+    rel.mkdir()
+    (rel / "env.auto.tfvars").write_text((qa / "env.auto.tfvars").read_text() + 'promote_from = "qa"\n')
+    _write_mask(envs / "dev")
+    qa_before = (qa / "env.auto.tfvars").read_bytes()
+    monkeypatch.setattr(scaffold_treatments, "_offline_markers", lambda _p: [(COLUMN, "class.postcode", "postcode")])
+    with pytest.raises(ValueError, match=re.escape(
+            "It is not adopted in envs/qa/custom_masks/, where this mapping goes. Custom masks are adopted only "
+            "in envs/dev (make adopt-custom-mask ENV=dev) and reach another env only by promote-to from it; "
+            "envs/qa has no promote_from, so map a mask-library treatment there")):
+        scaffold_treatments.map_deterministic(rel / "generated" / "abac.auto.tfvars", rel, NAME)
+    assert (qa / "env.auto.tfvars").read_bytes() == qa_before
 
 
 def test_the_account_tag_policy_accepts_custom_values_in_every_env():
