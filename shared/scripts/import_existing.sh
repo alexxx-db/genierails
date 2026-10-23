@@ -22,6 +22,9 @@
 #                                               # stale-tag cleanups to FILE; change nothing
 #   ./scripts/import_existing.sh --apply-recorded=FILE  # release MANIFEST=: run exactly FILE's
 #                                               # entries for this layer; fail on any failure
+#
+# Refuses (exit 1, before anything else) an env whose catalog_map maps a catalog
+# to itself, unless that env sets allow_identity_catalog_map = true.
 # =============================================================================
 
 set -euo pipefail
@@ -81,6 +84,13 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# A catalog_map that maps a catalog to itself (finding S2) is refused first,
+# before any API call or state read or write, from envs/<env> and
+# envs/<env>/data_access alike: importing by name would adopt the source env's
+# policies. Only the env's own allow_identity_catalog_map = true (the HCL
+# boolean) lets it through; envs/account holds no catalog_map.
+python3 "$SCRIPT_DIR/saved_settings.py" identity-check --env-file "$ENV_ROOT/env.auto.tfvars" || exit 1
 
 cd "$MODULE_DIR"
 
