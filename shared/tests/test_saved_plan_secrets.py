@@ -431,3 +431,33 @@ def test_a_new_account_plan_deletes_the_older_unapplied_plan_but_keeps_its_manif
     assert current != older and (current.parent / "account.tfplan").is_file()
     assert older.is_file() and not old_plan.exists()
     assert json.loads(older.read_text())["plan"]["sha256"]
+
+    # Cleanup is strictly backward: treating the older manifest as current
+    # must never delete the newer plan.
+    rg.drop_superseded_saved_plans(repo.cloud / "envs" / "account", "account", older)
+    assert (current.parent / "account.tfplan").is_file()
+
+
+def test_superseded_plan_delete_failure_warns_and_does_not_fail(tmp_path, repo, monkeypatch, capsys):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    old_plan = older.parent / "account.tfplan"
+    real_unlink = Path.unlink
+
+    def refuse_old_plan(path, *args, **kwargs):
+        if path == old_plan:
+            raise PermissionError("detail must not be printed")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_old_plan)
+    second = make("account-plan", "account")
+    assert second.returncode == 0, second.stdout + second.stderr
+    # The subprocess cannot see the monkeypatch, so exercise the cleanup's
+    # error boundary directly against its completed current manifest.
+    current = Path(second.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    old_plan.write_text("credential-bearing plan")
+    rg.drop_superseded_saved_plans(repo.cloud / "envs" / "account", "account", current)
+    warning = capsys.readouterr().err
+    assert str(old_plan) in warning and "contains credentials" in warning and "delete it by hand" in warning
+    assert "detail must not be printed" not in warning and old_plan.is_file()
