@@ -436,6 +436,73 @@ def test_captured_agent_rename_and_removal_refresh_mapping(tmp_path, monkeypatch
     assert fake.generate()[0] == removed
 
 
+def test_transient_api_failure_keeps_reviewed_inline_agent_config(env_dir, monkeypatch):
+    env_file = env_dir / "env.auto.tfvars"
+    named = ENV.replace(
+        f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}",',
+        f'genie_spaces = [{{ name = "{AGENT}", genie_space_id = "{SPACE_ID}",',
+    )
+    env_file.write_text(named)
+    _generate(env_dir, monkeypatch)
+    tfvars = env_dir / "generated/abac.auto.tfvars"
+    first = tfvars.read_bytes()
+    (env_dir / "generated/governed_tables.json").write_text(
+        json.dumps({"tables": TABLES}) + "\n"
+    )
+
+    env_file.write_text(named.replace(
+        f'acl_groups = {json.dumps(TIERS)}',
+        f'uc_tables = {json.dumps(TABLES)}, acl_groups = {json.dumps(TIERS)}',
+    ))
+    monkeypatch.setattr(
+        generate_abac, "fetch_tables_from_genie_space",
+        lambda *args, **kwargs: ([], {}, "", False),
+    )
+    _generate(env_dir, monkeypatch)
+
+    assert tfvars.read_bytes() == first
+    assert hcl2.loads(tfvars.read_text())["genie_space_configs"] == {
+        AGENT: {"instructions": "Amounts are in AUD."}
+    }
+
+
+def test_recapturing_agent_content_does_not_change_generated(tmp_path, monkeypatch):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch)
+    fake.add("Alpha")
+    first, first_calls = fake.generate()
+    fake.capture("Alpha")
+    second, second_calls = fake.generate()
+
+    capture = fake.env / "agents/Alpha.space.json"
+    payload = json.loads(capture.read_text())
+    payload["instructions"] = {
+        "text_instructions": [{"content": ["Recaptured instr."]}]
+    }
+    capture.write_text(json.dumps(payload) + "\n")
+    third, third_calls = fake.generate()
+
+    assert first_calls == [CAPTURE_IDS["Alpha"]]
+    assert second_calls == third_calls == []
+    assert first == second == third
+    assert hcl2.loads(third.decode())["genie_space_configs"] == {"Alpha": {}}
+
+
+def test_generate_refuses_two_agent_files_with_the_same_id(tmp_path, monkeypatch, capsys):
+    fake = _CaptureGenerateEnv(tmp_path, monkeypatch)
+    fake.add("Alpha")
+    duplicate = fake.env / "agents/Duplicate.auto.tfvars"
+    duplicate.write_text(
+        f'genie_space_id = "{CAPTURE_IDS["Alpha"]}"\n'
+        f'acl_groups = {json.dumps(TIERS)}\n'
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "generate_abac.py", "--auth-file", str(fake.env / "auth.auto.tfvars"),
+    ])
+
+    assert generate_abac.main() == 1
+    assert "share genie_space_id" in capsys.readouterr().out
+
+
 def test_a_free_text_column_with_several_partial_classes_is_redacted_and_marked(env_dir, monkeypatch):
     ddl = DDL.replace("  date_of_birth DATE\n);", "  date_of_birth DATE,\n  notes STRING\n);")
     rows = TAG_ROWS + [("dev_fin", "payments", "customers", "notes", f"class.{name}", "")

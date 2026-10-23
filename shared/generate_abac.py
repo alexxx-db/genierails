@@ -965,7 +965,7 @@ def inject_imported_genie_config(
         )
         hcl_block = hcl_block.rstrip() + "\n" + injected_hcl + "\n"
         print(
-            f"  Injected genie_space_configs from Genie API for: "
+            f"  Injected genie_space_configs for configured agents: "
             f"{', '.join(api_genie_configs)}"
         )
 
@@ -2687,7 +2687,7 @@ def write_deterministic_draft(
                     + ", ".join(kept_genie_fields)
                 )
             print(
-                "  Injected genie_space_configs from Genie API for: "
+                "  Injected genie_space_configs for configured agents: "
                 + ", ".join(api_genie_configs)
             )
     tfvars_path.write_text(text.rstrip() + "\n")
@@ -7486,12 +7486,28 @@ def main():
             # (agents/<agent>.space.json); its live config is never imported
             # into generated/, so agent content stays out of governance files.
             from agent_files import capture_path, load_all
-            captured_by_id = {
-                agent["genie_space_id"]: agent
-                for agent in load_all(auth_file.parent)
-                if agent["genie_space_id"]
-                and capture_path(auth_file.parent, agent["name"]).is_file()
-            }
+            agents_by_id = {}
+            for agent in load_all(auth_file.parent):
+                agent_id = agent["genie_space_id"]
+                if not agent_id:
+                    continue
+                if agent_id in agents_by_id:
+                    print(
+                        f"ERROR: Agent files {agents_by_id[agent_id]['name']!r} and "
+                        f"{agent['name']!r} share genie_space_id {agent_id!r}. "
+                        "Each agent file must identify a distinct Genie agent."
+                    )
+                    return 1
+                agents_by_id[agent_id] = agent
+
+            def add_genie_config(name: str, config: dict) -> None:
+                if name in api_genie_configs:
+                    print(
+                        "ERROR: Multiple Genie spaces resolve to the same canonical "
+                        f"name {name!r}. Set distinct names."
+                    )
+                    sys.exit(1)
+                api_genie_configs[name] = config
 
             for space in genie_spaces_cfg:
                 space_tables = space.get("uc_tables") or []
@@ -7501,7 +7517,13 @@ def main():
                 space_name = space.get("name") or space_id
                 agent_name = space_name
                 exposed_tables = list(space_tables)
-                captured_agent = captured_by_id.get(space_id)
+                file_agent = agents_by_id.get(space_id)
+                captured_agent = (
+                    file_agent
+                    if file_agent is not None
+                    and capture_path(auth_file.parent, file_agent["name"]).is_file()
+                    else None
+                )
 
                 if space_id and captured_agent is None:
                     # Always query the API for existing spaces to get config.
@@ -7545,29 +7567,21 @@ def main():
                     else:
                         all_space_tables.extend(space_tables)
 
-                    if effective_name in api_genie_configs:
-                        print(
-                            "ERROR: Multiple Genie spaces resolve to the same canonical "
-                            f"name {effective_name!r}. Set distinct names."
-                        )
-                        sys.exit(1)
-                    api_genie_configs[effective_name] = genie_cfg
+                    # File-defined agent content belongs only in agents/*.space.json.
+                    # An empty entry suppresses both API and model content in generated/.
+                    if file_agent is not None:
+                        add_genie_config(effective_name, {})
+                    elif genie_cfg:
+                        # A failed quick check must not replace reviewed config with {}.
+                        add_genie_config(effective_name, genie_cfg)
                 else:
                     # Captured agents are deliberately not read from the API.
-                    # Rebuild their imported config and canonical identity from
-                    # the checked-in agent files instead.
+                    # Only their canonical identity is written to generated/;
+                    # their content remains exclusively in agents/*.space.json.
                     if space_id:
                         genie_space_id_to_name[space_id] = space_name
                     if captured_agent is not None:
-                        capture = capture_path(auth_file.parent, captured_agent["name"])
-                        try:
-                            captured_payload = json.loads(capture.read_text())
-                        except (OSError, json.JSONDecodeError) as exc:
-                            print(f"ERROR: Could not read captured Genie agent {capture}: {exc}")
-                            return 1
-                        api_genie_configs[space_name] = parse_genie_config_from_serialized_space(
-                            json.dumps(captured_payload)
-                        )
+                        add_genie_config(space_name, {})
                     all_space_tables.extend(space_tables)
 
                 for table in exposed_tables:
