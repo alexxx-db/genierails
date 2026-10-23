@@ -7161,6 +7161,9 @@ def main():
     if auth_state is AuthStatus.MALFORMED:
         print(f"ERROR: {auth_file} is not valid HCL", file=sys.stderr)
         sys.exit(1)
+    if auth_state is AuthStatus.UNREADABLE:
+        print(f"ERROR: {auth_file} can't be read", file=sys.stderr)
+        sys.exit(1)
     if auth_state is AuthStatus.INCOMPLETE:
         print(
             f"ERROR: fill in {auth_file} (workspace host, client ID, and client secret) before running generate",

@@ -301,10 +301,11 @@ def check_readers(
 class DatabricksSource:
     """Databricks-backed source. SDK imports occur only when instantiated."""
 
-    def __init__(self, warehouse_id: str, client: object | None = None, timeout_seconds: int = 120):
+    def __init__(self, warehouse_id: str, client: object | None = None, timeout_seconds: int = 120,
+                 auth_file: Path = Path("auth.auto.tfvars")):
         if client is None:
-            from databricks.sdk import WorkspaceClient  # lazy: pure callers need no SDK
-            client = WorkspaceClient()
+            from scripts.auth_configured import workspace_client
+            client = workspace_client(auth_file)
         self.client = client
         self.warehouse_id = warehouse_id
         self.timeout_seconds = timeout_seconds
@@ -434,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tables", nargs="+", metavar="table", help="catalog.schema.table (one or more)")
     parser.add_argument("--warehouse-id", required=True)
+    parser.add_argument("--auth-file", type=Path, default=Path("auth.auto.tfvars"))
     parser.add_argument("--genierails-grants", type=Path, help="optional JSON list of Grant objects")
     parser.add_argument("--env", required=True)
     parser.add_argument("--tier", action="append", default=[])
@@ -450,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
             managed = [Grant(**row) for row in json.loads(args.genierails_grants.read_text())]
         from ack_file import parse_file
         entries = parse_file(args.ack_file, args.env)
-        source = DatabricksSource(args.warehouse_id)
+        source = DatabricksSource(args.warehouse_id, None, 120, args.auth_file)
         keys = {entry.key for entry in entries}
         reports, checks = [], []
         for table in args.tables:

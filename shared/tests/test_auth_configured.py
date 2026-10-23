@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
-from auth_configured import AuthStatus, auth_configured, auth_status  # noqa: E402
+from auth_configured import AuthStatus, auth_configured, auth_status, workspace_client  # noqa: E402
 
 import pytest
 
@@ -34,6 +34,23 @@ def test_malformed_auth_is_distinct_from_incomplete(tmp_path):
     auth = tmp_path / "auth.auto.tfvars"
     auth.write_text('databricks_client_secret = "unterminated\n')
     assert auth_status(auth) is AuthStatus.MALFORMED
+
+
+@pytest.mark.parametrize("value", ['["a"]', "123", "true"])
+def test_non_string_auth_value_is_incomplete(tmp_path, value):
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.write_text(f'databricks_client_id = {value}\n'
+                    'databricks_workspace_host = "https://dbc.example.com"\n'
+                    'databricks_client_secret = "secret"\n')
+    assert auth_status(auth) is AuthStatus.INCOMPLETE
+
+
+def test_directory_auth_is_unreadable(tmp_path):
+    auth = tmp_path / "auth.auto.tfvars"
+    auth.mkdir()
+    assert auth_status(auth) is AuthStatus.UNREADABLE
+    with pytest.raises(RuntimeError, match="can't be read"):
+        workspace_client(auth)
 
 
 @pytest.mark.parametrize("value", ["<client-id>", "your-client-id", "CHANGEME", "placeholder"])

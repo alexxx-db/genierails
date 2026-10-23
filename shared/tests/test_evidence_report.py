@@ -7,6 +7,16 @@ from evidence_report import assemble_report, collect_live_state, configured_tabl
 COL = {"catalog": "main", "schema": "sales", "table": "customers", "column": "email"}
 
 
+def _auth_file(tmp_path):
+    path = tmp_path / "auth.auto.tfvars"
+    path.write_text(
+        'databricks_workspace_host = "https://selected.example"\n'
+        'databricks_client_id = "selected-client"\n'
+        'databricks_client_secret = "selected-secret"\n'
+    )
+    return path
+
+
 def test_assemble_report_joins_and_sorts_mocked_state():
     report = assemble_report(
         [COL],
@@ -94,7 +104,7 @@ def test_configured_tables_includes_discovered_only_footprint(tmp_path):
     assert configured_tables(tmp_path) == ["main.discovered.orders"]
 
 
-def test_live_collector_uses_information_schema_mask_and_filter_columns(monkeypatch):
+def test_live_collector_uses_information_schema_mask_and_filter_columns(monkeypatch, tmp_path):
     statements = []
 
     class Response:
@@ -114,8 +124,9 @@ def test_live_collector_uses_information_schema_mask_and_filter_columns(monkeypa
         def __init__(self, **kwargs):
             self.statement_execution = Execution()
 
-    monkeypatch.setattr("databricks.sdk.WorkspaceClient", Client)
-    collect_live_state([COL], ["main.sales.customers"], "warehouse-1")
+    monkeypatch.setattr("scripts.auth_configured.workspace_client", lambda *_args, **_kwargs: Client())
+    auth = _auth_file(tmp_path)
+    collect_live_state([COL], ["main.sales.customers"], "warehouse-1", auth)
 
     mask_sql = next(sql for sql in statements if "information_schema.column_masks" in sql)
     filter_sql = next(sql for sql in statements if "information_schema.row_filters" in sql)
@@ -125,7 +136,7 @@ def test_live_collector_uses_information_schema_mask_and_filter_columns(monkeypa
     assert "catalog_name" not in filter_sql and "filter_catalog" not in filter_sql
 
 
-def test_live_collector_uses_catalog_scoped_column_privileges(monkeypatch):
+def test_live_collector_uses_catalog_scoped_column_privileges(monkeypatch, tmp_path):
     statements = []
 
     class Response:
@@ -150,8 +161,8 @@ def test_live_collector_uses_catalog_scoped_column_privileges(monkeypatch):
         def __init__(self, **kwargs):
             self.statement_execution = Execution()
 
-    monkeypatch.setattr("databricks.sdk.WorkspaceClient", Client)
-    state = collect_live_state([COL], ["odd`catalog.sales.customers"], "warehouse-1")
+    monkeypatch.setattr("scripts.auth_configured.workspace_client", lambda *_args, **_kwargs: Client())
+    state = collect_live_state([COL], ["odd`catalog.sales.customers"], "warehouse-1", _auth_file(tmp_path))
 
     privilege_sql = next(sql for sql in statements if "information_schema.column_privileges" in sql)
     assert "FROM `odd``catalog`.information_schema.column_privileges" in privilege_sql
@@ -159,7 +170,7 @@ def test_live_collector_uses_catalog_scoped_column_privileges(monkeypatch):
     assert state["column_privileges_availability"] == {"odd`catalog": "available"}
 
 
-def test_live_collector_tolerates_missing_column_privileges(monkeypatch):
+def test_live_collector_tolerates_missing_column_privileges(monkeypatch, tmp_path):
     statements = []
 
     class Response:
@@ -179,8 +190,8 @@ def test_live_collector_tolerates_missing_column_privileges(monkeypatch):
         def __init__(self, **kwargs):
             self.statement_execution = Execution()
 
-    monkeypatch.setattr("databricks.sdk.WorkspaceClient", Client)
-    state = collect_live_state([COL], ["main.sales.customers"], "warehouse-1")
+    monkeypatch.setattr("scripts.auth_configured.workspace_client", lambda *_args, **_kwargs: Client())
+    state = collect_live_state([COL], ["main.sales.customers"], "warehouse-1", _auth_file(tmp_path))
 
     assert state["grants"] == []
     assert state["column_privileges_availability"] == {"main": "not_available"}

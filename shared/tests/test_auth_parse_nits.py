@@ -372,7 +372,13 @@ def test_auth_parser_never_surfaces_secret(tmp_path, parser_id, env_name, extra,
     assert not [kind for kind in attached
                 if kind.startswith(("lark.", "hcl2.")) or kind.endswith("UnicodeDecodeError")], combined
     if expected is not None:
-        assert expected in combined, combined
+        if variant == "non_utf8" and parser_id in {
+            "custom_masks.workspace_client", "audit_schema_drift._get_sdk_client",
+            "agent_ownership._api",
+        }:
+            assert "can't be read" in combined, combined
+        else:
+            assert expected in combined, combined
     if parser_id == "e2e.driver.read_tfvars" and variant == "non_utf8":
         assert "is not valid UTF-8" in combined, combined
 

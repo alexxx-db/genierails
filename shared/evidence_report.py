@@ -184,13 +184,13 @@ def _sql_identifier(value: str) -> str:
     return "`" + value.replace("`", "``") + "`"
 
 
-def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehouse_id: str) -> dict[str, Any]:
+def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehouse_id: str,
+                       auth_file: Path = Path("auth.auto.tfvars")) -> dict[str, Any]:
     """Read live state through the SDK; called only in explicitly enabled integration mode."""
+    from scripts.auth_configured import workspace_client
+    client = workspace_client(auth_file, product="genierails-evidence", product_version=SCHEMA_VERSION)
     if not tables:
         return {name: [] for name in ("columns", "classifications", "tags", "masks", "policies", "grants")}
-    from databricks.sdk import WorkspaceClient
-
-    client = WorkspaceClient(product="genierails-evidence", product_version=SCHEMA_VERSION)
     def query(sql: str) -> list[list[Any]]:
         response = client.statement_execution.execute_statement(
             statement=sql, warehouse_id=warehouse_id, wait_timeout="50s"
@@ -311,7 +311,7 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
     if live:
         if not args.warehouse_id:
             parser.error(f"--warehouse-id or DATABRICKS_WAREHOUSE_ID is required when {INTEGRATION_ENV}=1")
-        state = collector(columns, tables, args.warehouse_id)
+        state = collector(columns, tables, args.warehouse_id, args.env_dir / "auth.auto.tfvars")
         report = assemble_report(state["columns"], classifications=state["classifications"], tags=state["tags"], masks=state["masks"], policies=state["policies"], grants=state["grants"], approved_by=args.approved_by, approved_at=args.approved_at, source="databricks-live")
         report["column_privileges_availability"] = state.get("column_privileges_availability", {})
     else:
