@@ -160,3 +160,38 @@ def test_a_gate_run_with_a_spec_and_no_minimum_refuses(tmp_path):
     with pytest.raises(SystemExit) as refused:
         vea.main(["--spec", str(spec), "--gate"])
     assert "needs --minimum-from-tfvars" in str(refused.value.code)
+
+
+# The staged controller's verify-created/verify-switched run before its grant phase and export
+# GENIERAILS_VERIFY_PRE_GRANT=1 (scripts/staged_policy_apply.py PRE_GRANT_VERIFY): only that gives the
+# test principals temporary access. The post-grant gates pass VERIFY_PRE_GRANT= so they check the tier
+# groups' real grants, even with VERIFY_PRE_GRANT=1 exported.
+STAGED_GOAL = '_verify-access-gate VERIFY_PRE_GRANT="$$GENIERAILS_VERIFY_PRE_GRANT"'
+
+
+@pytest.mark.parametrize("variant", MAKE_VARIANTS)
+@pytest.mark.parametrize("pre_grant, expected", [("1", True), ("", False)])
+def test_the_staged_verify_passes_pre_grant_access_only_when_the_controller_sets_it(tmp_path, variant, pre_grant,
+                                                                                    expected):
+    result, calls = _scenario(tmp_path, MAKES[variant], STAGED_GOAL, [], {"GENIERAILS_VERIFY_PRE_GRANT": pre_grant})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(calls) == 1 and ("--pre-grant-access" in calls[0]) is expected, calls
+
+
+@pytest.mark.parametrize("variant", MAKE_VARIANTS)
+def test_a_post_grant_gate_never_passes_pre_grant_access(tmp_path, variant):
+    result, calls = _scenario(tmp_path, MAKES[variant], "_verify-access-gate VERIFY_PRE_GRANT=", [],
+                              {"VERIFY_PRE_GRANT": "1", "GENIERAILS_VERIFY_PRE_GRANT": "1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(calls) == 1 and "--pre-grant-access" not in calls[0], calls
+
+
+def test_only_the_staged_controller_s_verify_command_takes_the_pre_grant_value():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    staged = makefile[makefile.index("override _STAGED_VERIFY_ACCESS ="):]
+    staged = staged[:staged.index("\noverride ", 1)]
+    assert 'VERIFY_PRE_GRANT="$$GENIERAILS_VERIFY_PRE_GRANT"' in staged
+    callers = [line for line in makefile.splitlines()
+               if re.search(r"\$\(MAKE\) _verify-access-gate ENV=", line)]
+    assert len(callers) == 4 and all(re.search(r"VERIFY_PRE_GRANT=(?: |\$\(if )", line) for line in callers), callers
+    assert "override _VERIFY_PRE_GRANT_FLAG = $(if $(filter 1,$(VERIFY_PRE_GRANT)),--pre-grant-access,)" in makefile

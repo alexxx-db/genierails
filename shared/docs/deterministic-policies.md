@@ -101,6 +101,28 @@ nothing for them.
 | `retire`, `verify-retired`, `drop-functions` | only for a generation an **earlier** release made obsolete and a successful release then confirmed: its policies leave, then the functions only it used are dropped once no live policy calls them |
 | `grant` | last, in every run: new `SELECT` from `table_readers`, with the readers' new `USE_CATALOG` and `USE_SCHEMA`. Every earlier phase plans with new grants withheld (grants already applied stay), so access opens only after its protection is applied and verified: a first deploy's `create` applies only the functions, the policies and the deployer's own grant, and its coverage check judges those against the treatment tags its `switch` applies. This plan may change no policy or tag |
 
+**verify-access before the grant phase.** `verify-created` and
+`verify-switched` run before `grant`, so a tier group may not hold
+`USE_CATALOG`, `USE_SCHEMA` or `SELECT` on a checked table yet (on a first
+deploy none does). The controller runs their verify-access with
+`GENIERAILS_VERIFY_PRE_GRANT=1` (make passes `--pre-grant-access`): each
+temporary test principal itself gets `USE CATALOG`, `USE SCHEMA` and `SELECT`
+on the checked tables it reads, the same direct grants the out-of-tier probe
+always gets. No tier group gets anything, so Unity Catalog still masks each
+principal by its group membership alone and a tier that sees the wrong value
+still fails. The grants never enter Terraform state and are revoked when
+verify-access exits, also after a failure, Ctrl-C, `SIGTERM` or `SIGHUP`; a
+revoke that fails fails the run and prints the `REVOKE` statements to run.
+A run killed before that cleanup (`SIGKILL`, a host crash) can't revoke them,
+and the next run reuses the same test principals. So every verify-access,
+before and after `grant`, first revokes any direct `USE CATALOG`, `USE SCHEMA`
+and `SELECT` each test principal holds on the checked tables, before it
+grants or reads anything, and refuses to run if a revoke fails. A post-grant
+check therefore reads only through the tier groups' own grants.
+`verify-rebound` doesn't get them: it checks the grants `rebind-access` put
+back. After the staged apply, `rehearse` and `release` run verify-access once
+more without them, so the tier groups' own grants are checked too.
+
 Before each apply the hook checks its render: every tagged value has a
 policy, and nobody gets two masks except principals a tier move is moving.
 Each plan is refused if it replaces anything or deletes a policy or tag the
@@ -153,6 +175,18 @@ any unfinished transition with its completed phases. Writes are atomic.
   previous protection at once (through `tighten` again when principals may
   already be moved), so columns go back to their old value and principals;
   newly governed columns keep their new mask.
+- **A first deploy that fails at `switch` or `verify-switched`** has no
+  previous protection to go back to: every column is newly governed, so the
+  restore keeps the new generation's masks and treatment tags on all of them
+  (fail-closed). No business `USE` or `SELECT` was granted, because `grant`
+  never ran. `make policy-status` says so (`live: generation <g>'s masks and
+  treatment tags on N column(s), kept by the restore after verify-switched:
+  a first deploy has no previous protection`), and `active generation` stays
+  `none` until the change finishes. Re-running the same command resumes it:
+  `verify-created` re-checks the restore (now with every column tagged),
+  then `switch` (no change), `verify-switched` and `grant`. `make
+  policy-abandon` refuses, because dropping the change would remove masks
+  that are live on every column (see "Changes that can't be dropped").
 - A failure in `create`, `retire` or `drop-functions` leaves everything live;
   the journal keeps the generation waiting to retire.
 - The generation a run switched away from is retired only by a **later** run,
@@ -317,7 +351,7 @@ columns, and leaves live protection as it is:
 
 - **A rolled-back switch that kept newly governed columns.** The restore
   leaves a column the change newly governs on its new value, masked by the
-  change's policies. Abandon would delete those policies, so abandon and
+  change's policies (on a failed first deploy, every column). Abandon would delete those policies, so abandon and
   rebind both refuse ("N column(s) keep the new generation's treatment").
   The way out is to resume the change: re-run the command that started it
   with the generated config on that generation. If principals it names were

@@ -808,7 +808,7 @@ override _GOVERNANCE_MODE_OF = python3 -c 'import hcl2,sys; print(hcl2.load(open
 override _STAGED_POLICY = python3 "$(SHARED_ROOT)/scripts/staged_policy_apply.py"
 _STAGED_CONFIRM ?= 1
 override _STAGED_VERIFY_ACCESS = $(MAKE) --no-print-directory _verify-access-gate ENV="$(TARGET_ENV_NAME)" ENV_DIR="$$GENIERAILS_ENV_DIR" TARGET_ENV= VERIFY_REQUIRE_MASKS=1 \
-	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
+	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE" VERIFY_PRE_GRANT="$$GENIERAILS_VERIFY_PRE_GRANT"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
 override _STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
 # The controller refuses, before it applies create, a VERIFY_SPEC its
 # verify-created run (old generation's tiers and functions) would refuse.
@@ -959,7 +959,7 @@ override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FL
 		key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
 		$(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac"; fi && \
 	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
-	$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+	$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 	$(_SAVE_VERIFY_KEY) && \
 	$(_GROUP_MAP_RECORD) && \
 	$(_STAGED_CONFIRM_RUN)
@@ -1005,7 +1005,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
 		GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
-		$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+		$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 		$(_SAVE_VERIFY_KEY) && \
 		$(_GROUP_MAP_RECORD) && \
 		$(_STAGED_CONFIRM_RUN)
@@ -1124,7 +1124,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "a captured Genie agent config was rejected"; \
 		exit 1; \
 	fi; \
-	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
+	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was applied but verify-access failed"; \
 		exit 1; \
 	fi; \
@@ -1371,7 +1371,7 @@ _release-manifest: _guard-not-ci-apply
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was withheld (above); once its protection is live, run make release-plan ENV=$(ENV) again to open it"; \
 		exit 1; \
 	fi; \
-	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
+	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was applied but verify-access failed"; \
 		exit 1; \
 	fi; \
@@ -2163,6 +2163,12 @@ VERIFY_GATE ?=
 # one stage's render, with the tier settings of the generation it checks.
 VERIFY_FROM_TFVARS ?=
 VERIFY_ENV_FILE ?=
+# VERIFY_PRE_GRANT=1: the controller's verify-created/verify-switched, which run
+# before its grant phase opens the tier groups' USE and SELECT. Each temporary
+# test principal (never a tier group) gets USE/SELECT on the tables it checks,
+# revoked when verify-access exits. The post-grant gates pass it empty, so they
+# check the tier groups' real grants.
+VERIFY_PRE_GRANT ?=
 override _VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
 _VERIFY_KEEP_FLAG = $(if $(KEEP_PRINCIPALS),--keep-principals,)
 # The global key (explicit VERIFY_KEY_COLUMN, else the saved verify_key_column)
@@ -2172,6 +2178,7 @@ override _VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_
 # provable row-pairing key fails instead of letting the release report success.
 override _VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)
 override _VERIFY_GATE_FLAG = $(if $(filter 1,$(VERIFY_GATE)),--gate,)
+override _VERIFY_PRE_GRANT_FLAG = $(if $(filter 1,$(VERIFY_PRE_GRANT)),--pre-grant-access,)
 override _VERIFY_MINIMUM_FLAG = $(if $(and $(VERIFY_SPEC),$(or $(filter 1,$(VERIFY_REQUIRE_MASKS)),$(filter 1,$(VERIFY_GATE)))),--minimum-from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --minimum-env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)" --minimum-account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars",)
 
 verify-access-spec: _guarded-bootstrap _guard-workspace-target ## Print the derived effective-access checks (no workspace/cluster needed)
@@ -2210,7 +2217,7 @@ verify-access: _guarded-bootstrap _guard-workspace-target ## Verify masking/row-
 	warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --terraform-runner "$(ROOT_RUNNER)" --env-name "$(ENV)")" && \
 	cd "$(SHARED_ROOT)" && GENIERAILS_LIVE_VERIFY=1 python3 verify_effective_access.py \
 		$(_VERIFY_SPEC_FLAG) $(_VERIFY_KEY_FLAGS) --warehouse-id "$$warehouse_id" $(_VERIFY_KEEP_FLAG) $(_VERIFY_REQUIRE_FLAG) \
-		$(_VERIFY_MINIMUM_FLAG) $(_VERIFY_GATE_FLAG) \
+		$(_VERIFY_MINIMUM_FLAG) $(_VERIFY_GATE_FLAG) $(_VERIFY_PRE_GRANT_FLAG) \
 		--auth-file "$(ENV_DIR)/auth.auto.tfvars" --live --result-file "$(_VERIFY_RESULT)"
 
 # Every applying gate (rehearse, release, the staged policy controller) runs

@@ -105,6 +105,16 @@ The supported mechanism is therefore a set of **dedicated test principals**:
 - each added as a **member of that tier's account group** (e.g. `Junior_Analyst`,
   `Compliance_Officer`),
 - each granted temporary **`CAN_USE`** on the selected SQL warehouse,
+- during the staged controller's `verify-created` and `verify-switched`, which
+  run before its `grant` phase opens the tier groups' `USE_CATALOG`,
+  `USE_SCHEMA` and `SELECT` (`--pre-grant-access`, set by
+  `GENIERAILS_VERIFY_PRE_GRANT=1`): temporary `USE CATALOG`, `USE SCHEMA` and
+  `SELECT` on the checked tables it reads, granted to the service principal
+  itself, never to its tier group, and revoked when the run exits (the
+  out-of-tier probe always gets these). Every run first revokes any such
+  direct access a test principal still holds on the checked tables (left by
+  a run that was killed before its cleanup), and refuses to run if that
+  fails,
 - each authenticating with **its own OAuth credentials** (`client_id` /
   `client_secret`) so it runs the query as itself.
 
