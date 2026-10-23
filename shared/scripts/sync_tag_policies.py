@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 WORK_DIR = Path.cwd()
+TAG_POLICY_UPDATE_ATTEMPTS = 3
 
 
 def retained_deterministic_values(key: str, current_values: set[str]) -> set[str]:
@@ -193,6 +194,52 @@ def update_diff(updates, left=()):
         entry = entries.setdefault(actual_key, {"key": actual_key, "added": [], "removed": []})
         entry["left_in_place"] = list(values)
     return [entries[k] for k in sorted(entries)]
+
+
+def _policy_values(w, tag_key):
+    """Return the current values for one policy, failing if it disappears."""
+    for policy in w.tag_policies.list_tag_policies():
+        if (getattr(policy, "tag_key", "") or "") == tag_key:
+            return {
+                getattr(value, "name", "") or ""
+                for value in (getattr(policy, "values", None) or [])
+                if getattr(value, "name", "") or ""
+            }
+    raise RuntimeError(f"tag policy {tag_key!r} disappeared while it was being updated")
+
+
+def _update_values_without_lost_additions(w, tag_key, intended, removed, TagPolicy, Value):
+    """Reconcile a full-list PATCH without overwriting additions we can observe.
+
+    The API/SDK exposes neither a per-value add nor an optimistic-concurrency
+    token.  Therefore every attempt refreshes the live list immediately before
+    PATCH, unions it with this run's intended values, and verifies after PATCH.
+    A concurrent full-list writer that lands after us can remove our additions;
+    the verification detects that and retries from its new list.  Values added
+    by another writer and visible to an attempt are always carried forward.
+    """
+    intended, removed = set(intended), set(removed)
+    last_live = set()
+    for attempt in range(1, TAG_POLICY_UPDATE_ATTEMPTS + 1):
+        live = _policy_values(w, tag_key)
+        write_values = (live | intended) - removed
+        w.tag_policies.update_tag_policy(
+            tag_key=tag_key,
+            tag_policy=TagPolicy(tag_key=tag_key, values=[Value(name=v) for v in sorted(write_values)]),
+            update_mask="values",
+        )
+        last_live = _policy_values(w, tag_key)
+        if intended <= last_live and not (removed & last_live):
+            return
+        missing = sorted(intended - last_live)
+        still_live = sorted(removed & last_live)
+        print(f"  [WARN] {tag_key}: concurrent tag-policy update detected after attempt {attempt}; "
+              f"missing intended values={missing}, values still awaiting removal={still_live}")
+    raise RuntimeError(
+        f"concurrent tag-policy updates did not converge after {TAG_POLICY_UPDATE_ATTEMPTS} attempts; "
+        f"missing intended values={sorted(intended - last_live)}, "
+        f"values still awaiting removal={sorted(removed & last_live)}"
+    )
 
 
 # -- usage check for named removals ----------------------------------------------------
@@ -435,13 +482,8 @@ def main(argv=None):
     updated = 0
     for actual_key, values, missing, removed in updates:
         try:
-            w.tag_policies.update_tag_policy(
-                tag_key=actual_key,
-                tag_policy=TagPolicy(
-                    tag_key=actual_key,
-                    values=[Value(name=v) for v in values],
-                ),
-                update_mask="values",
+            _update_values_without_lost_additions(
+                w, actual_key, values, removed, TagPolicy, Value,
             )
             changes = []
             if missing:
