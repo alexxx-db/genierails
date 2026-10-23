@@ -61,6 +61,11 @@ def _acl_error(placeholder: str, path: Path) -> str:
             "agent (acl_groups: who gets CAN_RUN; [] means nobody)")
 
 
+def _parse_error(path: Path) -> str:
+    # Never the parser's message: it can quote the file.
+    return f"fix {_display_path(path)}: it is not valid HCL"
+
+
 def agent_file_placeholder_errors(settings: dict, path: Path) -> list[str]:
     """Every unfilled placeholder in one agents/<agent>.auto.tfvars."""
     errors = []
@@ -86,7 +91,12 @@ def agent_files_placeholder_errors(env_dir: Path) -> list[str]:
             continue
         import hcl2
 
-        errors.extend(agent_file_placeholder_errors(hcl2.loads(text), path))
+        try:
+            settings = hcl2.loads(text)
+        except Exception:
+            errors.append(_parse_error(path))
+            continue
+        errors.extend(agent_file_placeholder_errors(settings, path))
     return errors
 
 
@@ -138,8 +148,12 @@ def main() -> int:
         if path.is_file() and ("<" in path.read_text() or ">" in path.read_text()):
             import hcl2
 
-            with path.open() as handle:
-                config = hcl2.load(handle)
+            try:
+                with path.open() as handle:
+                    config = hcl2.load(handle)
+            except Exception:
+                errors.append(_parse_error(path))
+                continue
             errors.extend(placeholder_errors(
                 config, path,
                 allow_access_tier_placeholders=os.environ.get("GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS") == "1",

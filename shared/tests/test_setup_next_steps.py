@@ -211,6 +211,38 @@ def test_setup_existing_legacy_env_does_not_request_a_deployer_principal(tmp_pat
     assert "deployer_principal_id" not in result.stdout
 
 
+MALFORMED = 'governance_mode = "deterministic"\ndeployer_principal_id = "<x>"\nnote = "s3cr3t-token-value" {\n'
+MODE_SPECIFIC_COMMANDS = ("generate", "rehearse", "release", "release-plan", "promote-to", "apply",
+                          "account-plan", "apply-account", "maintain")
+
+
+@pytest.mark.parametrize("env", ["dev", "prod", "stg"])
+def test_setup_with_a_malformed_env_file_warns_and_prints_only_safe_generic_steps(env, tmp_path):
+    """Setup's own work is done by then; only the banner can't pick a role, so it never fails on it."""
+    env_dir = tmp_path / "aws/envs" / env
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text(MALFORMED)
+
+    result = _make("aws", tmp_path, "setup", f"ENV={env}")
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert (f"WARNING: could not tell whether envs/{env} is a rehearsal or a promoted env (env-role failed; "
+            f"is envs/{env}/env.auto.tfvars valid HCL?), so these steps are generic.\n") in result.stderr
+    assert f"  Setup required: fix envs/{env}/env.auto.tfvars: it is not valid HCL\n" in result.stdout
+    assert "Traceback" not in out and "UnexpectedToken" not in out and "env-role failed:" not in out
+    assert "s3cr3t" not in out
+    assert (f"  1. Fix envs/{env}/env.auto.tfvars so it parses, then re-run: make setup ENV={env}   "
+            "(prints this env's steps)\n") in result.stdout
+    assert f"  2. Then: make check ENV={env}   (read-only check of the committed files)\n" in result.stdout
+    # Only commands every env role and mode accepts: nothing a promoted deterministic env refuses.
+    assert set(re.findall(r"make ([a-z][a-z-]*)", result.stdout)) <= {"setup", "check"}
+    assert not set(re.findall(r"make ([a-z][a-z-]*)", result.stdout)) & set(MODE_SPECIFIC_COMMANDS)
+    assert (env_dir / "auth.auto.tfvars").is_file()
+    # The step after the banner still runs.
+    assert "Version control:" in result.stdout
+
+
 def test_setup_legacy_dev_banner_commits_and_checks_but_skips_the_account_manifest(tmp_path):
     """A legacy-only checkout applies the account layer itself; its rehearse saves the proven keys."""
     env_dir = tmp_path / "aws/envs/dev"
