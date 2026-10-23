@@ -817,13 +817,13 @@ def real_cloud(tmp_path):
     (sdk / "__init__.py").write_text(FAKE_SDK)
     (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
 
-    def run(**fake):
+    def run(env_name="dev", **fake):
         env = _clean_env()
         env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
         env["PYTHONPATH"] = str(tmp_path / "sdk")
         env.update({"FAKE_TF_STDOUT": str(TF_CAPTURE), **fake})
         return subprocess.run(
-            ["make", "--no-print-directory", "enable-classification", "ENV=dev", *args],
+            ["make", "--no-print-directory", "enable-classification", f"ENV={env_name}", *args],
             cwd=REPO / "aws", text=True, capture_output=True, env=env, timeout=120,
         )
     return run
@@ -864,3 +864,41 @@ def test_real_target_with_auto_tagging_points_to_generate(real_cloud, tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Wait for class.* tags to appear in Catalog Explorer, then run:\n  make generate ENV=dev" in result.stdout
+
+
+def _auto_tagging_env(tmp_path, name, *, promote_from=None, mode="deterministic"):
+    """A copy of the fixture's dev env as `name`, with auto-tagging on."""
+    envs = tmp_path / "aws/envs"
+    if name != "dev":
+        shutil.copytree(envs / "dev", envs / name)
+    env_file = envs / name / "env.auto.tfvars"
+    text = env_file.read_text().replace('governance_mode = "deterministic"', f'governance_mode = "{mode}"')
+    if promote_from:
+        text += f'\npromote_from = "{promote_from}"\n'
+    env_file.write_text(text + "\nenable_auto_tagging = true\n")
+
+
+# Finding 27b: the hint follows env-role (prod, or any env with promote_from, is
+# promoted) and the governance mode, not the literal name "prod".
+@pytest.mark.parametrize("name, promote_from, mode, expected, absent", [
+    ("prod", None, "deterministic",
+     "  make release-plan ENV=prod   (after make rehearse ENV=dev on the same commit)\n"
+     "  Get that manifest approved, then: make release ENV=prod\n", "make generate"),
+    ("stg", "dev", "deterministic",
+     "  make release-plan ENV=stg   (after make rehearse ENV=dev on the same commit)\n"
+     "  Get that manifest approved, then: make release ENV=stg\n", "make generate"),
+    ("prod", "stg", "deterministic",
+     "  make release-plan ENV=prod   (after make rehearse ENV=stg on the same commit)\n", "make rehearse ENV=dev"),
+    ("stg", "dev", "legacy", "then run:\n  make release ENV=stg\n", "generate"),
+], ids=["prod", "stg-promoted", "prod-from-stg", "stg-promoted-legacy"])
+def test_real_target_auto_tagging_hint_follows_env_role_and_mode(real_cloud, tmp_path, name, promote_from, mode,
+                                                                  expected, absent):
+    _auto_tagging_env(tmp_path, name, promote_from=promote_from, mode=mode)
+
+    result = real_cloud(env_name=name)
+
+    out = result.stdout
+    assert result.returncode == 0, out + result.stderr
+    assert "Wait for class.* tags to appear in Catalog Explorer, then run:\n" in out
+    assert expected in out
+    assert absent not in out[out.index("then run:"):]

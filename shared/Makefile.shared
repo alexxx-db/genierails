@@ -368,13 +368,14 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo ""; \
 		echo "Next steps ($(ENV) promotion — the walkthrough's Prod section; finish the source rehearsal first):"; \
 		if [ -n "$$mode_note" ]; then echo "$$mode_note"; fi; \
-		echo "  1. Replace the seeded promote_from and catalog_map values in $(_SETUP_ENV_REL)/env.auto.tfvars, then run:"; \
+		echo "  1. Create or confirm the $(ENV) deployment SP (none yet? ../shared/docs/prerequisites.md, make bootstrap-sp), then edit"; \
+		echo "     $(_SETUP_ENV_REL)/auth.auto.tfvars — its client_id / client_secret + $(ENV) workspace host & id"; \
+		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; echo "     promote-to refuses while deployer_principal_id is still a placeholder."; fi; \
+		if [ "$$det" = 1 ]; then echo "     Where $(ENV)'s group names differ from $$src's, set group_map there (each $$src group = its $(ENV) group): promote-to writes this env's access_tier_groups from $$src's through it, so leave those placeholders."; fi; \
+		echo "  2. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
+		echo "  3. Replace the seeded promote_from and catalog_map values in $(_SETUP_ENV_REL)/env.auto.tfvars, then run:"; \
 		echo "       make promote-to ENV=$(ENV)"; \
 		echo "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)"; \
-		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + $(ENV) workspace host & id"; \
-		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
-		if [ "$$det" = 1 ]; then echo "     Where $(ENV)'s group names differ from $$src's, set group_map there (each $$src group = its $(ENV) group): promote-to writes this env's access_tier_groups from $$src's through it, so leave those placeholders."; fi; \
-		echo "  3. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
 		echo "  4. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
@@ -382,7 +383,9 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		if [ "$$det" = 1 ]; then \
 			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 			[ -n "$$src" ] || src=dev; \
-			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
+			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run:"; \
+			echo "     make check ENV=$(ENV)   (read-only; also runs promote-to CHECK=1, which release-plan doesn't)"; \
+			echo "     make rehearse ENV=$$src   (release-plan needs a passing rehearsal of this commit), then:"; \
 			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
 			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \
@@ -424,6 +427,9 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 			fi; \
 			echo "     (No agent yet? See ../shared/examples/dev_to_prod/SAMPLE_ENV.md)"; step=$$((step+1)); \
 		fi; \
+		echo "  $$step. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main:"; \
+		echo "     make check, rehearse receipts and release-plan read only committed files. Commit and push again"; \
+		echo "     after each step below that changes envs/."; step=$$((step+1)); \
 		echo "  $$step. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
@@ -433,9 +439,21 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		else \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
 		fi; \
+		echo "     Review envs/$(ENV)/generated/, then commit and push envs/."; \
+		step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; rehearse doesn't run it)"; \
+		if [ "$$det" = 1 ]; then \
+			step=$$((step+1)); echo "  $$step. First deploy only (rehearse refuses a non-empty account plan, e.g. the new gr_treatment tag policy):"; \
+			echo "       make account-plan    (plans the shared account layer and writes the manifest to approve; changes nothing live)"; \
+			echo "       make apply-account   (applies exactly that approved manifest)"; \
+		fi; \
 		step=$$((step+1)); echo "  $$step. Run: make rehearse ENV=$(ENV)"; \
 		echo "$$access_note"; \
-		echo "     verify-access picks a row-pairing key per masked table; the proven keys are saved and promoted."; \
+		if [ "$$det" = 1 ]; then \
+			echo "     verify-access picks a row-pairing key per masked table and prints the keys it proved;"; \
+			echo "     nothing is saved: committing that line is optional and pins those keys (promote-to copies committed keys)."; \
+		else \
+			echo "     verify-access picks a row-pairing key per masked table; the proven keys are saved and promoted."; \
+		fi; \
 		echo ""; \
 		echo "Walkthrough: $(_SETUP_WALKTHROUGH) (the walkthrough's Dev section)"; \
 	fi
@@ -476,8 +494,17 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 		2>&1 | python3 -u "$(SHARED_ROOT)/scripts/filter_target_warnings.py" --cloud "$(CLOUD)" $(if $(filter 1,$(VERBOSE)),--verbose,)
 	@echo ""
 	@if grep -Eq '^[[:space:]]*enable_auto_tagging[[:space:]]*=[[:space:]]*true' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
+		role="$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" || exit 1; \
 		echo "Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer, then run:"; \
-		echo "  make $(if $(filter prod,$(ENV)),release,generate) ENV=$(ENV)"; \
+		if [ "$$role" != promoted ]; then \
+			echo "  make generate ENV=$(ENV)"; \
+		elif [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+			echo "  make release-plan ENV=$(ENV)   (after make rehearse ENV=$${src:-dev} on the same commit)"; \
+			echo "  Get that manifest approved, then: make release ENV=$(ENV)"; \
+		else \
+			echo "  make release ENV=$(ENV)"; \
+		fi; \
 	elif grep -Eq '^[[:space:]]*enable_auto_tagging[[:space:]]*=[[:space:]]*false' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
 		echo "Classification is enabled. Auto-tagging is explicitly off in $(_SETUP_ENV_REL)/env.auto.tfvars."; \
 		echo "Delete that line to keep the UI setting, or use ALLOW_DISABLE_AUTO_TAGGING=1 only to intentionally disable it."; \
