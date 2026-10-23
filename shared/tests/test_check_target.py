@@ -17,6 +17,8 @@ from pathlib import Path
 import hcl2
 import pytest
 
+from shared.scripts import check_env
+
 ROOT = Path(__file__).resolve().parents[2]
 SHARED = ROOT / "shared"
 
@@ -563,8 +565,54 @@ def test_local_only_files_cannot_change_the_result(promoted, tmp_path, kind):
     _assert_check_prod_passes_offline(check_prod)
     assert check_dev.returncode == 0, check_dev.stdout + check_dev.stderr
     for result in (promote, check_prod, check_dev):
-        assert marker not in result.stdout + result.stderr
+        # check's non-failing NOTE may name an untracked file; its content still never reaches the result.
+        assert marker not in (result.stdout + result.stderr).replace(f"aws/envs/{rel}", "")
     _assert_read_only(promoted, before)
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_notes_modified_tracked_env_file_without_changing_exit(repo, tmp_path, ci):
+    env_file = _envs(repo) / "dev" / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + "\n# local review\n")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: make check passed against uncommitted working-tree content" in result.stdout
+    assert "aws/envs/dev/env.auto.tfvars" in result.stdout
+    assert "untracked files" not in result.stdout
+    assert "rehearse and release-plan use the commit" in result.stdout
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_notes_committable_untracked_env_file_without_changing_exit(repo, tmp_path, ci):
+    (_envs(repo) / "dev" / "review.txt").write_text("review me\n")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: untracked files in envs/dev were not checked" in result.stdout
+    assert "aws/envs/dev/review.txt" in result.stdout
+    assert "passed against uncommitted working-tree content" not in result.stdout
+    assert "rehearse and release-plan use the commit" in result.stdout
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_has_no_uncommitted_note_on_a_clean_tree(repo, tmp_path, ci):
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "uncommitted" not in result.stdout and "untracked files" not in result.stdout
+
+
+def test_uncommitted_note_is_silent_outside_git(tmp_path, capsys):
+    cloud = tmp_path / "aws"
+    (cloud / "envs" / "dev").mkdir(parents=True)
+    (cloud / "envs" / "dev" / "local.tfvars").write_text("x = 1\n")
+
+    check_env._note_uncommitted_env_files(cloud, "dev")
+
+    assert capsys.readouterr().out == ""
 
 
 def test_check_outside_a_git_checkout_is_refused(repo, tmp_path):

@@ -922,3 +922,27 @@ def test_group_keys_rename_bare_and_quoted_keys_and_group_members():
     assert list(out["groups"]) == ["prod_ops", "prod x", "keep"]
     assert out["groups"]["prod_ops"]["description"] == "a = { b }"
     assert out["group_members"] == {"prod_ops": ["u1"]}
+
+
+def test_check_runs_promote_check_exactly_when_env_role_says_promoted(repo, tmp_path, monkeypatch):
+    """check decides promotion by release_gate.env_role, the same rule rehearse and release use."""
+    from scripts import check_env
+    from scripts.release_gate import PROMOTED
+
+    for key, value in _env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    for key in ("CI", "MAKEFLAGS", "MAKELEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    roles = []
+    monkeypatch.setattr(check_env, "env_role", lambda env_dir: roles.append(Path(env_dir).name) or PROMOTED)
+
+    def stop(args):
+        raise check_env.CheckFailed("promote-check reached")
+
+    monkeypatch.setattr(check_env, "_promote_check", stop)
+
+    code = check_env.main(["check", "--env", "dev", "--cloud-dir", str(repo / "aws"),
+                           "--makefile", str(repo / "aws" / "Makefile")])
+
+    assert roles == ["dev"]
+    assert code == 1

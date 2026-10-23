@@ -362,3 +362,11 @@ def test_prod_setup_advice_does_not_ask_to_replace_tier_placeholders(tmp_path):
     }
     assert "access_tier_groups placeholder" in advice["0"]
     assert advice["1"] == ""
+
+
+def test_rehearse_reuse_docs_warn_that_live_dev_is_not_rechecked():
+    for path in (ROOT / "REFERENCE.md", SHARED / "docs" / "design" / "deterministic-governance.md"):
+        text = " ".join(path.read_text().split())
+        assert "does **not** re-check live dev for out-of-band drift" in text
+        assert "revert the live change and run a real apply/rehearse" in text
+        assert "abandon/re-stage the unfinished policy change" in text
