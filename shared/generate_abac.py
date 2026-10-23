@@ -924,8 +924,29 @@ def keep_reviewed_genie_content_from_config(
 
 _IMPORTED_GENIE_COMMENT_RE = re.compile(
     r"^# (?:genie_space_configs parsed verbatim from the existing Genie agent|"
-    r"Edit here to manage space config as code;)[^\n]*\n", re.MULTILINE,
+    r"Edit here to manage space config as code;|"
+    r"Empty entries are placeholders for agents defined in agents/)[^\n]*\n", re.MULTILINE,
 )
+
+
+def genie_config_summary(names, sources: dict[str, str] | None) -> list[str]:
+    """Log lines naming where each injected genie_space_configs entry came from.
+
+    ``sources`` maps a space name to "api" (read from the Genie API this run),
+    "reviewed" (the API returned no config, so the reviewed entry was kept) or
+    "placeholder" (an empty entry for an agents/ file agent). Unlisted names
+    are "api".
+    """
+    groups: dict[str, list[str]] = {"api": [], "reviewed": [], "placeholder": []}
+    for name in names:
+        groups[(sources or {}).get(name, "api")].append(name)
+    labels = {
+        "api": "Injected genie_space_configs from the Genie API for",
+        "reviewed": "Kept reviewed genie_space_configs (Genie API returned no config) for",
+        "placeholder": "Wrote empty genie_space_configs placeholders "
+                       "(content stays in agents/) for",
+    }
+    return [f"  {labels[k]}: {', '.join(v)}" for k, v in groups.items() if v]
 _ID_TO_NAME_COMMENT_RE = re.compile(
     r"^# Tool-owned canonical identity for id-only imported spaces[^\n]*\n", re.MULTILINE,
 )
@@ -933,14 +954,16 @@ _ID_TO_NAME_COMMENT_RE = re.compile(
 
 def inject_imported_genie_config(
     hcl_block: str, reviewed_path: Path, api_genie_configs: dict[str, dict],
-    genie_space_id_to_name: dict[str, str],
+    genie_space_id_to_name: dict[str, str], sources: dict[str, str] | None = None,
 ) -> str:
     """Replace genie_space_configs with the config imported from the Genie API.
 
     For spaces with a genie_space_id the UI config is authoritative, so the
     block is the verbatim parse of the Genie agent API, with reviewed
-    benchmarks/snippets in ``reviewed_path`` kept. The comments written with
-    the blocks are replaced too, so a re-run over its own output is stable.
+    benchmarks/snippets in ``reviewed_path`` kept. ``sources`` (see
+    genie_config_summary) marks entries that are kept reviewed config or empty
+    file-agent placeholders. The comments written with the blocks are replaced
+    too, so a re-run over its own output is stable.
     """
     if api_genie_configs:
         hcl_block = _IMPORTED_GENIE_COMMENT_RE.sub("", hcl_block)
@@ -955,19 +978,30 @@ def inject_imported_genie_config(
                 + ", ".join(kept_genie_fields)
             )
         hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_configs")
-        injected_hcl = (
-            "\n# genie_space_configs parsed verbatim from the existing Genie agent(s).\n"
-            "# Edit here to manage space config as code; make apply pushes changes back.\n"
-            + format_genie_space_configs_hcl(api_genie_configs)
-        )
+        placeholders = [
+            name for name in api_genie_configs
+            if (sources or {}).get(name) == "placeholder"
+        ]
+        injected_hcl = "\n"
+        if len(placeholders) < len(api_genie_configs):
+            injected_hcl += (
+                "# genie_space_configs parsed verbatim from the existing Genie agent(s).\n"
+                "# Edit here to manage space config as code; make apply pushes changes back.\n"
+            )
+        if placeholders:
+            # Terraform skips an empty config (existing_spaces_with_config).
+            injected_hcl += (
+                "# Empty entries are placeholders for agents defined in agents/; their config "
+                "stays with the agent (agents/<agent>.space.json once captured) and make apply "
+                "pushes nothing for them.\n"
+            )
+        injected_hcl += format_genie_space_configs_hcl(api_genie_configs)
         injected_hcl = restore_reviewed_genie_text(
             reviewed_genie_text, injected_hcl, list(api_genie_configs)
         )
         hcl_block = hcl_block.rstrip() + "\n" + injected_hcl + "\n"
-        print(
-            f"  Injected genie_space_configs for configured agents: "
-            f"{', '.join(api_genie_configs)}"
-        )
+        for line in genie_config_summary(api_genie_configs, sources):
+            print(line)
 
     if genie_space_id_to_name:
         hcl_block = remove_hcl_top_level_block(hcl_block, "genie_space_id_to_name")
@@ -2617,6 +2651,7 @@ def write_deterministic_draft(
     out_dir: Path, auth_cfg: dict, *, mode: str, group_names: list[str],
     catalog_schemas: list[tuple[str, str]], api_genie_configs: dict[str, dict],
     genie_space_id_to_name: dict[str, str], bootstrap_spaces: bool,
+    genie_config_sources: dict[str, str] | None = None,
 ) -> tuple[Path, Path]:
     """Write a deterministic env's draft without a model (design decision 5).
 
@@ -2676,7 +2711,7 @@ def write_deterministic_draft(
     if mode != "governance":
         text = inject_imported_genie_config(
             text, tfvars_path, api_genie_configs if config_changed else {},
-            desired_mapping if mapping_changed else {},
+            desired_mapping if mapping_changed else {}, genie_config_sources,
         )
         if api_genie_configs and not config_changed:
             if reviewed_cfg:
@@ -2686,10 +2721,8 @@ def write_deterministic_draft(
                     "  Kept reviewed Genie benchmarks/snippets: "
                     + ", ".join(kept_genie_fields)
                 )
-            print(
-                "  Injected genie_space_configs for configured agents: "
-                + ", ".join(api_genie_configs)
-            )
+            for line in genie_config_summary(api_genie_configs, genie_config_sources):
+                print(line)
     tfvars_path.write_text(text.rstrip() + "\n")
 
     if mode != "governance":
@@ -7467,6 +7500,7 @@ def main():
     # (no LLM involvement) and injected into the generated abac.auto.tfvars
     # after the LLM runs, replacing whatever the LLM generated for that space.
     api_genie_configs: dict[str, dict] = {}  # space_name -> config parsed from API
+    genie_config_sources: dict[str, str] = {}  # space_name -> see genie_config_summary
     footprint_entries: list = list(auth_cfg.get("declared_footprint", []) or [])
     preserved_discovery: list[str] = []
     all_space_tables: list[str] = []
@@ -7500,7 +7534,7 @@ def main():
                     return 1
                 agents_by_id[agent_id] = agent
 
-            def add_genie_config(name: str, config: dict) -> None:
+            def add_genie_config(name: str, config: dict, source: str = "api") -> None:
                 if name in api_genie_configs:
                     print(
                         "ERROR: Multiple Genie spaces resolve to the same canonical "
@@ -7508,6 +7542,28 @@ def main():
                     )
                     sys.exit(1)
                 api_genie_configs[name] = config
+                genie_config_sources[name] = source
+
+            reviewed_genie_configs: dict | None = None
+
+            def reviewed_genie_config(name: str) -> dict | None:
+                nonlocal reviewed_genie_configs
+                if reviewed_genie_configs is None:
+                    reviewed_genie_configs = {}
+                    reviewed_path = out_dir / "abac.auto.tfvars"
+                    if reviewed_path.is_file():
+                        import hcl2
+                        try:
+                            parsed = hcl2.loads(reviewed_path.read_text())
+                        except Exception:
+                            parsed = {}
+                        configs = parsed.get("genie_space_configs") or {}
+                        if isinstance(configs, list):
+                            configs = configs[0] if configs else {}
+                        if isinstance(configs, dict):
+                            reviewed_genie_configs = configs
+                entry = reviewed_genie_configs.get(name)
+                return entry if isinstance(entry, dict) else None
 
             for space in genie_spaces_cfg:
                 space_tables = space.get("uc_tables") or []
@@ -7570,10 +7626,13 @@ def main():
                     # File-defined agent content belongs only in agents/*.space.json.
                     # An empty entry suppresses both API and model content in generated/.
                     if file_agent is not None:
-                        add_genie_config(effective_name, {})
+                        add_genie_config(effective_name, {}, "placeholder")
                     elif genie_cfg:
-                        # A failed quick check must not replace reviewed config with {}.
                         add_genie_config(effective_name, genie_cfg)
+                    elif (reviewed_entry := reviewed_genie_config(effective_name)) is not None:
+                        # A failed or empty fetch keeps the reviewed config, so neither
+                        # {} nor (legacy) the model's draft replaces it.
+                        add_genie_config(effective_name, reviewed_entry, "reviewed")
                 else:
                     # Captured agents are deliberately not read from the API.
                     # Only their canonical identity is written to generated/;
@@ -7581,7 +7640,7 @@ def main():
                     if space_id:
                         genie_space_id_to_name[space_id] = space_name
                     if captured_agent is not None:
-                        add_genie_config(space_name, {})
+                        add_genie_config(space_name, {}, "placeholder")
                     all_space_tables.extend(space_tables)
 
                 for table in exposed_tables:
@@ -7839,6 +7898,7 @@ def main():
         tfvars_path, sql_path = write_deterministic_draft(
             out_dir, auth_cfg, mode=args.mode, group_names=group_names or [],
             catalog_schemas=all_cs, api_genie_configs=api_genie_configs,
+            genie_config_sources=genie_config_sources,
             genie_space_id_to_name=genie_space_id_to_name,
             bootstrap_spaces=target_space_cfg is None and not args.space,
         )
@@ -8081,6 +8141,7 @@ Before you apply, tune for your business roles, security requirements, and Genie
         if args.mode != "governance":
             hcl_block = inject_imported_genie_config(
                 hcl_block, out_dir / "abac.auto.tfvars", api_genie_configs, genie_space_id_to_name,
+                genie_config_sources,
             )
 
         tfvars_path = out_dir / "abac.auto.tfvars"

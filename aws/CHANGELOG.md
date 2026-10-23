@@ -101,6 +101,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **An agent in `agents/` gets only an empty placeholder in `generated/`**
+  (#225): its `genie_space_configs` entry in `generated/abac.auto.tfvars` is
+  `{}` whether or not it was captured, and Terraform pushes nothing for an
+  empty entry; the agent's content lives only in
+  `agents/<agent>.space.json`. **Upgrade:** an existing env whose committed
+  `generated/` held a file agent's content (imported from the Genie API, or
+  edited there) has it replaced by `{}` on the first `make generate` after
+  #225; later runs change nothing. The content is in
+  `agents/<agent>.space.json` (run `make capture ENV=dev SPACE="<agent>"` if
+  the agent was never captured). Make any edit you kept only in `generated/`
+  in the agent and capture it, then commit the placeholder.
+
+- **A failed Genie API read keeps the agent's reviewed config**: when
+  `make generate` gets no config for an inline agent (a transient API error,
+  or none returned while `uc_tables` is set), its reviewed entry in
+  `generated/abac.auto.tfvars` stays. Before, a legacy env took the model's
+  draft for that agent, and either mode wrote `{}` for it when another
+  agent's config changed in the same run. The comment above
+  `genie_space_configs` and the generate log now say which entries came from
+  the Genie API, which reviewed entries were kept, and which are empty
+  placeholders for `agents/` files. **Upgrade:** none.
+
 - **A promoted prod releases on the first try**: `make setup ENV=prod` adds
   prod's lines to `.gitignore`, but the walkthrough and the setup banner said
   only `git add envs/`, so the tree stayed dirty and `make rehearse ENV=dev`
