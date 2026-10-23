@@ -1,5 +1,5 @@
 ### EXIT 0 0
-### OUTPUT 10730
+### OUTPUT 10736
 ============================================================
   ABAC Configuration Generator
 ============================================================
@@ -35,7 +35,7 @@
   masking_functions.sql written to: <TMP>/env/generated/masking_functions.sql
     Target schemas: dev_fin.payments
   [auto-strip] Removed flat legacy Genie fields from multi-space draft
-  Injected genie_space_configs from Genie API for: Payments Agent
+  Injected genie_space_configs for configured agents: Payments Agent
   abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars
   [AUTOFIX] Repaired 3 HCL syntax issue(s)
   [AUTOFIX] Removed tag_policy value 'redacted' for key 'pii_level' because it is not in the registry
@@ -131,7 +131,7 @@
     Target schemas: dev_fin.payments
   [auto-strip] Removed flat legacy Genie fields from multi-space draft
   Loaded reviewed Genie config from: <TMP>/env/generated/abac.auto.tfvars
-  Injected genie_space_configs from Genie API for: Payments Agent
+  Injected genie_space_configs for configured agents: Payments Agent
   abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars
   [AUTOFIX] Repaired 3 HCL syntax issue(s)
   [AUTOFIX] Removed tag_policy value 'redacted' for key 'pii_level' because it is not in the registry

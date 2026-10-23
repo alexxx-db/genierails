@@ -439,7 +439,11 @@ def test_unreachable_id_only_agent_stops_with_named_actionable_error(
     monkeypatch, tmp_path, capsys
 ):
     auth = tmp_path / "auth.auto.tfvars"
-    auth.write_text("")
+    auth.write_text(
+        'databricks_workspace_host = "https://example.invalid"\n'
+        'databricks_client_id = "client"\n'
+        'databricks_client_secret = "secret"\n'
+    )
     (tmp_path / "env.auto.tfvars").write_text(
         'genie_spaces = [{ name = "Payments", genie_space_id = "space-unreachable" }]\n'
     )
@@ -455,6 +459,7 @@ def test_unreachable_id_only_agent_stops_with_named_actionable_error(
             self.api_client = FakeApiClient()
 
     monkeypatch.setattr(generate_abac, "configure_databricks_env", lambda _: None)
+    monkeypatch.setattr(generate_abac, "databricks_config", lambda _: object())
     monkeypatch.setattr(sys.modules["databricks.sdk"], "WorkspaceClient", FakeWorkspaceClient)
     monkeypatch.setattr(
         sys,
@@ -550,7 +555,11 @@ def test_main_does_not_write_empty_owner_attribution(monkeypatch, tmp_path):
 
 def test_main_incomplete_empty_discovery_fails_before_empty_governance(monkeypatch, tmp_path, capsys):
     auth = tmp_path / "auth.auto.tfvars"
-    auth.write_text("")
+    auth.write_text(
+        'databricks_workspace_host = "https://example.invalid"\n'
+        'databricks_client_id = "client"\n'
+        'databricks_client_secret = "secret"\n'
+    )
     (tmp_path / "env.auto.tfvars").write_text('''genie_spaces = [{
   name = "Live agent"
   genie_space_id = "space-1"
