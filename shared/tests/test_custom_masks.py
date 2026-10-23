@@ -617,6 +617,50 @@ def test_scaffold_treatments_maps_to_an_adopted_custom_mask(envs, monkeypatch):
     assert f'"class.postcode" = "{NAME}"' in (dev / "env.auto.tfvars").read_text()
 
 
+def test_scaffold_in_prod_accepts_a_custom_mask_adopted_only_in_dev(envs, monkeypatch):
+    """The mapping goes into dev's tag_treatments, so dev's adopted masks are the ones that count."""
+    from scripts import scaffold_treatments
+
+    dev, prod = envs / "dev", envs / "prod"
+    prod_before = (prod / "env.auto.tfvars").read_bytes()
+    _write_mask(dev)
+    monkeypatch.setattr(scaffold_treatments, "_offline_markers", lambda _p: [(COLUMN, "class.postcode", "postcode")])
+    result = scaffold_treatments.map_deterministic(prod / "generated" / "abac.auto.tfvars", prod, NAME)
+    assert result["labels"] == ["class.postcode"] and result["target"] == dev
+    assert f'"class.postcode" = "{NAME}"' in (dev / "env.auto.tfvars").read_text()
+    assert (prod / "env.auto.tfvars").read_bytes() == prod_before
+
+
+def test_scaffold_in_prod_refuses_a_custom_mask_dev_has_not_adopted(envs, monkeypatch):
+    """A mask only prod has would be written to dev, where tag_treatment_errors then rejects it."""
+    from scripts import scaffold_treatments
+
+    dev, prod = envs / "dev", envs / "prod"
+    dev_before = (dev / "env.auto.tfvars").read_bytes()
+    _write_mask(prod)
+    monkeypatch.setattr(scaffold_treatments, "_offline_markers", lambda _p: [(COLUMN, "class.postcode", "postcode")])
+    with pytest.raises(ValueError, match=re.escape(
+            f"It is not adopted in envs/dev/custom_masks/, where this mapping goes. "
+            f"Adopt it first: make adopt-custom-mask ENV=dev TREATMENT={NAME}")):
+        scaffold_treatments.map_deterministic(prod / "generated" / "abac.auto.tfvars", prod, NAME)
+    assert (dev / "env.auto.tfvars").read_bytes() == dev_before
+
+
+def test_scaffold_names_promote_to_when_the_mapping_env_is_not_dev(envs, monkeypatch):
+    from scripts import scaffold_treatments
+
+    uat = envs / "uat"
+    uat.mkdir()
+    (uat / "env.auto.tfvars").write_text((envs / "dev" / "env.auto.tfvars").read_text() + 'promote_from = "staging"\n')
+    _write_mask(envs / "dev")
+    monkeypatch.setattr(scaffold_treatments, "_offline_markers", lambda _p: [(COLUMN, "class.postcode", "postcode")])
+    with pytest.raises(ValueError, match=re.escape(
+            f"not adopted in envs/staging/custom_masks/, where this mapping goes. Adopt it in dev "
+            f"(make adopt-custom-mask ENV=dev TREATMENT={NAME}) and promote it to staging with "
+            f"make promote-to ENV=staging first")):
+        scaffold_treatments.map_deterministic(uat / "generated" / "abac.auto.tfvars", uat, NAME)
+
+
 def test_the_account_tag_policy_accepts_custom_values_in_every_env():
     from scripts.split_abac_config import merge_tag_policies
 

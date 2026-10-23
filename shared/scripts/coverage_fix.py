@@ -291,6 +291,24 @@ def promoted_release_steps(env_name: str, source: str) -> str:
             f"on that commit, make release-plan ENV={env_name} and make release ENV={env_name}")
 
 
+def recovery_steps(env_name: str, owner: str, changed: str, rerun: str = "", *, generate: bool = True) -> str:
+    """The one deterministic sequence after a coverage fix changes envs/<owner>/ (the dev_to_prod
+    README's "If it stops on coverage or drift"): commit, generate, check and rehearse the owner;
+    for a promoted env, then promote-to, check it, rehearse the promotion commit and release.
+
+    ``generate=False`` drops the generate step for a fix written straight into generated/
+    (materialize-treatment), which a deterministic generate would replace.
+    """
+    steps = [f"commit {changed}"] + ([f"make generate ENV={owner}"] if generate else []) + [
+        f"make check ENV={owner}", f"make rehearse ENV={owner}"]
+    if owner != env_name:
+        steps += [f"make promote-to ENV={env_name}", f"make check ENV={env_name}",
+                  promoted_release_steps(env_name, owner)]
+    elif rerun and rerun != steps[-1]:
+        steps.append(rerun)
+    return ", ".join(steps) + "; commit and push after each step that changes envs/"
+
+
 def release_steps(env_name: str, env_dir: Path, source: str = "") -> str:
     """What follows promote-to, for this env's mode: the deterministic sequence, or a legacy release."""
     if _deterministic(env_dir):
@@ -326,12 +344,7 @@ def deterministic_fix_lines(env_name: str, env_dir: Path, source: str, rerun: st
         f'       maps each unmapped class to it in tag_treatments ("class.<name>" = "<treatment>");',
         "       TREATMENT=redact keeps full redaction for every masked tier",
     ]
-    if owner != env_name:
-        lines.append(f"       then commit envs/{owner}/env.auto.tfvars, make rehearse ENV={owner}, "
-                     f"make promote-to ENV={env_name}")
-        lines.append(f"       then {promoted_release_steps(env_name, owner)}")
-    else:
-        lines.append(f"       then make generate ENV={env_name} and {rerun}; commit envs/{env_name}/")
+    lines.append(f"       then {recovery_steps(env_name, owner, f'envs/{owner}/env.auto.tfvars', rerun)}")
     return lines
 
 
@@ -345,9 +358,7 @@ def materialize_lines(env_name: str, env_dir: Path, treatments: list[str]) -> li
             f"    make materialize-treatment ENV={source or env_name} TREATMENT={treatment}"
         )
     if source and _deterministic(env_dir):
-        lines.append(f"    then commit envs/{source}/generated/, make rehearse ENV={source}, "
-                     f"make promote-to ENV={env_name}")
-        lines.append(f"    then {promoted_release_steps(env_name, source)}")
+        lines.append(f"    then {recovery_steps(env_name, source, f'envs/{source}/generated/', generate=False)}")
     elif source:
         lines.append(
             f"    then make rehearse ENV={source}, make promote-to ENV={env_name}, {rerun}; "

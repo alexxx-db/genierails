@@ -362,3 +362,72 @@ def test_prod_setup_advice_does_not_ask_to_replace_tier_placeholders(tmp_path):
     }
     assert "access_tier_groups placeholder" in advice["0"]
     assert advice["1"] == ""
+
+
+# ── A coverage gap's recovery sequence: one builder, the README's list ──────
+
+README = SHARED / "examples" / "dev_to_prod" / "README.md"
+DETERMINISTIC_PROD = 'governance_mode = "deterministic"\npromote_from = "dev"\n'
+MAKE_STEP = r"make [a-z-]+ ENV=[a-z]+"
+
+
+def _readme_recovery() -> list[str]:
+    """The make commands the README lists after a reused mask's commit, in order."""
+    line = next(line for line in README.read_text().splitlines() if line.startswith("- **Reuse an existing mask**"))
+    tail = line[line.index("Commit it, then"):]
+    assert "committing and pushing after each step that changes `envs/`" in tail
+    return re.findall(rf"`({MAKE_STEP})`", tail)
+
+
+def _gap_envs(tmp_path: Path) -> tuple[Path, Path]:
+    for name, text in (("dev", DETERMINISTIC), ("prod", DETERMINISTIC_PROD)):
+        (tmp_path / "envs" / name).mkdir(parents=True)
+        (tmp_path / "envs" / name / "env.auto.tfvars").write_text(text)
+    return tmp_path / "envs" / "dev", tmp_path / "envs" / "prod"
+
+
+def _scaffold_output(capsys, env_name: str, env_dir: Path, target: Path) -> str:
+    from scripts import scaffold_treatments
+
+    scaffold_treatments._print_deterministic({
+        "already": [], "labels": ["class.loyalty_id"], "treatment": "redact", "columns": [],
+        "types": ["STRING"], "target": target, "env_dir": env_dir}, env_name)
+    return capsys.readouterr().out
+
+
+def test_every_coverage_gap_fix_prints_the_readme_recovery_sequence(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("GENIERAILS_RERUN_TARGET", raising=False)
+    dev, prod = _gap_envs(tmp_path)
+    readme = _readme_recovery()
+    assert readme == ["make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
+                      "make promote-to ENV=prod", "make check ENV=prod", "make rehearse ENV=dev",
+                      "make release-plan ENV=prod", "make release ENV=prod"]
+    builder = coverage_fix.recovery_steps("prod", "dev", "envs/dev/env.auto.tfvars")
+    assert builder.startswith("commit envs/dev/env.auto.tfvars, make generate ENV=dev")
+    assert builder.endswith("; commit and push after each step that changes envs/")
+    assert re.findall(MAKE_STEP, builder) == readme
+
+    scaffold = _scaffold_output(capsys, "prod", prod, dev)
+    assert f"Next: {builder}\n" in scaffold
+    fix = "\n".join(coverage_fix.fix_lines("prod", prod, [("ppay.s.t.loyalty", "class.loyalty_id")]))
+    assert f"then {builder}" in fix
+    assert re.findall(MAKE_STEP, fix.split("then ", 1)[1]) == readme
+    # materialize-treatment writes generated/ itself, which a deterministic generate would replace.
+    materialize = "\n".join(coverage_fix.materialize_lines("prod", prod, ["generic_partial"]))
+    assert f"then {coverage_fix.recovery_steps('prod', 'dev', 'envs/dev/generated/', generate=False)}" in materialize
+    assert re.findall(MAKE_STEP, materialize.split("then ", 1)[1]) == [
+        step for step in readme if step != "make generate ENV=dev"]
+
+
+def test_an_unpromoted_envs_coverage_gap_fix_generates_checks_and_rehearses_itself(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("GENIERAILS_RERUN_TARGET", raising=False)
+    dev, _prod = _gap_envs(tmp_path)
+    expected = ["make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev"]
+    builder = coverage_fix.recovery_steps("dev", "dev", "envs/dev/env.auto.tfvars", "make rehearse ENV=dev")
+    assert re.findall(MAKE_STEP, builder) == expected
+    assert f"Next: {builder}\n" in _scaffold_output(capsys, "dev", dev, dev)
+    fix = "\n".join(coverage_fix.fix_lines("dev", dev, [("paycat.s.t.loyalty", "class.loyalty_id")]))
+    assert f"then {builder}" in fix
+    monkeypatch.setenv("GENIERAILS_RERUN_TARGET", "maintain")
+    fix = "\n".join(coverage_fix.fix_lines("dev", dev, [("paycat.s.t.loyalty", "class.loyalty_id")]))
+    assert re.findall(MAKE_STEP, fix.split("then ", 1)[1]) == expected + ["make maintain ENV=dev"]

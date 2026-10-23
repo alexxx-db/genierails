@@ -502,7 +502,8 @@ def test_scaffold_treatments_writes_the_envs_tag_treatments_never_shared(tmp_pat
     assert (tmp_path / "treatment_config.json").read_bytes() == (SHARED / "treatment_config.json").read_bytes()
     assert "MAPPED class.loyalty_id -> identifier" in result.stdout
     assert "envs/dev/env.auto.tfvars tag_treatments (a governance file; shared/ is unchanged)" in result.stdout
-    assert "Next: make generate ENV=dev" in result.stdout
+    assert "Next: commit envs/dev/env.auto.tfvars, make generate ENV=dev, make check ENV=dev, " \
+        "make rehearse ENV=dev; commit and push after each step that changes envs/" in result.stdout
     model = build_model(LOYALTY, LOYALTY_TYPES, after)
     assert model.unmapped == [] and model.columns["paycat.s.t.loyalty"].value.startswith("identifier__")
 
@@ -521,9 +522,9 @@ def test_scaffold_in_a_promoted_env_writes_the_env_it_is_promoted_from(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert hcl2.loads((dev / "env.auto.tfvars").read_text())["tag_treatments"] == {"class.loyalty_id": "redact"}
     assert (prod / "env.auto.tfvars").read_bytes() == prod_before, "promote-to owns prod's copy"
-    assert "make promote-to ENV=prod (it carries tag_treatments)" in result.stdout
+    assert "promote-to ENV=prod carries tag_treatments to prod." in result.stdout
     # release-plan needs the promotion on origin/main and a dev rehearsal of that same commit.
-    after = result.stdout[result.stdout.index("make promote-to ENV=prod (it carries"):]
+    after = result.stdout[result.stdout.index("make promote-to ENV=prod"):]
     steps = ["commit and push envs/prod/", "make rehearse ENV=dev on that commit", "make release-plan ENV=prod",
              "make release ENV=prod"]
     assert [after.index(step) for step in steps] == sorted(after.index(step) for step in steps)
