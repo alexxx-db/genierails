@@ -153,10 +153,14 @@ def test_rebind_reprotects_first_grants_after_and_abandon_then_only_deletes(harn
     # Strict abandon now plans only the change's policy deletes and the restarted wait.
     harness.calls.clear()
     harness.run = Harness.run.__get__(harness)
+    abandon_plan = pg.ledger_dir(harness.env_dir) / "abandon" / f"{t['run_id']}.tfplan"
+    planned = {}  # read before the abandon deletes its applied plan
+    _after_call(harness, "abandon:plan", lambda env: planned.setdefault("changes", _plan_of(harness, abandon_plan)))
     assert harness.controller().abandon() == 0
     assert harness.calls == ["abandon:plan", "inventory:rebind", "abandon:saved", "inventory:abandon"]
+    assert not abandon_plan.exists()
     created = {p["name"] for p in failed["fgac_policies"]} - {p["name"] for p in old["fgac_policies"]}
-    changes = _plan_of(harness, pg.ledger_dir(harness.env_dir) / "abandon" / f"{t['run_id']}.tfplan")
+    changes = planned["changes"]
     assert changes == sorted(
         [(f'module.data_access.databricks_policy_info.policies["{n}"]', ("delete",)) for n in created]
         + [("module.data_access.time_sleep.wait_for_policy_enforcement", ("delete", "create"))])

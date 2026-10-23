@@ -895,7 +895,7 @@ account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/
 	plan_dir="$$($(_RELEASE_GATE) account-plan-dir --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)")" || { rm -f "$$prov"; exit 1; }; \
 	cp "$$prov" "$$plan_dir/provenance.json"; rm -f "$$prov"; \
 	echo "=== Saved plan (account) ==="; \
-	set +e; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan"; status=$$?; set -e; \
+	set +e; (umask 077; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan"); status=$$?; set -e; \
 	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir"; echo "account-plan: planning failed (above); no manifest was written." >&2; exit 1; fi; \
 	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
 	show_json="$$(mktemp)"; \
@@ -1227,7 +1227,7 @@ override _SAVED_GRANT_CHANGES = python3 -c 'import json,sys; print(int(any(s.get
 _release-plan-roots:
 	@set -e; $(_DRY_RUN_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
 	echo "=== Saved plan (account) ==="; \
-	set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null; status=$$?; set -e; \
+	set +e; (umask 077; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null); status=$$?; set -e; \
 	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: account plan failed." >&2; exit 1; fi; \
 	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
 	echo "=== Saved plans (data_access:$(ENV), staged policy phases) ==="; \
@@ -1270,7 +1270,7 @@ _release-plan-roots:
 		fi; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
 		python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --arm --quiet; \
-		set +e; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"; status=$$?; set -e; \
+		set +e; (umask 077; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"); status=$$?; set -e; \
 		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: workspace plan failed." >&2; exit 1; fi; \
 		printf '{"file": "workspace.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/workspace.json"; \
 	fi
@@ -1803,7 +1803,7 @@ _apply-layer: _guard-not-ci-apply
 		done; \
 	elif [ "$$layer" = "account" ]; then \
 		account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"; trap 'rm -rf "$$account_plan_dir"' EXIT; \
-		plan_rc=0; LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" plan -input=false -detailed-exitcode -parallelism=1 -out="$$account_plan_dir/account.tfplan" || plan_rc=$$?; \
+		plan_rc=0; (umask 077; LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" plan -input=false -detailed-exitcode -parallelism=1 -out="$$account_plan_dir/account.tfplan") || plan_rc=$$?; \
 		if [ $$plan_rc -ne 0 ] && [ $$plan_rc -ne 2 ]; then echo "ERROR: account plan failed (above); nothing was applied." >&2; exit 1; fi; \
 		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" show -json "$$account_plan_dir/account.tfplan" > "$$account_plan_dir/account.json"; \
 		$(_RELEASE_GATE) tag-policy-delete-guard --env-dir "$$env_dir" --env "$$target_env" --show-json "$$account_plan_dir/account.json"; \

@@ -48,6 +48,10 @@ release-receipt / maintain-check
     A finished release writes a receipt (commit, digests, manifest, and each
     Genie agent's ID and detach state, which detach-agent and ID recovery read);
     ``make maintain`` refuses unless HEAD is that commit with matching digests.
+    Once the receipt (or an applied phase's record) is written, the manifest's
+    saved plans are deleted: they carry the deployer's credentials, and nothing
+    reads them after (the manifest keeps their sha256). A failed or unreleased
+    manifest keeps them, read-only.
 
 apply-guard / destroy-guard
     No side door around those gates. In a deterministic env, the targets that
@@ -1623,17 +1627,14 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
             drift.append(f"the {root} state changed since release-plan (serial "
                          f"{(manifest['state_serials'].get(root) or {}).get('serial')} -> "
                          f"{(serials.get(root) or {}).get('serial')})")
-    for root in ("account", "workspace"):
-        entry = manifest["plans"][root]
-        if entry.get("file"):
-            path = plan_dir / entry["file"]
-            if not path.is_file() or sha256_file(path) != entry["sha256"]:
-                drift.append(f"the saved {root} plan {path} changed or is missing")
-    for step in manifest["plans"]["data_access"].get("steps") or []:
-        if step.get("file"):
-            path = plan_dir / "data_access" / step["file"]
-            if not path.is_file() or sha256_file(path) != step.get("sha256"):
-                drift.append(f"the saved data_access plan {path} changed or is missing")
+    # A released manifest's saved plans were deleted after its receipt (drop_saved_plans):
+    # check_releasable below reports it as released, not as missing its plans.
+    released = released_by(cloud_dir_of(env_dir), env, manifest["id"])
+    for root, path, digest in _saved_plans(manifest_path, manifest):
+        if released and not path.exists():
+            continue
+        if not path.is_file() or sha256_file(path) != digest:
+            drift.append(f"the saved {root} plan {path} changed or is missing")
     imports = manifest.get("imports") or {}
     if imports.get("file") not in (None, "imports.jsonl"):  # release runs <manifest dir>/imports.jsonl
         drift.append(f"the manifest's recorded imports are {imports.get('file')!r}, not imports.jsonl")
@@ -1662,6 +1663,40 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
     # After the drift checks, so a changed manifest is always reported as changed.
     check_releasable(env_dir, env, manifest_path, manifest)
     return manifest
+
+
+def _saved_plans(manifest_path: Path, manifest: Mapping) -> list[tuple[str, Path, str | None]]:
+    """(root, path, sha256) of each saved plan a release manifest names."""
+    plan_dir = Path(manifest_path).parent
+    plans = [(root, plan_dir / manifest["plans"][root]["file"], manifest["plans"][root].get("sha256"))
+             for root in ("account", "workspace") if manifest["plans"][root].get("file")]
+    return plans + [("data_access", plan_dir / "data_access" / step["file"], step.get("sha256"))
+                    for step in manifest["plans"]["data_access"].get("steps") or [] if step.get("file")]
+
+
+def drop_saved_plans(env_dir: Path, env: str, manifest_path: Path) -> list[Path]:
+    """Delete a released manifest's saved plans; returns those that couldn't be deleted.
+
+    A saved plan carries the deployer's auth.auto.tfvars (client secret).
+    Only a manifest with a release receipt or an applied phase's record
+    (released_by) loses them, so a failed or interrupted release keeps the
+    plans it was approved with. Nothing reads them afterwards: a released
+    manifest is never released again, and the manifest keeps each plan's
+    sha256. A plan that can't be deleted is reported, not fatal: the apply
+    and its receipt already happened.
+    """
+    manifest = load_manifest(Path(manifest_path), env)
+    if not released_by(cloud_dir_of(Path(env_dir)), env, manifest["id"]):
+        raise Refused(f"{manifest_path} has no release receipt or phase record; its saved plans are kept")
+    left = []
+    for _, path, _ in _saved_plans(manifest_path, manifest):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"WARNING: the release was applied and its receipt was written, but the saved plan {path} "
+                  f"contains credentials and could not be deleted ({exc.strerror}); delete it.", file=sys.stderr)
+            left.append(path)
+    return left
 
 
 def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
@@ -2010,10 +2045,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Selected account manifest {manifest['id']} (sha256 {sha256_file(args.manifest)})")
         elif args.command == "release-receipt":
             print(f"Release receipt: {release_receipt(args.env_dir, args.env, args.manifest)}")
+            drop_saved_plans(args.env_dir, args.env, args.manifest)  # after the receipt, never before
         elif args.command == "account-receipt":
             print(f"Account receipt: {account_receipt(args.env_dir, args.env, args.manifest)}")
         elif args.command == "phase-record":
             print(f"Phase record: {phase_record(args.env_dir, args.env, args.manifest)}")
+            drop_saved_plans(args.env_dir, args.env, args.manifest)  # after the record, never before
         elif args.command == "apply-guard":
             apply_guard(args.env_dir, args.env, args.target)
         elif args.command == "destroy-guard":

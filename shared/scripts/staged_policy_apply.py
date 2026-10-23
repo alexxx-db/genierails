@@ -627,7 +627,8 @@ class Controller:
                 plan_file = out_dir / f"{len(steps):02d}-{phase}.tfplan"
                 env = self._hook_env(t) | {PLAN_OUT_ENV: str(plan_file)} | ({PLAN_BASIS_ENV: basis} if basis else {})
                 print(f"=== Policy phase {phase} ({self.env_name}): saving its plan ===", flush=True)
-                rc = self.run_cmd([str(self.hook_dir / APPLY_PHASES[phase])], env=env, check=False).returncode
+                with _owner_only(plan_file):
+                    rc = self.run_cmd([str(self.hook_dir / APPLY_PHASES[phase])], env=env, check=False).returncode
                 if rc:
                     print(f"ERROR: planning policy phase {phase} failed (exit {rc}); nothing was applied.",
                           file=sys.stderr)
@@ -931,11 +932,15 @@ class Controller:
             #    deleting this change's policies (policy_generations.plan_violations).
             plan_dir = pg.ledger_dir(self.env_dir) / "abandon"
             plan_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(plan_dir, 0o700)
             plan_file = plan_dir / f"{t['run_id']}.tfplan"
             for stale in (plan_file, pg.sidecar_path(plan_file)):
                 stale.unlink(missing_ok=True)
             env = self._hook_env(t) | {pg.PLAN_OUT_ENV: str(plan_file)}
-            if self.run_cmd([str(self.hook_dir / "abandon")], env=env, check=False).returncode:
+            with _owner_only(plan_file):
+                rc = self.run_cmd([str(self.hook_dir / "abandon")], env=env, check=False).returncode
+            if rc:
+                _drop_plans(plan_file)  # refused: it can never be applied
                 raise Refused("the abandon plan was refused or couldn't be made (see above); nothing was applied")
             planned = _sha256(plan_file)
             side = pg.load_sidecar(plan_file)
@@ -979,6 +984,8 @@ class Controller:
             journal["history"] = (journal.get("history") or [])[-(HISTORY_LIMIT - 1):] + [
                 {"run_id": t["run_id"], "abandoned": t["to"], "at": _now()}]
             self._save(journal)
+            # The journal records the abandon first; a failed abandon keeps its plan.
+            _drop_plans(plan_file, *(pg.ledger_dir(self.env_dir) / "rebind").glob(f"{t['run_id']}-*.tfplan"))
             print(f"Abandoned generation {t['to']}; {t['from'] or 'nothing'} stays live.")
             if moved:
                 print(f"  {len(moved)} column(s) have another treatment in the generated config than the abandoned "
@@ -1065,6 +1072,7 @@ class Controller:
             print(f"=== Policy rebind ({self.env_name}): run {t['run_id']} (generation {t['to']}) with the "
                   f"principals of {desired['fingerprint']} ===", flush=True)
             plan_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(plan_dir, 0o700)
 
             # 1. Protection: policies' principals and functions; no grant.
             plan_file, planned = self._rebind_plan(t, env, "rebind-protect", plan_dir)
@@ -1121,6 +1129,8 @@ class Controller:
             t.pop("rebind_held", None)
             t["rebound"] = {"at": _now(), "generation": desired["fingerprint"]}
             self._save(journal)
+            # The journal no longer needs the held-back record's plan copy; a failed rebind keeps them all.
+            _drop_plans(*plan_dir.glob(f"{t['run_id']}-*.tfplan"))
             print(f"Policy rebind: run {t['run_id']} is on the previous protection ({t['from'] or 'none'}) with "
                   f"the current principals, verified live. Next: make policy-abandon ENV={self.env_name}.")
             return 0
@@ -1131,7 +1141,8 @@ class Controller:
 
         kept = plan_dir / f"{t['run_id']}-held-{planned[:16]}.tfplan"
         if not kept.exists():
-            shutil.copyfile(plan_file, kept)
+            with _owner_only(kept):
+                shutil.copyfile(plan_file, kept)
         grants = sorted(pg.saved_plan_variables(self.env_dir, self.env_name, kept).get("held_access_grants") or [])
         if grants != sorted(pg.load_sidecar(plan_file).get("held") or []) or _sha256(kept) != planned:
             raise Refused(f"the saved rebind-protect plan {plan_file} doesn't hold back what its record says; "
@@ -1163,8 +1174,11 @@ class Controller:
         plan_file = plan_dir / f"{t['run_id']}-{stage}.tfplan"
         for stale in (plan_file, pg.sidecar_path(plan_file)):
             stale.unlink(missing_ok=True)
-        if self.run_cmd([str(self.hook_dir / stage)], env=env | {pg.PLAN_OUT_ENV: str(plan_file)},
-                        check=False).returncode:
+        with _owner_only(plan_file):
+            rc = self.run_cmd([str(self.hook_dir / stage)], env=env | {pg.PLAN_OUT_ENV: str(plan_file)},
+                              check=False).returncode
+        if rc:
+            _drop_plans(plan_file)  # refused: it can never be applied
             return None, ""
         planned = _sha256(plan_file)
         side = pg.load_sidecar(plan_file)
@@ -1438,6 +1452,31 @@ def _sha256(path: Path) -> str:
     import hashlib
 
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+@contextmanager
+def _owner_only(plan: Path):
+    """Write a saved plan owner-only from creation (umask 077), and owner-only afterwards whatever the writer returned.
+
+    A saved plan carries the deployer's credentials; the hook may write it and then refuse it.
+    """
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+        if plan.exists():
+            os.chmod(plan, 0o600)
+
+
+def _drop_plans(*plans: Path) -> None:
+    """Delete applied saved plans (they carry the deployer's credentials) once the journal records them."""
+    for plan in plans:
+        try:
+            plan.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"WARNING: the journal records this change, but the saved plan {plan} contains credentials and "
+                  f"could not be deleted ({exc.strerror}); delete it.", file=sys.stderr)
 
 
 def _git_head() -> str:
