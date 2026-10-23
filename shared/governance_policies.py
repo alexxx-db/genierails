@@ -48,6 +48,13 @@ UNMAPPED_MARKER = "# gr.classification_unmapped:"
 MIXED_PARTIAL_MARKER = "# gr.classification_mixed_partial:"
 MIXED_PARTIAL_TREATMENT = "redact"
 
+# Warning-only heuristic.  Names and comments are deliberately not policy
+# inputs: they can suggest a review, but never choose a treatment.
+FREE_TEXT_HINTS = frozenset({
+    "notes", "comment", "description", "free_text", "memo", "remarks",
+    "message", "body", "text",
+})
+
 _VALUE_RE = re.compile(
     r"(?P<treatment>[a-z0-9_]+?)__(?P<type>[a-z0-9_]+)__(?P<generation>[0-9a-f]{8})"
 )
@@ -215,6 +222,63 @@ def keeps_string_partial(value: str) -> bool:
     parsed = parse_treatment_value(value)
     return bool(parsed and parsed[1] == "string" and parsed[0] != MIXED_PARTIAL_TREATMENT
                 and not is_never_raw(value))
+
+
+def suggests_free_text(column: str, comment: str = "") -> bool:
+    """Whether a column name/comment suggests prose (warning-only heuristic)."""
+    name = column.rsplit(".", 1)[-1].lower()
+    name_words = set(re.findall(r"[a-z0-9]+", name))
+    comment_words = set(re.findall(r"[a-z0-9]+", (comment or "").lower()))
+    return ("free_text" in name or bool(FREE_TEXT_HINTS & name_words)
+            or bool(FREE_TEXT_HINTS & comment_words))
+
+
+def free_text_partial_columns(
+    treatments: Mapping[str, str], comments: Mapping[str, str] | None = None,
+) -> list[str]:
+    """String partial-mask columns whose name/comment suggests free text.
+
+    This is advisory only.  In particular, it must never participate in
+    treatment resolution or generated output.
+    """
+    notes = {str(k).lower(): str(v) for k, v in (comments or {}).items()}
+    return [
+        column for column, value in sorted(treatments.items())
+        if keeps_string_partial(value) and suggests_free_text(column, notes.get(column.lower(), ""))
+    ]
+
+
+def column_comments_from_ddl(ddl_text: str) -> dict[str, str]:
+    """Return lowercase fully-qualified column names mapped to SQL comments."""
+    comments: dict[str, str] = {}
+    for match in _DDL_TABLE_RE.finditer(ddl_text or ""):
+        table = match.group(1).replace("`", "")
+        depth, current, parts = 1, "", []
+        for char in (ddl_text or "")[match.end():]:
+            if char in "(<":
+                depth += 1
+            elif char in ")>":
+                depth -= 1
+                if depth == 0:
+                    if current.strip():
+                        parts.append(current)
+                    break
+            if char == "," and depth == 1:
+                parts.append(current)
+                current = ""
+            else:
+                current += char
+        for part in parts:
+            clean = " ".join(line.strip() for line in part.splitlines()
+                             if not line.strip().startswith("--")).strip()
+            tokens = clean.split(None, 1)
+            if len(tokens) < 2 or tokens[0].upper() in {"CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK"}:
+                continue
+            found = re.search(r"\bCOMMENT\s+(['\"])(.*?)\1", tokens[1], re.IGNORECASE)
+            if found:
+                column_name = tokens[0].strip('`"')
+                comments[f"{table}.{column_name}".lower()] = found.group(2)
+    return comments
 
 
 def mixed_partial_problem(value: str, classes: Sequence[str], library: dict | None = None) -> list[str]:

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 import generate_abac
-from governance_policies import build_model
+from governance_policies import apply_model, build_model
 from treatment_derivation import derive_treatment_model, load_treatment_config
 from validate_abac import ValidationResult, validate_coverage_gate
 
@@ -209,6 +209,28 @@ def test_coverage_gate_blocks_a_multi_class_free_text_column_keeping_a_partial(t
     assert "multi-class columns keeping a partial treatment" in error
     assert f"{notes} (classes keep email_partial, name_partial, phone_partial; gr_treatment phone_partial__string__" \
         in error
+
+
+def test_single_class_free_text_partial_is_advisory_without_changing_exit_status():
+    settings = {"access_tier_groups": ["raw", "regional", "masked"]}
+    classes = {
+        "cat.sch.t.notes": ["phone_number"],
+        "cat.sch.t.phone": ["phone_number"],
+        "cat.sch.t.remarks": ["email_address", "phone_number"],
+    }
+    model = build_model(classes, {name: "STRING" for name in classes}, settings)
+    cfg = apply_model({}, model)
+    result = ValidationResult()
+    functions = {line.split("(", 1)[0].rsplit(" ", 1)[1]
+                 for line in model.functions_sql.splitlines() if line.startswith("CREATE")}
+    validate_coverage_gate(cfg, functions, "", result)
+    assert result.passed
+    assert len(result.warnings) == 1
+    advisory = result.warnings[0]
+    assert "COVERAGE ADVISORY (non-blocking)" in advisory
+    assert "cat.sch.t.notes" in advisory
+    assert "cat.sch.t.phone" not in advisory
+    assert "cat.sch.t.remarks" not in advisory
 
 
 def test_coverage_gate_cli_exits_nonzero_for_classified_unprotected_column(tmp_path):

@@ -9,13 +9,30 @@ import pytest
 
 from governance_policies import (
     FAILSAFE_TREATMENT, DeterministicGovernanceError, apply_model, base_treatment, build_model,
-    build_policies, column_types_from_ddl, expand_principals, model_fingerprint,
+    build_policies, column_comments_from_ddl, column_types_from_ddl, expand_principals,
+    free_text_partial_columns, model_fingerprint,
     parse_treatment_value, principal_sets_are_disjoint, replace_sql_library, resolve_column,
     sql_library_block,
 )
 from validate_abac import ValidationResult, validate_coverage_gate
 
 TIERS = ["raw", "regional", "masked"]
+
+
+def test_free_text_partial_heuristic_is_advisory_and_centralized():
+    models = {
+        "cat.sch.t.notes": _model({"cat.sch.t.notes": ["phone_number"]}),
+        "cat.sch.t.phone": _model({"cat.sch.t.phone": ["phone_number"]}),
+        "cat.sch.t.remarks": _model({"cat.sch.t.remarks": ["email_address", "phone_number"]}),
+        "cat.sch.t.details": _model({"cat.sch.t.details": ["phone_number"]}),
+    }
+    treatments = {name: model.columns[name].value for name, model in models.items()}
+    comments = column_comments_from_ddl(
+        "CREATE TABLE cat.sch.t (details STRING COMMENT 'free text supplied by the customer');"
+    )
+    assert free_text_partial_columns(treatments, comments) == ["cat.sch.t.details", "cat.sch.t.notes"]
+    assert models["cat.sch.t.notes"].columns["cat.sch.t.notes"].partial == "last4"
+    assert base_treatment(treatments["cat.sch.t.remarks"]) == "redact"
 
 
 def _model(classes, types=None, **settings):

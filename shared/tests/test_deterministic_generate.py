@@ -180,6 +180,26 @@ def test_generate_calls_no_model_and_needs_no_endpoint(env_dir, monkeypatch, cap
     assert "kept reviewed rule" not in out
 
 
+def test_generate_warns_for_single_class_free_text_without_changing_generated_values(
+    env_dir, monkeypatch, capfd,
+):
+    ddl = DDL.replace("email STRING,", "notes STRING,\n  phone STRING,")
+    rows = [row for row in TAG_ROWS if row[3] != "email"] + [
+        ("dev_fin", "payments", "customers", "notes", "class.phone_number", ""),
+        ("dev_fin", "payments", "customers", "phone", "class.phone_number", ""),
+    ]
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_databricks", lambda refs, cfg: (ddl, [("dev_fin", "payments")]))
+    monkeypatch.setattr(generate_abac, "_fetch_live_classification_source",
+                        lambda *a, **k: ClassificationSource(tag_rows=rows))
+    _generate(env_dir, monkeypatch)
+    out = capfd.readouterr().out
+    assert "WARNING: dev_fin.payments.customers.notes is a STRING column" in out
+    assert "WARNING: dev_fin.payments.customers.phone is a STRING column" not in out
+    cfg = hcl2.loads((env_dir / "generated/abac.auto.tfvars").read_text())
+    notes = next(a for a in _treatments(cfg) if a["entity_name"].endswith(".notes"))
+    assert notes["tag_value"].startswith("phone_partial__string__")
+
+
 def test_generate_writes_exactly_the_deterministic_model(env_dir, monkeypatch):
     _generate(env_dir, monkeypatch)
 

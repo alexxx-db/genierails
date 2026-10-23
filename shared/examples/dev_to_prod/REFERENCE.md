@@ -29,6 +29,15 @@ So "expose last" isn't a policy you hope holds — there is simply no new or wid
 
 **One mask per column.** The single enforcement key is **`gr_treatment`** — GenieRails derives exactly **one** value per column from its `class.*` tags (strictest tag wins; a column whose tags need different partial formats, such as a free-text note tagged email, name and phone, is fully redacted), so Unity Catalog's "only one mask may apply per column" rule is never violated.
 
+Single-class free text is a review limit: `notes` tagged only
+`class.phone_number` still gets the phone partial mask, exposing its last four
+characters and length to the partial tier. Generate warns and the coverage
+gate gives a non-blocking advisory for free-text-looking STRING names/comments;
+the heuristic never changes output. Use `column_overrides = {
+"catalog.schema.table.notes" = { treatment = "redact" } }` for one column, or
+`treatment_versions = { phone_partial = { partial = "redacted" } }` for every
+column on that treatment.
+
 Compatibility limit: the coverage gate reads multi-class free-text escalation
 from the live-refresh class record, `generated/.live_refresh.json`
 (`column_classes`). DDL-only envs and pre-#223 records fall back to the

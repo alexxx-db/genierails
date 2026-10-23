@@ -21,8 +21,8 @@ from pathlib import Path
 
 from tag_vocabulary import REGISTRY
 from governance_policies import (
-    is_library_treatment_value, is_never_raw, keeps_string_partial, mixed_partial_problem,
-    parse_treatment_value,
+    column_comments_from_ddl, free_text_partial_columns, is_library_treatment_value,
+    is_never_raw, keeps_string_partial, mixed_partial_problem, parse_treatment_value,
 )
 from treatment_derivation import load_treatment_config
 
@@ -577,6 +577,7 @@ def validate_coverage_gate(
     exposure: dict | None = None,
     env_name: str = "",
     env_dir: Path | None = None,
+    ddl_comments: dict[str, str] | None = None,
 ) -> None:
     """Block every classification/treatment coverage gap in generated config.
 
@@ -711,6 +712,15 @@ def validate_coverage_gate(
     _check_unclassified_sensitive_columns(
         ddl_columns, set(source_columns) | set(treatments), result, exposure,
     )
+
+    free_text_partial = free_text_partial_columns(treatments, ddl_comments)
+    if free_text_partial:
+        result.warn(
+            "COVERAGE ADVISORY (non-blocking) — STRING columns whose name/comment suggests free text "
+            "keep a partial mask; partial-tier readers may see fragments such as the last four characters:\n"
+            "    - " + "\n    - ".join(free_text_partial)
+            + "\n  Review column_overrides / treatment_versions and use the redact treatment when fragments are unsafe."
+        )
 
     groups = [
         ("detected tags with no mapping/rule", [f"{c} ({d})" for c, d in unmapped]),
@@ -1242,6 +1252,10 @@ def validate_fgac_policies(
     validate_policy_overlaps(cfg, result)
 
     # Detect unsafe tag/function mismatches, especially heterogeneous contact collapse.
+    # Deterministic function names are content-addressed and do not exist in
+    # FUNCTION_EXPECTED_CATEGORIES.  Its equivalent safety checks live in the
+    # deterministic coverage gate, including the free-text partial advisory.
+    deterministic_category_skip = cfg.get("governance_mode") == "deterministic"
     assignments_by_tag: dict[tuple[str, str], list[dict]] = {}
     for ta in assignments:
         if ta.get("entity_type") != "columns":
@@ -1249,6 +1263,8 @@ def validate_fgac_policies(
         assignments_by_tag.setdefault((ta.get("tag_key", ""), ta.get("tag_value", "")), []).append(ta)
 
     for p in policies:
+        if deterministic_category_skip:
+            continue
         if p.get("policy_type") != "POLICY_TYPE_COLUMN_MASK":
             continue
         fn = p.get("function_name", "")
@@ -1651,8 +1667,11 @@ def main():
             result.error("COVERAGE CHECK — masking_functions.sql is required")
         ddl_path = Path(args.ddl).resolve() if args.ddl else find_fetched_ddl(anchor)
         ddl_columns = None
+        ddl_comments = None
         if ddl_path and ddl_path.exists():
-            ddl_columns = parse_ddl_columns(ddl_path.read_text())
+            ddl_text = ddl_path.read_text()
+            ddl_columns = parse_ddl_columns(ddl_text)
+            ddl_comments = column_comments_from_ddl(ddl_text)
         elif args.ddl:
             result.warn(f"COVERAGE CHECK — DDL file {ddl_path} not found; untagged-column check skipped")
         exposure = None
@@ -1665,6 +1684,7 @@ def main():
             merged_cfg, sql_functions, tfvars_path.read_text(), result,
             ddl_columns=ddl_columns, exposure=exposure,
             env_name=args.env_name, env_dir=anchor.parent.parent,
+            ddl_comments=ddl_comments,
         )
 
     result.print_report(args.summary_label, args.verbose)
