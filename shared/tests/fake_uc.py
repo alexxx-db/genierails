@@ -126,8 +126,6 @@ elif command == "import":
         state["resources"].append(resource)
     resource["instances"].append({{"index_key": key, "attributes": {{"id": args[1]}}}})
     json.dump(state, open(path, "w"))
-    if os.environ.get("FAKE_UC_FAIL_AFTER_IMPORT"):
-        sys.exit("Error: Invalid for_each argument (post-import refresh)")
 elif command == "plan":
     for arg in args:
         if arg.startswith("-out="):

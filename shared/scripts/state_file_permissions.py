@@ -14,7 +14,8 @@ STATE_MODE = 0o600
 def tighten_state_files(state_dir: Path) -> None:
     if not state_dir.exists():
         return
-    for path in sorted(state_dir.glob("terraform.tfstate*")):
+    paths = [*state_dir.glob("terraform.tfstate*"), state_dir / ".terraform" / "terraform.tfstate"]
+    for path in sorted(paths):
         try:
             info = path.lstat()
         except FileNotFoundError:

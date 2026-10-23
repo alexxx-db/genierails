@@ -30,6 +30,18 @@ def test_tightens_existing_state_and_warns(tmp_path, capsys):
     assert "may hold secrets" in err
 
 
+def test_tightens_existing_terraform_data_state(tmp_path, capsys):
+    path = tmp_path / ".terraform" / "terraform.tfstate"
+    path.parent.mkdir()
+    path.write_text("{}")
+    path.chmod(0o644)
+
+    tighten_state_files(tmp_path)
+
+    assert _mode(path) == 0o600
+    assert "tightening to 0600" in capsys.readouterr().err
+
+
 def test_runner_creates_account_and_env_state_as_0600_with_open_umask(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -68,3 +80,38 @@ def test_refuses_state_symlink(tmp_path):
         assert "symlink" in str(exc)
     else:
         raise AssertionError("state symlink was accepted")
+
+
+def test_runner_tightens_existing_state_and_refuses_symlink(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    terraform = fake_bin / "terraform"
+    terraform.write_text("#!/bin/sh\nexit 0\n")
+    terraform.chmod(0o755)
+    env_dir = tmp_path / "envs" / "dev"
+    env_dir.mkdir(parents=True)
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "ENVS_DIR": str(env_dir.parent),
+        "LAYER_ENV_DIR": str(env_dir),
+    }
+
+    state = env_dir / "terraform.tfstate"
+    state.write_text("{}")
+    state.chmod(0o644)
+    tightened = subprocess.run(
+        [RUNNER, "workspace", "dev", "plan"], env=env, text=True, capture_output=True,
+    )
+    assert tightened.returncode == 0, tightened.stdout + tightened.stderr
+    assert _mode(state) == 0o600
+    assert "tightening to 0600" in tightened.stderr
+
+    state.unlink()
+    outside = tmp_path / "outside.tfstate"
+    outside.write_text("{}")
+    state.symlink_to(outside)
+    refused = subprocess.run(
+        [RUNNER, "workspace", "dev", "plan"], env=env, text=True, capture_output=True,
+    )
+    assert refused.returncode != 0
+    assert "symlink" in refused.stderr

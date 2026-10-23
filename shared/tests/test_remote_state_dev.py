@@ -394,7 +394,9 @@ def test_no_state_file_is_read_outside_state_layout():
     for path in sorted([*SHARED.rglob("*.py"), *SHARED.rglob("*.sh"), SHARED / "Makefile.shared", *terraform]):
         rel = path.relative_to(ROOT).as_posix()
         if (rel.startswith(("shared/tests/", "shared/examples/")) or path.name in {
-                "state_layout.py", "run_integration_tests.py"}):  # the helper; the live e2e harness
+                "state_layout.py", "state_file_permissions.py", "run_integration_tests.py"}):
+            # The permissions helper names local state only to enforce its mode;
+            # state contents remain centralized through state_layout.
             continue
         allowed = ALLOWED_STATE_MENTIONS.get(rel, ())
         for number, line in enumerate(path.read_text().splitlines(), 1):
@@ -787,7 +789,8 @@ def test_state_readers_import_the_helper_without_help_from_other_modules(tmp_pat
 
 # -- the runner's own variables can't be overridden --------------------------
 
-RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir")
+RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
+               "expected_pre_release_withholding")
 OVERRIDE_FORMS = ("-var=NAME=", "-var NAME=", "--var=NAME=", "-var-file=FILE", "-var-file FILE",
                   "env tfvars", "TF_CLI_ARGS", "TF_CLI_ARGS_plan")
 

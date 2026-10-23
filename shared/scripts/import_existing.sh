@@ -170,10 +170,6 @@ run_import() {
   fi
   if [ "$import_rc" -eq 0 ]; then
     echo "  ✓ Imported $address"
-  elif "$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null | grep -qF "$address"; then
-    # A provider diagnostic can happen during the post-import refresh, after
-    # Terraform has already persisted the object. State is the source of truth.
-    echo "  ✓ Imported $address (Terraform returned a post-import diagnostic after saving it; verified in state)"
   elif echo "$import_out" | grep -q "Resource already managed by Terraform"; then
     # A previous retry already imported this resource — treat as success.
     echo "  ↩ Already managed: $address (skipping)"

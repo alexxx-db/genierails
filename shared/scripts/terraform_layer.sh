@@ -320,6 +320,10 @@ RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
   RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
 fi
+if [ "$LAYER:$COMMAND" = "workspace:plan" ] && \
+   python3 -c 'import os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from state_layout import STRUCTURAL_CHECK_TOKEN_ENV, consume_structural_check_token; raise SystemExit(0 if consume_structural_check_token(Path(sys.argv[2]), os.environ.get(STRUCTURAL_CHECK_TOKEN_ENV)) else 1)' "$SCRIPT_DIR" "$ENV_DIR"; then
+  RUNNER_VARS+=(-var="expected_pre_release_withholding=true")
+fi
 # Genie ID files: with GENIERAILS_STATE_DIR, the env's records/ in the state
 # dir (state_layout.py records-dir refuses while any is still in the checkout).
 # Exported for genie_space.sh, whose destroy-time commands resolve the file

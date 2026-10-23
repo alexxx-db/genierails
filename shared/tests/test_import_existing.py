@@ -266,27 +266,6 @@ def test_an_import_already_in_state_is_skipped(tmp_path, mode):
         assert f"Already in state: {TAG_IMPORT}" in result.stdout
 
 
-def test_post_import_diagnostic_is_reported_as_verified_success(tmp_path):
-    """Terraform can save an import before a provider refresh diagnostic."""
-    account = tmp_path / "account"
-    account.mkdir()
-    (account / "abac.auto.tfvars").write_text(
-        'tag_policies = [{ key = "gr_treatment", values = ["redact"] }]\n'
-    )
-    fake = fake_uc.install(tmp_path, {})
-    result = subprocess.run(
-        ["bash", SCRIPT, "--tags-only"], cwd=account,
-        env=os.environ | fake | {"LAYER_ENV_DIR": str(account), "FAKE_UC_FAIL_AFTER_IMPORT": "1"},
-        text=True, capture_output=True,
-    )
-
-    out = result.stdout + result.stderr
-    assert result.returncode == 0, out
-    assert "verified in state" in out
-    assert "Invalid for_each" not in out
-    assert "Failed to import" not in out
-
-
 def test_record_mode_refuses_what_it_cannot_verify(tmp_path):
     abac = ('fgac_policies = [{ name = "mask", catalog = "cat", policy_type = "POLICY_TYPE_COLUMN_MASK" }]\n')
     data_access = _layer(tmp_path, 'governance_mode = "deterministic"\n', abac)

@@ -392,13 +392,16 @@ def _check(args) -> None:
         from exposure_token import ENV_VAR, mint
 
         token = mint(scratch.envs / env)
+        from scripts.state_layout import STRUCTURAL_CHECK_TOKEN_ENV, mint_structural_check_token
+        structural_token = mint_structural_check_token(scratch.envs / env)
         try:
             if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token),
                                                              "CLASSIFICATION_READ_ONLY": "1",
-                                                             "TF_VAR_expected_pre_release_withholding": "true"}) != 0:
+                                                             STRUCTURAL_CHECK_TOKEN_ENV: str(structural_token)}) != 0:
                 raise CheckFailed("plan")
         finally:
             token.unlink(missing_ok=True)
+            structural_token.unlink(missing_ok=True)
     finally:
         scratch.close()
 
