@@ -374,6 +374,20 @@ variable "env_dir" {
   type = string
 }
 
+# Consumed by GenieRails validation/generation; accepted here because the
+# shared env.auto.tfvars is also passed to this root.
+variable "deployer_principal_id" {
+  type    = string
+  default = ""
+}
+
+# Only make check opts in while planning committed config against empty state.
+# Ordinary plan/apply retains the failing check for unexpected withholding.
+variable "expected_pre_release_withholding" {
+  type    = bool
+  default = false
+}
+
 # Snapshots of this env's workspace and data_access state, which the locals
 # above read. Empty (the default) means the in-checkout state files next to
 # env_dir. With GENIERAILS_STATE_DIR or remote state, terraform_layer.sh
@@ -913,7 +927,7 @@ output "genie_space_can_run_withheld" {
 # A raw terraform run that withholds CAN_RUN still applies; say so.
 check "genie_can_run_withheld" {
   assert {
-    condition     = length(module.workspace.genie_space_can_run_withheld) == 0
+    condition     = var.expected_pre_release_withholding || length(module.workspace.genie_space_can_run_withheld) == 0
     error_message = "Genie CAN_RUN withheld (${join("; ", [for key, groups in module.workspace.genie_space_can_run_withheld : "${key}: ${join(", ", groups)}"])}): ${local.genie_exposure_blocker != "" ? local.genie_exposure_blocker : (local.deterministic ? "the live agent coverage check failed for those agents" : "the data_access state lacks the SELECT grants those groups need")}. Removing or keeping CAN_RUN still applies. ${local.deterministic ? "Run the workspace layer through make (make apply, make rehearse or make release), which runs the live agent coverage check first." : "Apply governance first through make (make apply, make release or make apply-governance), which runs the coverage check and applies data_access before Genie ACLs."}"
   }
 }

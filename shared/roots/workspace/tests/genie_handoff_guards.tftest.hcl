@@ -47,6 +47,17 @@ run "id_contents_mismatch_gets_no_handoff" {
   }
 }
 
+run "structural_check_reports_expected_withholding_as_info" {
+  command = plan
+  variables {
+    expected_pre_release_withholding = true
+  }
+  assert {
+    condition     = toset(output.genie_space_can_run_widening["sales"]) == toset(["analysts", "auditors"])
+    error_message = "the structural-check exemption must change only the diagnostic, not withholding"
+  }
+}
+
 run "missing_id_file_state" {
   module { source = "../data_access/tests/file_writer" }
   variables {

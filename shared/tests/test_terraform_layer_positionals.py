@@ -25,7 +25,8 @@ from tests.terraform_helpers import TIMEOUT, shared_copy
 
 real_terraform = pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
 
-RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir")
+RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
+               "expected_pre_release_withholding")
 ADDR = "terraform_data.adopted"
 ID = "0f6e2c4a-1111-2222-3333-444455556666"
 
