@@ -29,6 +29,28 @@ output, the tool pairs each row (by a row-pairing key column it picks per table)
 between a masked and an unmasked principal and asserts the masked tier's value differs from the **raw**
 value the unmasked tier sees.
 
+Deterministic governance checks every tier against the exact output its
+expected function gives on the admin's raw rows. Two cases have no
+distinguishing row, and each gets a live proof instead:
+
+- **Partial = full under two names** (for example `ssn` and `redact`, both
+  `redacted`): the partial and full tiers can't be told apart on any row, so
+  the admin must prove the two live functions identical (same language,
+  determinism, data access, argument and return types, and token-identical
+  definitions). Each tier must then match its exact expected output, and raw
+  must still differ from both. Without that proof the check is INCONCLUSIVE.
+- **Never-raw columns** (`card_security_code`, `card_pin`, `card_track_data`,
+  `secret`): no principal reads the raw value, the deployer/admin baseline
+  included, so there is no raw value to compare against. The admin proves the
+  one live mask on the column is the configured function for all account
+  users with no exception (otherwise FAIL), and that the function is
+  caller-independent (as for fixed points; otherwise INCONCLUSIVE). It also
+  proves the function maps two distinct probe values to one constant
+  (otherwise FAIL). Every principal, the admin baseline included, must then
+  read only that constant, or NULL where the baseline reads NULL, on rows the
+  baseline also read. Any other value (a raw leak, the wrong constant, a
+  dropped mask) is a FAIL.
+
 ### How GenieRails picks the row-pairing key
 
 The key is how the tool knows two result rows, one per tier, are the *same* row. You don't choose it: for **each masked table**, `verify-access` picks one in this order and uses the first that is proven safe:
