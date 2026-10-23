@@ -28,7 +28,7 @@ git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git pus
 make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't run it)
 make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
-make release ENV=prod       # applies exactly the approved plan, proves the masks
+make release ENV=prod       # applies exactly the approved plan, proves the masks; a first release repeats release-plan + release until "Release complete"
 GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod   # live compliance record; finds the warehouse itself
 make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
@@ -93,7 +93,9 @@ Commit (and push) again after each step below that changes `envs/`. Later change
 ```bash
 make generate ENV=dev
 ```
-It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes its `table_readers`. Review those and the drafted rules in `envs/dev/generated/`, and edit the rules if you need to. If the tags aren't there yet, it stops and tells you to wait; re-run it later. Re-runs keep whatever is already in `envs/dev/generated/`, including your edits, and only add rules for new columns. Then commit and push `envs/`.
+It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes its `table_readers`. Review those and the drafted rules in `envs/dev/generated/`. If the tags aren't there yet, it stops and tells you to wait; re-run it later. Then commit and push `envs/`. What a re-run keeps depends on the env's `governance_mode`:
+- **Deterministic** (the template's default): every run recomputes the column masks, the `gr_treatment` column tags, the `gr_treatment` tag policy and the mask-library functions in `masking_functions.sql` from the `class.*` tags and the mask library. It replaces hand edits to those in `envs/dev/generated/` without a warning; row filters and table tags are kept. To change a treatment, set it in `envs/dev/env.auto.tfvars` and re-run `make generate ENV=dev`: `column_overrides` for one column, `treatment_versions` for a treatment's partial version, `tag_treatments` to map a class to another treatment ([settings](REFERENCE.md#deterministic-governance-settings)).
+- **Legacy**: re-runs keep whatever is already in `envs/dev/generated/`, including your edits, and only add rules for new columns.
 
 **5. Check.**
 ```bash
@@ -124,7 +126,7 @@ You don't set a row-pairing key: it picks one per masked table (a single-column 
 ```bash
 make setup ENV=prod
 ```
-Fill in `envs/prod/auth.auto.tfvars` (same service principal as dev? leave it blank and add `REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<prod host> WORKSPACE_ID=<prod id>` to the `promote-to` below: it copies dev's account ID, client ID and secret into the still-blank file and never dev's host), replace its `deployer_principal_id` placeholder, and set:
+Fill in `envs/prod/auth.auto.tfvars` (same service principal as dev? leave it blank and add `REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<prod host> WORKSPACE_ID=<prod id>` to the `promote-to` below: it copies dev's account ID, client ID and secret into the still-blank file and never dev's host), replace its `deployer_principal_id` placeholder and the seeded `catalog_map` line (`make setup` wrote one with placeholders; a second `catalog_map` line is refused), and set the rest:
 ```hcl
 catalog_map = { "dev_finance" = "prod_finance" }   # dev catalog = prod catalog
 sql_warehouse_id = "<existing-prod-warehouse-id>"   # or "" to create a new serverless warehouse
@@ -155,7 +157,9 @@ make release-plan ENV=prod
 make release ENV=prod
 ```
 `make release-plan ENV=prod` plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit (dev is prod's `promote_from` in this walkthrough; with `promote_from = "stg"` it is `make rehearse ENV=stg`); the dev step 6 rehearsal was of an earlier commit. Otherwise it stops with `no passing rehearsal of <commit>`. Since the promotion changed only `envs/prod/`, this rehearse doesn't apply anything in dev again. It prints `code and dev inputs are unchanged since the passing rehearsal of <earlier commit>; wrote a receipt for <this commit> without re-applying` and the `promote-to ENV=prod digest` it recorded. If code or `envs/dev/` changed since, it runs the full rehearsal. Rehearse again after any later commit, before its `release-plan`.
+Legacy envs skip `make release-plan`: run `make release ENV=prod` directly (`release-plan` refuses them with `Legacy envs keep: make release ENV=prod`).
 `make check ENV=prod` also runs `promote-to CHECK=1`. `make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
+**A first release takes several rounds.** Each deterministic `make release ENV=prod` applies one manifest, and a first release needs one per step: the masking functions and policies, then the column tags, then the tier groups' `USE_CATALOG`, `USE_SCHEMA` and `SELECT`, then (for an env with agents) Genie `CAN_RUN`, which is planned only once that `SELECT` is live. A prod with existing resources that aren't in Terraform state yet starts with one more manifest that only imports them (`This manifest imported existing resources into Terraform state; nothing else was applied.`). Every round but the last ends with `=== Release phase applied (prod) ===`, a line saying what it applied (`This manifest held one phase of a staged policy change; it is applied and verified.`, or for the `SELECT` round `This manifest opened the SELECT the Genie agents need; the workspace (CAN_RUN) is planned with it live.`) and `Next: make release-plan ENV=prod, approve the new manifest, make release ENV=prod.`. Do exactly that on the same commit (its dev rehearsal still counts) until `make release` prints `=== Release complete (prod) ===`. Later policy replacements and tier moves take one round per phase too ([staged policy changes](../../docs/deterministic-policies.md#staged-policy-changes-rollout-step-6)).
 **Pass looks like:** `ALL EFFECTIVE` (from its `verify-access` gate) and "Release complete". Business users can now open the agent and get masked answers. To re-run only that proof later: `make verify-access ENV=prod`.
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
