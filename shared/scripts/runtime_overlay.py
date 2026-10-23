@@ -204,24 +204,30 @@ def kept_policy_names(
             continue
         name, catalog = str(policy.get("name") or ""), str(policy.get("catalog") or "")
         older = sorted({remap_policy_name(name, catalog, src) for src in sources.get(catalog, [])} - {name})
-        if not older:
-            continue
         if catalog not in cache:
             cache[catalog] = live_names(catalog)
         live = cache[catalog]
         if live is None:
-            raise OverlayError(
-                f"the policies on {catalog} couldn't be listed, so it is unknown whether {name} is deployed "
-                f"under an older name; refusing to plan a rename (#68). Check {catalog}'s credentials and retry")
+            unknown = (f"{name} is deployed under an older name; refusing to plan a rename (#68)" if older else
+                       f"{remote_policy_name(catalog, name)} is taken by a policy GenieRails doesn't manage; "
+                       "refusing to plan it")
+            raise OverlayError(f"the policies on {catalog} couldn't be listed, so it is unknown whether "
+                               f"{unknown}. Check {catalog}'s credentials and retry")
         deployed = [k for k in older if (catalog, k) in managed or remote_policy_name(catalog, k) in live]
         if len(deployed) > 1:
             raise OverlayError(f"{catalog} deploys {name} under several older names ({', '.join(deployed)})")
         if deployed:
             kept[name] = deployed[0]
-        elif f"{catalog}_{name}" in live and (catalog, name) not in managed:
+        elif remote_policy_name(catalog, name) in live and (catalog, name) not in managed:
+            # Even with no older name: a catalog mapped to itself (S2) shares
+            # its policy names with the source env, whose state owns them.
+            identity = any(src.lower() == catalog.lower() == dest.lower() for src, dest in catalog_map.items())
             raise OverlayError(
-                f"{catalog} already has a policy named {catalog}_{name} that GenieRails doesn't manage; remove "
-                "it or import it into the prod data_access state, then re-run")
+                f"{catalog} already has a policy named {remote_policy_name(catalog, name)} that GenieRails "
+                "doesn't manage; " + (
+                    f"catalog_map maps {catalog} to itself, so it is likely the source env's: map {catalog} "
+                    "to a distinct catalog (don't import it), then re-run" if identity else
+                    "remove it or import it into the prod data_access state, then re-run"))
     final = [kept.get(str(p.get("name")), str(p.get("name"))) for p in policies]
     duplicates = sorted({n for n in final if final.count(n) > 1})
     if duplicates:

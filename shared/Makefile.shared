@@ -1466,7 +1466,7 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 			echo '    DEST_CATALOG_MAP="<src_catalog>=<dest_catalog>[,<src2>=<dest2>...]"'; \
 			exit 1; \
 		fi; \
-		python3 "$(SHARED_ROOT)/scripts/validate_catalog_map.py" "$(SOURCE_ENV_DIR)" "$(DEST_CATALOG_MAP)" || exit 1; \
+		python3 "$(SHARED_ROOT)/scripts/validate_catalog_map.py" "$(SOURCE_ENV_DIR)" "$(DEST_CATALOG_MAP)" "$(DEST_ENV_DIR)" || exit 1; \
 		echo "=== Cross-env promote: $(SOURCE_ENV) -> $(DEST_ENV) ==="; \
 		dest_env_dir="$(DEST_ENV_DIR)"; \
 		$(call _PROMOTION_TXN_BEGIN,"$$dest_env_dir" "$(ACCOUNT_ENV_DIR)"); \

@@ -326,6 +326,34 @@ def normalize_catalog_map(value: object) -> str:
     return ",".join(f"{src}={dest}" for src, dest in pairs.items())
 
 
+# The opt-in for a catalog mapped to itself (finding S2). Only the HCL boolean
+# true, in the destination's own env.auto.tfvars, counts: a committed, reviewed
+# line next to catalog_map, never a flag or a value copied from the source.
+IDENTITY_OPT_IN = "allow_identity_catalog_map"
+
+
+def identity_catalog_map_error(pairs: dict[str, str], dest_cfg: dict, setting: str, env_file: Path | None) -> str:
+    """Why a catalog_map that maps a catalog to itself is refused, or "" when it isn't.
+
+    With one metastore for both envs, src == dest makes the destination's policy
+    names those the source already deploys, so the destination's state could
+    adopt the source's masks and a later source retire would drop them.
+    """
+    identity = [src for src, dest in pairs.items() if src.lower() == dest.lower()]
+    if not identity or dest_cfg.get(IDENTITY_OPT_IN) is True:
+        return ""
+    entries = ", ".join(f"{src}={pairs[src]}" for src in identity)
+    env = Path(os.path.abspath(env_file)).parent.name if env_file else "dest"
+    where = display_path(env_file) if env_file else "the destination env's env.auto.tfvars"
+    return (
+        f"{setting} maps a catalog to itself ({entries}). If both envs share a metastore, "
+        f"the {env} state would adopt the source env's masks and a later retire in the source "
+        f"would drop {env}'s. Map each to a distinct {env} catalog (e.g. "
+        f'"{identity[0]}" = "<{env}_catalog>"), or, only if the envs use separate metastores, '
+        f"set {IDENTITY_OPT_IN} = true in {where}"
+    )
+
+
 def validate_source_catalogs(source_dir: Path, catalog_map: str, env_file: Path) -> None:
     from scripts.footprint import FootprintError, resolve_footprint
     from genie_space_placeholder import placeholder_error
@@ -430,6 +458,12 @@ def resolve_promote(env: str, env_dir: Path, envs_dir: Path, source: str, catalo
         catalog_map = normalize_catalog_map(catalog_map or saved_map)
     except ValueError as exc:
         raise ValueError(f"catalog_map in {display_path(env_file)}: {exc}") from exc
+    identity = identity_catalog_map_error(
+        catalog_map_dict(catalog_map), saved,
+        f"catalog_map in {display_path(env_file)}" if "CATALOG_MAP" in reused else "CATALOG_MAP", env_file,
+    )
+    if identity:
+        raise ValueError(identity)
     if source == env:
         raise ValueError(f"FROM must name another env (FROM={source} is the destination ENV={env})")
     if source in RESERVED_ENVS:
