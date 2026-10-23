@@ -98,6 +98,8 @@ class FakeWarehouse:
         self.statements.append((tier, sql, params))
         sql = sql.replace("`", "")      # identifiers are backtick-quoted; names here are plain
         cell = lambda v: None if v is None else str(v)  # noqa: E731 — data_array is strings
+        if re.fullmatch(r"(GRANT|REVOKE) (SELECT|USE SCHEMA|USE CATALOG) ON .*", sql):
+            return []  # the temporary checked-table access (and its cleanup); no rows
         m = re.fullmatch(r"SELECT (COUNT\(\*\)|tag_name, tag_value) FROM "
                          r"system\.information_schema\.(column_masks|column_tags) .*", sql)
         if m:
