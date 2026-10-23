@@ -1420,7 +1420,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 	if [ "$$mode" != deterministic ]; then $(MAKE) derive-assignments ENV="$(ENV)" || exit 1; fi; \
 	$(MAKE) coverage-gate ENV="$(ENV)" || exit 1; \
 	$(MAKE) validate-generated ENV="$(ENV)" || exit 1; \
-	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)"; key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac" || exit 1; fi; \
+	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)"; key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || { echo "maintain: could not resolve the verification key; governance was not applied." >&2; exit 1; }; $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac" || exit 1; fi; \
 	$(_RUN_AUDIT_RULEBOOK); \
 	if [ $$audit_rc -ne 0 ]; then \
 		if [ $$audit_rc -eq 1 ]; then \

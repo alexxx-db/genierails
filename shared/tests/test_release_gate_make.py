@@ -568,6 +568,16 @@ def test_plain_release_through_the_release_target_uses_the_current_manifest(tmp_
     assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
 
 
+def test_plan_between_release_plan_and_release_does_not_stale_the_manifest(make, repo):
+    manifest = _planned(make)
+    result = make("plan", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
+
+
 def test_plain_release_without_a_current_manifest_refuses_and_applies_nothing(make, repo):
     result = make("_release-manifest", "prod")
     assert result.returncode != 0
@@ -774,6 +784,24 @@ def test_legacy_maintain_is_unchanged(make, repo):
     result = make("maintain", "prod")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "apply-governance" in make.names()
+
+
+def test_maintain_verify_key_failure_stops_before_mask_proof_and_apply(make, repo):
+    (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    proof = make._recorder("proof")
+    result = make(
+        "maintain",
+        "prod",
+        "VERIFY_SPEC=/tmp/verify-spec.json",
+        stubs={
+            "resolve_env_config.py verify-key": "false",
+            "release_helpers.py require-mask-proof": str(proof),
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "maintain: could not resolve the verification key" in result.stderr
+    assert "proof" not in make.names()
+    assert "apply-governance" not in make.names()
 
 
 # -- rehearse --------------------------------------------------------------------------
