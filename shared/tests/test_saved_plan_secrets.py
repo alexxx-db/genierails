@@ -385,3 +385,37 @@ def test_a_failed_account_plan_wrote_its_plan_owner_only(tmp_path, repo):
     assert result.returncode != 0 and "planning failed" in result.stderr
     assert log.read_text() == "0o600"
     assert not _secret_files(repo)  # the failed plan's dir is removed
+
+
+NOOP_RUNNER = """#!{python}
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+if len(args) >= 3 and args[2] == "plan":
+    out = next(a.split("=", 1)[1] for a in args if a.startswith("-out="))
+    Path(out).write_text("databricks_client_secret = {secret}")
+elif len(args) >= 3 and args[2] == "show":
+    print(json.dumps({{"resource_changes": []}}))
+sys.exit(0)
+"""
+
+
+def test_a_noop_account_plan_records_the_result_without_keeping_its_saved_plan(tmp_path, repo):
+    runner = tmp_path / "noop-runner"
+    runner.write_text(NOOP_RUNNER.format(python=sys.executable, secret=SECRET))
+    runner.chmod(0o755)
+
+    make = Make(tmp_path, repo)
+    result = make("account-plan", "account", root_runner=runner)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                         if "Manifest (immutable):" in line))
+    data = json.loads(manifest.read_text())
+    assert data["plan"] == {"changes": False, "summary": {"changes": False, "resource_changes": {}}}
+    assert not (manifest.parent / "account.tfplan").exists()
+    assert not _secret_files(repo)
+
+    apply_result = make("apply-account", "account")
+    assert apply_result.returncode != 0
+    assert "no unreceipted account manifest" in apply_result.stderr

@@ -692,3 +692,17 @@ def test_check_never_runs_the_staged_policy_controller_or_any_apply(repo, tmp_pa
     assert not [c for c in commands if c.split()[1:2] in (["apply"], ["import"], ["destroy"])], commands
     assert any(c.startswith("data_access plan") and "-var=policy_stage=preview" in c for c in commands), commands
     _assert_read_only(repo, before)
+
+
+@pytest.mark.parametrize("secret, warns", [("filled-secret", False), ("", True)])
+def test_check_secret_warnings_reflect_the_real_auth_file(repo, tmp_path, secret, warns):
+    auth = _envs(repo) / "dev" / "auth.auto.tfvars"
+    auth.write_text('databricks_account_id = "account"\n'
+                    'databricks_client_id = "client"\n'
+                    f'databricks_client_secret = "{secret}"\n'
+                    'databricks_workspace_id = "workspace"\n'
+                    'databricks_workspace_host = "https://workspace.example"\n')
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert ("'databricks_client_secret' is empty" in out) is warns

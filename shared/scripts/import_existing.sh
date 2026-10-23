@@ -135,6 +135,7 @@ fi
 run_import() {
   local address="$1"
   local id="$2"
+  local state_out
 
   if $DRY_RUN; then
     echo "  [DRY RUN] $TF_RUNNER '$LAYER' '$ENV_NAME' import '$address' '$id'"
@@ -142,7 +143,8 @@ run_import() {
   fi
 
   if [ -n "$RECORD_FILE" ]; then
-    if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null | grep -qF "$address"; then
+    if state_out=$("$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null) \
+        && grep -Fxq "$address" <<<"$state_out"; then
       return 0
     fi
     echo "  Recorded import (release applies it): $address -> $id"
@@ -155,7 +157,11 @@ run_import() {
   # Fast-path: skip if already tracked in state. We list all resources and
   # grep for an exact match (not the address directly, because brackets are
   # treated as glob patterns by `terraform state list <address>`).
-  if "$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null | grep -qF "$address"; then
+  # Capture the complete listing before matching. With pipefail, `grep -q`
+  # used to close a large state-list pipe early; the runner then exited on
+  # SIGPIPE and we retried imports Terraform was already managing.
+  if state_out=$("$TF_RUNNER" "$LAYER" "$ENV_NAME" state-list 2>/dev/null) \
+      && grep -Fxq "$address" <<<"$state_out"; then
     echo "  ↩ Already in state: $address (skipping)"
     return 0
   fi

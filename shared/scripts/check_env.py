@@ -284,6 +284,7 @@ def _report(label: str, before: dict, after: dict, fix: str) -> None:
 def _promote_check(args) -> None:
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
     try:
+        scratch.add_credentials(args.env)
         before = _snapshot(scratch.envs)
         extra = [f"FROM={args.from_env}"] if args.from_env else []
         extra += [f"CATALOG_MAP={args.catalog_map}"] if args.catalog_map else []
@@ -304,6 +305,11 @@ def _check(args) -> None:
     promotes = env == "prod" or bool(_load_hcl(real_env_dir / "env.auto.tfvars").get("promote_from"))
     has_generated = (real_env_dir / "generated" / "abac.auto.tfvars").is_file()
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
+    # Validators run throughout the check, not only in the final plan. Give
+    # every scratch step the real runtime auth values so an empty-secret
+    # warning describes the caller's config. The files remain inside the
+    # private throwaway copy and are never included in comparisons.
+    scratch.add_credentials(env)
     steps = 6
 
     def step(number: int, title: str) -> None:
@@ -385,7 +391,6 @@ def _check(args) -> None:
               "change a release would make. Live tags are not re-read, so new SELECT grants show as withheld.")
         print("  INFO: Genie CAN_RUN withheld in this empty-state pre-release plan is expected; ordinary "
               "plans and applies still fail when CAN_RUN is unexpectedly withheld.")
-        scratch.add_credentials(env)
         # The structural plan doesn't re-read live tags (a plan applies nothing;
         # the gate withholds new grants), so it hands the plan the one-time
         # token that skips the derive (scripts/exposure_token.py).
