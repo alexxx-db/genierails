@@ -1745,3 +1745,37 @@ raise SystemExit(bootstrap_sp.main([
     assert fake_secret not in result.stderr
     assert fake_secret in auth.read_text()
     assert _mode(auth) == 0o600
+
+
+def test_dry_run_says_a_missing_sp_would_be_created_and_how_to_select_another_name():
+    account, _workspace, _factory, factory = _fake(existing=False)
+    output = []
+
+    assert bootstrap(_cfg(dry_run=True), client_factory=factory, emit=output.append) == 0
+
+    assert any(line.startswith("PLAN RESOLVED service principal: none is named 'deploy', so apply would CREATE")
+               and "pass SP_NAME=<that exact name>" in line for line in output), output
+    not_checked = [line for line in output if line.startswith("PLAN NOT CHECKED:")]
+    assert not_checked == [
+        "PLAN NOT CHECKED: Account Admin role, account tag-policy creator and manager roles, "
+        "workspace ADMIN. Apply grants only what is missing and reports each as GRANTED or UNCHANGED."
+    ]
+    assert output[-1] == "DRY RUN: read-only preflight passed; no changes were made."
+    account.service_principals.create.assert_not_called()
+    account.service_principal_secrets.list.assert_not_called()
+    account.workspace_assignment.update.assert_not_called()
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_dry_run_names_the_reused_sp_and_what_it_did_not_check(rotate):
+    account, _workspace, _factory, factory = _fake(existing=True)
+    output = []
+
+    assert bootstrap(_cfg(dry_run=True, rotate_secret=rotate), client_factory=factory, emit=output.append) == 0
+
+    assert "PLAN RESOLVED service principal: reuse 'deploy' (client_id=client-123)" in output
+    not_checked = next(line for line in output if line.startswith("PLAN NOT CHECKED:"))
+    assert "Account Admin role" in not_checked and "workspace ADMIN" in not_checked
+    assert ("whether the reused SP already has a secret" in not_checked) is (not rotate)
+    account.service_principal_secrets.create.assert_not_called()
+    account.access_control.update_rule_set.assert_not_called()

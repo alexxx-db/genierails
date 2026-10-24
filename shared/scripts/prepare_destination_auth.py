@@ -55,6 +55,8 @@ TEMPLATE_KEYS = ("databricks_account_id", "databricks_client_id", "databricks_cl
 CREDENTIAL_KEYS = ("databricks_account_id", "databricks_client_id", "databricks_client_secret")
 REUSED_KEYS = (*CREDENTIAL_KEYS, "databricks_account_host")
 HOST, WORKSPACE_ID = "databricks_workspace_host", "databricks_workspace_id"
+# make setup in azure/ seeds this line (auth_tfvars.py), so it is still template state.
+SEEDED_ACCOUNT_HOST = ("databricks_account_host", "https://accounts.azuredatabricks.net")
 PLACEHOLDERS = ("placeholder", "change_me", "changeme", "your_")
 
 
@@ -188,7 +190,8 @@ def prepare(source: Path, dest: Path, dest_env_file: Path | None, host: str, wor
     except NotPlainFile:
         return (f"  REUSE_SOURCE_AUTH: {dest} is not a plain file (a symlink or missing); left unchanged.")
     dest_config = _parse(dest_data, dest)
-    extra = sorted(set(dest_config) - set(TEMPLATE_KEYS))
+    extra = sorted(key for key in set(dest_config) - set(TEMPLATE_KEYS)
+                   if (key, _text(dest_config, key)) != SEEDED_ACCOUNT_HOST)
     if extra or any(_text(dest_config, key) for key in CREDENTIAL_KEYS):
         return (f"  REUSE_SOURCE_AUTH: {dest} already holds credentials or settings; left unchanged.")
 

@@ -20,14 +20,21 @@
 #   Workspace URL or Account Console -> Workspaces -> <your workspace>
 #   Example URL pattern: ?o=<workspace_id>
 # - databricks_workspace_host:
-#   Your workspace browser URL, e.g. https://dbc-....cloud.databricks.com/
+#   Your workspace browser URL, e.g. https://dbc-....cloud.databricks.com/ (AWS)
+#   or https://adb-<workspace-id>.<n>.azuredatabricks.net/ (Azure)
+# - databricks_account_host:
+#   Azure only: https://accounts.azuredatabricks.net (`make setup` in azure/ writes
+#   it below). Omit on AWS; it defaults to https://accounts.cloud.databricks.com.
 #
-# Required permissions for the service principal:
+# Required permissions for the service principal (shared/docs/prerequisites.md, Check 6):
 #
 # Full mode (default):
 #   - Account Admin   — create groups, assign groups to workspaces
+#   - Account Tag Policy Creator + Manager — create and maintain tag policies
 #   - Workspace Admin  — create warehouses, manage Genie agents and permissions
-#   - Metastore Admin  — create tag policies, FGAC policies, grants, masking functions
+#   - Authority over the governed catalog (not Metastore Admin) — own it, or hold
+#     SELECT + MANAGE + APPLY TAG on it — for tags, masking functions, FGAC
+#     policies and grants
 #
 # Genie-only mode (set genie_only = true in env.auto.tfvars):
 #   - Workspace Admin only

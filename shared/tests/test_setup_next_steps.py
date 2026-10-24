@@ -546,3 +546,26 @@ def test_cross_env_promote_points_to_release_not_apply():
     # release-steps prints release-plan and release after a same-commit source rehearsal, or a legacy release.
     assert '$(_RELEASE_STEPS) --env-dir "$$dest_env_dir" --env "$(DEST_ENV)"' in block
     assert "make apply ENV=$(DEST_ENV)" not in block
+
+
+@pytest.mark.parametrize("cloud", CLOUDS)
+def test_setup_seeds_the_azure_account_host_in_a_new_auth_file_only(cloud, tmp_path):
+    """The roots default databricks_account_host to AWS's, so azure/ setup writes Azure's."""
+    existing = tmp_path / cloud / "envs/prod/auth.auto.tfvars"
+    existing.parent.mkdir(parents=True)
+    existing.write_text('databricks_client_id = "kept"\n')
+    existing.chmod(0o600)
+
+    for env in ("dev", "prod"):
+        result = _make(cloud, tmp_path, "setup", f"ENV={env}")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    auth = tmp_path / cloud / "envs/dev/auth.auto.tfvars"
+    config = hcl2.loads(auth.read_text())
+    if cloud == "azure":
+        assert config["databricks_account_host"] == "https://accounts.azuredatabricks.net"
+    else:
+        assert "databricks_account_host" not in config
+    assert _mode(auth) == 0o600
+    # An auth file that already exists is never rewritten.
+    assert existing.read_text() == 'databricks_client_id = "kept"\n'

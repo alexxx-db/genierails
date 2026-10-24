@@ -23,15 +23,19 @@ From the `azure/` directory, `make bootstrap-sp` accepts multiple Azure workspac
 positionally aligned catalogs, for example:
 
 ```bash
-make bootstrap-sp ACCOUNT_ID=<id> \
+make bootstrap-sp ACCOUNT_ID=<id> SP_NAME=<deployer-sp-display-name> \
   WORKSPACE_ID=<dev-workspace-id>,<prod-workspace-id> \
   TARGET_CATALOG=<dev-catalog>,<prod-catalog> PLAN=1
 ```
 
+`SP_NAME` must be the exact display name of the SP to reuse (default `genierails-deployer`);
+any other existing name is not matched, and apply creates a second SP with a new secret.
 One `TARGET_CATALOG` value applies to all workspace IDs; otherwise its comma-separated
 count must match `WORKSPACE_ID`. `PLAN=1` makes only read-only preflight calls and reports
-the resolved Azure host, authentication, catalog/metastore grant authority, and whether
-model access uses `CAN_QUERY` or Unity Catalog `EXECUTE`.
+the resolved Azure host, authentication, whether the SP is reused or created,
+catalog/metastore grant authority, and whether model access uses `CAN_QUERY` or Unity
+Catalog `EXECUTE`. Its `PLAN NOT CHECKED:` line lists what it did not check (Account Admin,
+tag-policy roles, workspace ADMIN, and whether a reused SP has a secret).
 
 ### Azure Service Principal (for `provision_test_env.py`)
 Required Azure RBAC roles on the resource group:

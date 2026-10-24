@@ -125,6 +125,28 @@ def _plan(cfg: Config, emit: Callable[[str], None]) -> None:
         emit(f"  secret output: write auth.auto.tfvars at {cfg.auth_file} (value not printed)")
 
 
+def _plan_unverified(cfg: Config, existing_sp: Any | None, emit: Callable[[str], None]) -> None:
+    """What PLAN=1 resolved about the SP, and the grants it did not check (apply reports them)."""
+    if existing_sp is None:
+        emit(
+            f"PLAN RESOLVED service principal: none is named {cfg.sp_name!r}, so apply would CREATE "
+            "a new one and mint its secret. If your deployment SP has another display name, "
+            "pass SP_NAME=<that exact name> instead."
+        )
+        secret_unchecked = ""
+    else:
+        emit(
+            f"PLAN RESOLVED service principal: reuse {cfg.sp_name!r} "
+            f"(client_id={_value(existing_sp, 'application_id')})"
+        )
+        secret_unchecked = "" if cfg.rotate_secret else ", whether the reused SP already has a secret"
+    emit(
+        "PLAN NOT CHECKED: Account Admin role, account tag-policy creator and manager roles, "
+        f"workspace ADMIN{secret_unchecked}. Apply grants only what is missing and reports "
+        "each as GRANTED or UNCHANGED."
+    )
+
+
 def _clients(cfg: Config) -> tuple[Any, Callable[[str], Any]]:
     from databricks.sdk import AccountClient, WorkspaceClient
     from databricks.sdk.config import Config as SdkConfig
@@ -824,6 +846,7 @@ def bootstrap(
         cfg, workspaces, emit, existing_sp=existing[0] if existing else None
     )
     if cfg.dry_run:
+        _plan_unverified(cfg, existing[0] if existing else None, emit)
         emit("DRY RUN: read-only preflight passed; no changes were made.")
         return 0
     created = not existing

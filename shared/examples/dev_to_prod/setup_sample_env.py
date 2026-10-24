@@ -432,8 +432,11 @@ def setup(args: argparse.Namespace, client: Any) -> None:
             detail = str(exc)
             if "ALREADY_EXISTS" in detail.upper() or "ALREADY EXISTS" in detail.upper():
                 raise RuntimeError(
-                    f"schema {args.catalog}.{args.schema} already exists but is not tracked as owned by this script; "
-                    f"choose another --schema or restore the ownership state. Databricks said: {detail}"
+                    f"schema {args.catalog}.{args.schema} already exists but is not tracked as owned by this script. "
+                    f"Ownership is recorded per clone in the git-ignored {STATE_FILE}, which has no entry for it. "
+                    f"If a run from another clone created it, copy that clone's {STATE_FILE.name} to {STATE_FILE} "
+                    f"(merge the entries if this one already has a file) and re-run; otherwise choose another --schema. "
+                    f"Databricks said: {detail}"
                 ) from exc
             raise RuntimeError(
                 f"could not create schema {args.catalog}.{args.schema}. Databricks said: {detail}"

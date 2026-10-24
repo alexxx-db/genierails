@@ -396,3 +396,27 @@ def test_legacy_opt_in_delete_failure_reports_incomplete(teardown_env, monkeypat
     remaining = next(iter(json.loads(state_file.read_text()).values()))
     assert remaining["groups_created"] == [name]
     assert remaining["schema_created"] is True  # stopped before the schema step
+
+
+def test_untracked_existing_schema_names_the_per_clone_state_file_to_copy(tmp_path, monkeypatch):
+    """A fresh clone has no ownership state, so a schema an earlier clone created is refused."""
+    state_file = tmp_path / ".dev_to_prod_sample_env.json"
+    monkeypatch.setattr(sample, "STATE_FILE", state_file)
+
+    def run_sql(client, warehouse_id, sql):
+        raise RuntimeError("[SCHEMA_ALREADY_EXISTS] Cannot create schema because it already exists")
+
+    monkeypatch.setattr(sample, "_run_sql", run_sql)
+    client = Mock()
+    client.config.host = "https://workspace"
+    args = Namespace(catalog="cat", schema="dev_to_prod_demo", warehouse_id="wh", rows=1, skip_agent=True)
+
+    with pytest.raises(RuntimeError) as raised:
+        sample.setup(args, client)
+
+    message = str(raised.value)
+    assert "cat.dev_to_prod_demo already exists but is not tracked as owned by this script" in message
+    assert f"recorded per clone in the git-ignored {state_file}" in message
+    assert f"copy that clone's .dev_to_prod_sample_env.json to {state_file}" in message
+    assert "otherwise choose another --schema" in message
+    assert not state_file.exists()

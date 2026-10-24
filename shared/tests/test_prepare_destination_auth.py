@@ -95,6 +95,22 @@ def test_account_host_is_carried_for_azure(tmp_path):
     assert hcl2.loads(path.read_text())["databricks_account_host"] == "https://accounts.azuredatabricks.net"
 
 
+def test_azure_setup_template_with_its_seeded_account_host_is_still_filled(tmp_path):
+    from scripts.auth_tfvars import template_text
+
+    seeded = template_text(SHARED / "auth.auto.tfvars.example", "azure").decode()
+
+    result, path = _run(tmp_path, "--reuse", "1", "--workspace-host", PROD_HOST, "--workspace-id", "222",
+                        dest=seeded)
+
+    assert result.returncode == 0, result.stderr
+    assert "filled" in result.stdout
+    config = hcl2.loads(path.read_text())
+    assert config["databricks_client_secret"] == SECRET
+    assert config["databricks_account_host"] == "https://accounts.azuredatabricks.net"
+    _no_secret(result)
+
+
 @pytest.mark.parametrize("args, message", [
     ((), "needs the destination's databricks_workspace_host: pass WORKSPACE_HOST="),
     (("--workspace-host", PROD_HOST), "needs the destination's databricks_workspace_id: pass WORKSPACE_ID="),
@@ -127,7 +143,7 @@ def test_operator_host_that_contradicts_the_destination_file_is_refused(tmp_path
     _source_auth(secret="prod-secret", host=PROD_HOST),
     TEMPLATE.replace('databricks_client_id     = ""', 'databricks_client_id     = "typed-by-hand"'),
     TEMPLATE.replace('databricks_client_secret = ""', 'databricks_client_secret = "only-secret"'),
-    TEMPLATE + 'databricks_account_host = "https://accounts.azuredatabricks.net"\n',
+    TEMPLATE + 'databricks_account_host = "https://accounts.custom.invalid"\n',
 ], ids=["configured", "client-id-only", "secret-only", "extra-key"])
 def test_configured_destination_is_never_overwritten(tmp_path, dest):
     result, path = _run(tmp_path, "--reuse", "1", "--workspace-host", PROD_HOST, "--workspace-id", "222", dest=dest)
