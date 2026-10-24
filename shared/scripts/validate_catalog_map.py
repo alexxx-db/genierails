@@ -4,8 +4,11 @@
 Extracts source catalogs from env.auto.tfvars (uc_tables) or falls back
 to generated/data_access abac.auto.tfvars (tag_assignments).
 
+A catalog mapped to itself is refused unless the destination env (the
+optional third argument) sets allow_identity_catalog_map = true.
+
 Usage:
-    python validate_catalog_map.py <source_env_dir> <dest_catalog_map>
+    python validate_catalog_map.py <source_env_dir> <dest_catalog_map> [<dest_env_dir>]
 """
 import sys
 import os
@@ -27,11 +30,12 @@ except ImportError:
 
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <source_env_dir> <dest_catalog_map>")
+        print(f"Usage: {sys.argv[0]} <source_env_dir> <dest_catalog_map> [<dest_env_dir>]")
         sys.exit(2)
 
     source_env_dir = sys.argv[1]
     dest_catalog_map = sys.argv[2]
+    dest_env_file = Path(sys.argv[3]) / "env.auto.tfvars" if len(sys.argv) > 3 else None
 
     # Extract catalogs from the effective environment footprint.
     try:
@@ -67,6 +71,19 @@ def main():
         if "=" in pair:
             k, v = pair.split("=", 1)
             pairs[k.strip()] = v.strip()
+
+    # Refused before anything is written; only the destination can opt in.
+    from scripts.saved_settings import _load, identity_catalog_map_error
+
+    try:
+        dest_cfg = _load(dest_env_file) if dest_env_file else {}
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    identity = identity_catalog_map_error(pairs, dest_cfg, "DEST_CATALOG_MAP", dest_env_file)
+    if identity:
+        print(f"ERROR: {identity}")
+        sys.exit(1)
 
     if not src_cats:
         print(

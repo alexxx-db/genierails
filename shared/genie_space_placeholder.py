@@ -7,8 +7,14 @@ Real Genie agent IDs and group names never contain angle brackets, so any
 ``<...>`` value is an unfilled placeholder that would otherwise surface later as
 a confusing API error. Each env file's agents/*.auto.tfvars are checked with it.
 
+It also refuses a catalog_map that maps a catalog to itself unless the env sets
+allow_identity_catalog_map = true (scripts/saved_settings.py, finding S2), so
+every command behind this guard refuses a hand-edited identity map.
+--promotion-destination skips that check: promote-to and promote validate the
+map they are about to write (CATALOG_MAP= may replace the saved one).
+
 Usage:
-    python genie_space_placeholder.py <path/to/env.auto.tfvars> [<more env files>...]
+    python genie_space_placeholder.py [--advice] [--promotion-destination] <path/to/env.auto.tfvars> [<more env files>...]
 """
 
 import os
@@ -134,7 +140,8 @@ def placeholder_error(config: dict, path: Path, *, allow_access_tier_placeholder
 
 def main() -> int:
     advice = "--advice" in sys.argv[1:]
-    paths = [Path(arg) for arg in sys.argv[1:] if arg != "--advice"]
+    destination = "--promotion-destination" in sys.argv[1:]
+    paths = [Path(arg) for arg in sys.argv[1:] if arg not in ("--advice", "--promotion-destination")]
     for path in paths:
         if path.is_file() and len(re.findall(r"(?m)^\s*catalog_map\s*=", path.read_text())) > 1:
             print(f"ERROR: {_display_path(path)}: catalog_map is set twice; keep one", file=sys.stderr)
@@ -143,21 +150,33 @@ def main() -> int:
     for path in paths:
         # An agent's ID is reported first, as when it lived in env.auto.tfvars.
         errors.extend(agent_files_placeholder_errors(path.parent))
-        # Legacy configs have no placeholders. Avoid importing the HCL parser in
-        # bootstrap-only environments unless a placeholder can actually exist.
-        if path.is_file() and ("<" in path.read_text() or ">" in path.read_text()):
-            import hcl2
+        if not path.is_file():
+            continue  # a missing file passes (ENV=account, a destination not created yet)
+        # Every supplied env file is parsed once, so a malformed one is always
+        # reported, --promotion-destination or not.
+        import hcl2
 
-            try:
-                with path.open() as handle:
-                    config = hcl2.load(handle)
-            except Exception:
-                errors.append(_parse_error(path))
-                continue
+        text = path.read_text()
+        try:
+            config = hcl2.loads(text)
+        except Exception:
+            errors.append(_parse_error(path))
+            continue
+        if "<" in text or ">" in text:
             errors.extend(placeholder_errors(
                 config, path,
                 allow_access_tier_placeholders=os.environ.get("GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS") == "1",
             ))
+        # --promotion-destination only drops the identity check: promote-to and
+        # promote validate the map they are about to write.
+        if not destination and re.search(r"(?m)^\s*catalog_map\s*=", text):
+            # Reported with the placeholder problems, after them (S2).
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from scripts.saved_settings import config_identity_catalog_map_error
+
+            error = config_identity_catalog_map_error(config, path)
+            if error:
+                errors.append(error)
     # Every problem at once (each once, though a guard may pass one file twice).
     for error in dict.fromkeys(errors):
         if advice:
