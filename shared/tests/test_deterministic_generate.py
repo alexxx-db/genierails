@@ -913,27 +913,60 @@ def test_fresh_env_agent_without_acl_groups_stops_cleanly(env_dir, monkeypatch, 
     assert not (env_dir / "generated/abac.auto.tfvars").exists()
 
 
-@pytest.mark.parametrize("bad_input", ["deployer", "acl_groups"])
-def test_bad_deterministic_identity_or_acl_stops_before_live_calls(
-    env_dir, monkeypatch, capfd, bad_input
+@pytest.mark.parametrize("mode", ["full", "governance", "genie"])
+@pytest.mark.parametrize("bad_input", ["deployer", "agent_acl"])
+def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
+    env_dir, monkeypatch, capfd, mode, bad_input
 ):
+    import databricks.sdk
+
     env_file = env_dir / "env.auto.tfvars"
     if bad_input == "deployer":
         env_file.write_text(ENV.replace(DEPLOYER, "not-an-application-id"))
         expected = "deployer_principal_id must be a service principal application ID"
     else:
-        env_file.write_text(ENV.replace(f"acl_groups = {json.dumps(TIERS)}", 'acl_groups = "viewers"'))
-        expected = "acl_groups must be a list of non-empty strings"
+        env_file.write_text(
+            ENV.replace(
+                f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
+                "require_acl_groups = true\n",
+            )
+        )
+        agents = env_dir / "agents"
+        agents.mkdir()
+        (agents / "Payments.auto.tfvars").write_text(
+            f'genie_space_id = "{SPACE_ID}"\nuc_tables = {json.dumps(TABLES)}\n'
+        )
+        expected = "agent Payments has no acl_groups — set the groups allowed to run it"
 
-    def live_call(*_args, **_kwargs):
-        pytest.fail("invalid deterministic input reached a live call")
+    live_calls = []
+
+    def live_call(*args, **kwargs):
+        live_calls.append((args, kwargs))
+        return None
 
     monkeypatch.setattr(generate_abac, "list_account_group_names", live_call)
-    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", live_call)
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", live_call)
+    monkeypatch.setattr(socket.socket, "connect", live_call)
+    with pytest.raises(SystemExit) as exc:
+        _generate(env_dir, monkeypatch, "--mode", mode)
+    assert exc.value.code == 1
+    assert expected in capfd.readouterr().out
+    assert live_calls == []
+
+
+def test_deterministic_native_classification_failure_never_suggests_llm_opt_out(
+    env_dir, monkeypatch, capfd
+):
+    def missing_native(*_args, **_kwargs):
+        raise generate_abac.NativeClassificationRequiredError("class.* tags are unavailable")
+
+    monkeypatch.setattr(generate_abac, "_fetch_live_classification_source", missing_native)
     with pytest.raises(SystemExit) as exc:
         _generate(env_dir, monkeypatch)
     assert exc.value.code == 1
-    assert expected in capfd.readouterr().out
+    out = capfd.readouterr().out
+    assert "Deterministic governance requires native class.* tags" in out
+    assert "--allow-llm-sensitivity" not in out
 
 
 def test_opted_in_legacy_env_refuses_until_rebuild_governed_tables(env_dir, monkeypatch, capfd):

@@ -195,7 +195,7 @@ def genie_acl_group_errors(cfg: dict) -> list[str]:
         name = space.get("name") or space.get("genie_space_id") or str(index)
         missing = "acl_groups" not in space or space["acl_groups"] is None
         if require_acls is True and missing:
-            errors.append(f"agent {name} has no acl_groups — list the groups that may run it")
+            errors.append(f"agent {name} has no acl_groups — set the groups allowed to run it")
         if not missing:
             acl_groups = space["acl_groups"]
             if not isinstance(acl_groups, list) or not all(

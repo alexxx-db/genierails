@@ -7284,7 +7284,7 @@ def main():
         from deterministic_governance import genie_acl_group_errors
         early_errors = deployer_identity_errors(auth_cfg) + genie_acl_group_errors(auth_cfg)
         if early_errors:
-            print(f"ERROR: {early_errors[0]} in env.auto.tfvars")
+            print(f"ERROR: {early_errors[0]}")
             sys.exit(1)
     if deterministic_mode and args.mode != "genie" and (args.space or args.tables):
         print("ERROR: deterministic governance derives the whole governed set at once; run "
