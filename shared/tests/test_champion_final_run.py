@@ -793,6 +793,20 @@ def _recipe(makefile: str, target: str) -> str:
     return body[: body.index("\n\n")]
 
 
+def _recipe_with_subtargets(makefile: str, target: str) -> str:
+    """target's recipe plus every private target it runs through $(MAKE), in order."""
+    seen, pending, recipes = set(), [target], []
+    while pending:
+        name = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        recipe = _recipe(makefile, name)
+        recipes.append(recipe)
+        pending += re.findall(r"\$\(MAKE\)[^;|&\n]*?\s(_[\w-]+)", recipe)
+    return "\n".join(recipes)
+
+
 def _logical_makefile_lines(text: str) -> list[str]:
     lines = []
     pending = ""
@@ -945,8 +959,9 @@ def test_no_saved_plan_file_is_written_by_the_product():
     makefile = (SHARED / "Makefile.shared").read_text()
     roots = makefile[makefile.index("\n_release-plan-roots:"):]
     roots = roots[:roots.index("\n\n")]
-    account_plan = makefile[makefile.index("\naccount-plan:"):]
-    account_plan = account_plan[:account_plan.index("\n\n")]
+    # account-plan delegates to _account-plan-locked (and its guards); follow it.
+    account_plan = _recipe_with_subtargets(makefile, "account-plan")
+    assert "_account-plan-locked:" in account_plan
     apply_layer = makefile[makefile.index("\n_apply-layer:"):]
     apply_layer = apply_layer[:apply_layer.index("\n\n")]
     account_apply = apply_layer[apply_layer.index('elif [ "$$layer" = "account" ]; then'):]
@@ -957,6 +972,8 @@ def test_no_saved_plan_file_is_written_by_the_product():
                                          '-out="$$plan_dir/workspace.tfplan");']
     assert re.findall(tf_out, account_plan) == ['-out="$$plan_dir/account.tfplan");']
     assert "account-plan-dir" in account_plan
+    assert '(umask 077; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan");' in account_plan
+    assert 'if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir";' in account_plan
     assert re.findall(tf_out, account_apply) == ['-out="$$account_plan_dir/account.tfplan")']
     assert 'account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"' in account_apply
     assert 'trap \'rm -rf "$$account_plan_dir"\' EXIT' in account_apply
@@ -978,6 +995,36 @@ def test_saved_plan_check_flags_terraform_out_but_not_a_script_out(monkeypatch, 
         with pytest.raises(AssertionError):
             test_no_saved_plan_file_is_written_by_the_product()
     else:
+        test_no_saved_plan_file_is_written_by_the_product()
+
+
+_ACCOUNT_PLAN_OUT = '-out="$$plan_dir/account.tfplan"); status=$$?; set -e; \\\n'
+
+
+@pytest.mark.parametrize("old, new", [
+    # A second saved plan hidden in the locked sub-target account-plan delegates to.
+    (_ACCOUNT_PLAN_OUT,
+     _ACCOUNT_PLAN_OUT + '\t"$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -out="$$plan_dir/stray.tfplan"; \\\n'),
+    # The account plan is no longer owner-only from creation.
+    ('set +e; (umask 077; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan', 'set +e; ("$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan'),
+    # A failed account plan leaves its saved plan behind.
+    ('if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir"; echo "account-plan: planning failed',
+     'if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "account-plan: planning failed'),
+    # The account apply no longer checks its temporary plan for tag-policy deletions.
+    ('$(_RELEASE_GATE) tag-policy-delete-guard --env-dir "$$env_dir" --env "$$target_env" '
+     '--show-json "$$account_plan_dir/account.json";', 'true;'),
+    # The account apply's temporary plan is no longer removed on exit.
+    ('trap \'rm -rf "$$account_plan_dir"\' EXIT', 'trap \'true\' EXIT'),
+])
+def test_saved_plan_check_flags_account_plan_breaks(monkeypatch, tmp_path, old, new):
+    makefile = (SHARED / "Makefile.shared").read_text()
+    assert makefile.count(old) == 1
+    layer = tmp_path / "scripts/terraform_layer.sh"
+    layer.parent.mkdir()
+    layer.write_text((SHARED / "scripts/terraform_layer.sh").read_text())
+    (tmp_path / "Makefile.shared").write_text(makefile.replace(old, new))
+    monkeypatch.setattr(sys.modules[__name__], "SHARED", tmp_path)
+    with pytest.raises(AssertionError):
         test_no_saved_plan_file_is_written_by_the_product()
 
 
