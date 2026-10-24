@@ -725,6 +725,12 @@ variable "catalog_map" {
   description = "make promote-to input only (saved in the destination env): source-to-target catalog renames. Declared so env.auto.tfvars loads cleanly; no resource reads it."
 }
 
+variable "allow_identity_catalog_map" {
+  type        = bool
+  default     = false
+  description = "make promote-to input only (in the destination env): true lets catalog_map map a catalog to itself, for envs on separate metastores. Declared so env.auto.tfvars loads cleanly; no resource reads it."
+}
+
 variable "manage_groups" {
   type    = bool
   default = false

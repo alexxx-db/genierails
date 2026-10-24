@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import environment_lock
 from scripts import release_gate as rg
 from scripts import sticky_governance
 from tests import script_stubs
@@ -36,7 +37,7 @@ with open({log!r}, "a") as log:
     log.write(json.dumps(args) + "\n")
 if {fail!r} and {fail!r} in args:
     sys.exit(1)
-if set(args) & set({passthrough!r}):
+if set(args) & (set({passthrough!r}) | {{"_account-plan-locked"}}):
     # Run the real recipe (its own recursive makes come back to this stub via MAKEFLAGS).
     os.execvp("make", ["make", *args])
 if "_release-plan-roots" in args:
@@ -280,6 +281,29 @@ def test_account_plan_writes_an_immutable_manifest_from_clean_origin_main(make, 
     assert not (manifest.parent / "account.show.json").exists()
 
 
+def test_plain_account_plan_locks_the_account_env(make, repo):
+    result = make("account-plan", "dev")  # the public command's default workspace env
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "environment lock acquired (account, account-plan)" in result.stdout
+    assert "environment lock acquired (dev, account-plan)" not in result.stdout
+
+
+def test_account_plan_refuses_under_apply_account_lock_and_keeps_pending_plan(make, repo):
+    manifest = _account_planned(make)
+    plan = manifest.parent / "account.tfplan"
+    account = repo.cloud / "envs" / "account"
+    ok, message, _nonce = environment_lock.acquire(account, os.getpid(), "apply-account")
+    assert ok, message
+    try:
+        result = make("account-plan", "dev")
+    finally:
+        environment_lock.release_lock(account, os.getpid())
+    assert result.returncode != 0
+    assert "account is locked" in result.stderr and "held by make apply-account" in result.stderr
+    assert plan.is_file()
+    assert not [call for call in make.calls() if call[:4] == ["runner", "account", "account", "plan"]]
+
+
 def test_real_layer_runner_keeps_account_plan_show_json_clean(tmp_path, repo):
     """The real wrapper's diagnostics must not corrupt account-plan's JSON input."""
     secret = "regression-client-secret-must-not-persist"
@@ -493,13 +517,49 @@ def test_apply_account_pins_the_setup_layout_symlinked_auth_endpoint(tmp_path, r
     assert not rg.account_receipts(repo.cloud, "account")
 
 
-def test_apply_account_refuses_several_default_manifests_and_lists_ids(make, repo):
+def test_apply_account_selects_the_newest_manifest_after_the_older_plan_was_dropped(make, repo):
     first = _account_planned(make)
     second = _account_planned(make)
-    result = make("apply-account", "account")
+    assert rg.select_account_manifest(repo.cloud / "envs" / "account", "account") == second
+    assert not (first.parent / "account.tfplan").exists()
+
+
+def test_apply_account_explicitly_refuses_a_superseded_account_manifest(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    first = _account_planned(make)
+    second = _account_planned(make)
+    result = make("apply-account", "account", f"MANIFEST={first}")
     assert result.returncode != 0
-    assert "multiple unreceipted account manifests" in result.stderr
-    assert first.parent.name in result.stderr and second.parent.name in result.stderr
+    assert f"superseded by a newer account-plan ({second})" in result.stderr
+    assert "changed or is missing" not in result.stderr
+
+
+def test_apply_account_refuses_superseded_manifest_when_failed_delete_kept_its_plan(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    first = _account_planned(make)
+    old_plan = first.parent / "account.tfplan"
+    os.chmod(first.parent, 0o500)
+    try:
+        second_result = make("account-plan", "account")
+    finally:
+        os.chmod(first.parent, 0o700)
+    assert second_result.returncode == 0, second_result.stdout + second_result.stderr
+    second = Path(next(line.split(":", 1)[1].strip() for line in second_result.stdout.splitlines()
+                       if "Manifest (immutable):" in line))
+    assert old_plan.is_file() and "contains credentials" in second_result.stderr
+
+    make.reset()
+    ambiguous = make("apply-account", "account")
+    assert ambiguous.returncode != 0
+    assert "multiple unreceipted account manifests" in ambiguous.stderr
+    assert first.parent.name in ambiguous.stderr and second.parent.name in ambiguous.stderr
+
+    make.reset()
+    explicit = make("apply-account", "account", f"MANIFEST={first}")
+    assert explicit.returncode != 0
+    assert f"superseded by a newer account-plan ({second})" in explicit.stderr
+    assert not rg.account_receipts(repo.cloud, "account")
+    assert not [call for call in make.calls() if call[:4] == ["runner", "account", "account", "apply-plan"]]
 
 
 def test_account_bootstrap_targets_do_not_use_the_account_manifest_flow():

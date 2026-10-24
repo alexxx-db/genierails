@@ -132,6 +132,7 @@ catalog_map = { "dev_finance" = "prod_finance" }   # dev catalog = prod catalog
 sql_warehouse_id = "<existing-prod-warehouse-id>"   # or "" to create a new serverless warehouse
 group_map   = { "payments_ops" = "prod_payments_ops" }   # dev group = prod group, only where they differ
 ```
+Each `catalog_map` entry must name a distinct prod catalog. `"dev_finance" = "dev_finance"` is refused before anything is written: on a shared metastore prod's state would adopt dev's masks, and a later dev retire would drop prod's. If dev and prod use separate metastores and keep the same catalog names, add `allow_identity_catalog_map = true` to `envs/prod/env.auto.tfvars`.
 Leave the `access_tier_groups` placeholders: `promote-to` writes prod's tiers from dev's (and seeds `table_readers` and agent `acl_groups`), through `group_map`.
 If existing prod tiers cannot be traced to dev's mapped tiers, promotion refuses
 before writing and prints the missing `group_map` entry to add.
