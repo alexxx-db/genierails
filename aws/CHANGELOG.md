@@ -108,10 +108,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   method", `DATABRICKS_AUTH_TYPE=pat` sent the operator's token instead of the
   service principal's, and a `DATABRICKS_HOST` filled a host the env left
   empty, sending the SP's credentials to that workspace.
-  `scripts/terraform_layer.sh` now runs Terraform (and so its provisioners)
-  with those variables unset and `DATABRICKS_CONFIG_FILE=/dev/null`. Kept: the
-  pipelines' `DATABRICKS_AUTH_TYPE=github-oidc` or `azure-devops-oidc`, and
-  the `ARM_*` identity an `azurerm` remote-state backend reads state with.
+  `scripts/terraform_layer.sh` and `test.sh` now run Terraform (and so its
+  provisioners) with those variables unset and `DATABRICKS_CONFIG_FILE=/dev/null`
+  (one implementation, `scripts/terraform_env.sh`). Kept: the pipelines'
+  `DATABRICKS_AUTH_TYPE=github-oidc` only in a GitHub Actions job
+  (`GITHUB_ACTIONS=true`) and `azure-devops-oidc` only in an Azure Pipelines job
+  (`TF_BUILD=True`), with the job's OIDC token variables
+  (`ACTIONS_ID_TOKEN_REQUEST_*`, `SYSTEM_ACCESSTOKEN` and the `SYSTEM_*` it
+  needs), which a local shell no longer passes on; and the `ARM_*` identity an
+  `azurerm` remote-state backend reads state with.
 - **An agent in `agents/` gets only an empty placeholder in `generated/`**
   (#225): its `genie_space_configs` entry in `generated/abac.auto.tfvars` is
   `{}` whether or not it was captured, and Terraform pushes nothing for an

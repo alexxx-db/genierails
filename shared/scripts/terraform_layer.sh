@@ -179,29 +179,14 @@ else
   INIT_CMD+=(-backend-config="path=$STATE_BASE/terraform.tfstate")
 fi
 
-# The provider, and the provisioners Terraform runs, authenticate only from the
-# env's auth.auto.tfvars. Shell auth would add a second method (a stray
-# DATABRICKS_TOKEN or ARM_CLIENT_SECRET fails "more than one authorization
-# method"), pick another identity (DATABRICKS_AUTH_TYPE=pat), or fill a host
-# the env leaves empty (a DATABRICKS_HOST gets the SP's credentials), so none
-# of it reaches Terraform, nor does ~/.databrickscfg. Kept: the user agent,
-# the pipelines' OIDC auth type (shared/docs/pipelines.md: an IDs-only auth
-# file) and, for an azurerm backend, the ARM_* identity it reads its state with.
-AZURERM_BACKEND=0
+# Only the env's auth.auto.tfvars authenticates Terraform (scripts/terraform_env.sh).
+AZURERM_BACKEND=
 for arg in ${REMOTE_BACKEND_ARGS[@]+"${REMOTE_BACKEND_ARGS[@]}"}; do
-  case "$arg" in -backend-config=storage_account_name=*) AZURERM_BACKEND=1 ;; esac
+  case "$arg" in -backend-config=storage_account_name=*) AZURERM_BACKEND=azurerm ;; esac
 done
-for name in ${!DATABRICKS_@} ${!ARM_@}; do
-  case "$name" in
-    DATABRICKS_USER_AGENT_EXTRA) ;;
-    DATABRICKS_AUTH_TYPE)
-      case "$DATABRICKS_AUTH_TYPE" in github-oidc|azure-devops-oidc) ;; *) unset "$name" ;; esac
-      ;;
-    ARM_*) [ "$AZURERM_BACKEND" = 1 ] || unset "$name" ;;
-    *) unset "$name" ;;
-  esac
-done
-export DATABRICKS_CONFIG_FILE=/dev/null
+# shellcheck source=terraform_env.sh
+. "$SCRIPT_DIR/terraform_env.sh"
+genierails_terraform_env "$AZURERM_BACKEND"
 WRITABLE_INIT_CMD=("${INIT_CMD[@]}")
 if [ -f .terraform.lock.hcl ]; then
   INIT_CMD+=(-lockfile=readonly)
