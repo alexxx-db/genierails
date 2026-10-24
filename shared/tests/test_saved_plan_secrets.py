@@ -461,3 +461,20 @@ def test_superseded_plan_delete_failure_warns_and_does_not_fail(tmp_path, repo, 
     warning = capsys.readouterr().err
     assert str(old_plan) in warning and "contains credentials" in warning and "delete it by hand" in warning
     assert "detail must not be printed" not in warning and old_plan.is_file()
+
+
+def test_malformed_old_manifest_cleanup_warns_path_only_and_account_plan_succeeds(tmp_path, repo):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    assert first.returncode == 0, first.stdout + first.stderr
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    malformed = json.loads(older.read_text())
+    malformed["plan"] = "malformed-secret-marker"
+    os.chmod(older, 0o600)
+    older.write_text(json.dumps(malformed))
+    os.chmod(older, 0o400)
+
+    second = make("account-plan", "account")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert f"superseded saved-plan cleanup failed for {older}" in second.stderr
+    assert "malformed-secret-marker" not in second.stdout + second.stderr

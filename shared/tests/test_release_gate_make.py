@@ -532,6 +532,34 @@ def test_apply_account_explicitly_refuses_a_superseded_account_manifest(tmp_path
     assert "changed or is missing" not in result.stderr
 
 
+def test_apply_account_refuses_superseded_manifest_when_failed_delete_kept_its_plan(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    first = _account_planned(make)
+    old_plan = first.parent / "account.tfplan"
+    os.chmod(first.parent, 0o500)
+    try:
+        second_result = make("account-plan", "account")
+    finally:
+        os.chmod(first.parent, 0o700)
+    assert second_result.returncode == 0, second_result.stdout + second_result.stderr
+    second = Path(next(line.split(":", 1)[1].strip() for line in second_result.stdout.splitlines()
+                       if "Manifest (immutable):" in line))
+    assert old_plan.is_file() and "contains credentials" in second_result.stderr
+
+    make.reset()
+    ambiguous = make("apply-account", "account")
+    assert ambiguous.returncode != 0
+    assert "multiple unreceipted account manifests" in ambiguous.stderr
+    assert first.parent.name in ambiguous.stderr and second.parent.name in ambiguous.stderr
+
+    make.reset()
+    explicit = make("apply-account", "account", f"MANIFEST={first}")
+    assert explicit.returncode != 0
+    assert f"superseded by a newer account-plan ({second})" in explicit.stderr
+    assert not rg.account_receipts(repo.cloud, "account")
+    assert not [call for call in make.calls() if call[:4] == ["runner", "account", "account", "apply-plan"]]
+
+
 def test_account_bootstrap_targets_do_not_use_the_account_manifest_flow():
     text = (ROOT / "shared" / "Makefile.shared").read_text()
     bootstrap = text[text.index("\nbootstrap-sp:"):text.index("\n# Set up the Databricks side")]

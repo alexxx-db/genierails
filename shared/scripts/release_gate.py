@@ -1451,12 +1451,14 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
                      f"{(manifest.get('state_serial') or {}).get('serial')} -> {(serial or {}).get('serial')})")
     entry = manifest.get("plan") or {}
     newer = newer_account_manifest(cloud_dir_of(env_dir), env, manifest)
+    if newer:
+        drift.append(f"the manifest was superseded by a newer account-plan ({newer})")
     if entry.get("file") != "account.tfplan":
         drift.append(f"the manifest's account plan is {entry.get('file')!r}, not account.tfplan")
     else:
         path = plan_dir / entry["file"]
         if not path.is_file() and newer:
-            drift.append(f"the manifest was superseded by a newer account-plan ({newer})")
+            pass  # expected cleanup; the superseded refusal above is clearer
         elif not path.is_file() or sha256_file(path) != entry.get("sha256"):
             drift.append(f"the saved account plan {path} changed or is missing")
     current_inputs = account_input_hashes(env_dir)
