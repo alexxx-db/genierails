@@ -919,8 +919,9 @@ def test_fresh_env_agent_without_acl_groups_stops_cleanly(env_dir, monkeypatch, 
     "bad_input",
     [
         "deployer", "inline_acl", "agent_acl", "inline_prefix_collision",
-        "agent_prefix_collision", "require_nonbool_agents_only",
-        "nondict_inline_then_bad_agent",
+            "agent_prefix_collision", "require_nonbool_agents_only",
+            "nondict_inline_then_bad_agent", "nondict_only_no_agents",
+            "valid_then_nondict_no_agents",
     ],
 )
 def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
@@ -994,7 +995,7 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
         )
         expected = "require_acl_groups must be a boolean"
         expected_file = "env.auto.tfvars"
-    else:
+    elif bad_input == "nondict_inline_then_bad_agent":
         env_file.write_text(
             ENV.replace(
                 f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
@@ -1008,6 +1009,21 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
         )
         expected = "agent Payments acl_groups must not contain duplicates"
         expected_file = "agents/pay.auto.tfvars"
+    else:
+        spaces = (
+            '["junk"]'
+            if bad_input == "nondict_only_no_agents"
+            else '[{ name = "Valid", acl_groups = ["a"] }, "junk"]'
+        )
+        env_file.write_text(
+            ENV.replace(
+                f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
+                f"genie_spaces = {spaces}\n",
+            )
+        )
+        bad_index = 0 if bad_input == "nondict_only_no_agents" else 1
+        expected = f"genie_spaces[{bad_index}] must be an object"
+        expected_file = "env.auto.tfvars"
 
     live_calls = []
 

@@ -7300,8 +7300,11 @@ def main():
             agents = [agent for agent in load_all(auth_file.parent) if not agent["delete"]]
             with (auth_file.parent / "env.auto.tfvars").open() as handle:
                 raw_inline = hcl2.load(handle).get("genie_spaces") or []
+            # with_agents leaves the raw list untouched when there are no
+            # agent files. With agent files, merged_config drops non-dict
+            # inline entries before appending agents. Mirror that exact list.
             inline = (
-                [space for space in raw_inline if isinstance(space, dict)]
+                ([space for space in raw_inline if isinstance(space, dict)] if agents else raw_inline)
                 if isinstance(raw_inline, list) else []
             )
             global_errors = genie_acl_group_errors({
@@ -7318,8 +7321,9 @@ def main():
                     if not entry_errors:
                         continue
                     if index >= len(inline):
-                        agent = agents[index - len(inline)]
-                        source = f"agents/{agent['name']}.auto.tfvars"
+                        agent_index = index - len(inline)
+                        if agent_index < len(agents):
+                            source = f"agents/{agents[agent_index]['name']}.auto.tfvars"
                     break
             print(f"ERROR: {error} in {source}")
             sys.exit(1)
