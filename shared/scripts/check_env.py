@@ -258,7 +258,7 @@ class Scratch:
         return subprocess.run(command, env=env).returncode
 
     def add_credentials(self, env_name: str) -> None:
-        """Copy the env's and account's auth files in for the plan step only."""
+        """Copy the env's and account's auth files into the throwaway copy."""
         for rel in (Path(env_name) / "auth.auto.tfvars",
                     Path(env_name) / "data_access" / "auth.auto.tfvars",
                     Path("account") / "auth.auto.tfvars"):
@@ -344,17 +344,19 @@ def _check(args) -> None:
     promotes = env_role(real_env_dir) == PROMOTED
     has_generated = (real_env_dir / "generated" / "abac.auto.tfvars").is_file()
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
-    # Validators run throughout the check, not only in the final plan. Give
-    # every scratch step the real runtime auth values so an empty-secret
-    # warning describes the caller's config. The files remain inside the
-    # private throwaway copy and are never included in comparisons.
-    scratch.add_credentials(env)
     steps = 6
 
     def step(number: int, title: str) -> None:
         print(f"\n--- check {number}/{steps}: {title} ---")
 
     try:
+        # Validators run throughout the check, not only in the final plan. Give
+        # every scratch step the real runtime auth values so an empty-secret
+        # warning describes the caller's config. The files remain inside the
+        # private throwaway copy and are never included in comparisons. Copied
+        # inside the try: a copy that fails partway still leaves no secret in
+        # the scratch directory.
+        scratch.add_credentials(env)
         step(1, "validate")
         if not has_generated and not (scratch.envs / env / "abac.auto.tfvars").is_file():
             print(f"  NOTE: skipped: envs/{env} has not been generated; run make generate ENV={env}.")

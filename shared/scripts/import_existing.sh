@@ -176,7 +176,9 @@ run_import() {
   fi
   if [ "$import_rc" -eq 0 ]; then
     echo "  ✓ Imported $address"
-  elif echo "$import_out" | grep -q "Resource already managed by Terraform"; then
+  # A here-string, not `echo | grep -q`: on a large import error grep -q exits
+  # at the first match, echo gets SIGPIPE, and pipefail reported a failure.
+  elif grep -qF "Resource already managed by Terraform" <<<"$import_out"; then
     # A previous retry already imported this resource — treat as success.
     echo "  ↩ Already managed: $address (skipping)"
   else

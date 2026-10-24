@@ -594,6 +594,51 @@ def test_an_opt_in_removal_the_sync_must_not_make_is_refused(tmp_path, value, wh
     assert repo.wrote() == []
 
 
+def _terraform_sees_no_changes(repo):
+    """The tag policies ignore their values, so a values-only plan exits 0 with no resource changes."""
+    no_changes = RUNNER.replace('[ "$wrote_plan" = 1 ] && exit 2 || exit 0', "exit 0")
+    assert no_changes != RUNNER
+    repo.runner.write_text(no_changes)
+    (repo.tmp / "show.json").write_text('{"resource_changes":[]}\n')
+
+
+@pytest.mark.parametrize("removal, live_after", [
+    ((), ["email_partial__string__0a1b2c3d", "new_value", "retired_by_hand"]),
+    (("ALLOW_TAG_VALUE_REMOVAL=gr_treatment:retired_by_hand", "WAREHOUSE_ID=wh"),
+     ["email_partial__string__0a1b2c3d", "new_value"]),
+], ids=["addition", "addition-and-named-removal"])
+def test_a_tag_values_only_manifest_without_terraform_changes_stays_applicable(tmp_path, removal, live_after):
+    repo = Repo(tmp_path, LIVE)
+    _terraform_sees_no_changes(repo)
+    manifest = Path(repo.account_manifest(*removal))
+    data = json.loads(manifest.read_text())
+    assert data["plan"]["changes"] is False
+    assert data["plan"]["file"] == "account.tfplan"
+    assert (manifest.parent / "account.tfplan").is_file()
+
+    # Selected without MANIFEST=, like any manifest that changes something.
+    result = repo.make("apply-account", "account")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert repo.live()["gr_treatment"] == live_after
+
+
+def test_only_a_manifest_with_no_terraform_or_tag_changes_is_a_noop(tmp_path):
+    repo = Repo(tmp_path, {"gr_treatment": ["email_partial__string__0a1b2c3d", "new_value"]})
+    _terraform_sees_no_changes(repo)
+    manifest = Path(repo.account_manifest())
+    data = json.loads(manifest.read_text())
+    assert data["plan"] == {"changes": False, "summary": data["plan"]["summary"]}
+    assert not (manifest.parent / "account.tfplan").exists()
+
+    selected = repo.make("apply-account", "account")
+    assert selected.returncode != 0
+    assert "a manifest that changes nothing is never selected" in selected.stderr
+    named = repo.make("apply-account", "account", f"MANIFEST={manifest}")
+    assert named.returncode != 0
+    assert "records no account changes" in named.stderr
+    assert repo.applies() == [] and repo.wrote() == []
+
+
 def test_apply_account_refuses_if_untracked_account_input_changed_after_plan(tmp_path):
     live = {"gr_treatment": ["email_partial__string__0a1b2c3d", "new_value", "keep_me"]}
     repo = Repo(tmp_path, live)

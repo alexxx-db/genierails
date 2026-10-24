@@ -759,3 +759,28 @@ def test_check_secret_warnings_reflect_the_real_auth_file(repo, tmp_path, secret
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert ("'databricks_client_secret' is empty" in out) is warns
+
+
+def test_check_removes_the_scratch_copy_when_copying_credentials_fails(repo, tmp_path, monkeypatch):
+    secret = "scratch-secret-value"
+    for env_name in ("dev", "account"):
+        (_envs(repo) / env_name / "auth.auto.tfvars").write_text(f'databricks_client_secret = "{secret}"\n')
+    scratch_tmp = tmp_path / "scratch-tmp"
+    scratch_tmp.mkdir()
+    monkeypatch.setattr(check_env.tempfile, "tempdir", str(scratch_tmp))
+    copyfile = check_env.shutil.copyfile
+
+    def failing_copyfile(source, dest, *args, **kwargs):
+        # The env's auth file is already copied in when the account's fails.
+        if Path(dest).parts[-2:] == ("account", "auth.auto.tfvars"):
+            raise OSError("disk full")
+        return copyfile(source, dest, *args, **kwargs)
+
+    monkeypatch.setattr(check_env.shutil, "copyfile", failing_copyfile)
+    args = check_env.argparse.Namespace(env="dev", cloud_dir=repo / "aws", makefile=repo / "aws" / "Makefile",
+                                        make="make")
+
+    with pytest.raises(OSError, match="disk full"):
+        check_env._check(args)
+
+    assert list(scratch_tmp.iterdir()) == []
