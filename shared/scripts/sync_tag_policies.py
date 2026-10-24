@@ -52,13 +52,16 @@ import sys
 import time
 from pathlib import Path
 
+SHARED = Path(__file__).resolve().parents[1]
+if str(SHARED) not in sys.path:
+    sys.path.insert(0, str(SHARED))
+
 WORK_DIR = Path.cwd()
 TAG_POLICY_UPDATE_ATTEMPTS = 3
 
 
 def retained_deterministic_values(key: str, current_values: set[str]) -> set[str]:
     """Live deterministic gr_treatment values (``<treatment>__<type>__<gen>``)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from governance_policies import TAG_KEY, parse_treatment_value
 
     if key != TAG_KEY and not key.startswith(TAG_KEY + "_"):
@@ -344,7 +347,6 @@ def check_usage(w, warehouse_id, removals):
     """
     if not warehouse_id:
         raise Refusal("no SQL warehouse to read system.information_schema; set WAREHOUSE_ID=<id>")
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from scripts.audit_schema_drift import _run_sql
 
     keys = sorted({k for k, _ in removals})

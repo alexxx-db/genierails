@@ -32,7 +32,11 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SHARED = Path(__file__).resolve().parents[1]
+for _path in (SHARED, SHARED / "scripts"):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
 from state_layout import record_path, state_json  # noqa: E402
 
 LEGACY_TYPE = "null_resource"
