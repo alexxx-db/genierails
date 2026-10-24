@@ -1374,6 +1374,7 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     for path in plan_dir.rglob("*"):
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)
+    drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
 
 
@@ -1409,15 +1410,32 @@ def account_manifest_paths(cloud_dir: Path, env: str = ACCOUNT_ENV) -> list[Path
     return sorted(manifests_dir(cloud_dir, env).glob("*/manifest.json"))
 
 
+def newer_account_manifest(cloud_dir: Path, env: str, manifest: Mapping) -> Path | None:
+    """Newest unreceipted account manifest written after ``manifest``, if any."""
+    older_key = (str(manifest.get("created_at") or ""), str(manifest.get("id") or ""))
+    newer = []
+    for path in account_manifest_paths(cloud_dir, env):
+        candidate = _read_json(path)
+        if (candidate and candidate.get("kind") == "account-manifest" and candidate.get("version") == VERSION
+                and candidate.get("env") == env
+                and (str(candidate.get("created_at") or ""), str(candidate.get("id") or "")) > older_key
+                and not account_manifest_used(cloud_dir, env, str(candidate.get("id") or ""))):
+            newer.append(path)
+    return newer[-1] if newer else None
+
+
 def select_account_manifest(env_dir: Path, env: str) -> Path:
     status = checkout_status(env_dir)
     cloud_dir = cloud_dir_of(env_dir)
     candidates = []
     for path in account_manifest_paths(cloud_dir, env):
         manifest = _read_json(path)
+        entry = (manifest or {}).get("plan") or {}
+        plan = path.parent / str(entry.get("file") or "")
         if (manifest and manifest.get("kind") == "account-manifest" and manifest.get("version") == VERSION
                 and manifest.get("env") == env and manifest.get("commit") == status["commit"]
                 and not account_manifest_noop(manifest)
+                and entry.get("file") == "account.tfplan" and plan.is_file()
                 and not account_manifest_used(cloud_dir, env, str(manifest.get("id") or ""))):
             candidates.append((path, manifest))
     if len(candidates) != 1:
@@ -1453,6 +1471,10 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         drift.append(f"the account state changed since account-plan (serial "
                      f"{(manifest.get('state_serial') or {}).get('serial')} -> {(serial or {}).get('serial')})")
     entry = manifest.get("plan") or {}
+    # A newer no-op manifest supersedes too: account-plan is the latest word on the account.
+    newer = newer_account_manifest(cloud_dir_of(env_dir), env, manifest)
+    if newer:
+        drift.append(f"the manifest was superseded by a newer account-plan ({newer})")
     if account_manifest_noop(manifest):
         drift.append("the manifest records no account changes (no Terraform changes and no tag values to "
                      "add or remove), so it kept no saved plan and has nothing to apply")
@@ -1460,7 +1482,9 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         drift.append(f"the manifest's account plan is {entry.get('file')!r}, not account.tfplan")
     else:
         path = plan_dir / entry["file"]
-        if not path.is_file() or sha256_file(path) != entry.get("sha256"):
+        if path.is_file() and sha256_file(path) != entry.get("sha256"):
+            drift.append(f"the saved account plan {path} changed or is missing")
+        elif not path.is_file() and not newer:
             drift.append(f"the saved account plan {path} changed or is missing")
     current_inputs = account_input_hashes(env_dir)
     if current_inputs != manifest.get("inputs"):
@@ -1618,6 +1642,7 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)  # the manifest dir appears complete or not at all
     _set_current(cloud_dir_of(env_dir), env, manifest_id, created)  # supersedes the previous manifest
+    drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
 
 
@@ -1654,8 +1679,13 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
     # A released manifest's saved plans were deleted after its receipt (drop_saved_plans):
     # check_releasable below reports it as released, not as missing its plans.
     released = released_by(cloud_dir_of(env_dir), env, manifest["id"])
+    current = current_manifest_id(cloud_dir_of(env_dir), env)
+    superseded = current is not None and current != manifest["id"]
     for root, path, digest in _saved_plans(manifest_path, manifest):
-        if released and not path.exists():
+        # Successful releases and newer manifests deliberately remove these.
+        # Preserve the stronger released/superseded refusal below rather than
+        # misreporting the expected cleanup as drift.
+        if (released or superseded) and not path.exists():
             continue
         if not path.is_file() or sha256_file(path) != digest:
             drift.append(f"the saved {root} plan {path} changed or is missing")
@@ -1696,6 +1726,60 @@ def _saved_plans(manifest_path: Path, manifest: Mapping) -> list[tuple[str, Path
              for root in ("account", "workspace") if manifest["plans"][root].get("file")]
     return plans + [("data_access", plan_dir / "data_access" / step["file"], step.get("sha256"))
                     for step in manifest["plans"]["data_access"].get("steps") or [] if step.get("file")]
+
+
+def drop_superseded_saved_plans(env_dir: Path, env: str, current_path: Path) -> list[Path]:
+    """Delete only the credential-bearing plans superseded by ``current_path``.
+
+    The caller has completed the new immutable manifest and holds the env lock,
+    so an older unreceipted manifest cannot be entering apply concurrently.
+    Manifests and all non-plan audit records remain append-only.
+    """
+    env_dir, current_path = Path(env_dir), Path(current_path)
+    left = []
+    try:
+        current = _read_json(current_path) or {}
+        kind = current.get("kind")
+        current_key = (str(current.get("created_at") or ""), str(current.get("id") or ""))
+        cloud_dir = cloud_dir_of(env_dir)
+        for manifest_path in sorted(manifests_dir(cloud_dir, env).glob("*/manifest.json")):
+            try:
+                if manifest_path == current_path:
+                    continue
+                manifest = _read_json(manifest_path)
+                if not manifest or manifest.get("kind") != kind or manifest.get("env") != env:
+                    continue
+                # A cleanup may only move backward in manifest time. The env
+                # lock serializes writers, but this guard also protects a
+                # restored/copied future manifest from being treated as old.
+                manifest_key = (str(manifest.get("created_at") or ""), str(manifest.get("id") or ""))
+                if manifest_key >= current_key:
+                    continue
+                manifest_id = str(manifest.get("id") or "")
+                if kind == "release-manifest":
+                    if released_by(cloud_dir, env, manifest_id):
+                        continue
+                    paths = [path for _, path, _ in _saved_plans(manifest_path, manifest)]
+                elif kind == "account-manifest":
+                    if account_manifest_used(cloud_dir, env, manifest_id):
+                        continue
+                    entry = manifest.get("plan") or {}
+                    paths = [manifest_path.parent / entry["file"]] if entry.get("file") else []
+                else:
+                    continue
+                for path in paths:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        print(f"WARNING: superseded saved plan {path} contains credentials and could not be "
+                              "deleted; delete it by hand.", file=sys.stderr)
+                        left.append(path)
+            except Exception:
+                print(f"WARNING: superseded saved-plan cleanup failed for {manifest_path}", file=sys.stderr)
+                continue
+    except Exception:
+        print(f"WARNING: superseded saved-plan cleanup failed for {current_path}", file=sys.stderr)
+    return left
 
 
 def drop_saved_plans(env_dir: Path, env: str, manifest_path: Path) -> list[Path]:

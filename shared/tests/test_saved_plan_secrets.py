@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,34 @@ def test_a_release_deletes_its_saved_plans_after_the_receipt(make, repo):
     assert result.returncode != 0 and "was already released" in result.stderr
     assert "changed or is missing" not in result.stderr
     assert not [c for c in make.calls() if c[0] in ("staged", "runner")]
+
+
+def test_a_new_release_plan_deletes_only_the_superseded_plans_and_keeps_audit_records(make, repo):
+    older = _planned(make)
+    old_plans = _with_secret(older)
+    receipt = older.parent / "approval-receipt.json"
+    os.chmod(older.parent, 0o700)
+    receipt.write_text('{"approved": true}\n')
+    os.chmod(receipt, 0o400)
+    time.sleep(1.1)  # release manifest ids have one-second resolution
+
+    result = make("release-plan", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    current = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    current_plans = _plans(current)
+
+    assert not [path for path in old_plans if path.exists()]
+    assert current_plans and all(path.is_file() for path in current_plans)
+    assert older.is_file() and receipt.read_text() == '{"approved": true}\n'
+    assert json.loads(older.read_text())["plans"]["workspace"]["sha256"]
+    assert not _secret_files(repo)
+
+    make.reset()
+    refused = make("_release-manifest", "prod", f"MANIFEST={older}")
+    assert refused.returncode != 0
+    assert "was superseded by a newer make release-plan" in refused.stderr
+    assert "changed or is missing" not in refused.stderr
+    assert not [call for call in make.calls() if call[0] in ("staged", "runner")]
 
 
 @pytest.mark.parametrize("kind", ["staged-phase", "imports"])
@@ -419,3 +448,90 @@ def test_a_noop_account_plan_records_the_result_without_keeping_its_saved_plan(t
     apply_result = make("apply-account", "account")
     assert apply_result.returncode != 0
     assert "no unreceipted account manifest" in apply_result.stderr
+
+
+def test_a_new_account_plan_deletes_the_older_unapplied_plan_but_keeps_its_manifest(tmp_path, repo):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    assert first.returncode == 0, first.stdout + first.stderr
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    old_plan = older.parent / "account.tfplan"
+    assert old_plan.is_file()
+
+    second = make("account-plan", "account")
+    assert second.returncode == 0, second.stdout + second.stderr
+    current = Path(second.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+
+    assert current != older and (current.parent / "account.tfplan").is_file()
+    assert older.is_file() and not old_plan.exists()
+    assert json.loads(older.read_text())["plan"]["sha256"]
+
+    # Cleanup is strictly backward: treating the older manifest as current
+    # must never delete the newer plan.
+    rg.drop_superseded_saved_plans(repo.cloud / "envs" / "account", "account", older)
+    assert (current.parent / "account.tfplan").is_file()
+
+
+def test_superseded_plan_delete_failure_warns_and_does_not_fail(tmp_path, repo, monkeypatch, capsys):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    old_plan = older.parent / "account.tfplan"
+    real_unlink = Path.unlink
+
+    def refuse_old_plan(path, *args, **kwargs):
+        if path == old_plan:
+            raise PermissionError("detail must not be printed")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_old_plan)
+    second = make("account-plan", "account")
+    assert second.returncode == 0, second.stdout + second.stderr
+    # The subprocess cannot see the monkeypatch, so exercise the cleanup's
+    # error boundary directly against its completed current manifest.
+    current = Path(second.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    old_plan.write_text("credential-bearing plan")
+    rg.drop_superseded_saved_plans(repo.cloud / "envs" / "account", "account", current)
+    warning = capsys.readouterr().err
+    assert str(old_plan) in warning and "contains credentials" in warning and "delete it by hand" in warning
+    assert "detail must not be printed" not in warning and old_plan.is_file()
+
+
+def test_malformed_old_manifest_cleanup_warns_path_only_and_account_plan_succeeds(tmp_path, repo):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    assert first.returncode == 0, first.stdout + first.stderr
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    malformed = json.loads(older.read_text())
+    malformed["plan"] = "malformed-secret-marker"
+    os.chmod(older, 0o600)
+    older.write_text(json.dumps(malformed))
+    os.chmod(older, 0o400)
+
+    second = make("account-plan", "account")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert f"superseded saved-plan cleanup failed for {older}" in second.stderr
+    assert "malformed-secret-marker" not in second.stdout + second.stderr
+
+
+def test_a_newer_noop_account_plan_supersedes_an_older_pending_one(tmp_path, repo):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    assert first.returncode == 0, first.stdout + first.stderr
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    assert (older.parent / "account.tfplan").is_file()
+    runner = tmp_path / "noop-runner"
+    runner.write_text(NOOP_RUNNER.format(python=sys.executable, secret=SECRET))
+    runner.chmod(0o755)
+
+    second = make("account-plan", "account", root_runner=runner)
+    assert second.returncode == 0, second.stdout + second.stderr
+    noop = Path(second.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+
+    assert noop != older and older.is_file() and not _secret_files(repo)
+    selected = make("apply-account", "account")
+    assert selected.returncode != 0 and "no unreceipted account manifest" in selected.stderr
+    with pytest.raises(rg.Refused, match="superseded by a newer account-plan"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", older)
+    with pytest.raises(rg.Refused, match="records no account changes"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", noop)
