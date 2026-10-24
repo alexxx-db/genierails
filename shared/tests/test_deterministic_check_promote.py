@@ -162,9 +162,14 @@ def _promote_to_prod(repo, tmp_path, env_text=None, deployer=DEPLOYER):
     result = _make(repo, tmp_path, "promote-to", "ENV=prod")
     assert result.returncode == 0, result.stdout + result.stderr
     (tmp_path / "promote.log").write_text(result.stdout + result.stderr)
-    # Inline agents: promote-to writes no governed-tables record (as before agent files),
-    # and make check ENV=prod expects none.
-    assert not (prod / "generated" / "governed_tables.json").exists()
+    record = prod / "generated" / "governed_tables.json"
+    if (prod / "agents").is_dir():
+        # Agent files: promote-to records prod's agent tables, which make check ENV=prod expects.
+        assert json.loads(record.read_text())["agent_tables"] == {SPACE: ["ppay.s.t"]}
+    else:
+        # Inline agents: promote-to writes no governed-tables record (as before agent files),
+        # and make check ENV=prod expects none.
+        assert not record.exists()
     _commit(repo, "promote")
     return repo
 
