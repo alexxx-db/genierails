@@ -150,27 +150,26 @@ def main() -> int:
     for path in paths:
         # An agent's ID is reported first, as when it lived in env.auto.tfvars.
         errors.extend(agent_files_placeholder_errors(path.parent))
-        text = path.read_text() if path.is_file() else ""
-        # Legacy configs have no placeholders. Avoid importing the HCL parser in
-        # bootstrap-only environments unless a placeholder or a catalog_map can
-        # actually exist.
-        placeholders = "<" in text or ">" in text
-        identity = not destination and re.search(r"(?m)^\s*catalog_map\s*=", text)
-        if not placeholders and not identity:
-            continue
+        if not path.is_file():
+            continue  # a missing file passes (ENV=account, a destination not created yet)
+        # Every supplied env file is parsed once, so a malformed one is always
+        # reported, --promotion-destination or not.
         import hcl2
 
+        text = path.read_text()
         try:
             config = hcl2.loads(text)
         except Exception:
             errors.append(_parse_error(path))
             continue
-        if placeholders:
+        if "<" in text or ">" in text:
             errors.extend(placeholder_errors(
                 config, path,
                 allow_access_tier_placeholders=os.environ.get("GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS") == "1",
             ))
-        if identity:
+        # --promotion-destination only drops the identity check: promote-to and
+        # promote validate the map they are about to write.
+        if not destination and re.search(r"(?m)^\s*catalog_map\s*=", text):
             # Reported with the placeholder problems, after them (S2).
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from scripts.saved_settings import config_identity_catalog_map_error
@@ -185,6 +184,7 @@ def main() -> int:
         else:
             print(f"ERROR: {error}", file=sys.stderr)
     return 1 if errors and not advice else 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

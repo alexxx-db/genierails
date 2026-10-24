@@ -243,3 +243,20 @@ def test_the_staged_controller_and_the_overlay_refuse_before_writing(tmp_path, c
     with pytest.raises(runtime_overlay.OverlayError, match=r"maps a catalog to itself \(paycat=paycat\)"):
         runtime_overlay.build_kept_names(prod, state_keys=set(), live_names=lambda c: set())
     assert sorted(p.name for p in prod.rglob("*")) == before
+
+
+@pytest.mark.parametrize("text", ["catalog_map = {\n", 'governance_mode = "legacy"\ncatalog_map = { "paycat" = \n',
+                                  "governance_mode = {\n"])
+@pytest.mark.parametrize("flags", [[], ["--promotion-destination"]], ids=["guard", "promotion-destination"])
+def test_the_guard_reports_a_malformed_env_file_with_or_without_the_destination_flag(tmp_path, monkeypatch,
+                                                                                     capsys, text, flags):
+    """--promotion-destination only drops the identity check; the file is still parsed and reported."""
+    env_file = tmp_path / "envs" / "prod" / "env.auto.tfvars"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(text)
+
+    monkeypatch.setattr(sys, "argv", ["genie_space_placeholder.py", *flags, str(env_file), str(env_file)])
+    assert genie_space_placeholder.main() == 1
+    err = capsys.readouterr().err
+    assert err.count("fix envs/prod/env.auto.tfvars: it is not valid HCL") == 1, err
+    assert "maps a catalog to itself" not in err
