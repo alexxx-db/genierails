@@ -915,7 +915,10 @@ def test_fresh_env_agent_without_acl_groups_stops_cleanly(env_dir, monkeypatch, 
 
 
 @pytest.mark.parametrize("mode", ["full", "governance", "genie"])
-@pytest.mark.parametrize("bad_input", ["deployer", "inline_acl", "agent_acl"])
+@pytest.mark.parametrize(
+    "bad_input",
+    ["deployer", "inline_acl", "agent_acl", "inline_prefix_collision", "agent_prefix_collision"],
+)
 def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
     env_dir, monkeypatch, capfd, mode, bad_input
 ):
@@ -930,7 +933,7 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
         env_file.write_text(ENV.replace(f"acl_groups = {json.dumps(TIERS)}", 'acl_groups = "viewers"'))
         expected = "acl_groups must be a list of non-empty strings"
         expected_file = "env.auto.tfvars"
-    else:
+    elif bad_input == "agent_acl":
         env_file.write_text(
             ENV.replace(
                 f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
@@ -944,6 +947,35 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
         )
         expected = "agent Payments has no acl_groups — set the groups allowed to run it"
         expected_file = "agents/Payments.auto.tfvars"
+    else:
+        inline_name, agent_name = (
+            ("Payments Agent", "Payments")
+            if bad_input == "inline_prefix_collision"
+            else ("Payments", "Payments Agent")
+        )
+        inline_acl, agent_acl = (
+            (["a", "a"], ["a"])
+            if bad_input == "inline_prefix_collision"
+            else (["a"], ["a", "a"])
+        )
+        env_file.write_text(
+            ENV.replace(
+                f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
+                f'genie_spaces = [{{ name = "{inline_name}", acl_groups = {json.dumps(inline_acl)} }}]\n',
+            )
+        )
+        agents = env_dir / "agents"
+        agents.mkdir()
+        (agents / "pay.auto.tfvars").write_text(
+            f'name = "{agent_name}"\nacl_groups = {json.dumps(agent_acl)}\n'
+        )
+        bad_name = inline_name if bad_input == "inline_prefix_collision" else agent_name
+        expected = f"agent {bad_name} acl_groups must not contain duplicates"
+        expected_file = (
+            "env.auto.tfvars"
+            if bad_input == "inline_prefix_collision"
+            else "agents/pay.auto.tfvars"
+        )
 
     live_calls = []
 

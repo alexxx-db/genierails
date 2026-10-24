@@ -7289,18 +7289,29 @@ def main():
         acl_errors = genie_acl_group_errors(auth_cfg)
         if acl_errors:
             # load_auth_config appends agent-file entries after inline
-            # genie_spaces. Match the validator's displayed agent identifier
-            # back to that file so the early refusal tells the operator where
-            # to edit; all unmatched/global ACL settings belong to env.auto.tfvars.
+            # genie_spaces. Attribute the first failing entry by that position,
+            # never by a name prefix ("Payments" and "Payments Agent" may both
+            # exist); global ACL settings belong to env.auto.tfvars.
+            import hcl2
             from agent_files import load_all
             source = "env.auto.tfvars"
             error = acl_errors[0]
-            for agent in load_all(auth_file.parent):
-                identifiers = {
-                    agent["name"], agent["display_name"], agent["genie_space_id"]
-                } - {""}
-                if any(error.startswith(f"agent {identifier} ") for identifier in identifiers):
-                    source = f"agents/{agent['name']}.auto.tfvars"
+            spaces = auth_cfg.get("genie_spaces")
+            agents = [agent for agent in load_all(auth_file.parent) if not agent["delete"]]
+            with (auth_file.parent / "env.auto.tfvars").open() as handle:
+                inline = hcl2.load(handle).get("genie_spaces") or []
+            if isinstance(spaces, list):
+                require_acls = auth_cfg.get("require_acl_groups", False)
+                for index, space in enumerate(spaces):
+                    entry_errors = genie_acl_group_errors({
+                        "require_acl_groups": require_acls,
+                        "genie_spaces": [space],
+                    })
+                    if not entry_errors:
+                        continue
+                    if index >= len(inline):
+                        agent = agents[index - len(inline)]
+                        source = f"agents/{agent['name']}.auto.tfvars"
                     break
             print(f"ERROR: {error} in {source}")
             sys.exit(1)
