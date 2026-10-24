@@ -8806,6 +8806,16 @@ Before you apply, tune for your business roles, security requirements, and Genie
         from governance_policies import mixed_override_warning
         for column in model.overridden_mixed:
             print(f"  WARNING: {mixed_override_warning(column)}")
+        # Warning-only name/comment heuristic; generated values stay unchanged.
+        from governance_policies import column_comments_from_ddl, free_text_partial_columns
+        advisory = free_text_partial_columns(
+            model.columns,
+            column_comments_from_ddl(ddl_text),
+        )
+        for column in advisory:
+            print(f"  WARNING: {column} is a STRING column whose name/comment suggests free text, but it "
+                  "keeps a partial mask; partial-tier readers may see a fragment. Review column_overrides / "
+                  "treatment_versions and use the redact treatment when fragments are unsafe.")
 
     # Genie mode: skip validation — the output intentionally has no groups/ABAC sections
     # and validate_abac.py would incorrectly report "groups is missing".

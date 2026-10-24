@@ -1457,9 +1457,9 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         drift.append(f"the manifest's account plan is {entry.get('file')!r}, not account.tfplan")
     else:
         path = plan_dir / entry["file"]
-        if not path.is_file() and newer:
-            pass  # expected cleanup; the superseded refusal above is clearer
-        elif not path.is_file() or sha256_file(path) != entry.get("sha256"):
+        if path.is_file() and sha256_file(path) != entry.get("sha256"):
+            drift.append(f"the saved account plan {path} changed or is missing")
+        elif not path.is_file() and not newer:
             drift.append(f"the saved account plan {path} changed or is missing")
     current_inputs = account_input_hashes(env_dir)
     if current_inputs != manifest.get("inputs"):

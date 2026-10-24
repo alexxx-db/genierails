@@ -180,6 +180,55 @@ def test_generate_calls_no_model_and_needs_no_endpoint(env_dir, monkeypatch, cap
     assert "kept reviewed rule" not in out
 
 
+def test_generate_warns_for_single_class_free_text_without_changing_generated_values(
+    env_dir, monkeypatch, capfd,
+):
+    ddl = DDL.replace(
+        "email STRING,",
+        "details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc',\n"
+        "  phone STRING COMMENT 'Mobile phone used for text messages',",
+    )
+    rows = [row for row in TAG_ROWS if row[3] != "email"] + [
+        ("dev_fin", "payments", "customers", "details", "class.phone_number", ""),
+        ("dev_fin", "payments", "customers", "phone", "class.phone_number", ""),
+    ]
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_databricks", lambda refs, cfg: (ddl, [("dev_fin", "payments")]))
+    monkeypatch.setattr(generate_abac, "_fetch_live_classification_source",
+                        lambda *a, **k: ClassificationSource(tag_rows=rows))
+    _generate(env_dir, monkeypatch)
+    out = capfd.readouterr().out
+    assert "WARNING: dev_fin.payments.customers.details is a STRING column" in out
+    assert "WARNING: dev_fin.payments.customers.phone is a STRING column" not in out
+    cfg = hcl2.loads((env_dir / "generated/abac.auto.tfvars").read_text())
+    details = next(a for a in _treatments(cfg) if a["entity_name"].endswith(".details"))
+    assert details["tag_value"].startswith("phone_partial__string__")
+
+
+@pytest.mark.parametrize(("extra_env", "semantic"), [
+    ('treatment_versions = { phone_partial = { partial = "redacted" } }\n', "phone_number"),
+    ('column_overrides = { "dev_fin.payments.customers.notes" = { partial = "redacted" } }\n',
+     "phone_number"),
+    ('column_overrides = { "dev_fin.payments.customers.notes" = { treatment = "redact" } }\n',
+     "phone_number"),
+    ("", "us_ssn"),
+])
+def test_generate_does_not_warn_when_free_text_gets_no_weaker_partial(
+    env_dir, monkeypatch, capfd, extra_env, semantic,
+):
+    env_file = env_dir / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + extra_env)
+    ddl = DDL.replace("email STRING,", "notes STRING,")
+    rows = [row for row in TAG_ROWS if row[3] != "email"] + [
+        ("dev_fin", "payments", "customers", "notes", f"class.{semantic}", ""),
+    ]
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_databricks",
+                        lambda refs, cfg: (ddl, [("dev_fin", "payments")]))
+    monkeypatch.setattr(generate_abac, "_fetch_live_classification_source",
+                        lambda *a, **k: ClassificationSource(tag_rows=rows))
+    _generate(env_dir, monkeypatch)
+    assert "WARNING: dev_fin.payments.customers.notes is a STRING column" not in capfd.readouterr().out
+
+
 def test_generate_writes_exactly_the_deterministic_model(env_dir, monkeypatch):
     _generate(env_dir, monkeypatch)
 

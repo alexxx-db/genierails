@@ -47,6 +47,23 @@ No mask can fail a query. Numeric masks read the column only through
 values of 1E20 or more, and the final typed `TRY_CAST` is NULL when the
 result does not fit the column type (for example a rounded `BIGINT` maximum).
 
+A single class has no such conflict signal. For example, `notes` tagged only
+`class.phone_number` still receives the phone partial mask, so a partial tier
+can see the note's last four characters and infer its length. `make generate`
+warns, and `make coverage-gate` emits a non-blocking advisory, when a STRING
+column's name or comment suggests free text but its resolved treatment keeps a
+partial version. Names/comments are only a review heuristic and never change
+the generated treatment. To redact one column, set:
+
+```hcl
+column_overrides = {
+  "catalog.schema.table.notes" = { treatment = "redact" }
+}
+```
+
+To make every column using a treatment redact at the partial tier, use
+`treatment_versions = { phone_partial = { partial = "redacted" } }`.
+
 The keyed hash (`hmac_sha256`) is deferred from v1: identifiers are redacted for
 tiers 2 and 3, and `treatment_versions` or `column_overrides` naming
 `hmac_sha256` is refused with "keyed hash is not available in this version".
