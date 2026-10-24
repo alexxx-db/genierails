@@ -258,7 +258,7 @@ class Scratch:
         return subprocess.run(command, env=env).returncode
 
     def add_credentials(self, env_name: str) -> None:
-        """Copy the env's and account's auth files in for the plan step only."""
+        """Copy the env's and account's auth files into the throwaway copy."""
         for rel in (Path(env_name) / "auth.auto.tfvars",
                     Path(env_name) / "data_access" / "auth.auto.tfvars",
                     Path("account") / "auth.auto.tfvars"):
@@ -323,6 +323,7 @@ def _report(label: str, before: dict, after: dict, fix: str) -> None:
 def _promote_check(args) -> None:
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
     try:
+        scratch.add_credentials(args.env)
         before = _snapshot(scratch.envs)
         extra = [f"FROM={args.from_env}"] if args.from_env else []
         extra += [f"CATALOG_MAP={args.catalog_map}"] if args.catalog_map else []
@@ -349,6 +350,13 @@ def _check(args) -> None:
         print(f"\n--- check {number}/{steps}: {title} ---")
 
     try:
+        # Validators run throughout the check, not only in the final plan. Give
+        # every scratch step the real runtime auth values so an empty-secret
+        # warning describes the caller's config. The files remain inside the
+        # private throwaway copy and are never included in comparisons. Copied
+        # inside the try: a copy that fails partway still leaves no secret in
+        # the scratch directory.
+        scratch.add_credentials(env)
         step(1, "validate")
         if not has_generated and not (scratch.envs / env / "abac.auto.tfvars").is_file():
             print(f"  NOTE: skipped: envs/{env} has not been generated; run make generate ENV={env}.")
@@ -424,7 +432,6 @@ def _check(args) -> None:
               "change a release would make. Live tags are not re-read, so new SELECT grants show as withheld.")
         print("  INFO: Genie CAN_RUN withheld in this empty-state pre-release plan is expected; ordinary "
               "plans and applies still fail when CAN_RUN is unexpectedly withheld.")
-        scratch.add_credentials(env)
         # The structural plan doesn't re-read live tags (a plan applies nothing;
         # the gate withholds new grants), so it hands the plan the one-time
         # token that skips the derive (scripts/exposure_token.py).

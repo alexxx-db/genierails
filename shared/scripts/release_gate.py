@@ -1365,15 +1365,20 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     created = _now()
     manifest_id = f"{created.replace(':', '').replace('.', '').replace('-', '')}-{prov['commit'][:12]}-account"
     final_dir = manifests_dir(cloud_dir_of(env_dir), env) / manifest_id
-    plan_name = Path(info["file"]).name
+    plan_entry = {"changes": bool(info.get("changes")), "summary": summary}
+    if account_plan_noop(plan_entry, tag_sync["diff"]):
+        # No later operation applies or otherwise reads a no-op account plan.
+        # Keep the immutable result, but not the credential-bearing plan file.
+        plan.unlink()
+    else:
+        plan_entry |= {"file": Path(info["file"]).name, "sha256": sha256_file(plan)}
     manifest = {
         "kind": "account-manifest", "version": VERSION, "id": manifest_id, "env": env,
         "cloud": cloud_dir_of(env_dir).name, "commit": prov["commit"], "provenance": dict(prov),
         # account-plan does not lock state. Terraform's saved-plan stale-state
         # check is the final backstop if state changes after this serial read.
         "state_serial": account_state_serial(env_dir),
-        "plan": {"file": plan_name, "sha256": sha256_file(plan), "changes": bool(info.get("changes")),
-                 "summary": summary},
+        "plan": plan_entry,
         "inputs": account_input_hashes(env_dir),
         "tag_sync": tag_sync["diff"],
         # Approving the manifest approves exactly these removals; apply-account
@@ -1389,6 +1394,21 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     os.rename(plan_dir, final_dir)
     drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
+
+
+def account_plan_noop(plan: Mapping, tag_diff) -> bool:
+    """True when applying the account manifest would change nothing.
+
+    The tag policies ignore their values in Terraform, so a plan whose only
+    effect is adding or (approved) removing tag values has no Terraform changes;
+    apply-account makes those changes in its tag sync after the plan. Only a
+    manifest with neither is a no-op.
+    """
+    return not plan.get("changes") and not tag_sync_changes(tag_diff)
+
+
+def account_manifest_noop(manifest: Mapping) -> bool:
+    return account_plan_noop(manifest.get("plan") or {}, manifest.get("tag_sync"))
 
 
 def load_account_manifest(path: Path, env: str) -> dict:
@@ -1432,14 +1452,15 @@ def select_account_manifest(env_dir: Path, env: str) -> Path:
         plan = path.parent / str(entry.get("file") or "")
         if (manifest and manifest.get("kind") == "account-manifest" and manifest.get("version") == VERSION
                 and manifest.get("env") == env and manifest.get("commit") == status["commit"]
+                and not account_manifest_noop(manifest)
                 and entry.get("file") == "account.tfplan" and plan.is_file()
                 and not account_manifest_used(cloud_dir, env, str(manifest.get("id") or ""))):
             candidates.append((path, manifest))
     if len(candidates) != 1:
         ids = [f"{m.get('id')} ({p})" for p, m in candidates]
         if not candidates:
-            raise Refused("make apply-account found no unreceipted account manifest for HEAD. "
-                          "Run make account-plan, get its manifest approved, then run make apply-account.")
+            raise Refused("make apply-account found no unreceipted account manifest for HEAD "
+                          "(a manifest that changes nothing is never selected). Run make account-plan, get its manifest approved, then run make apply-account.")
         raise Refused("make apply-account found multiple unreceipted account manifests for HEAD; "
                       "rerun with MANIFEST=<path> for one of:\n  - " + "\n  - ".join(ids))
     return candidates[0][0]
@@ -1468,10 +1489,14 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         drift.append(f"the account state changed since account-plan (serial "
                      f"{(manifest.get('state_serial') or {}).get('serial')} -> {(serial or {}).get('serial')})")
     entry = manifest.get("plan") or {}
+    # A newer no-op manifest supersedes too: account-plan is the latest word on the account.
     newer = newer_account_manifest(cloud_dir_of(env_dir), env, manifest)
     if newer:
         drift.append(f"the manifest was superseded by a newer account-plan ({newer})")
-    if entry.get("file") != "account.tfplan":
+    if account_manifest_noop(manifest):
+        drift.append("the manifest records no account changes (no Terraform changes and no tag values to "
+                     "add or remove), so it kept no saved plan and has nothing to apply")
+    elif entry.get("file") != "account.tfplan":
         drift.append(f"the manifest's account plan is {entry.get('file')!r}, not account.tfplan")
     else:
         path = plan_dir / entry["file"]

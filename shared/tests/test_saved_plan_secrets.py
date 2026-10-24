@@ -416,6 +416,40 @@ def test_a_failed_account_plan_wrote_its_plan_owner_only(tmp_path, repo):
     assert not _secret_files(repo)  # the failed plan's dir is removed
 
 
+NOOP_RUNNER = """#!{python}
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+if len(args) >= 3 and args[2] == "plan":
+    out = next(a.split("=", 1)[1] for a in args if a.startswith("-out="))
+    Path(out).write_text("databricks_client_secret = {secret}")
+elif len(args) >= 3 and args[2] == "show":
+    print(json.dumps({{"resource_changes": []}}))
+sys.exit(0)
+"""
+
+
+def test_a_noop_account_plan_records_the_result_without_keeping_its_saved_plan(tmp_path, repo):
+    runner = tmp_path / "noop-runner"
+    runner.write_text(NOOP_RUNNER.format(python=sys.executable, secret=SECRET))
+    runner.chmod(0o755)
+
+    make = Make(tmp_path, repo)
+    result = make("account-plan", "account", root_runner=runner)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
+                         if "Manifest (immutable):" in line))
+    data = json.loads(manifest.read_text())
+    assert data["plan"] == {"changes": False, "summary": {"changes": False, "resource_changes": {}}}
+    assert not (manifest.parent / "account.tfplan").exists()
+    assert not _secret_files(repo)
+
+    apply_result = make("apply-account", "account")
+    assert apply_result.returncode != 0
+    assert "no unreceipted account manifest" in apply_result.stderr
+
+
 def test_a_new_account_plan_deletes_the_older_unapplied_plan_but_keeps_its_manifest(tmp_path, repo):
     make = Make(tmp_path, repo)
     first = make("account-plan", "account")
@@ -478,3 +512,26 @@ def test_malformed_old_manifest_cleanup_warns_path_only_and_account_plan_succeed
     assert second.returncode == 0, second.stdout + second.stderr
     assert f"superseded saved-plan cleanup failed for {older}" in second.stderr
     assert "malformed-secret-marker" not in second.stdout + second.stderr
+
+
+def test_a_newer_noop_account_plan_supersedes_an_older_pending_one(tmp_path, repo):
+    make = Make(tmp_path, repo)
+    first = make("account-plan", "account")
+    assert first.returncode == 0, first.stdout + first.stderr
+    older = Path(first.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+    assert (older.parent / "account.tfplan").is_file()
+    runner = tmp_path / "noop-runner"
+    runner.write_text(NOOP_RUNNER.format(python=sys.executable, secret=SECRET))
+    runner.chmod(0o755)
+
+    second = make("account-plan", "account", root_runner=runner)
+    assert second.returncode == 0, second.stdout + second.stderr
+    noop = Path(second.stdout.split("Manifest (immutable): ")[-1].splitlines()[0])
+
+    assert noop != older and older.is_file() and not _secret_files(repo)
+    selected = make("apply-account", "account")
+    assert selected.returncode != 0 and "no unreceipted account manifest" in selected.stderr
+    with pytest.raises(rg.Refused, match="superseded by a newer account-plan"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", older)
+    with pytest.raises(rg.Refused, match="records no account changes"):
+        rg.account_manifest_check(repo.cloud / "envs" / "account", "account", noop)
