@@ -321,8 +321,14 @@ if args[:2] == ["show", "-json"]:
 ''')
     terraform.chmod(0o755)
     make = Make(tmp_path, repo)
+    checkout_account = ROOT / "aws/envs/account"
+    existed = checkout_account.exists()
+    # account-plan runs the runner without LAYER_ENV_DIR, so the real runner
+    # would use CLOUD_ROOT/envs/account: this checkout's, not ACCOUNT_ENV_DIR.
     result = make("account-plan", "account", root_runner=ROOT / "shared/scripts/terraform_layer.sh",
-                  environ_extra={"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"})
+                  environ_extra={"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+                                 "LAYER_ENV_DIR": str(repo.cloud / "envs" / "account")})
+    assert checkout_account.exists() is existed
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
                          if "Manifest (immutable):" in line))

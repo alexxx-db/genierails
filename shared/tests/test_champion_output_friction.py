@@ -905,14 +905,10 @@ def test_real_target_auto_tagging_hint_follows_env_role_and_mode(real_cloud, tmp
     assert absent not in out[out.index("then run:"):]
 
 
-# With a <...> in the file the placeholder guard parses it first; without one the
-# classification validator does.
-@pytest.mark.parametrize("keep_template, error", [
-    (True, "ERROR: fix envs/dev/env.auto.tfvars: it is not valid HCL\n"),
-    (False, "ERROR: envs/dev/env.auto.tfvars is not valid HCL; fix it, then re-run this command\n"),
-], ids=["placeholder-guard", "classification-validator"])
-def test_real_target_with_a_malformed_env_file_refuses_clearly_before_applying(real_cloud, tmp_path,
-                                                                               keep_template, error):
+# The placeholder guard parses every env file (#240), <...> in it or not, so it
+# reports a malformed one before the classification validator runs.
+@pytest.mark.parametrize("keep_template", [True, False], ids=["with-placeholder", "without-placeholder"])
+def test_real_target_with_a_malformed_env_file_refuses_clearly_before_applying(real_cloud, tmp_path, keep_template):
     """Nothing can be enabled without a readable config: refuse in one line, no traceback or file contents."""
     env_file = tmp_path / "aws/envs/dev/env.auto.tfvars"
     base = env_file.read_text() if keep_template else 'governance_mode = "deterministic"\nenable_classification = true\n'
@@ -923,10 +919,25 @@ def test_real_target_with_a_malformed_env_file_refuses_clearly_before_applying(r
 
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
-    assert error in result.stderr
+    assert "ERROR: fix envs/dev/env.auto.tfvars: it is not valid HCL\n" in result.stderr
     assert "Traceback" not in out and "UnexpectedToken" not in out
     assert "s3cr3t" not in out
     assert "Apply complete" not in out
+
+
+def test_classification_validator_refuses_a_malformed_env_file_in_one_line(tmp_path):
+    """Run on its own (the guard normally reports first), it names the file and never quotes it."""
+    env_file = tmp_path / "envs/dev/env.auto.tfvars"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text('governance_mode = "deterministic"\nenable_classification = true\n'
+                        'note = "s3cr3t-token-value" {\n')
+
+    result = subprocess.run([sys.executable, str(SHARED / "scripts/validate_classification_config.py"),
+                             str(env_file)], capture_output=True, text=True)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert result.stderr == "ERROR: envs/dev/env.auto.tfvars is not valid HCL; fix it, then re-run this command\n"
 
 
 def test_real_target_hint_falls_back_when_env_role_fails_after_the_apply(real_cloud, tmp_path):
