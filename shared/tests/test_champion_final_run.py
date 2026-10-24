@@ -939,6 +939,7 @@ def test_no_saved_plan_file_is_written_by_the_product():
     # envs only), whose plans go to owner-only manifest dirs (release_gate.py),
     # plus the account apply's temporary owner-only plan that is immediately
     # checked for tag-policy deletions and applied, then removed by the EXIT trap.
+    # Each runs in a (umask 077; ...) subshell, so the plan is owner-only from creation.
     tf_out = r"(?<![-\w])-out[= ]\S*"  # Terraform's -out, not a script's --out
     assert not re.findall(tf_out, (SHARED / "scripts/terraform_layer.sh").read_text())
     makefile = (SHARED / "Makefile.shared").read_text()
@@ -953,10 +954,10 @@ def test_no_saved_plan_file_is_written_by_the_product():
     allowed = re.findall(tf_out, account_plan) + re.findall(tf_out, roots) + re.findall(tf_out, account_apply)
     assert re.findall(tf_out, makefile) == allowed
     assert re.findall(tf_out, roots) == ['-out="$$plan_dir/account.tfplan"',
-                                         '-out="$$plan_dir/workspace.tfplan";']
-    assert re.findall(tf_out, account_plan) == ['-out="$$plan_dir/account.tfplan";']
+                                         '-out="$$plan_dir/workspace.tfplan");']
+    assert re.findall(tf_out, account_plan) == ['-out="$$plan_dir/account.tfplan");']
     assert "account-plan-dir" in account_plan
-    assert re.findall(tf_out, account_apply) == ['-out="$$account_plan_dir/account.tfplan"']
+    assert re.findall(tf_out, account_apply) == ['-out="$$account_plan_dir/account.tfplan")']
     assert 'account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"' in account_apply
     assert 'trap \'rm -rf "$$account_plan_dir"\' EXIT' in account_apply
     _assert_tag_policy_delete_guard_precedes_account_apply_plan(makefile)

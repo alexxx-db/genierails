@@ -2,7 +2,9 @@
 
 make evidence resolves the SQL warehouse itself (resolve_env_config.py
 warehouse), so the documented command carries no WAREHOUSE_ID. The README
-also once said adopt-custom-mask was not on main; it is.
+also once said adopt-custom-mask was not on main; it is. make maintain runs
+on the deployment machine (cron) at the last released commit, never in CI.
+Dev step 4 says what a generate re-run keeps in each governance mode.
 """
 
 import re
@@ -60,3 +62,112 @@ def test_readme_no_longer_says_adopt_custom_mask_is_not_on_main():
     assert "make adopt-custom-mask ENV=dev TREATMENT=custom_<name>" in readme
     # ...because the target is on main.
     assert re.search(r"^adopt-custom-mask:", MAKEFILE.read_text(), re.MULTILINE)
+
+
+def test_maintain_runs_on_the_deployment_machine_at_the_last_released_commit_not_ci():
+    readme = README.read_text()
+    flow = _section(readme, "## The whole flow", "## Before you start")
+    safe = _section(readme, "## Keep it safe", "## Commit it")
+    line = "make maintain ENV=prod      # deployment machine, cron, at the last released commit"
+    assert line in flow.splitlines() and line in safe.splitlines()
+    assert "Run it from the [deployment machine](../../docs/deployment-machine.md)." in safe
+    assert "In a deterministic env it runs only from the last released commit, on a clean checkout." in safe
+    # No walkthrough line puts maintain in CI.
+    for path in (README, REFERENCE):
+        for text in path.read_text().splitlines():
+            if "maintain" in text:
+                assert not re.search(r"\b(in|from|on) CI\b|CI (job|pipeline|schedule)|schedule[^.]*\bCI\b", text), (path, text)
+    applying = _section(REFERENCE.read_text(), "### Applying from CI", "## Step details")
+    assert "`maintain`" in applying and "refuse common CI markers" in applying
+    # ...because maintain refuses in CI and, deterministic, off the last release.
+    makefile = MAKEFILE.read_text()
+    assert re.search(r"^maintain: _guard-not-ci-apply ", makefile, re.MULTILINE)
+    recipe = makefile[makefile.index("\nmaintain:"):]
+    assert '$(_RELEASE_GATE) maintain-check --env-dir "$(ENV_DIR)" --env "$(ENV)"' in recipe[:recipe.index("\n\n")]
+
+
+def _generate_step(readme: str) -> str:
+    dev = _section(readme, "## Dev", "## Prod")
+    return dev[dev.index("**4. Generate.**"):dev.index("**5. Check.**")]
+
+
+def test_dev_step_4_says_a_deterministic_generate_replaces_masks_and_points_at_the_settings():
+    step = _generate_step(README.read_text())
+    assert "What a re-run keeps depends on the env's `governance_mode`:" in step
+    det = next(line for line in step.splitlines() if line.startswith("- **Deterministic**"))
+    for replaced in ("the column masks", "the `gr_treatment` column tags", "the `gr_treatment` tag policy",
+                     "the mask-library functions in `masking_functions.sql`"):
+        assert replaced in det, replaced
+    assert "It replaces hand edits to those in `envs/dev/generated/` without a warning" in det
+    for setting in ("`column_overrides` for one column", "`treatment_versions` for a treatment's partial version",
+                    "`tag_treatments` to map a class to another treatment"):
+        assert setting in det, setting
+    assert "[settings](REFERENCE.md#deterministic-governance-settings)" in det
+    assert "### Deterministic-governance settings" in REFERENCE.read_text()
+    # ...and what it keeps, custom SQL above the mask-library marker included.
+    marker = "-- === GenieRails deterministic mask library ==="
+    assert f"row filters, table tags and any custom SQL above the `{marker}` marker in `masking_functions.sql` are kept" in det
+    legacy = next(line for line in step.splitlines() if line.startswith("- **Legacy**"))
+    assert "including your edits" in legacy
+    # The edits-survive promise is only made for legacy.
+    assert step.count("including your edits") == 1
+    assert "edit the rules if you need to" not in step
+    # ...because deterministic generate replaces every column mask and the gr_treatment tag policy.
+    policies = (SHARED / "governance_policies.py").read_text()
+    apply_model = policies[policies.index("def apply_model("):policies.index("def replace_sql_library(")]
+    assert 'policy.get("policy_type") != "POLICY_TYPE_COLUMN_MASK"' in apply_model
+    assert 'policy.get("key") != TAG_KEY' in apply_model
+    assert '"key": TAG_KEY, "description": TAG_POLICY_DESCRIPTION, "values": model.tag_values' in apply_model
+    from governance_policies import SQL_MARKER, replace_sql_library
+    assert SQL_MARKER == marker
+    replaced = replace_sql_library(f"-- custom\nCREATE FUNCTION mine() RETURN 1;\n\n{marker}\nold library\n", "new library")
+    assert replaced.startswith("-- custom\nCREATE FUNCTION mine() RETURN 1;") and "old library" not in replaced
+
+
+def test_reference_generate_says_what_a_re_run_keeps_per_mode():
+    reference = REFERENCE.read_text()
+    row = next(line for line in reference.splitlines() if line.startswith("| `make generate ENV=<e>` |"))
+    assert "Deterministic envs: every run replaces the column masks" in row
+    assert "hand edits to them are lost" in row
+    assert "Legacy envs: re-runs keep reviewed rules" in row
+    details = reference[reference.index("**`make generate ENV=dev`**"):reference.index("**`make rehearse ENV=dev`**")]
+    assert "- Deterministic envs: every run recomputes the column masks" in details
+    assert "- Legacy envs: re-runs keep reviewed rules" in details
+    assert "\n- Re-runs keep reviewed rules" not in details
+    assert "any custom SQL above the `-- === GenieRails deterministic mask library ===` marker" in details
+
+
+def _rows(reference: str, command: str) -> list[str]:
+    return [line for line in reference.splitlines() if line.startswith(f"| `{command}` |")]
+
+
+def test_reference_scopes_the_direct_release_and_apply_paths_to_legacy():
+    reference = REFERENCE.read_text()
+    legacy, manifest = _rows(reference, "make release ENV=prod")
+    assert legacy.startswith("| `make release ENV=prod` | 4 | (legacy prod only; a deterministic prod uses the "
+                             "`release-plan` and manifest `release` rows below) Placeholder guard"), legacy
+    assert manifest.startswith("| `make release ENV=prod` | 4 | (deterministic prod) Releases the current manifest")
+    [apply] = _rows(reference, "make apply ENV=<e>")
+    assert "(legacy envs; a deterministic env runs it only inside `make rehearse` (dev), and a promoted one " \
+        "refuses it: release through `release-plan`/`release`)" in apply
+    [governance] = _rows(reference, "make apply-governance ENV=<e>")
+    assert "(legacy envs; a deterministic env runs it only inside `rehearse`/`ungovern` (dev) or `maintain` " \
+        "(promoted envs))" in governance
+    details = reference[reference.index("**`make release ENV=prod`**"):reference.index("**`make maintain ENV=prod`**")]
+    bullets = [line for line in details.splitlines() if line.startswith("- ")]
+    assert bullets[0].startswith("- Deterministic envs: `make release` applies only the current manifest that "
+                                 "`make release-plan` wrote"), bullets[0]
+    assert bullets[1].startswith("- Legacy envs, order: placeholder guard"), bullets[1]
+    withdraw = next(line for line in bullets if line.startswith("- To withdraw access"))
+    assert "run `make apply ENV=prod` (legacy) or commit it and run `make release-plan ENV=prod` and " \
+        "`make release ENV=prod` (deterministic, where `make apply ENV=prod` refuses)" in withdraw
+    # ...because a deterministic release is the manifest path and the apply guard owns apply there.
+    makefile = MAKEFILE.read_text()
+    release = makefile[makefile.index("\nrelease:"):]
+    release = release[:release.index("\n\n")]
+    assert '= 1 ]; then \\\n\t\t$(MAKE) --no-print-directory _release-manifest' in release
+    from scripts import release_gate as rg
+    assert rg.APPLY_OWNERS[rg.PROMOTED]["apply"] == ()
+    assert rg.APPLY_OWNERS[rg.PROMOTED]["apply-governance"] == ("maintain",)
+    assert rg.APPLY_OWNERS[rg.REHEARSE]["apply"] == ("rehearse",)
+    assert rg.APPLY_OWNERS[rg.REHEARSE]["apply-governance"] == ("rehearse", "ungovern")

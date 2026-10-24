@@ -149,7 +149,8 @@ _is_own_env_dir = { [ -n "$(GENIERAILS_CLOUD_DIR)" ] && _own=$$(CDPATH= cd -P "$
 # exist in the checkout's own envs/<name>, so the cleanup runs only where
 # _is_own_env_dir holds. Anywhere else the dir is still scaffolded (missing
 # dirs, symlinks and tfvars are created), nothing is deleted, and one line
-# notes any leftovers kept.
+# notes any leftovers kept. Every step fails the target (|| exit 1): a half-made
+# env dir must never reach setup's next-steps banner.
 _prepare-env:
 	@envs="$(ENV)"; \
 	if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$(ENV)" != "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -163,7 +164,7 @@ _prepare-env:
 		else \
 			env_dir="$(CLOUD_ROOT)/envs/$$env_name"; \
 		fi; \
-		mkdir -p "$$env_dir"; \
+		mkdir -p "$$env_dir" || exit 1; \
 		owned=; \
 		if $(call _is_own_env_dir,"$$env_dir","$$env_name"); then owned=1; fi; \
 		leftovers="$$env_dir/*.tf $$env_dir/*.py $$env_dir/ABAC_PROMPT.md $$env_dir/scripts"; \
@@ -179,54 +180,53 @@ _prepare-env:
 			done; \
 		fi; \
 		if [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-			if [ -n "$$owned" ]; then rm -rf "$$env_dir/ddl" "$$env_dir/generated" "$$env_dir/$(DATA_ACCESS_SUBDIR)"; fi; \
+			if [ -n "$$owned" ]; then rm -rf "$$env_dir/ddl" "$$env_dir/generated" "$$env_dir/$(DATA_ACCESS_SUBDIR)" || exit 1; fi; \
 		else \
-			mkdir -p "$$env_dir/ddl" "$$env_dir/generated"; \
+			mkdir -p "$$env_dir/ddl" "$$env_dir/generated" || exit 1; \
 			gov_dir="$$env_dir/$(DATA_ACCESS_SUBDIR)"; \
-			mkdir -p "$$gov_dir"; \
+			mkdir -p "$$gov_dir" || exit 1; \
 			if [ -L "$$gov_dir/auth.auto.tfvars" ] && [ ! -e "$$gov_dir/auth.auto.tfvars" ]; then \
 				echo "ERROR: $$gov_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 			fi; \
 			if [ ! -e "$$gov_dir/auth.auto.tfvars" ] && [ ! -L "$$gov_dir/auth.auto.tfvars" ]; then \
-				ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars"; \
+				ln -sfn ../auth.auto.tfvars "$$gov_dir/auth.auto.tfvars" || exit 1; \
 			fi; \
 			if [ -L "$$gov_dir/env.auto.tfvars" ] && [ ! -e "$$gov_dir/env.auto.tfvars" ]; then \
 				echo "ERROR: $$gov_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 			fi; \
 			if [ ! -e "$$gov_dir/env.auto.tfvars" ] && [ ! -L "$$gov_dir/env.auto.tfvars" ]; then \
-				ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars"; \
+				ln -sfn ../env.auto.tfvars "$$gov_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 		fi; \
 		if [ -n "$$owned" ]; then \
-			rm -f "$$env_dir"/*.tf; \
-			rm -f "$$env_dir"/*.py "$$env_dir"/ABAC_PROMPT.md; \
-			rm -rf "$$env_dir/scripts"; \
+			rm -f "$$env_dir"/*.tf "$$env_dir"/*.py "$$env_dir"/ABAC_PROMPT.md || exit 1; \
+			rm -rf "$$env_dir/scripts" || exit 1; \
 		fi; \
 		if [ -L "$$env_dir/auth.auto.tfvars" ] && [ ! -e "$$env_dir/auth.auto.tfvars" ]; then \
 			echo "ERROR: $$env_dir/auth.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 		fi; \
 		if [ ! -e "$$env_dir/auth.auto.tfvars" ] && [ ! -L "$$env_dir/auth.auto.tfvars" ]; then \
 			if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars"; \
+				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars" || exit 1; \
 			else \
-				python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example"; \
+				python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" || exit 1; \
 			fi; \
 		else \
-			python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example"; \
+			python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" || exit 1; \
 		fi; \
 		if [ -L "$$env_dir/env.auto.tfvars" ] && [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
 			echo "ERROR: $$env_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \
 		fi; \
 		if [ ! -e "$$env_dir/env.auto.tfvars" ] && [ ! -L "$$env_dir/env.auto.tfvars" ]; then \
-			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars"; \
+			cp "$(SHARED_ROOT)/env.auto.tfvars.example" "$$env_dir/env.auto.tfvars" || exit 1; \
 			if [ "$$env_name" = "$(ACCOUNT_ENV)" ] || [ "$${_SEED_PROMOTION_SETTINGS:-1}" = 0 ]; then \
-				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars"; \
+				python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); s=p.read_text(); a="# GENIERAILS_DETERMINISTIC_DEFAULTS_BEGIN\n"; b="# GENIERAILS_DETERMINISTIC_DEFAULTS_END\n"; before, rest=s.split(a,1); _, after=rest.split(b,1); p.write_text(before+after.lstrip("\n"))' "$$env_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 			if [ "$${_SEED_PROMOTION_SETTINGS:-1}" != 0 ] && [ "$$env_name" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" != "$(DEFAULT_ENV)" ]; then \
-				printf '\n# Promotion source and catalog renames; replace both catalog placeholders.\npromote_from = "$(DEFAULT_ENV)"\ncatalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }\n' "$$env_name" >> "$$env_dir/env.auto.tfvars"; \
+				printf '\n# Promotion source and catalog renames; replace both catalog placeholders.\npromote_from = "$(DEFAULT_ENV)"\ncatalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }\n' "$$env_name" >> "$$env_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 			if [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
-				printf "\n# Consume IdP-synced groups by default; set true for demo/greenfield creation.\nmanage_groups = false\n" >> "$$env_dir/env.auto.tfvars"; \
+				printf "\n# Consume IdP-synced groups by default; set true for demo/greenfield creation.\nmanage_groups = false\n" >> "$$env_dir/env.auto.tfvars" || exit 1; \
 			fi; \
 		fi; \
 	done
@@ -334,7 +334,7 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 	@allow=0; [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)" 2>/dev/null)" = promoted ] && allow=1; \
 	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$$allow python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
 	@gov_only="$$($(_GOVERNANCE_ONLY) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
-	role="$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)")" || exit 1; \
+	role="$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)" 2>/dev/null)" || role=unknown; \
 	if python3 -c 'import sys,hcl2; c=hcl2.load(open(sys.argv[1])); raise SystemExit(0 if any(str(g).startswith("<") for g in c.get("access_tier_groups",[])) else 1)' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then gov_only=0; fi; \
 	dest_det="$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; det="$$dest_det"; mode_note=""; \
 	if [ "$$role" = promoted ] && [ "$$dest_det" = 1 ]; then \
@@ -361,6 +361,15 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo "  1. Edit $(ACCOUNT_ENV_DIR)/auth.auto.tfvars"; \
 		echo "  2. Review $(ACCOUNT_ENV_DIR)/env.auto.tfvars"; \
 		echo "  3. Run: make apply ENV=$(ACCOUNT_ENV)"; \
+	elif [ "$$role" = unknown ]; then \
+		echo "WARNING: could not tell whether $(_SETUP_ENV_REL) is a rehearsal or a promoted env (env-role failed; is $(_SETUP_ENV_REL)/env.auto.tfvars valid HCL?), so these steps are generic." >&2; \
+		echo "Workspace environment ready:          $(ENV_DIR)"; \
+		echo ""; \
+		echo "Next steps:"; \
+		echo "  1. Fix $(_SETUP_ENV_REL)/env.auto.tfvars so it parses, then re-run: make setup ENV=$(ENV)   (prints this env's steps)"; \
+		echo "  2. Then: make check ENV=$(ENV)   (read-only check of the committed files)"; \
+		echo ""; \
+		echo "Walkthrough: $(_SETUP_WALKTHROUGH)"; \
 	elif [ "$$role" = promoted ]; then \
 		echo "Shared account environment ready:     $(ACCOUNT_ENV_DIR)"; \
 		echo "Environment governance ready:         $(ENV_DIR)/$(DATA_ACCESS_SUBDIR)"; \
@@ -368,13 +377,14 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		echo ""; \
 		echo "Next steps ($(ENV) promotion — the walkthrough's Prod section; finish the source rehearsal first):"; \
 		if [ -n "$$mode_note" ]; then echo "$$mode_note"; fi; \
-		echo "  1. Replace the seeded promote_from and catalog_map values in $(_SETUP_ENV_REL)/env.auto.tfvars, then run:"; \
+		echo "  1. Create or confirm the $(ENV) deployment SP (none yet? ../shared/docs/prerequisites.md, make bootstrap-sp), then edit"; \
+		echo "     $(_SETUP_ENV_REL)/auth.auto.tfvars — its client_id / client_secret + $(ENV) workspace host & id"; \
+		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; echo "     promote-to refuses while deployer_principal_id is still a placeholder."; fi; \
+		if [ "$$det" = 1 ]; then echo "     Where $(ENV)'s group names differ from $$src's, set group_map there (each $$src group = its $(ENV) group): promote-to writes this env's access_tier_groups from $$src's through it, so leave those placeholders."; fi; \
+		echo "  2. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
+		echo "  3. Replace the seeded promote_from and catalog_map values in $(_SETUP_ENV_REL)/env.auto.tfvars, then run:"; \
 		echo "       make promote-to ENV=$(ENV)"; \
 		echo "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)"; \
-		echo "  2. Edit $(_SETUP_ENV_REL)/auth.auto.tfvars — deployment SP client_id / client_secret + $(ENV) workspace host & id"; \
-		if [ -n "$$deployer_note" ]; then echo "$$deployer_note"; fi; \
-		if [ "$$det" = 1 ]; then echo "     Where $(ENV)'s group names differ from $$src's, set group_map there (each $$src group = its $(ENV) group): promote-to writes this env's access_tier_groups from $$src's through it, so leave those placeholders."; fi; \
-		echo "  3. In $(_SETUP_ENV_REL)/env.auto.tfvars, also set sql_warehouse_id (or leave \"\" to auto-create)"; \
 		echo "  4. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
@@ -382,7 +392,9 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		if [ "$$det" = 1 ]; then \
 			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 			[ -n "$$src" ] || src=dev; \
-			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run make rehearse ENV=$$src (release-plan needs it), then:"; \
+			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run:"; \
+			echo "     make check ENV=$(ENV)   (read-only; also runs promote-to CHECK=1, which release-plan doesn't)"; \
+			echo "     make rehearse ENV=$$src   (release-plan needs a passing rehearsal of this commit), then:"; \
 			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
 			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \
@@ -424,6 +436,9 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 			fi; \
 			echo "     (No agent yet? See ../shared/examples/dev_to_prod/SAMPLE_ENV.md)"; step=$$((step+1)); \
 		fi; \
+		echo "  $$step. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main:"; \
+		echo "     make check, rehearse receipts and release-plan read only committed files. Commit and push again"; \
+		echo "     after each step below that changes envs/."; step=$$((step+1)); \
 		echo "  $$step. In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on."; \
 		echo "     When the scan finishes, review the detections and exclude any false positives, then turn on"; \
 		echo "     auto-tagging. Wait until the class.* tags appear."; \
@@ -433,9 +448,21 @@ setup: _bootstrap ## Prepare the selected environment(s) and show next steps
 		else \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
 		fi; \
+		echo "     Review envs/$(ENV)/generated/, then commit and push envs/."; \
+		step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; rehearse doesn't run it)"; \
+		if [ "$$det" = 1 ]; then \
+			step=$$((step+1)); echo "  $$step. First deploy only (rehearse refuses a non-empty account plan, e.g. the new gr_treatment tag policy):"; \
+			echo "       make account-plan    (plans the shared account layer and writes the manifest to approve; changes nothing live)"; \
+			echo "       make apply-account   (applies exactly that approved manifest)"; \
+		fi; \
 		step=$$((step+1)); echo "  $$step. Run: make rehearse ENV=$(ENV)"; \
 		echo "$$access_note"; \
-		echo "     verify-access picks a row-pairing key per masked table; the proven keys are saved and promoted."; \
+		if [ "$$det" = 1 ]; then \
+			echo "     verify-access picks a row-pairing key per masked table and prints the keys it proved;"; \
+			echo "     nothing is saved: committing that line is optional and pins those keys (promote-to copies committed keys)."; \
+		else \
+			echo "     verify-access picks a row-pairing key per masked table; the proven keys are saved and promoted."; \
+		fi; \
 		echo ""; \
 		echo "Walkthrough: $(_SETUP_WALKTHROUGH) (the walkthrough's Dev section)"; \
 	fi
@@ -476,8 +503,23 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 		2>&1 | python3 -u "$(SHARED_ROOT)/scripts/filter_target_warnings.py" --cloud "$(CLOUD)" $(if $(filter 1,$(VERBOSE)),--verbose,)
 	@echo ""
 	@if grep -Eq '^[[:space:]]*enable_auto_tagging[[:space:]]*=[[:space:]]*true' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
-		echo "Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer, then run:"; \
-		echo "  make $(if $(filter prod,$(ENV)),release,generate) ENV=$(ENV)"; \
+		role="$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)" 2>/dev/null)" || role=unknown; \
+		if [ "$$role" = unknown ]; then \
+			echo "WARNING: could not tell whether $(_SETUP_ENV_REL) is a rehearsal or a promoted env (env-role failed; is $(_SETUP_ENV_REL)/env.auto.tfvars valid HCL?)." >&2; \
+			echo "Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer. Then fix $(_SETUP_ENV_REL)/env.auto.tfvars"; \
+			echo "so it parses, and run make setup ENV=$(ENV) for this env's next step (make check ENV=$(ENV) checks the committed files)."; \
+		elif [ "$$role" != promoted ]; then \
+			echo "Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer, then run:"; \
+			echo "  make generate ENV=$(ENV)"; \
+		elif [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
+			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
+			echo "Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer, then run:"; \
+			echo "  make release-plan ENV=$(ENV)   (after make rehearse ENV=$${src:-dev} on the same commit)"; \
+			echo "  Get that manifest approved, then: make release ENV=$(ENV)"; \
+		else \
+			echo "Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer, then run:"; \
+			echo "  make release ENV=$(ENV)"; \
+		fi; \
 	elif grep -Eq '^[[:space:]]*enable_auto_tagging[[:space:]]*=[[:space:]]*false' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null; then \
 		echo "Classification is enabled. Auto-tagging is explicitly off in $(_SETUP_ENV_REL)/env.auto.tfvars."; \
 		echo "Delete that line to keep the UI setting, or use ALLOW_DISABLE_AUTO_TAGGING=1 only to intentionally disable it."; \
@@ -812,7 +854,7 @@ override _GOVERNANCE_MODE_OF = python3 -c 'import hcl2,sys; print(hcl2.load(open
 override _STAGED_POLICY = python3 "$(SHARED_ROOT)/scripts/staged_policy_apply.py"
 _STAGED_CONFIRM ?= 1
 override _STAGED_VERIFY_ACCESS = $(MAKE) --no-print-directory _verify-access-gate ENV="$(TARGET_ENV_NAME)" ENV_DIR="$$GENIERAILS_ENV_DIR" TARGET_ENV= VERIFY_REQUIRE_MASKS=1 \
-	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
+	VERIFY_FROM_TFVARS="$$GENIERAILS_VERIFY_TFVARS" VERIFY_ENV_FILE="$$GENIERAILS_VERIFY_ENV_FILE" VERIFY_PRE_GRANT="$$GENIERAILS_VERIFY_PRE_GRANT"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",)
 override _STAGED_CONFIRM_RUN = $(_STAGED_POLICY) confirm --env-dir "$(ENV_DIR)"
 # The controller refuses, before it applies create, a VERIFY_SPEC its
 # verify-created run (old generation's tiers and functions) would refuse.
@@ -899,7 +941,7 @@ account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/
 	plan_dir="$$($(_RELEASE_GATE) account-plan-dir --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)")" || { rm -f "$$prov"; exit 1; }; \
 	cp "$$prov" "$$plan_dir/provenance.json"; rm -f "$$prov"; \
 	echo "=== Saved plan (account) ==="; \
-	set +e; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan"; status=$$?; set -e; \
+	set +e; (umask 077; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan"); status=$$?; set -e; \
 	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir"; echo "account-plan: planning failed (above); no manifest was written." >&2; exit 1; fi; \
 	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
 	show_json="$$(mktemp)"; \
@@ -963,7 +1005,7 @@ override _REHEARSE_STEPS = $(MAKE) _derive-before-exposure ENV="$(ENV)" APPLY_FL
 		key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" && \
 		$(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac"; fi && \
 	GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
-	$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+	$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 	$(_SAVE_VERIFY_KEY) && \
 	$(_GROUP_MAP_RECORD) && \
 	$(_STAGED_CONFIRM_RUN)
@@ -1009,7 +1051,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(MAKE) validate-generated ENV="$(ENV)" && \
 		$(MAKE) coverage-gate ENV="$(ENV)" && \
 		GENIERAILS_EXPOSURE_TOKEN="$$($(_EXPOSURE_TOKEN) mint --env-dir "$(ENV_DIR)")" $(MAKE) apply ENV="$(ENV)" APPLY_FLAGS= _STAGED_CONFIRM=0 && \
-		$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
+		$(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT= $(if $(strip $(VERIFY_KEY_COLUMN)),VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",) && \
 		$(_SAVE_VERIFY_KEY) && \
 		$(_GROUP_MAP_RECORD) && \
 		$(_STAGED_CONFIRM_RUN)
@@ -1128,7 +1170,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "a captured Genie agent config was rejected"; \
 		exit 1; \
 	fi; \
-	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
+	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was applied but verify-access failed"; \
 		exit 1; \
 	fi; \
@@ -1231,7 +1273,7 @@ override _SAVED_GRANT_CHANGES = python3 -c 'import json,sys; print(int(any(s.get
 _release-plan-roots:
 	@set -e; $(_DRY_RUN_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
 	echo "=== Saved plan (account) ==="; \
-	set +e; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null; status=$$?; set -e; \
+	set +e; (umask 077; "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null); status=$$?; set -e; \
 	if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: account plan failed." >&2; exit 1; fi; \
 	printf '{"file": "account.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/account.json"; \
 	echo "=== Saved plans (data_access:$(ENV), staged policy phases) ==="; \
@@ -1274,7 +1316,7 @@ _release-plan-roots:
 		fi; \
 		$(_COVERAGE_GATE) can-run-check --env-dir "$(ENV_DIR)" --env-name "$(ENV)" --runner "$(ROOT_RUNNER)"; \
 		python3 "$(GENIE_ADOPT_PREFLIGHT_SCRIPT)" "$(ENV_DIR)" --arm --quiet; \
-		set +e; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"; status=$$?; set -e; \
+		set +e; (umask 077; LAYER_ENV_DIR="$(ENV_DIR)" "$(ROOT_RUNNER)" workspace "$(ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/workspace.tfplan"); status=$$?; set -e; \
 		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "ERROR: workspace plan failed." >&2; exit 1; fi; \
 		printf '{"file": "workspace.tfplan", "changes": %s}\n' "$$([ $$status -eq 2 ] && echo true || echo false)" > "$$plan_dir/workspace.json"; \
 	fi
@@ -1375,7 +1417,7 @@ _release-manifest: _guard-not-ci-apply
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was withheld (above); once its protection is live, run make release-plan ENV=$(ENV) again to open it"; \
 		exit 1; \
 	fi; \
-	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
+	if ! $(MAKE) _verify-access-gate ENV="$(ENV)" VERIFY_REQUIRE_MASKS=1 VERIFY_FROM_TFVARS= VERIFY_ENV_FILE= VERIFY_PRE_GRANT=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); then \
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "access was applied but verify-access failed"; \
 		exit 1; \
 	fi; \
@@ -1424,7 +1466,7 @@ maintain: _guard-not-ci-apply _guard-genie-placeholder ## Reconcile governance (
 	if [ "$$mode" != deterministic ]; then $(MAKE) derive-assignments ENV="$(ENV)" || exit 1; fi; \
 	$(MAKE) coverage-gate ENV="$(ENV)" || exit 1; \
 	$(MAKE) validate-generated ENV="$(ENV)" || exit 1; \
-	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)"; key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")"; $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac" || exit 1; fi; \
+	if [ -n "$(VERIFY_SPEC)" ]; then gen_abac="$$($(_OVERLAY) path --env-dir "$(ENV_DIR)" abac.auto.tfvars)" || { echo "maintain: could not resolve the generated ABAC config; governance was not applied." >&2; exit 1; }; key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || { echo "maintain: could not resolve the verification key; governance was not applied." >&2; exit 1; }; $(_RELEASE_HELPER) require-mask-proof "$(ENV_DIR)" --env "$(ENV)" --key "$$key" --spec "$(VERIFY_SPEC)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars" --tfvars "$$gen_abac" || exit 1; fi; \
 	$(_RUN_AUDIT_RULEBOOK); \
 	if [ $$audit_rc -ne 0 ]; then \
 		if [ $$audit_rc -eq 1 ]; then \
@@ -1809,7 +1851,7 @@ _apply-layer: _guard-not-ci-apply
 		done; \
 	elif [ "$$layer" = "account" ]; then \
 		account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"; trap 'rm -rf "$$account_plan_dir"' EXIT; \
-		plan_rc=0; LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" plan -input=false -detailed-exitcode -parallelism=1 -out="$$account_plan_dir/account.tfplan" || plan_rc=$$?; \
+		plan_rc=0; (umask 077; LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" plan -input=false -detailed-exitcode -parallelism=1 -out="$$account_plan_dir/account.tfplan") || plan_rc=$$?; \
 		if [ $$plan_rc -ne 0 ] && [ $$plan_rc -ne 2 ]; then echo "ERROR: account plan failed (above); nothing was applied." >&2; exit 1; fi; \
 		LAYER_ENV_DIR="$$env_dir" "$(ROOT_RUNNER)" account "$$target_env" show -json "$$account_plan_dir/account.tfplan" > "$$account_plan_dir/account.json"; \
 		$(_RELEASE_GATE) tag-policy-delete-guard --env-dir "$$env_dir" --env "$$target_env" --show-json "$$account_plan_dir/account.json"; \
@@ -2169,6 +2211,12 @@ VERIFY_GATE ?=
 # one stage's render, with the tier settings of the generation it checks.
 VERIFY_FROM_TFVARS ?=
 VERIFY_ENV_FILE ?=
+# VERIFY_PRE_GRANT=1: the controller's verify-created/verify-switched, which run
+# before its grant phase opens the tier groups' USE and SELECT. Each temporary
+# test principal (never a tier group) gets USE/SELECT on the tables it checks,
+# revoked when verify-access exits. The post-grant gates pass it empty, so they
+# check the tier groups' real grants.
+VERIFY_PRE_GRANT ?=
 override _VERIFY_SPEC_FLAG = $(if $(VERIFY_SPEC),--spec "$(VERIFY_SPEC)",--from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars")
 _VERIFY_KEEP_FLAG = $(if $(KEEP_PRINCIPALS),--keep-principals,)
 # The global key (explicit VERIFY_KEY_COLUMN, else the saved verify_key_column)
@@ -2178,6 +2226,7 @@ override _VERIFY_KEY_FLAGS = --key-column "$$key" --env-file "$(or $(VERIFY_ENV_
 # provable row-pairing key fails instead of letting the release report success.
 override _VERIFY_REQUIRE_FLAG = $(if $(filter 1,$(VERIFY_REQUIRE_MASKS)),--require-mask-checks,)
 override _VERIFY_GATE_FLAG = $(if $(filter 1,$(VERIFY_GATE)),--gate,)
+override _VERIFY_PRE_GRANT_FLAG = $(if $(filter 1,$(VERIFY_PRE_GRANT)),--pre-grant-access,)
 override _VERIFY_MINIMUM_FLAG = $(if $(and $(VERIFY_SPEC),$(or $(filter 1,$(VERIFY_REQUIRE_MASKS)),$(filter 1,$(VERIFY_GATE)))),--minimum-from-tfvars "$(or $(VERIFY_FROM_TFVARS),$(TARGET_DATA_ACCESS_ENV_DIR)/abac.auto.tfvars)" --minimum-env-file "$(or $(VERIFY_ENV_FILE),$(ENV_DIR)/env.auto.tfvars)" --minimum-account-tfvars "$(ACCOUNT_ENV_DIR)/abac.auto.tfvars",)
 
 verify-access-spec: _guarded-bootstrap _guard-workspace-target ## Print the derived effective-access checks (no workspace/cluster needed)
@@ -2216,7 +2265,7 @@ verify-access: _guarded-bootstrap _guard-workspace-target ## Verify masking/row-
 	warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --terraform-runner "$(ROOT_RUNNER)" --env-name "$(ENV)")" && \
 	cd "$(SHARED_ROOT)" && GENIERAILS_LIVE_VERIFY=1 python3 verify_effective_access.py \
 		$(_VERIFY_SPEC_FLAG) $(_VERIFY_KEY_FLAGS) --warehouse-id "$$warehouse_id" $(_VERIFY_KEEP_FLAG) $(_VERIFY_REQUIRE_FLAG) \
-		$(_VERIFY_MINIMUM_FLAG) $(_VERIFY_GATE_FLAG) \
+		$(_VERIFY_MINIMUM_FLAG) $(_VERIFY_GATE_FLAG) $(_VERIFY_PRE_GRANT_FLAG) \
 		--auth-file "$(ENV_DIR)/auth.auto.tfvars" --live --result-file "$(_VERIFY_RESULT)"
 
 # Every applying gate (rehearse, release, the staged policy controller) runs

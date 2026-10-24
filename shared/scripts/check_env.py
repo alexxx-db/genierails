@@ -41,6 +41,7 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 from scripts.sticky_governance import GovernedTablesError, _load_hcl, deterministic  # noqa: E402
+from scripts.release_gate import PROMOTED, env_role  # noqa: E402
 
 RESERVED_ENVS = ("account", "data_access")
 # Runtime files never enter the scratch copy: credentials, state, Terraform
@@ -166,6 +167,44 @@ def _copy_tracked_envs(source: Path, dest: Path) -> None:
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, target)
+
+
+def _uncommitted_env_files(cloud_dir: Path, env: str) -> tuple[list[str], list[str]]:
+    """(tracked files changed since the commit, untracked files) under envs/<env>.
+
+    Informational only, from one read-only git call (no optional index
+    refresh). Any git failure, including not being in a repo, returns nothing.
+    """
+    try:
+        out = subprocess.run(["git", "--no-optional-locks", "-C", str(cloud_dir / "envs" / env), "status",
+                              "--porcelain", "-z", "--untracked-files=all", "--", "."],
+                             capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return [], []
+    changed, untracked = [], []
+    fields = iter(os.fsdecode(out).split("\0"))
+    for entry in fields:
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        (untracked if status == "??" else changed).append(path)
+        if "R" in status or "C" in status:
+            next(fields, None)  # the rename/copy source follows its destination
+    return sorted(changed), sorted(untracked)
+
+
+def _note_uncommitted_env_files(cloud_dir: Path, env: str) -> None:
+    changed, untracked = _uncommitted_env_files(cloud_dir, env)
+    if changed:
+        print(f"  NOTE: make check passed against uncommitted working-tree content in envs/{env}:")
+        for path in changed:
+            print(f"    {path}")
+    if untracked:
+        print(f"  NOTE: untracked files in envs/{env} were not checked; commit them if they belong to the env:")
+        for path in untracked:
+            print(f"    {path}")
+    if changed or untracked:
+        print("  rehearse and release-plan use the commit, not these uncommitted changes.")
 
 
 def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
@@ -301,7 +340,7 @@ def _check(args) -> None:
     env = args.env
     real_env_dir = args.cloud_dir / "envs" / env
     is_deterministic = deterministic(real_env_dir)
-    promotes = env == "prod" or bool(_load_hcl(real_env_dir / "env.auto.tfvars").get("promote_from"))
+    promotes = env_role(real_env_dir) == PROMOTED
     has_generated = (real_env_dir / "generated" / "abac.auto.tfvars").is_file()
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
     steps = 6
@@ -383,6 +422,8 @@ def _check(args) -> None:
         print(f"  STRUCTURAL plan: envs/{env} as committed, against EMPTY state (no remote state is "
               "configured). It shows every resource as new and proves the config plans; it is not the "
               "change a release would make. Live tags are not re-read, so new SELECT grants show as withheld.")
+        print("  INFO: Genie CAN_RUN withheld in this empty-state pre-release plan is expected; ordinary "
+              "plans and applies still fail when CAN_RUN is unexpectedly withheld.")
         scratch.add_credentials(env)
         # The structural plan doesn't re-read live tags (a plan applies nothing;
         # the gate withholds new grants), so it hands the plan the one-time
@@ -390,12 +431,16 @@ def _check(args) -> None:
         from exposure_token import ENV_VAR, mint
 
         token = mint(scratch.envs / env)
+        from scripts.state_layout import STRUCTURAL_CHECK_TOKEN_ENV, mint_structural_check_token
+        structural_token = mint_structural_check_token(scratch.envs / env)
         try:
             if scratch.make("plan", f"ENV={env}", extra_env={ENV_VAR: str(token),
-                                                             "CLASSIFICATION_READ_ONLY": "1"}) != 0:
+                                                             "CLASSIFICATION_READ_ONLY": "1",
+                                                             STRUCTURAL_CHECK_TOKEN_ENV: str(structural_token)}) != 0:
                 raise CheckFailed("plan")
         finally:
             token.unlink(missing_ok=True)
+            structural_token.unlink(missing_ok=True)
     finally:
         scratch.close()
 
@@ -426,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
     except (CheckFailed, GovernedTablesError) as exc:
         print(f"\n=== {label}: FAILED ({exc}) ===", file=sys.stderr)
         return 1
+    if args.command == "check":
+        _note_uncommitted_env_files(args.cloud_dir, args.env)
     print(f"\n=== {label}: passed ===")
     return 0
 

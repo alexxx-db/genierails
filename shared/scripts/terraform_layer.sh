@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Terraform state can contain credentials and resource secrets. Make every
+# file this runner creates owner-only regardless of the caller's umask.
+umask 077
+
 if [ "$#" -lt 3 ]; then
   echo "Usage: $0 <layer> <env> <command> [args...]" >&2
   exit 1
@@ -68,6 +72,7 @@ if [ "$USE_STATE_LAYOUT" = 1 ] || [ -f "$STATE_ENV_DIR/.state-moved" ]; then
   STATE_BASE="$(python3 "$SCRIPT_DIR/state_layout.py" layer-dir --env-dir "$STATE_ENV_DIR" --env "$ENV_NAME" --layer "$LAYER")" || exit 2
 fi
 mkdir -p "$STATE_BASE"
+python3 "$SCRIPT_DIR/state_file_permissions.py" "$STATE_BASE"
 
 if [ ! -d "$ROOT_DIR" ]; then
   echo "Missing Terraform root: $ROOT_DIR" >&2
@@ -318,6 +323,10 @@ esac
 RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
   RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
+fi
+if [ "$LAYER:$COMMAND" = "workspace:plan" ] && \
+   python3 -c 'import os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from state_layout import STRUCTURAL_CHECK_TOKEN_ENV, consume_structural_check_token; raise SystemExit(0 if consume_structural_check_token(Path(sys.argv[2]), os.environ.get(STRUCTURAL_CHECK_TOKEN_ENV)) else 1)' "$SCRIPT_DIR" "$ENV_DIR"; then
+  RUNNER_VARS+=(-var="expected_pre_release_withholding=true")
 fi
 # Genie ID files: with GENIERAILS_STATE_DIR, the env's records/ in the state
 # dir (state_layout.py records-dir refuses while any is still in the checkout).

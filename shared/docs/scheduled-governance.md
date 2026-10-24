@@ -66,6 +66,18 @@ name for actionable failure guidance. The runner also
 retains `--step all|audit|delta|coverage` for existing callers;
 `--auth-file` and `--catalog` are legacy-only.
 
+Legacy `make maintain` deliberately fails closed when the schema-drift audit
+reports drift, including a name-pattern false positive (a column such as
+`patient_count` whose name looks sensitive but has no `class.*` or governed
+tag). A legacy env's tags come from an LLM draft, so maintain cannot prove the
+column is safe to leave unmasked, and there is no way to acknowledge a finding.
+If the column is sensitive, review its native UC classification detection,
+enable auto-tagging in Catalog Explorer, wait for the `class.*` tag, and re-run
+`make maintain ENV=<env>`. If it is a false positive, exclude it in Catalog
+Explorer; maintain stays blocked while the audit still flags the column, so
+migrate the env to deterministic governance, where maintain reports schema
+drift as advisory and continues through its coverage and rulebook gates.
+
 Before enabling legacy scheduled coverage, legacy envs generated before
 `gr_treatment` existed must run `make generate ENV=<env>`, then
 `make validate-generated ENV=<env>` and `make plan ENV=<env>`. Expect existing

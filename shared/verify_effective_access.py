@@ -501,7 +501,7 @@ def _live_policy_targets(policy: Mapping[str, Any], principals: Iterable[str]) -
 
 def live_mask_problem(check: "ColumnMaskCheck", policies: Sequence[Mapping[str, Any]],
                       column_tags: Sequence[tuple[str, str]], table_tags: Sequence[tuple[str, str]],
-                      direct_masks: int) -> str:
+                      direct_masks: int, *, never_raw: bool = False) -> str:
     """Why the live mask on the column isn't proven to be ``check.mask_function`` ("" if it is).
 
     Pure. ABAC masks don't show in information_schema.column_masks, so the
@@ -509,7 +509,8 @@ def live_mask_problem(check: "ColumnMaskCheck", policies: Sequence[Mapping[str, 
     column's live tags satisfy (and when_condition its table's tags). It must
     be the only mask on the column (no directly attached one), call exactly
     the configured function with no extra USING arguments, and apply to every
-    masked tier.
+    masked tier. ``never_raw``: it must also apply to all account users with
+    no exception, so no principal at all (the deployer included) reads raw.
     """
     from validate_abac import _condition_matches_tags, condition_is_supported
 
@@ -548,6 +549,125 @@ def live_mask_problem(check: "ColumnMaskCheck", policies: Sequence[Mapping[str, 
         return f"the live policy {policy.get('name')!r} passes extra USING arguments to the mask"
     if not _live_policy_targets(policy, check.masked_principals):
         return f"the live policy {policy.get('name')!r} does not apply to every masked tier"
+    if never_raw and (ALL_USERS_GROUP not in {str(p) for p in policy.get("to_principals") or []}
+                      or policy.get("except_principals")):
+        return (f"the live never-raw policy {policy.get('name')!r} does not apply to all account users "
+                "without exception")
+    return ""
+
+
+@dataclass(frozen=True)
+class NeverRawProof:
+    """What the admin proved about a never-raw column's live mask.
+
+    ``status`` PASS: the one live mask is the configured caller-independent
+    function, applied to all account users with no exception, whose body is
+    proven not to depend on its argument beyond NULL
+    (never_raw_structure_problem), and it maps distinct probe values to the
+    single masked ``constant`` (a sanity check, not the proof).
+    """
+    status: str
+    detail: str = ""
+    constant: Any = None
+
+
+# Distinct non-NULL probe arguments per mask parameter type (cast from strings).
+_NEVER_RAW_PROBES = {
+    **{t: ("genierails-never-raw-probe-a", "genierails-never-raw-probe-b") for t in ("STRING", "VARCHAR", "CHAR")},
+    **{t: ("7", "3") for t in ("INT", "INTEGER", "BIGINT", "LONG", "SMALLINT", "SHORT", "TINYINT", "BYTE",
+                               "DECIMAL", "DOUBLE", "FLOAT")},
+    "DATE": ("2001-02-03", "2004-05-06"),
+    **{t: ("2001-02-03 04:05:06", "2004-05-06 07:08:09") for t in ("TIMESTAMP", "TIMESTAMP_NTZ")},
+}
+
+
+def never_raw_probes(data_type: str) -> tuple[str, ...]:
+    """Two distinct probe arguments for a mask parameter of ``data_type`` (() if unsupported)."""
+    if not re.fullmatch(r"[A-Za-z_]+(\(\s*\d+\s*(,\s*\d+\s*)?\))?", data_type or ""):
+        return ()
+    return _NEVER_RAW_PROBES.get(data_type.split("(")[0].upper(), ())
+
+
+def never_raw_structure_problem(definition: Any, parameter: Any) -> str:
+    """Why a never-raw mask's body isn't proven to ignore its argument ("" when it is). Pure.
+
+    Probes can't prove this: a body can single out any value it likes
+    (``CASE WHEN value IN (<probes>, '999') ...``). Instead the parameter may
+    appear only as the whole condition of a CASE branch, ``WHEN p IS NULL
+    THEN`` or ``WHEN p IS NOT NULL THEN``; anywhere else (a comparison, IN,
+    a call, a concatenation, a THEN/ELSE result) → a problem. A WHEN
+    condition ends at its THEN, so that branch tests only whether the
+    argument is NULL, and every other token is argument-free: the output
+    depends on nothing but the argument's nullness, which the caller's own
+    read of NULL already shows. The rest of the body (no UDFs, nothing
+    caller- or session-dependent) is fixed_point_function_problem's job.
+    """
+    from sql_tokenizer import SqlTokenizeError, sql_tokens
+
+    name = str(parameter or "").strip().lower()
+    if not isinstance(definition, str) or not definition.strip() or not name:
+        return "the never-raw mask function's definition or parameter could not be read"
+    try:
+        tokens = sql_tokens(definition)
+    except SqlTokenizeError as exc:
+        return f"the never-raw mask function's definition could not be parsed ({exc})"
+    for i, token in enumerate(tokens):
+        if token != name:
+            continue
+        after = tokens[i + 1:i + 5]
+        if i and tokens[i - 1] == "when" and (after[:3] == ["is", "null", "then"]
+                                              or after == ["is", "not", "null", "then"]):
+            continue
+        return (f"the never-raw mask function's output may depend on its argument {name} (it is used other than "
+                f"as WHEN {name} IS [NOT] NULL THEN), so a constant output is not proven")
+    return ""
+
+
+def never_raw_constant_problem(probes: Sequence[str], outputs: Sequence[Any]) -> str:
+    """Why probe outputs don't show one masked constant ("" when they do). Pure."""
+    if len(outputs) != len(probes) or len(probes) < 2:
+        return "the mask function's probe query did not return one output per probe"
+    normalized = {_normalize_exact_value(v) for v in outputs}
+    if len(normalized) != 1:
+        return "the mask function maps distinct values to distinct outputs, so it is not a constant mask"
+    if normalized & {_normalize_exact_value(p) for p in probes}:
+        return "the mask function returns a probe value unchanged"
+    return ""
+
+
+def routines_equivalence_problem(left: Sequence[Any], left_params: Sequence[tuple[str, str]],
+                                 right: Sequence[Any], right_params: Sequence[tuple[str, str]]) -> str:
+    """Why two live routines aren't proven to compute the same function ("" when they are). Pure.
+
+    ``left``/``right`` are (routine_body, external_language, is_deterministic,
+    sql_data_access, routine_definition, data_type); params are (name, type) in
+    order. Equivalent means the same language, determinism, data access,
+    return and argument types, and token-identical definitions once each
+    parameter is named by its position.
+    """
+    from sql_tokenizer import SqlTokenizeError, sql_tokens
+
+    def upper(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    for index, label in ((0, "routine body"), (1, "language"), (2, "determinism"), (3, "data access"),
+                         (5, "return type")):
+        if upper(left[index]) != upper(right[index]):
+            return f"the functions differ in {label}"
+    if [upper(t) for _n, t in left_params] != [upper(t) for _n, t in right_params]:
+        return "the functions differ in their argument types"
+
+    def tokens(definition: Any, params: Sequence[tuple[str, str]]) -> list[str]:
+        if not isinstance(definition, str) or not definition.strip():
+            raise SqlTokenizeError("a definition could not be read")
+        position = {str(name).strip().lower(): f"\0arg{i}" for i, (name, _t) in enumerate(params)}
+        return [position.get(t, t) for t in sql_tokens(definition)]
+
+    try:
+        if tokens(left[4], left_params) != tokens(right[4], right_params):
+            return "the functions' definitions differ"
+    except SqlTokenizeError as exc:
+        return f"the functions' definitions could not be compared ({exc})"
     return ""
 
 
@@ -972,6 +1092,80 @@ def evaluate_column_mask_check(
     )
 
 
+def _evaluate_never_raw(
+    check: ColumnMaskCheck,
+    tiers: Mapping[str, str],
+    values_by_principal: Mapping[str, Any],
+    baseline: Mapping[Any, Any],
+    accepted: set[str],
+    proof: Optional[NeverRawProof],
+) -> CheckResult:
+    """Verify a never-raw column: everyone, the deployer included, sees only the masked constant.
+
+    No principal reads the raw value, so there is no raw baseline and no row
+    can show a masked value differing from it. Instead the admin's
+    ``proof`` must show the one live mask is the configured function, applied
+    to all account users with no exception, mapping distinct values to one
+    constant (a failed attachment proof FAILs). Then ``baseline`` (the admin
+    baseline's own read) and every principal's paired rows must be exactly
+    that constant, or NULL where the baseline is NULL; any other value is a
+    leak or a wrong mask → FAIL. Each principal must have read the constant on
+    at least one row the baseline also read, else → INCONCLUSIVE.
+    """
+    target = check.describe()
+    if proof is None:
+        return CheckResult("column-mask", target, INCONCLUSIVE,
+                           "never-raw mask: its live attachment and constant output were not proven",
+                           {"never_raw": True})
+    if proof.status != PASS:
+        return CheckResult("column-mask", target, proof.status, f"never-raw mask: {proof.detail}",
+                           {"never_raw": True})
+    constant = _normalize_exact_value(proof.constant)
+    baseline_off = sum(1 for v in baseline.values()
+                       if v is not None and _normalize_exact_value(v) != constant)
+    unexpected: dict[str, int] = {DEFAULT_ADMIN_TIER: baseline_off} if baseline_off else {}
+    compared: dict[str, int] = {}
+    missing: list[str] = []
+    for principal in sorted(tiers):
+        if principal in accepted:
+            continue
+        rows = _row_pairs(values_by_principal.get(principal))
+        problem = sample_key_problem(check, principal, rows)
+        if problem:
+            return CheckResult("column-mask", target, INCONCLUSIVE, problem,
+                               {"key_column": check.key_column})
+        actual = dict(rows)
+        off = sum(1 for key, value in actual.items()
+                  if _normalize_exact_value(value) not in (constant, None)
+                  or (key in baseline and _normalize_exact_value(value)
+                      != _normalize_exact_value(baseline[key])))
+        if off:
+            unexpected[principal] = unexpected.get(principal, 0) + off
+        compared[principal] = sum(1 for key, value in actual.items()
+                                  if key in baseline and _normalize_exact_value(value) == constant)
+        if not compared[principal] or any(key not in baseline for key in actual):
+            missing.append(principal)
+    if unexpected:
+        return CheckResult("column-mask", target, FAIL,
+                           ("never-raw column: principal(s) read a value other than the mask's constant "
+                            f"(a raw leak or the wrong mask), rows per principal: {unexpected}"),
+                           {"never_raw": True, "unexpected_by_principal": unexpected})
+    if missing:
+        return CheckResult("column-mask", target, INCONCLUSIVE,
+                           ("never-raw column: principal(s) read no masked row, or a row the admin "
+                            f"baseline did not read: {missing}"),
+                           {"never_raw": True, "missing": missing, "per_principal_compared": compared})
+    if not compared or DEFAULT_ADMIN_TIER not in compared:
+        return CheckResult("column-mask", target, INCONCLUSIVE,
+                           "never-raw column: the admin/deployer baseline's own read was not compared",
+                           {"never_raw": True, "accepted_fail_closed": sorted(accepted)})
+    return CheckResult(
+        "column-mask", target, PASS,
+        (f"never-raw: every principal, the admin/deployer baseline included, read only the mask's constant "
+         f"across {sum(compared.values())} row(s); the mask applies to all account users without exception"),
+        {"never_raw": True, "per_principal_compared": compared, "accepted_fail_closed": sorted(accepted)})
+
+
 def evaluate_tiered_column_mask_check(
     check: ColumnMaskCheck,
     values_by_principal: Mapping[str, Any],
@@ -980,11 +1174,22 @@ def evaluate_tiered_column_mask_check(
     *,
     pairing_problem: str = "",
     principal_memberships: Optional[Mapping[str, Sequence[str]]] = None,
+    function_equivalence: Optional[str] = None,
+    never_raw_proof: Optional[NeverRawProof] = None,
 ) -> CheckResult:
     """Compare every deterministic tier with its exact admin-computed output.
 
     ``expected_by_tier`` contains paired ``(key, value)`` rows for raw,
     partial and full.  No values are included in evidence or diagnostics.
+
+    ``function_equivalence`` is "" when the admin proved the differently named
+    partial and full functions have identical live definitions (else why not;
+    None when unchecked). Only then may their identical sample outputs be
+    verified by output alone; otherwise the tiers must be distinguishable.
+
+    A never-raw check (no tier, the admin/deployer baseline included, sees
+    raw) has no raw baseline to compare: it is verified by
+    _evaluate_never_raw with ``never_raw_proof``.
     """
     target = check.describe()
     tiers = dict(check.expected_tiers)
@@ -1027,6 +1232,9 @@ def evaluate_tiered_column_mask_check(
                                {"key_column": check.key_column})
     expected = {tier: dict(rows) for tier, rows in expected_rows.items()}
     used_tiers = set(tiers.values())
+    if "raw" not in used_tiers and tiers.get(DEFAULT_ADMIN_TIER, "raw") != "raw":
+        return _evaluate_never_raw(check, tiers, values_by_principal, expected["raw"], accepted,
+                                   never_raw_proof)
     common = set.intersection(*(set(expected[tier]) for tier in used_tiers)) if used_tiers else set()
     # Only tier pairs whose expected results differ need separate proof.  Some
     # reviewed treatments intentionally use the same function for partial and
@@ -1046,11 +1254,16 @@ def evaluate_tiered_column_mask_check(
             if differs:
                 required_pairs.append((left, right))
             elif ({left, right} == {"partial", "full"}
-                  and check.partial_function.lower() != check.full_function.lower()):
+                  and check.partial_function.lower() != check.full_function.lower()
+                  and function_equivalence != ""):
+                # Identical definitions (ssn, redact: partial = full) make the
+                # names irrelevant; anything less could hide the wrong one.
+                why = f" ({function_equivalence})" if function_equivalence else ""
                 return CheckResult(
                     "column-mask", target, INCONCLUSIVE,
                     ("partial and full use different expected functions but their outputs "
-                     "cannot be distinguished on the sample"),
+                     "cannot be distinguished on the sample, and the functions were not proven "
+                     f"identical{why}"),
                     {"sampled_rows": len(common)},
                 )
     masked_tiers = used_tiers - {"raw"}
@@ -1255,6 +1468,8 @@ def evaluate_effective_access(
     unpaired: Optional[Mapping[tuple, Mapping[str, str]]] = None,
     fixed_points: Optional[Mapping[tuple, Iterable[Any]]] = None,
     expected_values: Optional[Mapping[tuple, Mapping[str, Any]]] = None,
+    function_equivalence: Optional[Mapping[tuple, str]] = None,
+    never_raw_proofs: Optional[Mapping[tuple, NeverRawProof]] = None,
 ) -> EffectiveAccessReport:
     """Evaluate every check in the spec against collected observations (pure)."""
     report = EffectiveAccessReport()
@@ -1266,7 +1481,9 @@ def evaluate_effective_access(
             report.add(evaluate_tiered_column_mask_check(
                 check, vals, (expected_values or {}).get(sig, {}), errs,
                 pairing_problem=(pairing_problems or {}).get(sig, ""),
-                principal_memberships=spec.principal_memberships))
+                principal_memberships=spec.principal_memberships,
+                function_equivalence=(function_equivalence or {}).get(sig),
+                never_raw_proof=(never_raw_proofs or {}).get(sig)))
         else:
             report.add(evaluate_column_mask_check(
                 check, vals, errs,
@@ -1964,13 +2181,16 @@ class EffectiveAccessVerifier:
                 time.sleep(min(QUERY_PREFLIGHT_BACKOFF_SECONDS,
                                max(0.0, deadline - time.monotonic())))
 
-    def grant_outsider_table_access(
+    def grant_temporary_table_access(
         self, principal: TestPrincipal, tables: Sequence[str], *, revoke: bool = False,
     ) -> None:
-        """Temporarily grant/revoke the outsider access to only checked tables.
+        """Temporarily grant/revoke a test principal access to only checked tables.
 
-        These direct SQL grants deliberately never enter Terraform state.  The
-        caller always revokes them in its outermost ``finally`` block.
+        The out-of-tier probe always gets this; with ``pre_grant`` (a staged
+        verify before the grant phase opens business access) every test
+        principal does. The grantee is the test principal itself, never its
+        tier group. These direct SQL grants deliberately never enter Terraform
+        state.  The caller always revokes them in its outermost ``finally`` block.
         """
         self._guard()
         verb = "REVOKE" if revoke else "GRANT"
@@ -2014,7 +2234,7 @@ class EffectiveAccessVerifier:
                 failures.append(str(exc))
         if failures:
             raise RuntimeError(
-                f"failed to revoke {len(failures)} temporary outsider privilege(s): "
+                f"failed to revoke {len(failures)} temporary privilege(s): "
                 + "; ".join(failures)
             )
 
@@ -2227,19 +2447,11 @@ class EffectiveAccessVerifier:
                 return policies
         raise RuntimeError(f"too many pages of policies on {table}")
 
-    def fixed_point_problem(self, principal: TestPrincipal, check: ColumnMaskCheck,
-                            policies: Sequence[Mapping[str, Any]]) -> str:
-        """Why fixed points can't be excluded for ``check`` ("" when they can).
-
-        Run as the admin. The live mask on the column must be exactly the
-        configured function with no extra arguments (live_mask_problem), and
-        that function caller-independent (fixed_point_function_problem).
-        """
-        self._guard()
-        fn_catalog, fn_schema, fn_name = table_parts(check.mask_function)
+    def _live_mask_metadata(self, ws, check: ColumnMaskCheck, policies: Sequence[Mapping[str, Any]],
+                            ) -> tuple[list[tuple[str, str]], list[tuple[str, str]], int]:
+        """The column's live tags, its table's (when a policy needs them) and its direct masks."""
         catalog, schema, table = table_parts(check.table)
         quote_identifier(check.column)
-        ws = self._ws_for(principal)
         col = {"c": catalog.lower(), "s": schema.lower(), "t": table.lower(), "k": check.column.lower()}
         where = ("WHERE lower({0}) = :c AND lower({1}) = :s "
                  "AND lower(table_name) = :t AND lower(column_name) = :k")
@@ -2253,7 +2465,88 @@ class EffectiveAccessVerifier:
             ws, "SELECT tag_name, tag_value FROM system.information_schema.table_tags "
             "WHERE lower(catalog_name) = :c AND lower(schema_name) = :s AND lower(table_name) = :t",
             {n: col[n] for n in ("c", "s", "t")}) if r] if any(p.get("when_condition") for p in policies) else []
-        problem = live_mask_problem(check, policies, column_tags, table_tags, direct)
+        return column_tags, table_tags, direct
+
+    def routine_facts(self, ws, function: str) -> tuple[tuple, list[tuple[str, str]]]:
+        """One live routine's (body, language, deterministic, data access, definition, return type)
+        and its (parameter name, type) list in order. Raises unless exactly one routine has the name."""
+        catalog, schema, name = table_parts(function)
+        fn = {"c": catalog.lower(), "s": schema.lower(), "n": name.lower()}
+        routines = self.run_query(
+            ws, "SELECT routine_body, external_language, is_deterministic, sql_data_access, "
+            "routine_definition, data_type FROM system.information_schema.routines WHERE "
+            "lower(routine_catalog) = :c AND lower(routine_schema) = :s AND lower(routine_name) = :n", fn)
+        if len(routines) != 1:
+            raise RuntimeError(f"{len(routines)} routines named {function}, not exactly one")
+        params = self.run_query(
+            ws, "SELECT parameter_name, data_type FROM system.information_schema.parameters WHERE "
+            "lower(specific_catalog) = :c AND lower(specific_schema) = :s AND lower(specific_name) = :n "
+            "ORDER BY ordinal_position", fn)
+        return tuple(routines[0]), [(str(r[0] or ""), str(r[1] or "")) for r in params]
+
+    def function_equivalence_problem(self, principal: TestPrincipal, left: str, right: str) -> str:
+        """Why the live ``left`` and ``right`` functions aren't proven identical ("" when they are). Admin."""
+        self._guard()
+        ws = self._ws_for(principal)
+        return routines_equivalence_problem(*self.routine_facts(ws, left), *self.routine_facts(ws, right))
+
+    def never_raw_mask_proof(self, principal: TestPrincipal, check: ColumnMaskCheck,
+                             policies: Sequence[Mapping[str, Any]]) -> NeverRawProof:
+        """Prove a never-raw column's live mask, as the admin (see NeverRawProof).
+
+        FAIL when the live mask is not the configured function on the column
+        for all account users without exception, or the function doesn't map
+        distinct probe values to one constant; INCONCLUSIVE when the function
+        isn't proven caller-independent (fixed_point_function_problem), so the
+        admin's probe might not be what a tier gets, or its body isn't proven
+        to ignore its argument (never_raw_structure_problem), since probes
+        alone can't rule out a value the body singles out.
+        """
+        self._guard()
+        if len({check.mask_function.lower(), check.partial_function.lower(), check.full_function.lower()}) != 1:
+            return NeverRawProof(INCONCLUSIVE, "the check's mask, partial and full functions are not one function")
+        ws = self._ws_for(principal)
+        problem = live_mask_problem(check, policies, *self._live_mask_metadata(ws, check, policies),
+                                    never_raw=True)
+        if problem:
+            return NeverRawProof(FAIL, f"the configured mask is not proven attached to everyone: {problem}")
+        (body, language, deterministic, data_access, definition, _returns), params = self.routine_facts(
+            ws, check.full_function)
+        problem = fixed_point_function_problem(
+            routine_body=body, external_language=language, is_deterministic=deterministic,
+            sql_data_access=data_access, definition=definition, parameters=[name for name, _t in params])
+        if problem:
+            return NeverRawProof(INCONCLUSIVE, f"the mask function is not proven caller-independent: {problem}")
+        problem = never_raw_structure_problem(definition, params[0][0])
+        if problem:
+            return NeverRawProof(INCONCLUSIVE, problem)
+        data_type = params[0][1]
+        probes = never_raw_probes(data_type)
+        if not probes:
+            return NeverRawProof(INCONCLUSIVE, f"no probe values for a {data_type!r} mask argument")
+        function = ".".join(quote_identifier(part) for part in table_parts(check.full_function))
+        # data_type is a plain type name: never_raw_probes refuses anything else.
+        rows = self.run_query(
+            ws, "SELECT " + ", ".join(f"{function}(CAST(:p{i} AS {data_type}))" for i in range(len(probes))),
+            {f"p{i}": probe for i, probe in enumerate(probes)})
+        outputs = list(rows[0]) if rows else []
+        problem = never_raw_constant_problem(probes, outputs)
+        if problem:
+            return NeverRawProof(FAIL, problem)
+        return NeverRawProof(PASS, "", outputs[0])
+
+    def fixed_point_problem(self, principal: TestPrincipal, check: ColumnMaskCheck,
+                            policies: Sequence[Mapping[str, Any]]) -> str:
+        """Why fixed points can't be excluded for ``check`` ("" when they can).
+
+        Run as the admin. The live mask on the column must be exactly the
+        configured function with no extra arguments (live_mask_problem), and
+        that function caller-independent (fixed_point_function_problem).
+        """
+        self._guard()
+        fn_catalog, fn_schema, fn_name = table_parts(check.mask_function)
+        ws = self._ws_for(principal)
+        problem = live_mask_problem(check, policies, *self._live_mask_metadata(ws, check, policies))
         if problem:
             return problem
         fn = {"c": fn_catalog.lower(), "s": fn_schema.lower(), "n": fn_name.lower()}
@@ -2380,6 +2673,7 @@ def verify_effective_access_live(
     admin_tier: str = DEFAULT_ADMIN_TIER,
     global_key: str = "",
     unsafe_by_table: Optional[Mapping[str, set[str]]] = None,
+    pre_grant: bool = False,
 ) -> EffectiveAccessReport:
     """Provision per-tier principals, run queries as each, and evaluate effects.
 
@@ -2387,6 +2681,13 @@ def verify_effective_access_live(
     and proven (see pick_table_key). A table with no provable key is always
     blocking (INCONCLUSIVE), so the run can't pass; the rest are verified with
     their keys.
+
+    ``pre_grant``: a staged verify that runs before the grant phase opens the
+    tier groups' USE and SELECT (scripts/staged_policy_apply.py). Each test
+    principal then gets temporary USE CATALOG/USE SCHEMA/SELECT on the checked
+    tables it reads, granted to the principal itself (never its tier group, so
+    masks still see only its group membership) and revoked on every exit
+    (temporary_table_access).
 
     Guarded: raises unless ``GENIERAILS_LIVE_VERIFY=1``.
     """
@@ -2439,6 +2740,7 @@ def verify_effective_access_live(
 
     report: Optional[EffectiveAccessReport] = None
     cleanup_error: Optional[BaseException] = None
+    granted: dict[str, list[str]] = {}
     try:
         resolved_groups = {}
         for tier in sorted(spec.principals):
@@ -2459,11 +2761,18 @@ def verify_effective_access_live(
             print(f"  Granting warehouse CAN_USE to test principal: {tier}")
             verifier.grant_warehouse_use(principal)
 
-        outsider = principals.get(OUT_OF_TIER_PRINCIPAL)
-        outsider_tables = sorted({check.table for check in spec.column_masks})
-        if outsider and outsider_tables:
-            print("  Granting temporary checked-table access to out-of-tier principal")
-            verifier.grant_outsider_table_access(outsider, outsider_tables)
+        # A run killed before its finally (SIGKILL, a host crash) leaves its direct grants on these
+        # fixed-name principals, which the next run reuses; a post-grant gate would then read through
+        # them instead of the tier group's own grants. So every run revokes them first, or refuses.
+        revoke_stale_table_access(verifier, spec, principals)
+
+        for tier, tables in temporary_table_access(spec, principals, pre_grant=pre_grant).items():
+            print(f"  Granting temporary checked-table access to test principal: {tier}"
+                  if tier != OUT_OF_TIER_PRINCIPAL else
+                  "  Granting temporary checked-table access to out-of-tier principal")
+            # Recorded before the grant, so a grant that fails partway is still revoked.
+            granted[tier] = tables
+            verifier.grant_temporary_table_access(principals[tier], tables)
 
         # Newly-added group membership can take a short while to propagate.
         time.sleep(int(os.environ.get("GENIERAILS_VERIFY_PROPAGATION_SLEEP", "10")))
@@ -2478,6 +2787,8 @@ def verify_effective_access_live(
         expected_values: dict[tuple, dict[str, list[tuple[Any, Any]]]] = {}
         pairing_problems: dict[tuple, str] = {}
         fixed_points: dict[tuple, set[Any]] = {}
+        function_equivalence: dict[tuple, str] = {}
+        never_raw_proofs: dict[tuple, NeverRawProof] = {}
         table_policies: dict[str, list[Mapping[str, Any]]] = {}
         key_proofs: dict[tuple, str] = {}   # once per (table, key, read keys)
         key_metadata: dict[tuple, str] = {}  # once per (table, key)
@@ -2583,6 +2894,29 @@ def verify_effective_access_live(
                     expected_values[sig] = verifier.expected_tier_values(admin_principal, check, keys)
                 except Exception as exc:
                     pairing_problems[sig] = f"could not compute exact expected tier outputs as admin: {exc}"
+                # No tier, the admin baseline included, reads a never-raw
+                # column raw: prove its live mask instead. Differently named
+                # partial and full functions whose outputs coincide must be
+                # proven identical (ssn, redact).
+                expected_tiers = set(dict(check.expected_tiers).values())
+                never_raw = ("raw" not in expected_tiers
+                             and dict(check.expected_tiers).get(admin_tier, "raw") != "raw")
+                if sig in expected_values and never_raw:
+                    try:
+                        if check.table not in table_policies:
+                            table_policies[check.table] = verifier.table_policies(admin_principal, check.table)
+                        never_raw_proofs[sig] = verifier.never_raw_mask_proof(
+                            admin_principal, check, table_policies[check.table])
+                    except Exception as exc:
+                        never_raw_proofs[sig] = NeverRawProof(
+                            INCONCLUSIVE, f"could not prove the mask as the admin baseline: {exc}")
+                elif (sig in expected_values and {"partial", "full"} <= expected_tiers
+                      and check.partial_function.lower() != check.full_function.lower()):
+                    try:
+                        function_equivalence[sig] = verifier.function_equivalence_problem(
+                            admin_principal, check.partial_function, check.full_function)
+                    except Exception as exc:
+                        function_equivalence[sig] = f"could not compare the functions as the admin baseline: {exc}"
                 # Account group membership is eventually consistent. Retry an
                 # exact-output mismatch (but never a raw leak) with bounded
                 # exponential backoff; query failures retain their normal
@@ -2594,7 +2928,9 @@ def verify_effective_access_live(
                 while sig in expected_values and not pairing_problems.get(sig):
                     result = evaluate_tiered_column_mask_check(
                         check, per_principal, expected_values[sig], per_errors,
-                        principal_memberships=spec.principal_memberships)
+                        principal_memberships=spec.principal_memberships,
+                        function_equivalence=function_equivalence.get(sig),
+                        never_raw_proof=never_raw_proofs.get(sig))
                     expired = time.time() >= deadline
                     if result.status != FAIL or "did not exactly match" not in result.detail or expired:
                         if expired and result.status == FAIL and "did not exactly match" in result.detail:
@@ -2648,7 +2984,8 @@ def verify_effective_access_live(
         report = evaluate_effective_access(
             spec, column_values, row_counts, column_errors, row_errors,
             pairing_problems=pairing_problems, fixed_points=fixed_points,
-            expected_values=expected_values,
+            expected_values=expected_values, function_equivalence=function_equivalence,
+            never_raw_proofs=never_raw_proofs,
         )
         report.results.extend(blocking)
         report.pairing_keys = proven_keys_by_table(report, spec)
@@ -2659,21 +2996,20 @@ def verify_effective_access_live(
                 "not every row")
         return report
     finally:
-        outsider = principals.get(OUT_OF_TIER_PRINCIPAL)
-        outsider_tables = sorted({check.table for check in spec.column_masks})
-        if outsider and outsider_tables:
+        for tier, tables in granted.items():
+            grantee_principal = principals[tier]
             try:
-                verifier.grant_outsider_table_access(outsider, outsider_tables, revoke=True)
+                verifier.grant_temporary_table_access(grantee_principal, tables, revoke=True)
             except BaseException as exc:
                 cleanup_error = exc
                 privileges = ", ".join(f"USE CATALOG/USE SCHEMA/SELECT on {table}"
-                                       for table in outsider_tables)
-                grantee = quote_identifier(outsider.application_id)
-                catalogs = sorted({table_parts(table)[0] for table in outsider_tables})
-                schemas = sorted({table_parts(table)[:2] for table in outsider_tables})
+                                       for table in tables)
+                grantee = quote_identifier(grantee_principal.application_id)
+                catalogs = sorted({table_parts(table)[0] for table in tables})
+                schemas = sorted({table_parts(table)[:2] for table in tables})
                 manual_revokes = [
                     f"REVOKE SELECT ON TABLE {quote_table(table)} FROM {grantee}"
-                    for table in outsider_tables
+                    for table in tables
                 ]
                 manual_revokes.extend(
                     f"REVOKE USE SCHEMA ON SCHEMA {quote_identifier(catalog)}."
@@ -2684,17 +3020,18 @@ def verify_effective_access_live(
                     f"REVOKE USE CATALOG ON CATALOG {quote_identifier(catalog)} FROM {grantee}"
                     for catalog in catalogs
                 )
+                who = "outsider" if tier == OUT_OF_TIER_PRINCIPAL else f"test-principal ({tier})"
                 detail = (
-                    f"temporary outsider access was not fully revoked for service principal "
-                    f"{outsider.application_id}: {privileges}. Remove it manually with REVOKE "
+                    f"temporary {who} access was not fully revoked for service principal "
+                    f"{grantee_principal.application_id}: {privileges}. Remove it manually with REVOKE "
                     f"statements before retrying: {'; '.join(manual_revokes)}. Cause: {exc}"
                 )
                 print(f"  ERROR: {detail}", file=sys.stderr)
                 if report is not None:
                     report.results.append(CheckResult(
-                        "cleanup", outsider.application_id, FAIL, detail,
-                        {"principal": outsider.application_id,
-                         "tables_with_possible_access": outsider_tables},
+                        "cleanup", grantee_principal.application_id, FAIL, detail,
+                        {"principal": grantee_principal.application_id,
+                         "tables_with_possible_access": tables},
                     ))
         if not keep_principals:
             for tier, p in principals.items():
@@ -2707,6 +3044,61 @@ def verify_effective_access_live(
             raise RuntimeError(
                 f"verification cleanup failed after another error: {cleanup_error}"
             ) from cleanup_error
+
+
+def checked_tables(spec: VerificationSpec) -> list[str]:
+    return sorted({check.table for check in spec.column_masks} | {check.table for check in spec.row_filters})
+
+
+def revoke_stale_table_access(verifier: "EffectiveAccessVerifier", spec: VerificationSpec,
+                              principals: Mapping[str, Any], admin_tier: str = DEFAULT_ADMIN_TIER) -> None:
+    """Revoke any direct USE/SELECT a test principal holds on the checked tables, before it is used.
+
+    Only an earlier run that never reached its cleanup leaves such grants (a
+    reused principal keeps its application ID). Revoking one that isn't held
+    changes nothing. A revoke that fails refuses the run before any grant or
+    query, so no check can read through a leftover grant.
+    """
+    tables = checked_tables(spec)
+    if not tables:
+        return
+    for tier, principal in sorted(principals.items()):
+        if tier == admin_tier:
+            continue
+        print(f"  Revoking any direct checked-table access left on test principal: {tier}")
+        try:
+            verifier.grant_temporary_table_access(principal, tables, revoke=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"refusing to verify: test principal {principal.application_id} ({tier}) may still hold "
+                f"direct USE/SELECT on {', '.join(tables)} from an earlier run that didn't clean up, and "
+                f"revoking it failed: {exc}") from exc
+
+
+def temporary_table_access(spec: VerificationSpec, principals: Mapping[str, Any], *,
+                           pre_grant: bool = False,
+                           admin_tier: str = DEFAULT_ADMIN_TIER) -> dict[str, list[str]]:
+    """Test principal -> the checked tables it gets temporary USE/SELECT on.
+
+    The out-of-tier probe is in no tier group, so it always gets every
+    mask-checked table. With ``pre_grant`` (a verify before the grant phase)
+    every other provisioned test principal gets the tables of the checks it
+    takes part in; the admin baseline and the tier groups never do.
+    """
+    out: dict[str, set[str]] = {}
+    if OUT_OF_TIER_PRINCIPAL in principals and spec.column_masks:
+        out[OUT_OF_TIER_PRINCIPAL] = {check.table for check in spec.column_masks}
+    if pre_grant:
+        for check in spec.column_masks:
+            involved = (set(dict(check.expected_tiers)) if check.expected_tiers else
+                        set(check.masked_principals) | set(check.unmasked_principals))
+            for tier in involved:
+                out.setdefault(tier, set()).add(check.table)
+        for check in spec.row_filters:
+            for tier in set(check.restricted_principals) | set(check.unrestricted_principals):
+                out.setdefault(tier, set()).add(check.table)
+    return {tier: sorted(tables) for tier, tables in sorted(out.items())
+            if tier != admin_tier and tier in principals}
 
 
 def pick_pairing_keys(
@@ -3202,6 +3594,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "row-pairing key per table) for tooling such as make rehearse/release.")
     p.add_argument("--print-spec", action="store_true",
                    help="Print the resolved spec and exit (no workspace needed).")
+    p.add_argument("--pre-grant-access", action="store_true",
+                   help="A staged verify before the grant phase (the controller sets it): give each "
+                        "test principal itself temporary USE CATALOG/USE SCHEMA/SELECT on the "
+                        "checked tables it reads, revoked on exit. Tier groups get nothing.")
     p.add_argument("--require-mask-checks", action="store_true",
                    help="Fail instead of skipping a mask check whose table has no provable "
                         "row-pairing key (make release: production masking must be proven).")
@@ -3463,7 +3859,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = verify_effective_access_live(
         spec, args.auth_file,
         warehouse_id=args.warehouse_id, keep_principals=args.keep_principals,
-        global_key=args.key_column, unsafe_by_table=unsafe,
+        global_key=args.key_column, unsafe_by_table=unsafe, pre_grant=args.pre_grant_access,
     )
     print(report.summary())
     write_result_file(args.result_file, report, spec)

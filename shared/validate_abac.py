@@ -21,8 +21,9 @@ from pathlib import Path
 
 from tag_vocabulary import REGISTRY
 from governance_policies import (
-    is_library_treatment_value, is_never_raw, keeps_string_partial, mixed_partial_problem,
-    parse_treatment_value,
+    column_comments_from_ddl, free_text_partial_columns, is_library_treatment_value,
+    is_never_raw, keeps_string_partial, mixed_partial_problem, parse_treatment_value,
+    treatment_value_column,
 )
 from treatment_derivation import load_treatment_config
 
@@ -74,7 +75,12 @@ class ValidationResult:
         return len(self.errors) == 0
 
     def print_report(self, summary_label: str = "", verbose: bool = False):
-        if summary_label and self.passed and not self.warnings and not verbose:
+        advisory_only = self.warnings and all(
+            warning.startswith("COVERAGE ADVISORY") for warning in self.warnings
+        )
+        if summary_label and self.passed and not verbose and (not self.warnings or advisory_only):
+            for warning in self.warnings:
+                print(f"{summary_label}: [WARN] {warning}")
             print(f"{summary_label}: PASS ({len(self.info)} checks)")
             return
         width = 60
@@ -577,6 +583,7 @@ def validate_coverage_gate(
     exposure: dict | None = None,
     env_name: str = "",
     env_dir: Path | None = None,
+    ddl_comments: dict[str, str] | None = None,
 ) -> None:
     """Block every classification/treatment coverage gap in generated config.
 
@@ -711,6 +718,26 @@ def validate_coverage_gate(
     _check_unclassified_sensitive_columns(
         ddl_columns, set(source_columns) | set(treatments), result, exposure,
     )
+
+    advisory_library = library
+    if advisory_library is None:
+        try:
+            advisory_library = _gate_library(env_dir)
+        except Exception as exc:  # noqa: BLE001 - advisory only; coverage errors above still decide the exit
+            result.warn(f"COVERAGE ADVISORY skipped: the env's mask library can't be read: {exc}")
+    resolved_treatments = {
+        column: item for column, value in treatments.items()
+        if advisory_library is not None
+        and (item := treatment_value_column(column, value, cfg, advisory_library)) is not None
+    }
+    free_text_partial = free_text_partial_columns(resolved_treatments, ddl_comments)
+    if free_text_partial:
+        result.warn(
+            "COVERAGE ADVISORY (non-blocking) — STRING columns whose name/comment suggests free text "
+            "keep a partial mask; partial-tier readers may see fragments such as the last four characters:\n"
+            "    - " + "\n    - ".join(free_text_partial)
+            + "\n  Review column_overrides / treatment_versions and use the redact treatment when fragments are unsafe."
+        )
 
     groups = [
         ("detected tags with no mapping/rule", [f"{c} ({d})" for c, d in unmapped]),
@@ -1242,6 +1269,10 @@ def validate_fgac_policies(
     validate_policy_overlaps(cfg, result)
 
     # Detect unsafe tag/function mismatches, especially heterogeneous contact collapse.
+    # Deterministic function names are content-addressed and do not exist in
+    # FUNCTION_EXPECTED_CATEGORIES.  #223's blocking mixed-partial coverage
+    # gate is the replacement; the free-text partial advisory is informational.
+    deterministic_category_skip = cfg.get("governance_mode") == "deterministic"
     assignments_by_tag: dict[tuple[str, str], list[dict]] = {}
     for ta in assignments:
         if ta.get("entity_type") != "columns":
@@ -1249,6 +1280,8 @@ def validate_fgac_policies(
         assignments_by_tag.setdefault((ta.get("tag_key", ""), ta.get("tag_value", "")), []).append(ta)
 
     for p in policies:
+        if deterministic_category_skip:
+            continue
         if p.get("policy_type") != "POLICY_TYPE_COLUMN_MASK":
             continue
         fn = p.get("function_name", "")
@@ -1404,7 +1437,10 @@ def load_validation_context(cfg: dict, result: ValidationResult, tfvars_path: Pa
 
     # The deployer SP the policies exempt is the committed one, never
     # auth.auto.tfvars, so validation needs no credentials.
-    for key in ("access_tier_groups", "raw_exempt_principals", "deployer_principal_id"):
+    for key in (
+        "access_tier_groups", "raw_exempt_principals", "deployer_principal_id",
+        "treatment_versions", "column_overrides",
+    ):
         if key not in merged and key in env_cfg:
             merged[key] = env_cfg[key]
     if env_path is not None and not env_parse_failed:
@@ -1651,8 +1687,11 @@ def main():
             result.error("COVERAGE CHECK — masking_functions.sql is required")
         ddl_path = Path(args.ddl).resolve() if args.ddl else find_fetched_ddl(anchor)
         ddl_columns = None
+        ddl_comments = None
         if ddl_path and ddl_path.exists():
-            ddl_columns = parse_ddl_columns(ddl_path.read_text())
+            ddl_text = ddl_path.read_text()
+            ddl_columns = parse_ddl_columns(ddl_text)
+            ddl_comments = column_comments_from_ddl(ddl_text)
         elif args.ddl:
             result.warn(f"COVERAGE CHECK — DDL file {ddl_path} not found; untagged-column check skipped")
         exposure = None
@@ -1665,6 +1704,7 @@ def main():
             merged_cfg, sql_functions, tfvars_path.read_text(), result,
             ddl_columns=ddl_columns, exposure=exposure,
             env_name=args.env_name, env_dir=anchor.parent.parent,
+            ddl_comments=ddl_comments,
         )
 
     result.print_report(args.summary_label, args.verbose)

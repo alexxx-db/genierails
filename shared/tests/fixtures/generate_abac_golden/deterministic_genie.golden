@@ -1,5 +1,5 @@
 ### EXIT 0
-### OUTPUT 2202
+### OUTPUT 2203
 ============================================================
   ABAC Configuration Generator
   Mode: genie — Genie configs only (no ABAC, no masking SQL)
@@ -29,7 +29,7 @@
 
   Masking UDFs will be deployed to: dev_fin.payments
   Fetched DDLs saved to: <TMP>/env/ddl/_fetched.sql
-  Injected genie_space_configs for configured agents: Payments Agent
+  Injected genie_space_configs from the Genie API for: Payments Agent
   Derived ACL sidecar for 1 Genie agent(s)
   abac.auto.tfvars written to: <TMP>/env/generated/abac.auto.tfvars (deterministic; no model called)
   Per-agent config: generated/spaces/payments_agent/abac.auto.tfvars

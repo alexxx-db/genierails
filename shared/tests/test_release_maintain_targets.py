@@ -123,7 +123,7 @@ def test_release_runs_unified_pipeline_in_order_and_writes_no_receipt(tmp_path):
         ["audit-rulebook", "ENV=prod"],
         ["apply", "ENV=prod", "APPLY_FLAGS=", "_STAGED_CONFIRM=0", TOKEN],
         ["_verify-access-gate", "ENV=prod", "VERIFY_REQUIRE_MASKS=1",
-         "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_KEY_COLUMN=customer_id"],
+         "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_PRE_GRANT=", "VERIFY_KEY_COLUMN=customer_id"],
     ]
     # No gate to open or persist: release neither passes nor writes it. The
     # stubbed verify-access proves no mask check, so the key isn't saved either.
@@ -349,7 +349,7 @@ def test_release_without_key_still_calls_verify_access(tmp_path):
     result = _make("release", env_dir, stub, audit)
     assert result.returncode == 0, result.stdout + result.stderr
     assert _calls(log)[-1] == ["_verify-access-gate", "ENV=prod", "VERIFY_REQUIRE_MASKS=1",
-                                "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="]
+                                "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_PRE_GRANT="]
 
 
 @pytest.mark.parametrize("target", ["release", "maintain"])

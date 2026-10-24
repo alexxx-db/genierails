@@ -19,7 +19,9 @@ from pathlib import Path
 import pytest
 
 from scripts import release_gate as rg
+from scripts import sticky_governance
 from tests import script_stubs
+from tests import test_prod_coverage_gap_fix as uc
 from tests.test_release_gate import EMPTY_ABAC, PROD_ENV, Repo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -568,6 +570,62 @@ def test_plain_release_through_the_release_target_uses_the_current_manifest(tmp_
     assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
 
 
+def _fake_uc(tmp_path: Path, table: str) -> dict[str, str]:
+    """test_prod_coverage_gap_fix's fake Databricks SDK, answering ``table``'s DDL and class.* tags."""
+    sdk = tmp_path / "sdk" / "databricks" / "sdk"
+    (sdk / "service").mkdir(parents=True)
+    (sdk.parent / "__init__.py").write_text("")
+    (sdk / "__init__.py").write_text(uc.FAKE_SDK)
+    (sdk / "config.py").write_text("class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n")
+    (sdk / "useragent.py").write_text("")  # else generate_abac pip-upgrades the real SDK
+    (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
+    (sdk / "service" / "__init__.py").write_text("")
+    (sdk / "service" / "sql.py").write_text(uc.FAKE_SQL)
+    live = tmp_path / "uc.json"
+    live.write_text(json.dumps({"tables": {table: uc.COLUMNS}, "tags": uc._tags(table.split(".")[0])}))
+    return {"PYTHONPATH": str(tmp_path / "sdk"), "FAKE_UC": str(live), "PIP_NO_INDEX": "1"}
+
+
+def test_plan_between_release_plan_and_release_does_not_stale_the_manifest(tmp_path, repo):
+    """S9. The plan really re-derives prod from live tags and re-splits it; only the overlay may change."""
+    table = uc.PROD_TABLE
+    (repo.prod / "env.auto.tfvars").write_text(PROD_ENV + f'uc_tables = ["{table}"]\nsql_warehouse_id = "wh"\n')
+    (repo.prod / "generated" / "abac.auto.tfvars").write_text(
+        'groups = { analysts = { description = "A" }, viewers = { description = "V" } }\n' + EMPTY_ABAC)
+    sticky_governance.save_governed_tables(repo.prod, [table])  # what promote-to records
+    repo.commit({})
+    (repo.prod / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://prod.example.invalid"\n'
+                                                'databricks_client_id = "c"\ndatabricks_client_secret = "s"\n')
+
+    def committed_generated():  # the ignored .live_refresh.json and .runtime/ are the plan's to write
+        return {p.name: p.read_bytes() for p in (repo.prod / "generated").iterdir()
+                if p.is_file() and not p.name.startswith(".")}
+
+    committed = committed_generated()
+    live = _fake_uc(tmp_path, table)
+    # release-plan derives and splits for real too, so its manifest pins what the live tags give.
+    make = Make(tmp_path, repo, passthrough=("derive-assignments", "promote"))
+    assert make("rehearse", "dev").returncode == 0
+    result = make("release-plan", "prod", environ_extra=live)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    gate = make._write("gate-full", '#!/bin/sh\n[ "$1" = needs-derive ] && echo full\nexit 0\n')
+    result = make("plan", "prod", stub_make=False, stubs={"coverage_gate.py": str(gate)}, environ_extra=live)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Derived 2 gr_treatment assignment(s)" in result.stdout
+    assert "=== Split generated/ to account + data_access + workspace (prod) ===" in result.stdout
+    # The live derive (not the committed, empty assignments) reached the overlay and the split.
+    derived = f'entity_name = "{table}.cvv"'
+    assert derived in (repo.prod / "generated" / ".runtime" / "abac.auto.tfvars").read_text()
+    assert derived in (repo.prod / "data_access" / "abac.auto.tfvars").read_text()
+    assert committed_generated() == committed
+    assert repo.git("status", "--porcelain") == ""
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
+
+
 def test_plain_release_without_a_current_manifest_refuses_and_applies_nothing(make, repo):
     result = make("_release-manifest", "prod")
     assert result.returncode != 0
@@ -776,6 +834,24 @@ def test_legacy_maintain_is_unchanged(make, repo):
     assert "apply-governance" in make.names()
 
 
+def test_maintain_verify_key_failure_stops_before_mask_proof_and_apply(make, repo):
+    (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    proof = make._recorder("proof")
+    result = make(
+        "maintain",
+        "prod",
+        "VERIFY_SPEC=/tmp/verify-spec.json",
+        stubs={
+            "resolve_env_config.py verify-key": "false",
+            "release_helpers.py require-mask-proof": str(proof),
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "maintain: could not resolve the verification key" in result.stderr
+    assert "proof" not in make.names()
+    assert "apply-governance" not in make.names()
+
+
 # -- rehearse --------------------------------------------------------------------------
 
 def test_rehearse_writes_a_receipt_and_reuses_it_without_reapplying(make, repo):
@@ -797,9 +873,9 @@ def test_rehearse_writes_a_receipt_and_reuses_it_without_reapplying(make, repo):
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        ((), ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE="]),
+        ((), ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_PRE_GRANT="]),
         (("VERIFY_KEY_COLUMN=customer_id",),
-         ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=",
+         ["_verify-access-gate", "ENV=dev", "VERIFY_FROM_TFVARS=", "VERIFY_ENV_FILE=", "VERIFY_PRE_GRANT=",
           "VERIFY_KEY_COLUMN=customer_id"]),
     ],
     ids=["autopick", "explicit-key"],
@@ -1066,3 +1142,28 @@ def test_a_failed_verify_key_stops_before_the_mask_proof_and_applies_nothing(mak
     assert not [c for c in make.calls() if c[0] in ("staged", "runner")]
     assert "_release-plan-roots" not in names and "derive-assignments" not in names
     assert not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
+
+
+@pytest.mark.parametrize("mode", ["legacy", "deterministic"])
+def test_maintain_stops_when_the_verify_config_path_cannot_be_resolved(make, repo, mode):
+    if mode == "legacy":
+        (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    else:
+        assert make("_release-manifest", "prod", f"MANIFEST={_planned(make)}").returncode == 0
+        make.reset()
+    proof = make._recorder("proof")
+    stubs = {"resolve_env_config.py verify-key": str(make._write("key", "#!/bin/sh\necho id\n")),
+             "release_helpers.py require-mask-proof": str(proof)}
+    # Control: with the path resolved, the proof gets it and governance applies.
+    result = make("maintain", "prod", "VERIFY_SPEC=masked", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    proofs = [c for c in make.calls() if c[0] == "proof"]
+    assert proofs and proofs[0][proofs[0].index("--tfvars") + 1] == str(repo.prod / "generated" / "abac.auto.tfvars")
+    assert "apply-governance" in make.names()
+    make.reset()
+
+    result = make("maintain", "prod", "VERIFY_SPEC=masked", stubs=stubs | {"runtime_overlay.py path": "false"})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "maintain: could not resolve the generated ABAC config; governance was not applied." in result.stderr
+    assert "proof" not in make.names() and "apply-governance" not in make.names()
+    assert _no_lock(repo, "prod")

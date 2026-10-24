@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -451,7 +452,9 @@ def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
 
 
 # Variables only terraform_layer.sh sets: where the roots read their state and Genie ID files.
-RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir")
+RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
+               "expected_pre_release_withholding")
+STRUCTURAL_CHECK_TOKEN_ENV = "GENIERAILS_STRUCTURAL_CHECK_TOKEN"
 # Variables only the staged policy controller sets (policy_generations._runner), as -var with the
 # env-lock token (environment_lock.stage_token). policy_stage selects which grants a plan withholds
 # and whether the staged guard applies; the rebind variables hold grants back. make's own
@@ -521,7 +524,8 @@ def runner_var_overrides(args: list[str], command: str, var_files: list[Path] = 
     for name in ("TF_CLI_ARGS", f"TF_CLI_ARGS_{command}"):
         if environ.get(name, "").strip():
             found += [(n, w, v, False) for n, w, v in _assigned_names(shlex.split(environ[name]), name)]
-    found += [(name, f"TF_VAR_{name}", None, False) for name in STAGE_VARS if f"TF_VAR_{name}" in environ]
+    protected = (*RUNNER_VARS, *STAGE_VARS)
+    found += [(name, f"TF_VAR_{name}", None, False) for name in protected if f"TF_VAR_{name}" in environ]
     token_ok = None
 
     def stage_allowed(name, value, is_arg) -> bool:
@@ -545,6 +549,30 @@ def runner_var_overrides(args: list[str], command: str, var_files: list[Path] = 
         elif name in STAGE_VARS and not stage_allowed(name, value, is_arg):
             out.append(f"{where} sets {name}, which only the staged policy controller sets")
     return out
+
+
+def mint_structural_check_token(env_dir: Path) -> Path:
+    """Mint the private, one-use proof that check_env is running an empty-state plan."""
+    fd, name = tempfile.mkstemp(prefix=".genierails-structural-check-")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(str(Path(env_dir).resolve()) + "\n")
+    return Path(name)
+
+
+def consume_structural_check_token(env_dir: Path, token: str | None) -> bool:
+    if not token:
+        return False
+    path = Path(token)
+    try:
+        info = path.lstat()
+        valid = (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                 and stat.S_IMODE(info.st_mode) == 0o600
+                 and path.read_text() == str(Path(env_dir).resolve()) + "\n")
+    except OSError:
+        return False
+    if valid:
+        path.unlink()
+    return valid
 
 
 def root_state_paths(env_dir: Path) -> dict[str, Path]:

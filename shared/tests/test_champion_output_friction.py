@@ -771,6 +771,7 @@ FAKE_TERRAFORM = """#!/usr/bin/env bash
 case "$1" in
   init|state) exit 0 ;;
   apply) cat "$FAKE_TF_STDOUT"; [ -z "$FAKE_TF_STDERR" ] || printf '%s\\n' "$FAKE_TF_STDERR" >&2
+         [ -z "$FAKE_TF_BREAK" ] || printf 'broken = "s3cr3t-token-value" {\\n' >> "$FAKE_TF_BREAK"
          exit "${FAKE_TF_EXIT:-0}" ;;
 esac
 """
@@ -827,13 +828,13 @@ def real_cloud(tmp_path):
     )
     (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
 
-    def run(**fake):
+    def run(env_name="dev", **fake):
         env = _clean_env()
         env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
         env["PYTHONPATH"] = str(tmp_path / "sdk")
         env.update({"FAKE_TF_STDOUT": str(TF_CAPTURE), **fake})
         return subprocess.run(
-            ["make", "--no-print-directory", "enable-classification", "ENV=dev", *args],
+            ["make", "--no-print-directory", "enable-classification", f"ENV={env_name}", *args],
             cwd=REPO / "aws", text=True, capture_output=True, env=env, timeout=120,
         )
     return run
@@ -890,3 +891,84 @@ def test_real_target_refuses_ambient_credentials_without_env_auth(real_cloud, tm
     assert result.returncode != 0, out
     assert f"fill in {auth_file}" in out
     assert "Apply complete!" not in out
+
+
+def _auto_tagging_env(tmp_path, name, *, promote_from=None, mode="deterministic"):
+    """A copy of the fixture's dev env as `name`, with auto-tagging on."""
+    envs = tmp_path / "aws/envs"
+    if name != "dev":
+        shutil.copytree(envs / "dev", envs / name)
+    env_file = envs / name / "env.auto.tfvars"
+    text = env_file.read_text().replace('governance_mode = "deterministic"', f'governance_mode = "{mode}"')
+    if promote_from:
+        text += f'\npromote_from = "{promote_from}"\n'
+    env_file.write_text(text + "\nenable_auto_tagging = true\n")
+
+
+# Finding 27b: the hint follows env-role (prod, or any env with promote_from, is
+# promoted) and the governance mode, not the literal name "prod".
+@pytest.mark.parametrize("name, promote_from, mode, expected, absent", [
+    ("prod", None, "deterministic",
+     "  make release-plan ENV=prod   (after make rehearse ENV=dev on the same commit)\n"
+     "  Get that manifest approved, then: make release ENV=prod\n", "make generate"),
+    ("stg", "dev", "deterministic",
+     "  make release-plan ENV=stg   (after make rehearse ENV=dev on the same commit)\n"
+     "  Get that manifest approved, then: make release ENV=stg\n", "make generate"),
+    ("prod", "stg", "deterministic",
+     "  make release-plan ENV=prod   (after make rehearse ENV=stg on the same commit)\n", "make rehearse ENV=dev"),
+    ("stg", "dev", "legacy", "then run:\n  make release ENV=stg\n", "generate"),
+], ids=["prod", "stg-promoted", "prod-from-stg", "stg-promoted-legacy"])
+def test_real_target_auto_tagging_hint_follows_env_role_and_mode(real_cloud, tmp_path, name, promote_from, mode,
+                                                                  expected, absent):
+    _auto_tagging_env(tmp_path, name, promote_from=promote_from, mode=mode)
+
+    result = real_cloud(env_name=name)
+
+    out = result.stdout
+    assert result.returncode == 0, out + result.stderr
+    assert "Wait for class.* tags to appear in Catalog Explorer, then run:\n" in out
+    assert expected in out
+    assert absent not in out[out.index("then run:"):]
+
+
+# With a <...> in the file the placeholder guard parses it first; without one the
+# classification validator does.
+@pytest.mark.parametrize("keep_template, error", [
+    (True, "ERROR: fix envs/dev/env.auto.tfvars: it is not valid HCL\n"),
+    (False, "ERROR: envs/dev/env.auto.tfvars is not valid HCL; fix it, then re-run this command\n"),
+], ids=["placeholder-guard", "classification-validator"])
+def test_real_target_with_a_malformed_env_file_refuses_clearly_before_applying(real_cloud, tmp_path,
+                                                                               keep_template, error):
+    """Nothing can be enabled without a readable config: refuse in one line, no traceback or file contents."""
+    env_file = tmp_path / "aws/envs/dev/env.auto.tfvars"
+    base = env_file.read_text() if keep_template else 'governance_mode = "deterministic"\nenable_classification = true\n'
+    assert ("<" in base) is keep_template
+    env_file.write_text(base + '\nnote = "s3cr3t-token-value" {\n')
+
+    result = real_cloud()
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert error in result.stderr
+    assert "Traceback" not in out and "UnexpectedToken" not in out
+    assert "s3cr3t" not in out
+    assert "Apply complete" not in out
+
+
+def test_real_target_hint_falls_back_when_env_role_fails_after_the_apply(real_cloud, tmp_path):
+    """The apply succeeded; if env-role then fails, the hint suggests only commands safe in every role and mode."""
+    _auto_tagging_env(tmp_path, "prod")
+    env_file = tmp_path / "aws/envs/prod/env.auto.tfvars"
+
+    result = real_cloud(env_name="prod", FAKE_TF_BREAK=str(env_file))
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "Apply complete! Resources: 1 added" in out
+    assert ("WARNING: could not tell whether envs/prod is a rehearsal or a promoted env (env-role failed; "
+            "is envs/prod/env.auto.tfvars valid HCL?).\n") in result.stderr
+    hint = result.stdout[result.stdout.index("Automatic tagging is on."):]
+    assert hint == ("Automatic tagging is on. Wait for class.* tags to appear in Catalog Explorer. Then fix "
+                    "envs/prod/env.auto.tfvars\nso it parses, and run make setup ENV=prod for this env's next step "
+                    "(make check ENV=prod checks the committed files).\n")
+    assert "Traceback" not in out and "env-role failed:" not in out and "s3cr3t" not in out

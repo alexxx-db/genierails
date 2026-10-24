@@ -159,6 +159,92 @@ def test_the_prod_section_reads_as_expected():
     assert "git add .gitignore envs/ && git commit -m \"Promote the rules to prod\"" in flow
 
 
+def _step(section: str, title: str) -> str:
+    start = section.index(f"**{title}**")
+    end = re.compile(r"\n\*\*\d+\. ").search(section, start + 1)
+    return section[start:end.start() if end else None]
+
+
+def test_prod_step_1_says_to_replace_the_seeded_catalog_map_line():
+    # make setup ENV=prod seeds catalog_map with placeholders; a second line is refused.
+    step = _step(_section("Prod"), "1. Set up and promote.")
+    assert "replace its `deployer_principal_id` placeholder and the seeded `catalog_map` line" in step
+    assert "a second `catalog_map` line is refused" in step
+    assert "placeholder, and set:" not in step
+    makefile = (SHARED / "Makefile.shared").read_text()
+    assert 'catalog_map  = { "<$(DEFAULT_ENV)_catalog>" = "<%s_catalog>" }' in makefile
+    assert "catalog_map is set twice; keep one" in (SHARED / "genie_space_placeholder.py").read_text()
+
+
+RELEASE_PHASE_HEADING = "=== Release phase applied (prod) ==="
+# Each round's own line, in the recipe's order: import-only, a staged policy phase, the SELECT round.
+RELEASE_ROUND_EXPLANATIONS = [
+    "This manifest imported existing resources into Terraform state; nothing else was applied.",
+    "This manifest held one phase of a staged policy change; it is applied and verified.",
+    "This manifest opened the SELECT the Genie agents need; the workspace (CAN_RUN) is planned with it live.",
+]
+RELEASE_NEXT = "Next: make release-plan ENV=prod, approve the new manifest, make release ENV=prod."
+RELEASE_COMPLETE = "=== Release complete (prod) ==="
+
+
+def _recipe_echo_lines() -> list[str]:
+    """The echoed strings of _release-manifest, in recipe order, with ENV=prod."""
+    makefile = (SHARED / "Makefile.shared").read_text()
+    start = makefile.index("\n_release-manifest:")
+    recipe = makefile[start:makefile.index("\n\n", start)]
+    return [match.group(1).replace("$(ENV)", "prod")
+            for match in re.finditer(r'^\s*echo "([^"]*)"', recipe, re.M)]
+
+
+def test_the_release_recipe_prints_heading_then_explanation_then_next_per_round():
+    lines = [line.strip() for line in _recipe_echo_lines()]
+    headings = [i for i, line in enumerate(lines) if line == RELEASE_PHASE_HEADING]
+    assert len(headings) == 3, lines
+    for heading, explanation in zip(headings, RELEASE_ROUND_EXPLANATIONS):
+        assert lines[heading + 1:heading + 3] == [explanation, RELEASE_NEXT], lines[heading:heading + 3]
+    assert lines.index(RELEASE_COMPLETE) > headings[-1]
+
+
+def test_prod_step_3_says_a_first_release_takes_several_rounds_in_the_real_messages():
+    step = _step(_section("Prod"), "3. Check, rehearse, plan, release.")
+    rounds = step[step.index("**A first release takes several rounds.**"):]
+    rounds = rounds[:rounds.index("\n")]
+    # The README shows one round's output in the recipe's order: heading, what it applied, Next;
+    # then the end, "Release complete".
+    def at(message: str) -> int:
+        assert rounds.count(f"`{message}`") == 1, message
+        return rounds.index(f"`{message}`")
+    heading, explanations, after = at(RELEASE_PHASE_HEADING), [at(m) for m in RELEASE_ROUND_EXPLANATIONS], at(RELEASE_NEXT)
+    assert heading < explanations[0] and explanations == sorted(explanations) and explanations[-1] < after, rounds
+    assert after < rounds.index(f"until `make release` prints `{RELEASE_COMPLETE}`"), rounds
+    assert "Every round but the last prints `=== Release phase applied (prod) ===`, then a line saying what it applied" in rounds
+    # create (functions, policies) -> switch (column tags) -> grant (USE, SELECT) -> deferred workspace (CAN_RUN).
+    order = ["masking functions and policies", "column tags", "`SELECT`", "Genie `CAN_RUN`"]
+    assert [rounds.index(part) for part in order] == sorted(rounds.index(part) for part in order)
+    assert "planned only once that `SELECT` is live" in rounds
+    # The reference's release row and the whole flow say so too.
+    reference = (README.parent / "REFERENCE.md").read_text()
+    row = next(line for line in reference.splitlines()
+               if line.startswith("| `make release ENV=prod` | 4 | (deterministic prod)"))
+    assert "A first release takes several rounds (an import-only manifest if needed, create, switch, grant, " \
+        "then the deferred workspace)" in row
+    positions = [row.index(f"`{message}`") for message in (RELEASE_PHASE_HEADING, RELEASE_NEXT, RELEASE_COMPLETE)]
+    assert positions == sorted(positions), row
+    flow = _section("The whole flow")
+    assert 'make release ENV=prod       # applies exactly the approved plan, proves the masks; ' \
+        'a first release repeats release-plan + release until "Release complete"' in flow
+
+
+def test_prod_step_3_tells_legacy_envs_to_skip_release_plan():
+    step = _step(_section("Prod"), "3. Check, rehearse, plan, release.")
+    line = "Legacy envs skip `make release-plan`: run `make release ENV=prod` directly " \
+        "(`release-plan` refuses them with `Legacy envs keep: make release ENV=prod`)."
+    assert line in step.splitlines()
+    makefile = (SHARED / "Makefile.shared").read_text()
+    recipe = makefile[makefile.index("\nrelease-plan:"):]
+    assert "Legacy envs keep: make release ENV=$(ENV)" in recipe[:recipe.index("_DEPLOYER_CHECK")]
+
+
 def test_following_the_prod_section_word_for_word_reaches_a_release_manifest(customer):
     repo = customer
     out = {}

@@ -75,6 +75,8 @@ class FakeWarehouse:
         params = params or {}
         self.statements.append((tier, sql, dict(params)))
         cell = lambda v: None if v is None else str(v)  # noqa: E731 — data_array is strings
+        if re.fullmatch(r"(GRANT|REVOKE) (SELECT|USE SCHEMA|USE CATALOG) ON .*", sql):
+            return []  # the temporary checked-table access (and its cleanup); no rows
         m = re.fullmatch(r"SELECT (COUNT\(\*\)|tag_name, tag_value) FROM "
                          r"system\.information_schema\.(column_masks|column_tags|table_tags) .*", sql)
         if m:
@@ -277,7 +279,8 @@ def test_a_masked_key_column_is_reported_clearly(tmp_path, warehouse):
     assert result.detail == (
         f"row-pairing key id may be masked for {JUNIOR}, {DEFAULT_ADMIN_TIER} on {TABLE} "
         "(it has 1 column mask(s)); choose a unique, non-null, unmasked key")
-    assert not [s for s in wh.statements if TABLE.split(".")[-1] in s[1]]  # no row read
+    assert not [s for s in wh.statements if TABLE.split(".")[-1] in s[1]  # no row read
+                and not s[1].startswith(("GRANT ", "REVOKE "))]
 
 
 def test_a_masked_key_blocks_even_when_another_tier_leaks(tmp_path, warehouse):
