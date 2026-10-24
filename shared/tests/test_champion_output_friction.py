@@ -807,6 +807,11 @@ def real_cloud(tmp_path):
         .replace("<least-privileged-group>", "viewers")
         + '\nuc_tables = ["dev_finance.genierails_e2e.customers"]\n'
     )
+    (cloud_root / "envs/dev/auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://selected.example"\n'
+        'databricks_client_id = "selected-client"\n'
+        'databricks_client_secret = "selected-secret"\n'
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "terraform").write_text(FAKE_TERRAFORM)
@@ -815,6 +820,11 @@ def real_cloud(tmp_path):
     sdk.mkdir(parents=True)
     (sdk.parent / "__init__.py").write_text("")
     (sdk / "__init__.py").write_text(FAKE_SDK)
+    (sdk / "config.py").write_text(
+        "class Config:\n"
+        "    def __init__(self, **kwargs):\n"
+        "        self.__dict__.update(kwargs)\n"
+    )
     (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
 
     def run(**fake):
@@ -864,3 +874,19 @@ def test_real_target_with_auto_tagging_points_to_generate(real_cloud, tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Wait for class.* tags to appear in Catalog Explorer, then run:\n  make generate ENV=dev" in result.stdout
+
+
+def test_real_target_refuses_ambient_credentials_without_env_auth(real_cloud, tmp_path):
+    auth_file = tmp_path / "aws/envs/dev/auth.auto.tfvars"
+    auth_file.write_text('databricks_workspace_host = ""\n')
+
+    result = real_cloud(
+        DATABRICKS_HOST="https://ambient.example",
+        DATABRICKS_CLIENT_ID="ambient-id",
+        DATABRICKS_CLIENT_SECRET="ambient-secret",
+    )
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert f"fill in {auth_file}" in out
+    assert "Apply complete!" not in out
