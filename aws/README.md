@@ -20,7 +20,8 @@
 | ---- | ---- | --------------- |
 | Full (default) | **Account Admin** | Create groups, assign groups to workspaces, manage group membership |
 | Full (default) | **Workspace Admin** | Grant entitlements, create warehouses, manage Genie agents and permissions |
-| Full (default) | **Metastore Admin** | Create tag policies, FGAC policies, grants, and masking functions |
+| Full (default) | **Account Tag Policy Creator + Manager** | Create and maintain tag policies |
+| Full (default) | **Authority over the governed catalog** (not Metastore Admin) | Own it, or hold `SELECT` + `MANAGE` + `APPLY TAG` on it: tags, masking functions, FGAC policies and grants ([Check 6](../shared/docs/prerequisites.md#service-principal)) |
 | Genie-only | **Workspace USER** + **Databricks SQL access** entitlement | Create Genie agents only — set `genie_only = true` and provide `sql_warehouse_id` in `env.auto.tfvars`. No admin roles needed. |
 
 ## Step 1 — Set up your environment

@@ -209,10 +209,10 @@ _prepare-env:
 			if [ "$(ENV)" != "$(ACCOUNT_ENV)" ] && [ "$$env_name" = "$(ACCOUNT_ENV)" ]; then \
 				ln -sfn "../$(ENV)/auth.auto.tfvars" "$$env_dir/auth.auto.tfvars" || exit 1; \
 			else \
-				python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" || exit 1; \
+				python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" --cloud "$(CLOUD)" || exit 1; \
 			fi; \
 		else \
-			python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" || exit 1; \
+			python3 "$(SHARED_ROOT)/scripts/auth_tfvars.py" ensure-template "$$env_dir/auth.auto.tfvars" --template "$(SHARED_ROOT)/auth.auto.tfvars.example" --cloud "$(CLOUD)" || exit 1; \
 		fi; \
 		if [ -L "$$env_dir/env.auto.tfvars" ] && [ ! -e "$$env_dir/env.auto.tfvars" ]; then \
 			echo "ERROR: $$env_dir/env.auto.tfvars is a dangling symlink; fix or remove it before setup."; exit 1; \

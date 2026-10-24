@@ -230,6 +230,8 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
    make bootstrap-sp ACCOUNT_PROFILE=genierails-bootstrap WORKSPACE_PROFILE=genierails-dev,genierails-prod ACCOUNT_ID=<id> WORKSPACE_ID=<dev-workspace-id>,<prod-workspace-id> TARGET_CATALOG=<dev-catalog>,<prod-catalog> YES=1
    ```
 
+   > **Already have a deployment SP? Pass its exact display name as `SP_NAME`.** `bootstrap-sp` reuses an SP only by exact display name, `genierails-deployer` by default. If yours is named anything else (say `genierails-deployer-azure`), add `SP_NAME=genierails-deployer-azure` to every command above, or it creates a second SP named `genierails-deployer` and mints a new secret for it. Run with `PLAN=1` first: it prints `PLAN RESOLVED service principal: reuse '<name>' (client_id=…)` or that apply would **CREATE** one.
+
    Optional safer secret handling for a single workspace/env: add
    `BOOTSTRAP_AUTH_ENV=<env>` to write the newly minted secret directly to
    `envs/<env>/auth.auto.tfvars` with file mode `0600`. In that mode the secret
@@ -241,8 +243,13 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
 
    To preview the changes first, run the same command with `PLAN=1` instead of `YES=1`.
    Plan mode performs the same read-only authentication, endpoint, access-path, and
-   grant-authority preflight as apply mode. If credentials are absent, it explicitly
-   reports that it is showing an offline, unverified plan.
+   grant-authority preflight as apply mode. It resolves whether the SP is reused or
+   created, and which catalog privileges and model access are already in place. It does
+   **not** check the Account Admin role, the tag-policy roles, workspace ADMIN, or (for a
+   reused SP without `ROTATE_SECRET=1`) whether a secret would be minted; it lists these
+   on a `PLAN NOT CHECKED:` line, and apply reports each as `GRANTED` or `UNCHANGED`. If
+   credentials are absent, it explicitly reports that it is showing an offline,
+   unverified plan.
 
    | Parameter | Required | Value / where to find it |
    |-----------|----------|--------------------------|
@@ -250,7 +257,7 @@ The SP governs an **existing** catalog — `make apply` never creates one — so
    | `WORKSPACE_PROFILE` | No | Workspace profile whose host matches the target workspace. For multiple workspaces, pass a comma-separated profile per `WORKSPACE_ID`. If omitted, OAuth M2M or Azure client-secret SP credentials are used to create fresh workspace authentication; all other account auth types use host-based Databricks CLI login. |
    | `ACCOUNT_ID` | Yes | Databricks Account Console → top-right profile menu. |
    | `WORKSPACE_ID` | Yes | Numeric ID in Account Console → **Workspaces**, or the workspace URL's `?o=` value. Use commas for multiple workspaces. |
-   | `SP_NAME` | No | Display name for the deployment SP; defaults to `genierails-deployer`. |
+   | `SP_NAME` | No, but set it when reusing an SP | Exact display name of the deployment SP to create or reuse; defaults to `genierails-deployer`. A different existing name is not matched, so a new SP is created. |
    | `TARGET_CATALOG` | Recommended | Exact name of the existing Unity Catalog catalog GenieRails will govern, from Catalog Explorer. With multiple `WORKSPACE_ID` values, supply either one catalog for every workspace (back-compatible) or one comma-separated catalog per workspace in the same order. Omit only for the greenfield alternative below. |
    | `MODEL_ENDPOINT` | No | Model serving endpoint to grant query access; bootstrap grants `CAN QUERY` on custom endpoints or Unity Catalog `EXECUTE` on the backing `system.ai` function for Foundation Model API endpoints. Defaults to `databricks-claude-sonnet-4-6`. |
    | `PLAN=1` / `YES=1` | No | `PLAN=1` previews without changing anything; `YES=1` applies without an interactive prompt. |
@@ -283,9 +290,17 @@ You'll need these values in each `envs/<env>/auth.auto.tfvars`.
 **Used `make bootstrap-sp`?** By default it prints a ready-to-paste block for each workspace with `databricks_client_id`, `databricks_client_secret`, `databricks_workspace_host` and `databricks_workspace_id`. Paste it, then add:
 
 - `databricks_account_id` — the same `ACCOUNT_ID` you passed to `bootstrap-sp`.
-- `databricks_account_host` — **Azure only:** `https://accounts.azuredatabricks.net`. On AWS you can omit it (defaults to `https://accounts.cloud.databricks.com`).
+- `databricks_account_host` — **Azure only:** `https://accounts.azuredatabricks.net`. `make setup` in `azure/` writes this line into each new `auth.auto.tfvars`; keep it. On AWS you can omit it (defaults to `https://accounts.cloud.databricks.com`).
 
 The OAuth secret is shown only on the run that creates it — save it then. A later run shows `<existing-secret-not-retrievable>`; use `ROTATE_SECRET=1` to mint a new one. To avoid printing the value, rerun one workspace at a time with `BOOTSTRAP_AUTH_ENV=<env>`; it writes `auth.auto.tfvars` with mode `0600` and prints only the secret id/expiry.
+
+**Reusing an SP that already works elsewhere (a new clone or customer repo)?** Don't rotate its secret. After `make setup ENV=<env>`, copy the client ID and secret from your secret store, or from the old repo's file, into `envs/<env>/auth.auto.tfvars`, and keep the file at mode `0600`. Never print or commit it. For example, from your cloud's folder:
+
+```bash
+install -m 0600 <old-repo>/<cloud>/envs/dev/auth.auto.tfvars envs/dev/auth.auto.tfvars
+```
+
+Then check that the workspace host and ID are this env's. Run `bootstrap-sp` only when the SP still needs grants, with its `SP_NAME` and without `ROTATE_SECRET=1` or `BOOTSTRAP_AUTH_ENV`.
 
 <details>
 <summary><strong>Created the SP manually? Where to find each value</strong></summary>
