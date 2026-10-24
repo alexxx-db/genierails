@@ -7041,19 +7041,25 @@ def champion_genie_next_steps(env_name: str) -> list[str]:
     ]
 
 
-def native_classification_stop(error: Exception, table_refs: list[str], env_name: str) -> list[str]:
+def native_classification_stop(
+    error: Exception, table_refs: list[str], env_name: str, *, deterministic: bool
+) -> list[str]:
     """Fail-closed stop (before any model call) when class.* tags can't be read."""
     lines = [f"ERROR: {error}"]
     if table_refs:
         lines.append(f"  Tables found ({len(table_refs)}): {', '.join(table_refs)} (saved). No model was called.")
-    return lines + [
+    lines += [
         "  Next: in Catalog Explorer, open the catalog > Details tab > Data classification: turn it on.",
         "  When the scan finishes, review the detections and exclude any false positives, then turn on",
         "  auto-tagging. Wait until the class.* tags appear.",
         f"  Prefer a script? make enable-classification ENV={env_name} turns it on (you still review detections in the UI).",
         f"  Then re-run make generate ENV={env_name}.",
-        "  Re-run with --allow-llm-sensitivity only to explicitly accept LLM/DDL inference.",
     ]
+    if deterministic:
+        lines.append("  Deterministic governance requires native class.* tags; LLM/DDL inference is unavailable.")
+    else:
+        lines.append("  Re-run with --allow-llm-sensitivity only to explicitly accept LLM/DDL inference.")
+    return lines
 
 
 def main():
@@ -7273,6 +7279,13 @@ def main():
     # tags and the mask library, its Genie config from the Genie API import, so
     # generate never calls a model and needs no model endpoint.
     deterministic_mode = auth_cfg.get("governance_mode", "legacy") == "deterministic"
+    if deterministic_mode:
+        from deployer_identity import validation_errors as deployer_identity_errors
+        from deterministic_governance import genie_acl_group_errors
+        early_errors = deployer_identity_errors(auth_cfg) + genie_acl_group_errors(auth_cfg)
+        if early_errors:
+            print(f"ERROR: {early_errors[0]} in env.auto.tfvars")
+            sys.exit(1)
     if deterministic_mode and args.mode != "genie" and (args.space or args.tables):
         print("ERROR: deterministic governance derives the whole governed set at once; run "
               "make generate without SPACE or tables, or make derive-assignments")
@@ -7922,7 +7935,9 @@ def main():
                 require_native=native_expected and not args.allow_llm_sensitivity,
             )
         except NativeClassificationRequiredError as exc:
-            for line in native_classification_stop(exc, table_refs or [], WORK_DIR.name):
+            for line in native_classification_stop(
+                exc, table_refs or [], WORK_DIR.name, deterministic=deterministic_mode
+            ):
                 print(line)
             sys.exit(1)
 

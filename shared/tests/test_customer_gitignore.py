@@ -179,12 +179,23 @@ def test_auto_writes_in_a_customer_repo_that_keeps_a_genierails_remote(remotes, 
     out = capsys.readouterr().out
     _assert_written(cloud, out)
     assert (cloud / ".gitignore").read_text().startswith(USER_LINES)
-    assert FORK_NOTE in out  # a contributor fork is told how to opt out
+    assert FORK_NOTE not in out  # an untracked customer file cannot be reverted
     # Idempotent: a second run changes nothing.
     first = (cloud / ".gitignore").read_text()
     assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
     assert (cloud / ".gitignore").read_text() == first
     assert "up to date" in capsys.readouterr().out
+
+
+def test_tracked_contributor_gitignore_with_upstream_gets_revert_note(tmp_path, monkeypatch, capsys):
+    cloud = tmp_path / "aws"
+    _git_init(cloud, ("origin", CUSTOMER_FORK), ("upstream", UPSTREAM_HTTPS))
+    _isolate_git(monkeypatch, tmp_path)
+    (cloud / ".gitignore").write_text(USER_LINES)
+    subprocess.run(["git", "-C", str(cloud), "add", ".gitignore"], check=True)
+
+    assert cg.main(["--cloud-dir", str(cloud), "--mode", "auto"]) == 0
+    assert FORK_NOTE in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("url", [
@@ -263,7 +274,7 @@ def test_customer_and_off_overrides_win_over_detection(tmp_path, monkeypatch, ca
     _isolate_git(monkeypatch, tmp_path)
     assert cg.main(["--cloud-dir", str(clone), "--mode", "customer"]) == 0
     _assert_written(clone, out := capsys.readouterr().out)
-    assert FORK_NOTE in out
+    assert FORK_NOTE not in out  # the newly created file is not tracked, so cannot be reverted
 
     fork = tmp_path / "azure"
     _git_init(fork, ("origin", CUSTOMER_FORK), ("upstream", UPSTREAM_HTTPS))

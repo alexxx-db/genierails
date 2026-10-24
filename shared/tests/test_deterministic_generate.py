@@ -913,6 +913,29 @@ def test_fresh_env_agent_without_acl_groups_stops_cleanly(env_dir, monkeypatch, 
     assert not (env_dir / "generated/abac.auto.tfvars").exists()
 
 
+@pytest.mark.parametrize("bad_input", ["deployer", "acl_groups"])
+def test_bad_deterministic_identity_or_acl_stops_before_live_calls(
+    env_dir, monkeypatch, capfd, bad_input
+):
+    env_file = env_dir / "env.auto.tfvars"
+    if bad_input == "deployer":
+        env_file.write_text(ENV.replace(DEPLOYER, "not-an-application-id"))
+        expected = "deployer_principal_id must be a service principal application ID"
+    else:
+        env_file.write_text(ENV.replace(f"acl_groups = {json.dumps(TIERS)}", 'acl_groups = "viewers"'))
+        expected = "acl_groups must be a list of non-empty strings"
+
+    def live_call(*_args, **_kwargs):
+        pytest.fail("invalid deterministic input reached a live call")
+
+    monkeypatch.setattr(generate_abac, "list_account_group_names", live_call)
+    monkeypatch.setattr(generate_abac, "fetch_tables_from_genie_space", live_call)
+    with pytest.raises(SystemExit) as exc:
+        _generate(env_dir, monkeypatch)
+    assert exc.value.code == 1
+    assert expected in capfd.readouterr().out
+
+
 def test_opted_in_legacy_env_refuses_until_rebuild_governed_tables(env_dir, monkeypatch, capfd):
     # A legacy env's draft has treatment tags but no governed_tables.json.
     generated = env_dir / "generated"
