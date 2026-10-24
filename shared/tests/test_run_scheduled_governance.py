@@ -360,6 +360,15 @@ def test_legacy_coverage_docs_require_treatment_upgrade_before_enablement(path):
     assert "`classified but unprotected ... no gr_treatment`" in text
 
 
+def test_legacy_maintain_docs_explain_fail_closed_schema_drift_resolution():
+    text = " ".join((REPO_ROOT / "shared" / "docs" / "scheduled-governance.md").read_text().split())
+    assert "Legacy `make maintain` deliberately fails closed" in text
+    assert "including a name-pattern false positive" in text
+    assert "there is no way to acknowledge a finding" in text
+    assert "maintain stays blocked while the audit still flags the column" in text
+    assert "migrate the env to deterministic governance, where maintain reports schema drift as advisory" in text
+
+
 def test_catalog_warns_when_unused_by_check(tmp_path, monkeypatch, capsys):
     env_dir = _env_dir(tmp_path)
     monkeypatch.setattr(rsg, "_check", lambda ed: 0)

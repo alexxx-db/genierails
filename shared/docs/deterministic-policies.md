@@ -23,6 +23,15 @@ Code: `governance_policies.py` (pure), `generate_abac.write_deterministic_model`
   `column_overrides` entry for it is applied only if it is `redact` or
   never raw. The coverage check judges it from the live `class.*` tags the
   live refresh recorded (and the `gr.classification_mixed_partial` marker).
+
+- A free-text-looking STRING with only one class cannot be distinguished from
+  a normally structured value. Thus `notes` tagged only `class.phone_number`
+  keeps the phone partial mask (including last four characters and length).
+  Generate warns and the coverage gate advises without blocking; the
+  name/comment heuristic never changes treatment values. Redact the one column
+  with `column_overrides = { "catalog.schema.table.notes" = { treatment =
+  "redact" } }`, or set `treatment_versions = { phone_partial = { partial =
+  "redacted" } }` to redact that treatment's partial tier everywhere.
   Compatibility limit: the live class record is
   `generated/.live_refresh.json` (`column_classes`). DDL-only envs and
   records written before this check recorded `column_classes` fall back to the

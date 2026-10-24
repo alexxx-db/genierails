@@ -372,6 +372,11 @@ def env_identity_catalog_map_error(env_file: Path) -> str:
         config = _load(env_file)
     except ValueError as exc:
         return str(exc)
+    return config_identity_catalog_map_error(config, env_file)
+
+
+def config_identity_catalog_map_error(config: dict, env_file: Path) -> str:
+    """env_identity_catalog_map_error for an env file already parsed into config."""
     raw = config.get("catalog_map")
     if isinstance(raw, list):  # hcl2 may wrap a map in a list
         raw = raw[0] if raw else {}

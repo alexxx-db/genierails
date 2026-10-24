@@ -67,49 +67,75 @@ def _acl_error(placeholder: str, path: Path) -> str:
             "agent (acl_groups: who gets CAN_RUN; [] means nobody)")
 
 
+def _parse_error(path: Path) -> str:
+    # Never the parser's message: it can quote the file.
+    return f"fix {_display_path(path)}: it is not valid HCL"
+
+
+def agent_file_placeholder_errors(settings: dict, path: Path) -> list[str]:
+    """Every unfilled placeholder in one agents/<agent>.auto.tfvars."""
+    errors = []
+    if _is_placeholder(settings.get("genie_space_id")):
+        errors.append(_id_error(settings["genie_space_id"], path))
+    placeholder = _acl_placeholder(settings.get("acl_groups"))
+    if placeholder:
+        errors.append(_acl_error(placeholder, path))
+    return errors
+
+
 def agent_file_placeholder_error(settings: dict, path: Path) -> str | None:
     """The first unfilled placeholder in one agents/<agent>.auto.tfvars, else None."""
-    if _is_placeholder(settings.get("genie_space_id")):
-        return _id_error(settings["genie_space_id"], path)
-    placeholder = _acl_placeholder(settings.get("acl_groups"))
-    return _acl_error(placeholder, path) if placeholder else None
+    return next(iter(agent_file_placeholder_errors(settings, path)), None)
 
 
-def agent_files_placeholder_error(env_dir: Path) -> str | None:
-    """The first unfilled placeholder in the env's agents/*.auto.tfvars, else None."""
+def agent_files_placeholder_errors(env_dir: Path) -> list[str]:
+    """Every unfilled placeholder in the env's agents/*.auto.tfvars."""
+    errors = []
     for path in sorted((Path(env_dir) / "agents").glob("*.auto.tfvars")):
         text = path.read_text()
         if "<" not in text and ">" not in text:
             continue
         import hcl2
 
-        error = agent_file_placeholder_error(hcl2.loads(text), path)
-        if error:
-            return error
-    return None
+        try:
+            settings = hcl2.loads(text)
+        except Exception:
+            errors.append(_parse_error(path))
+            continue
+        errors.extend(agent_file_placeholder_errors(settings, path))
+    return errors
 
 
-def placeholder_error(config: dict, path: Path, *, allow_access_tier_placeholders: bool = False) -> str | None:
-    """Return the first actionable placeholder error, else None."""
-    found = placeholder_genie_space_ids(config)
-    if found:
-        return _id_error(found[0], path)
-    for space in config.get("genie_spaces") or []:
-        placeholder = _acl_placeholder(space.get("acl_groups")) if isinstance(space, dict) else None
-        if placeholder:
-            return _acl_error(placeholder, path)
+def agent_files_placeholder_error(env_dir: Path) -> str | None:
+    """The first unfilled placeholder in the env's agents/*.auto.tfvars, else None."""
+    return next(iter(agent_files_placeholder_errors(env_dir)), None)
+
+
+def placeholder_errors(config: dict, path: Path, *, allow_access_tier_placeholders: bool = False) -> list[str]:
+    """Every actionable placeholder error in one env.auto.tfvars, in the order they are fixed."""
+    spaces = [space for space in config.get("genie_spaces") or [] if isinstance(space, dict)]
+    # Every agent ID first, then every acl_groups placeholder.
+    errors = [_id_error(found, path) for found in placeholder_genie_space_ids(config)]
+    errors += [_acl_error(placeholder, path) for placeholder in
+               (_acl_placeholder(space.get("acl_groups")) for space in spaces) if placeholder]
     deployer = config.get("deployer_principal_id")
     if isinstance(deployer, str) and deployer.startswith("<") and deployer.endswith(">"):
-        return (f"replace placeholder {deployer} in {_display_path(path)} with the application ID of the "
-                "service principal that applies this env")
+        errors.append(f"replace placeholder {deployer} in {_display_path(path)} with the application ID of the "
+                      "service principal that applies this env")
     groups = config.get("access_tier_groups")
     if isinstance(groups, list) and not allow_access_tier_placeholders:
         placeholder = next((group for group in groups if isinstance(group, str)
                             and group.startswith("<") and group.endswith(">")), None)
         if placeholder:
-            return (f"replace placeholder {placeholder} in {_display_path(path)} with an IdP-synced group "
-                    "name; replace every access_tier_groups placeholder, most to least privileged")
-    return None
+            errors.append(f"replace placeholder {placeholder} in {_display_path(path)} with an IdP-synced group "
+                          "name; replace every access_tier_groups placeholder, most to least privileged")
+    return errors
+
+
+def placeholder_error(config: dict, path: Path, *, allow_access_tier_placeholders: bool = False) -> str | None:
+    """Return the first actionable placeholder error, else None."""
+    return next(iter(placeholder_errors(
+        config, path, allow_access_tier_placeholders=allow_access_tier_placeholders)), None)
 
 
 def main() -> int:
@@ -120,32 +146,45 @@ def main() -> int:
         if path.is_file() and len(re.findall(r"(?m)^\s*catalog_map\s*=", path.read_text())) > 1:
             print(f"ERROR: {_display_path(path)}: catalog_map is set twice; keep one", file=sys.stderr)
             return 1
+    errors = []
+    for path in paths:
         # An agent's ID is reported first, as when it lived in env.auto.tfvars.
-        error = agent_files_placeholder_error(path.parent)
+        errors.extend(agent_files_placeholder_errors(path.parent))
+        text = path.read_text() if path.is_file() else ""
         # Legacy configs have no placeholders. Avoid importing the HCL parser in
-        # bootstrap-only environments unless a placeholder can actually exist.
-        if not error and path.is_file() and ("<" in path.read_text() or ">" in path.read_text()):
-            import hcl2
+        # bootstrap-only environments unless a placeholder or a catalog_map can
+        # actually exist.
+        placeholders = "<" in text or ">" in text
+        identity = not destination and re.search(r"(?m)^\s*catalog_map\s*=", text)
+        if not placeholders and not identity:
+            continue
+        import hcl2
 
-            with path.open() as handle:
-                config = hcl2.load(handle)
-            error = placeholder_error(
+        try:
+            config = hcl2.loads(text)
+        except Exception:
+            errors.append(_parse_error(path))
+            continue
+        if placeholders:
+            errors.extend(placeholder_errors(
                 config, path,
                 allow_access_tier_placeholders=os.environ.get("GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS") == "1",
-            )
-        if not error and not destination and path.is_file() and re.search(r"(?m)^\s*catalog_map\s*=", path.read_text()):
+            ))
+        if identity:
+            # Reported with the placeholder problems, after them (S2).
             sys.path.insert(0, str(Path(__file__).resolve().parent))
-            from scripts.saved_settings import env_identity_catalog_map_error
+            from scripts.saved_settings import config_identity_catalog_map_error
 
-            error = env_identity_catalog_map_error(path) or None
-        if error:
-            if advice:
-                print(f"  Setup required: {error}")
-            else:
-                print(f"ERROR: {error}", file=sys.stderr)
-                return 1
-    return 0
-
+            error = config_identity_catalog_map_error(config, path)
+            if error:
+                errors.append(error)
+    # Every problem at once (each once, though a guard may pass one file twice).
+    for error in dict.fromkeys(errors):
+        if advice:
+            print(f"  Setup required: {error}")
+        else:
+            print(f"ERROR: {error}", file=sys.stderr)
+    return 1 if errors and not advice else 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
