@@ -56,6 +56,8 @@ def _str(v) -> str:
 
 
 def _promotion_setting(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
     if isinstance(value, dict):
         return "{ " + ", ".join(f"{json.dumps(str(k))} = {json.dumps(str(v))}" for k, v in value.items()) + " }"
     return json.dumps(_str(value))
@@ -729,12 +731,15 @@ def main():
     promoted_readers = (_normalize_readers(dest_cfg.get("table_readers")) if "table_readers" in dest_cfg
                         else source_readers)
     preserved_exempt = [_str(p) for p in dest_cfg.get("raw_exempt_principals") or []]
-    # make promote-to's saved source env + catalog map belong to the destination.
+    # make promote-to's saved source env + catalog map belong to the destination,
+    # and so does the opt-in for a catalog mapped to itself (only the boolean true).
     preserved_promote = {
         name: dest_cfg[name]
         for name in ("promote_from", "catalog_map")
         if dest_cfg.get(name)
     }
+    if dest_cfg.get("allow_identity_catalog_map") is True:
+        preserved_promote["allow_identity_catalog_map"] = True
     promoted_verify_key = (
         _str(cfg.get("verify_key_column", ""))
         or _str(dest_cfg.get("verify_key_column", ""))
@@ -1009,7 +1014,10 @@ def main():
     if preserved_promote:
         lines.append("")
         lines.append("# Saved by make promote-to (source env + catalog map for the next promote).")
-        lines.extend(f"{name} = {_promotion_setting(value)}" for name, value in preserved_promote.items())
+        for name, value in preserved_promote.items():
+            if name == "allow_identity_catalog_map":
+                lines.append("# Separate metastores only: lets catalog_map map a catalog to itself.")
+            lines.append(f"{name} = {_promotion_setting(value)}")
 
     # Write
     os.makedirs(dest_env_dir, exist_ok=True)
