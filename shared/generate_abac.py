@@ -7282,9 +7282,27 @@ def main():
     if deterministic_mode:
         from deployer_identity import validation_errors as deployer_identity_errors
         from deterministic_governance import genie_acl_group_errors
-        early_errors = deployer_identity_errors(auth_cfg) + genie_acl_group_errors(auth_cfg)
-        if early_errors:
-            print(f"ERROR: {early_errors[0]}")
+        deployer_errors = deployer_identity_errors(auth_cfg)
+        if deployer_errors:
+            print(f"ERROR: {deployer_errors[0]} in env.auto.tfvars")
+            sys.exit(1)
+        acl_errors = genie_acl_group_errors(auth_cfg)
+        if acl_errors:
+            # load_auth_config appends agent-file entries after inline
+            # genie_spaces. Match the validator's displayed agent identifier
+            # back to that file so the early refusal tells the operator where
+            # to edit; all unmatched/global ACL settings belong to env.auto.tfvars.
+            from agent_files import load_all
+            source = "env.auto.tfvars"
+            error = acl_errors[0]
+            for agent in load_all(auth_file.parent):
+                identifiers = {
+                    agent["name"], agent["display_name"], agent["genie_space_id"]
+                } - {""}
+                if any(error.startswith(f"agent {identifier} ") for identifier in identifiers):
+                    source = f"agents/{agent['name']}.auto.tfvars"
+                    break
+            print(f"ERROR: {error} in {source}")
             sys.exit(1)
     if deterministic_mode and args.mode != "genie" and (args.space or args.tables):
         print("ERROR: deterministic governance derives the whole governed set at once; run "

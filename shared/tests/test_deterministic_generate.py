@@ -7,6 +7,7 @@ from the Genie API import; no model endpoint is configured or needed.
 import json
 import socket
 import sys
+import types
 from pathlib import Path
 
 import hcl2
@@ -914,16 +915,21 @@ def test_fresh_env_agent_without_acl_groups_stops_cleanly(env_dir, monkeypatch, 
 
 
 @pytest.mark.parametrize("mode", ["full", "governance", "genie"])
-@pytest.mark.parametrize("bad_input", ["deployer", "agent_acl"])
+@pytest.mark.parametrize("bad_input", ["deployer", "inline_acl", "agent_acl"])
 def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
     env_dir, monkeypatch, capfd, mode, bad_input
 ):
-    import databricks.sdk
+    import databricks
 
     env_file = env_dir / "env.auto.tfvars"
     if bad_input == "deployer":
         env_file.write_text(ENV.replace(DEPLOYER, "not-an-application-id"))
         expected = "deployer_principal_id must be a service principal application ID"
+        expected_file = "env.auto.tfvars"
+    elif bad_input == "inline_acl":
+        env_file.write_text(ENV.replace(f"acl_groups = {json.dumps(TIERS)}", 'acl_groups = "viewers"'))
+        expected = "acl_groups must be a list of non-empty strings"
+        expected_file = "env.auto.tfvars"
     else:
         env_file.write_text(
             ENV.replace(
@@ -937,6 +943,7 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
             f'genie_space_id = "{SPACE_ID}"\nuc_tables = {json.dumps(TABLES)}\n'
         )
         expected = "agent Payments has no acl_groups — set the groups allowed to run it"
+        expected_file = "agents/Payments.auto.tfvars"
 
     live_calls = []
 
@@ -944,13 +951,23 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
         live_calls.append((args, kwargs))
         return None
 
-    monkeypatch.setattr(generate_abac, "list_account_group_names", live_call)
-    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", live_call)
+    fake_sdk = types.ModuleType("databricks.sdk")
+    fake_sdk.WorkspaceClient = live_call
+    fake_sdk.AccountClient = live_call
+    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
+    monkeypatch.setattr(databricks, "sdk", fake_sdk)
+    for helper in (
+        "list_account_group_names", "fetch_tables_from_genie_space",
+        "fetch_tables_from_databricks", "_fetch_live_classification_source",
+    ):
+        monkeypatch.setattr(generate_abac, helper, live_call)
     monkeypatch.setattr(socket.socket, "connect", live_call)
     with pytest.raises(SystemExit) as exc:
         _generate(env_dir, monkeypatch, "--mode", mode)
     assert exc.value.code == 1
-    assert expected in capfd.readouterr().out
+    out = capfd.readouterr().out
+    assert expected in out
+    assert f"in {expected_file}" in out
     assert live_calls == []
 
 
