@@ -84,12 +84,12 @@ def _overlay(src: Path, dst: Path, label: str) -> None:
 def _materialize_env_dir(config_source: str, env_dir: Path) -> None:
     """Copy the env configuration from a runtime-visible source into env_dir.
 
-    The repo's `envs/` directories are .gitignore'd (they hold per-deployment
-    config + secrets), so a Git checkout of this repo does NOT contain
-    envs/<env>/. When the job runs from a fresh checkout, the operator points it
-    at a path the job runtime can see — a Unity Catalog Volume, workspace files,
-    or DBFS mount holding auth.auto.tfvars, env.auto.tfvars, data_access/,
-    generated/, etc. — and we copy that tree into env_dir before scanning.
+    A Git checkout holds only committed files, and the upstream GenieRails repo
+    doesn't commit `envs/`, so a fresh checkout may lack envs/<env>/. The
+    operator points the job at a path the job runtime can see — a Unity Catalog
+    Volume, workspace files, or DBFS mount holding env.auto.tfvars, data_access/,
+    generated/, etc. (never auth.auto.tfvars) — and we copy that tree into
+    env_dir before scanning.
 
     Overlays onto env_dir if it already exists (source wins).
     """
@@ -263,7 +263,7 @@ def main() -> int:
 
     if not env_dir.is_dir():
         print(f"ERROR: env directory not found: {env_dir}\n"
-              f"       The repo's envs/ is .gitignore'd, so a Git-checked-out job will not\n"
+              f"       A Git checkout holds only committed files, so a job's checkout may not\n"
               f"       contain it. Pass --config-source <volume/workspace path> to materialize\n"
               f"       the env config at runtime.", file=sys.stderr)
         return 2

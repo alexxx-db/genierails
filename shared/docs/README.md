@@ -18,7 +18,7 @@ New here? Pick a path in the [project overview](../../README.md#pick-your-path):
 - **[Deployment machine](deployment-machine.md)** — releasing prod in v1: persistent checkout, `GENIERAILS_STATE_DIR`, locks, `release-plan` and `release`.
 - **[Architecture](architecture.md)** — layers, artifact ownership, config files, Genie agent lifecycle.
 - **[Access](access.md)** — `table_readers`, `acl_groups`, `group_map`, the deployer SP.
-- **[Scheduled governance](scheduled-governance.md)** — the opt-in read-only scheduled job.
+- **[Scheduled governance](scheduled-governance.md)** — scheduling maintain and the audits yourself; the legacy-only (deprecated) scheduled job.
 
 ### Customize
 - **[Advanced Usage](advanced.md)** — IdP-synced groups, independent environments, masking-UDF reuse.
