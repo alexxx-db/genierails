@@ -95,6 +95,52 @@ def test_account_host_is_carried_for_azure(tmp_path):
     assert hcl2.loads(path.read_text())["databricks_account_host"] == "https://accounts.azuredatabricks.net"
 
 
+def _azure_seeded():
+    from scripts.auth_tfvars import template_text
+
+    return template_text(SHARED / "auth.auto.tfvars.example", "azure").decode()
+
+
+def test_azure_setup_template_with_its_seeded_account_host_is_still_filled(tmp_path):
+    seeded = _azure_seeded()
+
+    result, path = _run(tmp_path, "--reuse", "1", "--workspace-host", PROD_HOST, "--workspace-id", "222",
+                        dest=seeded)
+
+    assert result.returncode == 0, result.stderr
+    assert "filled" in result.stdout
+    config = hcl2.loads(path.read_text())
+    assert config["databricks_client_secret"] == SECRET
+    assert config["databricks_account_host"] == "https://accounts.azuredatabricks.net"
+    _no_secret(result)
+
+
+def _azure_touched_by_hand():
+    seeded = _azure_seeded()
+    host_line = 'databricks_account_host   = "https://accounts.azuredatabricks.net"\n'
+    assert seeded.endswith(host_line)
+    return {
+        "host-comment": seeded.replace(host_line, host_line.rstrip("\n") + "   # azure account console\n"),
+        "workspace-prefilled": seeded.replace('databricks_workspace_host = ""', f'databricks_workspace_host = "{PROD_HOST}"')
+                                     .replace('databricks_workspace_id  = ""', 'databricks_workspace_id  = "222"'),
+        "host-spacing": seeded.replace(host_line, 'databricks_account_host = "https://accounts.azuredatabricks.net"\n'),
+    }
+
+
+@pytest.mark.parametrize("variant", ["host-comment", "workspace-prefilled", "host-spacing"])
+def test_azure_template_touched_by_hand_is_never_filled(tmp_path, variant):
+    """Only the exact file azure/ make setup writes counts as unfilled; any edit means a human was here."""
+    dest = _azure_touched_by_hand()[variant]
+    assert dest != _azure_seeded()
+
+    result, path = _run(tmp_path, "--reuse", "1", "--workspace-host", PROD_HOST, "--workspace-id", "222", dest=dest)
+
+    assert result.returncode == 0, result.stderr
+    assert "left unchanged" in result.stdout
+    assert path.read_text() == dest
+    _no_secret(result)
+
+
 @pytest.mark.parametrize("args, message", [
     ((), "needs the destination's databricks_workspace_host: pass WORKSPACE_HOST="),
     (("--workspace-host", PROD_HOST), "needs the destination's databricks_workspace_id: pass WORKSPACE_ID="),

@@ -10,14 +10,21 @@ SHARED_ROOT = Path(__file__).resolve().parent.parent
 if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
-from genie_space_placeholder import agent_files_placeholder_error, placeholder_error  # noqa: E402
+from genie_space_placeholder import _display_path, agent_files_placeholder_error, placeholder_error  # noqa: E402
 from scripts.footprint import FootprintError, load_env_config, resolve_footprint
 
 
 def main() -> int:
     path = Path(sys.argv[1])
-    with path.open() as handle:
-        config = hcl2.load(handle)
+    try:
+        with path.open() as handle:
+            config = hcl2.load(handle)
+    except OSError:
+        print(f"ERROR: {_display_path(path)} not found; run make setup first", file=sys.stderr)
+        return 1
+    except Exception:  # the parser's message can quote the file, which may hold secrets
+        print(f"ERROR: {_display_path(path)} is not valid HCL; fix it, then re-run this command", file=sys.stderr)
+        return 1
 
     placeholder = agent_files_placeholder_error(path.parent) or placeholder_error(config, path)
     if placeholder:

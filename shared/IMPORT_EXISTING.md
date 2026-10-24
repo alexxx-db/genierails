@@ -35,6 +35,14 @@ cd envs/dev/data_access && ../../../../shared/scripts/import_existing.sh --fgac-
 cd envs/dev/data_access && ../../../../shared/scripts/import_existing.sh --tag-assignments-only
 ```
 
+Run by hand or by `make`, the script first refuses (exit 1, before any API call
+or state read) an env whose `catalog_map` maps a catalog to itself, such as
+`"paycat" = "paycat"`: importing by name could adopt the source env's policies
+into this env's state. Map each catalog to a distinct one; only if the envs use
+separate metastores, set `allow_identity_catalog_map = true` in that env's own
+`env.auto.tfvars`. `scripts/terraform_layer.sh` refuses `import`, `apply`,
+`apply-plan` and `destroy` for such an env the same way.
+
 Run by hand, the script sets `ENVS_DIR` (where the Terraform runner finds each
 layer's env dir and state) to the parent of the env dir, i.e. `<cloud>/envs`,
 the same value `make` exports. Run it only from `envs/account`, `envs/<env>` or

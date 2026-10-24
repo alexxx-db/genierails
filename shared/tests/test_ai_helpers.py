@@ -653,9 +653,15 @@ from databricks.sdk.service.serving import ServingEndpointsAPI
 
 
 class WorkspaceClient:
-    def __init__(self, **kwargs):
+    def __init__(self, config=None, **kwargs):
+        if config is not None:
+            kwargs = {**vars(config), **kwargs}
         self.kwargs = kwargs
         self.serving_endpoints = ServingEndpointsAPI(kwargs)
+''',
+    "databricks/sdk/config.py": '''class Config:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 ''',
     "databricks/sdk/service/serving.py": '''import json, os, types
 
@@ -687,7 +693,11 @@ def repo(tmp_path, envs):
     repo = tmp_path
     shutil.copy2(ROOT / "aws" / "Makefile", repo / "aws" / "Makefile")
     (repo / "shared").symlink_to(SHARED)
-    (envs / "dev" / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://dev.example.invalid"\n')
+    (envs / "dev" / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://dev.example.invalid"\n'
+        'databricks_client_id = "dev-client"\n'
+        'databricks_client_secret = "dev-secret"\n'
+    )
     for rel, text in FAKE_SDK.items():
         path = tmp_path / "fake_sdk" / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -734,6 +744,18 @@ def test_make_draft_genie_content_and_draft_custom_mask(repo):
     assert drafts == ["dev/drafts/custom_masks/custom_postcode_area.json", "dev/drafts/custom_masks/custom_postcode_area.sql",
                       "dev/drafts/genie/Payments.json"]
     assert len(_model_calls(repo)) == 2
+
+
+def test_make_suggest_treatment_refuses_ambient_credentials_without_env_auth(repo):
+    auth_file = repo / "aws" / "envs" / "dev" / "auth.auto.tfvars"
+    auth_file.write_text('databricks_workspace_host = "https://dev.example.invalid"\n')
+    # _make drops DATABRICKS_* from the parent env, so ambient values come in through a config file.
+    (repo / ".databrickscfg").write_text("[DEFAULT]\nhost = https://ambient.example\ntoken = ambient-token\n")
+    result = _make(repo, "suggest-treatment", "ENV=dev", "CLASS=loyalty_id",
+                   reply={"treatment": "redact", "rationale": "x", "custom_mask": None})
+    assert result.returncode != 0
+    assert "fill in" in result.stderr and "auth.auto.tfvars" in result.stderr
+    assert _model_calls(repo) == [] and not (repo / "aws" / "envs" / "dev" / "drafts").exists()
 
 
 @pytest.mark.parametrize("target, extra", [

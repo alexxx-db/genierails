@@ -1,9 +1,41 @@
 # Scheduled Governance Checks
 
-The opt-in scheduled job is read-only by default. On serverless compute it runs
-the schema-drift audit (untagged sensitive-looking columns and stale
-assignments) and the rulebook audit (live production tags with no covering
-policy or mask):
+## Deterministic envs: use your own scheduler
+
+GenieRails doesn't create a scheduled job for a deterministic env. Setting
+`enable_scheduled_governance = true` in a deterministic env's `env.auto.tfvars`
+is refused by `make setup`, `check`, `plan`, `promote-to`, `release-plan`,
+`maintain` and the other commands that read it, before anything is planned or
+written. If the env already has the job, removing the setting shows
+`databricks_job.scheduled_governance[0]` as a destroy in the next release plan.
+
+Schedule the checks with your own scheduler (cron, a CI scheduler, an
+orchestrator):
+
+- `make maintain ENV=<env>` reconciles governance. Run it on the deployment
+  machine, from the last released commit with a clean tree; it refuses
+  anything else.
+- `make audit-schema ENV=<env>` and `make audit-rulebook ENV=<env>` only
+  report (untagged sensitive columns and stale assignments; applied tags with
+  no covering policy or mask). A non-zero exit means findings.
+
+For example, a crontab entry on the deployment machine, in the checkout that
+ran `make release ENV=prod`:
+
+```cron
+0 6 * * * cd /srv/genierails/aws && make maintain ENV=prod >> /var/log/genierails-maintain.log 2>&1
+```
+
+The scheduler's `PATH` needs the same `make`, `python3` and `terraform` as your
+shell. Use the deployment machine's existing `auth.auto.tfvars`; never copy it,
+or any other secret, anywhere else for the scheduler.
+
+## Legacy envs: the Terraform-managed job (deprecated)
+
+Legacy envs keep the opt-in Terraform-managed job exactly as before; it is
+deprecated, and new setups should use your own scheduler as above. By default
+it is read-only. On serverless compute it runs the schema-drift audit and the
+rulebook audit:
 
 ```bash
 python shared/scripts/run_scheduled_governance.py \
@@ -12,28 +44,24 @@ python shared/scripts/run_scheduled_governance.py \
 ```
 
 The job does not run make, Terraform, derivation, or apply, and it does not
-write to the workspace. Existing serverless dependencies are sufficient. The
-config source is required because `envs/` is gitignored. Point it at a
-runtime-visible envs root containing both `account/` and the target environment
-(for example `prod/`) to enable both audits. This gives the rulebook audit the
-promoted account policies without relying on local Terraform state.
-Relative values for both `--env-dir` and `--config-source` are resolved from
-the repository root; absolute paths are used unchanged. To run the check
-locally, point it at your own envs root:
+write to the workspace. Its Git checkout holds only committed files, and the
+upstream GenieRails repo doesn't commit `envs/`, so the config source is
+required: a runtime-visible envs root containing `account/` and the target env
+(for example `prod/`, with `env.auto.tfvars` and `data_access/`). Leave
+`auth.auto.tfvars` and every other secret out of it: the default check mode
+then authenticates as the job's run-as identity. (The legacy delta step below
+reads `auth.auto.tfvars`, so it does not run without one; use check mode.)
+Relative `--env-dir` and `--config-source` values are resolved from the
+repository root. To run the check locally:
 `python3 shared/scripts/run_scheduled_governance.py --env-dir aws/envs/prod --step check --config-source aws/envs`.
 
-On findings, the run fails and its output explains what was found. Open the run
-from the failure notification, then run this from the authoritative GenieRails
-checkout:
-
-```bash
-make maintain ENV=prod
-```
+On findings, the run fails and its output explains what was found. Run
+`make maintain ENV=prod` from the authoritative GenieRails checkout.
 
 Enable the job with `enable_scheduled_governance = true`, its Git URL and config
-source, then `make apply ENV=prod`. Schedule, timezone, Git branch/provider,
-dependencies, notifications, and job name use the existing
-`scheduled_governance_*` variables.
+source in the legacy env's `env.auto.tfvars`, then `make apply ENV=prod`.
+Schedule, timezone, Git branch/provider, dependencies, notifications, and job
+name use the existing `scheduled_governance_*` variables.
 
 The job is deployed from the data_access root
 (`shared/roots/data_access/scheduled_governance.tf`), so a governance-only env
@@ -55,7 +83,7 @@ cd "$(mktemp -d)" && terraform state mv \
 After the move, the job's ID and URL outputs come from the data_access root
 (`scheduled_governance_job_id`, `scheduled_governance_job_url`).
 
-## Legacy mode
+### Legacy mode
 
 Set `scheduled_governance_mode = "legacy"` to retain the explicit legacy
 `audit -> generate-delta -> coverage` flow. Its model-based delta step may
@@ -66,6 +94,18 @@ name for actionable failure guidance. The runner also
 retains `--step all|audit|delta|coverage` for existing callers;
 `--auth-file` and `--catalog` are legacy-only.
 
+Legacy `make maintain` deliberately fails closed when the schema-drift audit
+reports drift, including a name-pattern false positive (a column such as
+`patient_count` whose name looks sensitive but has no `class.*` or governed
+tag). A legacy env's tags come from an LLM draft, so maintain cannot prove the
+column is safe to leave unmasked, and there is no way to acknowledge a finding.
+If the column is sensitive, review its native UC classification detection,
+enable auto-tagging in Catalog Explorer, wait for the `class.*` tag, and re-run
+`make maintain ENV=<env>`. If it is a false positive, exclude it in Catalog
+Explorer; maintain stays blocked while the audit still flags the column, so
+migrate the env to deterministic governance, where maintain reports schema
+drift as advisory and continues through its coverage and rulebook gates.
+
 Before enabling legacy scheduled coverage, legacy envs generated before
 `gr_treatment` existed must run `make generate ENV=<env>`, then
 `make validate-generated ENV=<env>` and `make plan ENV=<env>`. Expect existing
@@ -73,7 +113,7 @@ legacy mask policies to be replaced by `gr_mask_*` ones; review the plan, then
 run `make apply ENV=<env>` to add `gr_treatment` tags. Otherwise every scheduled
 run fails with `classified but unprotected ... no gr_treatment`.
 
-## Upgrading
+### Upgrading
 
 The mode defaults to `"check"`, so existing jobs stop running legacy
 `generate-delta`. If an existing config source still points directly at the old

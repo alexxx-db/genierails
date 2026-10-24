@@ -197,6 +197,9 @@ def kept_policy_names(
         if src != dest:
             sources.setdefault(dest, []).append(src)
     managed = state_keys or set()
+    # Catalogs some source maps into: only there can a promoted name collide
+    # with a source env's policy (every source catalog must be mapped).
+    destinations = {dest.lower() for dest in catalog_map.values()}
     cache: dict[str, set[str] | None] = {}
     kept: dict[str, str] = {}
     for policy in policies:
@@ -204,24 +207,32 @@ def kept_policy_names(
             continue
         name, catalog = str(policy.get("name") or ""), str(policy.get("catalog") or "")
         older = sorted({remap_policy_name(name, catalog, src) for src in sources.get(catalog, [])} - {name})
-        if not older:
-            continue
         if catalog not in cache:
             cache[catalog] = live_names(catalog)
         live = cache[catalog]
+        if live is None and not older and catalog.lower() not in destinations:
+            continue
         if live is None:
-            raise OverlayError(
-                f"the policies on {catalog} couldn't be listed, so it is unknown whether {name} is deployed "
-                f"under an older name; refusing to plan a rename (#68). Check {catalog}'s credentials and retry")
+            unknown = (f"{name} is deployed under an older name; refusing to plan a rename (#68)" if older else
+                       f"{remote_policy_name(catalog, name)} is taken by a policy GenieRails doesn't manage; "
+                       "refusing to plan it")
+            raise OverlayError(f"the policies on {catalog} couldn't be listed, so it is unknown whether "
+                               f"{unknown}. Check {catalog}'s credentials and retry")
         deployed = [k for k in older if (catalog, k) in managed or remote_policy_name(catalog, k) in live]
         if len(deployed) > 1:
             raise OverlayError(f"{catalog} deploys {name} under several older names ({', '.join(deployed)})")
         if deployed:
             kept[name] = deployed[0]
-        elif f"{catalog}_{name}" in live and (catalog, name) not in managed:
+        elif remote_policy_name(catalog, name) in live and (catalog, name) not in managed:
+            # Even with no older name: a catalog mapped to itself (S2) shares
+            # its policy names with the source env, whose state owns them.
+            identity = any(src.lower() == catalog.lower() == dest.lower() for src, dest in catalog_map.items())
             raise OverlayError(
-                f"{catalog} already has a policy named {catalog}_{name} that GenieRails doesn't manage; remove "
-                "it or import it into the prod data_access state, then re-run")
+                f"{catalog} already has a policy named {remote_policy_name(catalog, name)} that GenieRails "
+                "doesn't manage; " + (
+                    f"catalog_map maps {catalog} to itself, so it is likely the source env's: map {catalog} "
+                    "to a distinct catalog (don't import it), then re-run" if identity else
+                    "remove it or import it into the prod data_access state, then re-run"))
     final = [kept.get(str(p.get("name")), str(p.get("name"))) for p in policies]
     duplicates = sorted({n for n in final if final.count(n) > 1})
     if duplicates:
@@ -252,6 +263,12 @@ def build_kept_names(env_dir: Path, *, state_keys=None, live_names=None) -> dict
     from remap_generated_config import live_policy_lister, read_state_policy_keys
 
     env_dir = Path(env_dir)
+    # A catalog mapped to itself (S2) is refused before the overlay is touched.
+    from scripts.saved_settings import env_identity_catalog_map_error
+
+    identity = env_identity_catalog_map_error(env_dir / "env.auto.tfvars")
+    if identity:
+        raise OverlayError(identity)
     if not ensure(env_dir):
         return {}
     catalog_map = _catalog_map(env_dir)

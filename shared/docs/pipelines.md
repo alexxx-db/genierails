@@ -386,8 +386,9 @@ How the operator runs them: [deployment machine](deployment-machine.md#release-p
 
 `make audit-schema ENV=prod` is read-only and safe to schedule in CI: it exits
 `1` on untagged sensitive columns or tags on deleted columns. Fix drift with
-`make maintain ENV=prod` on the deployment machine. GenieRails also ships an
-opt-in, read-only scheduled Databricks job: [scheduled governance](scheduled-governance.md).
+`make maintain ENV=prod` on the deployment machine. To run these on a
+schedule, see [scheduled governance](scheduled-governance.md) (deterministic
+envs use your own scheduler; the Databricks job is legacy-only).
 
 Independent environments that should not inherit dev governance (for example
 one per business unit): [Advanced](advanced.md#independent-environments).

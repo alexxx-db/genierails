@@ -219,6 +219,70 @@ def test_a_missing_governance_mode_is_legacy_as_everywhere_else(tmp_path):
     assert "ALTER TABLE cat.sch.tbl ALTER COLUMN ssn UNSET TAGS ('gr_treatment')" in fake_uc.sql_writes(fake)
 
 
+@pytest.mark.parametrize("ci", [False, True])
+def test_large_idempotent_state_is_quiet_and_does_not_retry_import(tmp_path, ci):
+    data_access = _layer(tmp_path, DETERMINISTIC, abac=(
+        'tag_assignments = [{ entity_type = "tables", entity_name = "cat.sch.tbl", '
+        'tag_key = "owner", tag_value = "fin" }]\n'))
+    runner = tmp_path / "state-runner"
+    runner.write_text(f'''#!{sys.executable}
+import sys
+address = {TAG_IMPORT!r}
+if sys.argv[3] == "state-list":
+    print(address)
+    for i in range(20000):
+        print(f"module.data_access.fake.resource[{{i}}]-" + "x" * 100)
+elif sys.argv[3] == "import":
+    print("Error: Resource already managed by Terraform", file=sys.stderr)
+    sys.exit(1)
+''')
+    runner.chmod(0o755)
+    record = _write_record(tmp_path / "imports.jsonl", [
+        {"kind": "import", "layer": "data_access", "address": TAG_IMPORT,
+         "id": "tables,cat.sch.tbl,owner"},
+    ])
+    env = os.environ | {"TERRAFORM_RUNNER": str(runner)} | ({"CI": "true"} if ci else {})
+
+    result = subprocess.run(["bash", SCRIPT, "--skip-treatment-tags", f"--apply-recorded={record}"], cwd=data_access,
+                            env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Already in state" in result.stdout
+    assert "Resource already managed by Terraform" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("ci", [False, True])
+def test_a_large_already_managed_import_error_is_skipped_not_failed(tmp_path, ci):
+    # The state listing misses the address (a concurrent import landed it), so
+    # the import runs and Terraform reports it already managed, followed by far
+    # more output than a pipe holds. grep -q stops reading at the first match.
+    data_access = _layer(tmp_path, DETERMINISTIC, abac=(
+        'tag_assignments = [{ entity_type = "tables", entity_name = "cat.sch.tbl", '
+        'tag_key = "owner", tag_value = "fin" }]\n'))
+    runner = tmp_path / "import-runner"
+    runner.write_text(f'''#!{sys.executable}
+import sys
+if sys.argv[3] == "import":
+    print("Error: Resource already managed by Terraform", file=sys.stderr)
+    for i in range(20000):
+        print(f"  detail line {{i}} " + "x" * 100, file=sys.stderr)
+    sys.exit(1)
+''')
+    runner.chmod(0o755)
+    record = _write_record(tmp_path / "imports.jsonl", [
+        {"kind": "import", "layer": "data_access", "address": TAG_IMPORT,
+         "id": "tables,cat.sch.tbl,owner"},
+    ])
+    env = os.environ | {"TERRAFORM_RUNNER": str(runner)} | ({"CI": "true"} if ci else {})
+
+    result = subprocess.run(["bash", SCRIPT, "--skip-treatment-tags", f"--apply-recorded={record}"], cwd=data_access,
+                            env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
+    assert f"Already managed: {TAG_IMPORT} (skipping)" in result.stdout
+    assert "Failed to import" not in result.stdout
+
+
 def _state_bytes(data_access):
     path = data_access / "terraform.tfstate"
     return path.read_bytes() if path.exists() else None

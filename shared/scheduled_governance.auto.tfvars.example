@@ -1,14 +1,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduled steady-state governance — opt-in snippet
+# Scheduled governance job — LEGACY envs only (deprecated) — opt-in snippet
 # ─────────────────────────────────────────────────────────────────────────────
-# These variables are consumed by the data_access root
-# (roots/data_access/scheduled_governance.tf), so governance-only envs (no
-# agents) get the job too. They are DISABLED by default, so leaving them unset
-# changes nothing about `make apply`.
+# Deterministic envs: not supported. make refuses enable_scheduled_governance =
+# true there; schedule make maintain ENV=<env> (from the last released commit,
+# clean tree, on the deployment machine) or make audit-rulebook / make
+# audit-schema with your own scheduler. See shared/docs/scheduled-governance.md.
 #
-# To enable the scheduled prod re-scan, copy the block below into the target
-# environment's env.auto.tfvars (e.g. aws/envs/prod/env.auto.tfvars) — that is
-# the tfvars file the data_access layer loads — then run `make apply ENV=prod`.
+# Legacy envs: these variables are consumed by the data_access root
+# (roots/data_access/scheduled_governance.tf). They are DISABLED by default.
+# To enable the job, copy the block below into the legacy env's env.auto.tfvars
+# (e.g. aws/envs/prod/env.auto.tfvars), then run `make apply ENV=prod`.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Turn the scheduled job on. Default is false.
@@ -36,10 +37,12 @@ scheduled_governance_git_url      = "https://github.com/<org>/<repo>"
 scheduled_governance_git_branch   = "main"
 scheduled_governance_git_provider = "gitHub" # gitHub | gitLab | bitbucketCloud | azureDevOpsServices | ...
 
-# Runtime-visible envs root. REQUIRED when enabled because envs/ is gitignored.
-# For check mode it must contain account/abac.auto.tfvars plus prod/ (or the
-# selected env) with auth.auto.tfvars, env.auto.tfvars, data_access/, and
-# optionally generated/. The wrapper copies both into its ephemeral checkout.
+# Runtime-visible envs root. REQUIRED when enabled: the job's Git checkout holds
+# only committed files, and the upstream GenieRails repo doesn't commit envs/.
+# It must contain account/abac.auto.tfvars plus prod/ (or the selected env) with
+# env.auto.tfvars, data_access/, and optionally generated/. The wrapper copies
+# both into its ephemeral checkout. Never put auth.auto.tfvars or any other
+# secret here: check mode authenticates as the job's run-as identity.
 scheduled_governance_config_source = "/Volumes/main/governance/genierails/envs"
 
 # Optional: who to email when the job fails. The notification links to the run;

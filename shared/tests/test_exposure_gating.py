@@ -15,6 +15,15 @@ SHARED = Path(__file__).parents[1]
 ROOTS = (SHARED / "roots/data_access/main.tf", SHARED / "roots/workspace/main.tf")
 
 
+def _write_layer_auth(path, host):
+    path.mkdir(exist_ok=True)
+    (path / "auth.auto.tfvars").write_text(
+        f'databricks_workspace_host = "{host}"\n'
+        'databricks_client_id = "client"\n'
+        'databricks_client_secret = "secret"\n'
+    )
+
+
 def test_retired_flag_is_declared_deprecated_in_the_roots_only_and_never_read():
     # Modules no longer know the flag; nothing can gate (or revoke) on it.
     for module in ("data_access", "workspace"):
@@ -172,7 +181,7 @@ def test_created_space_semantic_config_reapplies_after_space_recreation():
 
 def test_trash_fails_loud_when_current_id_file_is_missing(tmp_path):
     env_dir = tmp_path / "env"
-    env_dir.mkdir()
+    _write_layer_auth(env_dir, "https://example.invalid")
     result = subprocess.run(
         ["bash", str(SHARED / "scripts/genie_space.sh"), "trash"],
         text=True,
@@ -190,6 +199,8 @@ def test_trash_fails_loud_when_current_id_file_is_missing(tmp_path):
 
 
 def test_trash_targets_original_host_not_current_host_on_mismatch(tmp_path):
+    layer = tmp_path / "env"
+    _write_layer_auth(layer, "https://w2.example")
     id_file = tmp_path / "space.id"
     id_file.write_text("space-123\n")
     calls = tmp_path / "curl.calls"
@@ -215,6 +226,7 @@ def test_trash_targets_original_host_not_current_host_on_mismatch(tmp_path):
             **os.environ,
             "PATH": f"{tmp_path}:{os.environ['PATH']}",
             "CURL_CALLS": str(calls),
+            "LAYER_ENV_DIR": str(layer),
             "GENIE_ID_FILE": str(id_file),
             "GENIE_EXPECTED_HOST": "https://w1.example/",
             "DATABRICKS_HOST": "https://w2.example",
@@ -231,6 +243,8 @@ def test_trash_targets_original_host_not_current_host_on_mismatch(tmp_path):
 
 
 def test_trash_mismatched_host_auth_failure_names_both_hosts(tmp_path):
+    layer = tmp_path / "env"
+    _write_layer_auth(layer, "https://w2.example")
     id_file = tmp_path / "space.id"
     id_file.write_text("space-123\n")
     curl = tmp_path / "curl"
@@ -243,6 +257,7 @@ def test_trash_mismatched_host_auth_failure_names_both_hosts(tmp_path):
         env={
             **os.environ,
             "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "LAYER_ENV_DIR": str(layer),
             "GENIE_ID_FILE": str(id_file),
             "GENIE_EXPECTED_HOST": "https://w1.example",
             "DATABRICKS_HOST": "https://w2.example",
@@ -254,6 +269,29 @@ def test_trash_mismatched_host_auth_failure_names_both_hosts(tmp_path):
     assert id_file.exists()
     assert "https://w1.example" in result.stderr
     assert "https://w2.example" in result.stderr
+
+
+def test_trash_refuses_ambient_sp_without_layer_env(tmp_path):
+    called = tmp_path / "curl-called"
+    curl = tmp_path / "curl"
+    curl.write_text(f"#!/bin/sh\ntouch {called}\nexit 99\n")
+    curl.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "DATABRICKS_HOST": "https://wrong.example",
+        "DATABRICKS_CLIENT_ID": "ambient-id",
+        "DATABRICKS_CLIENT_SECRET": "ambient-secret",
+        "GENIE_ID_FILE": str(tmp_path / "space.id"),
+    }
+    env.pop("LAYER_ENV_DIR", None)
+    result = subprocess.run(
+        ["bash", str(SHARED / "scripts/genie_space.sh"), "trash"],
+        text=True, capture_output=True, env=env,
+    )
+    assert result.returncode != 0
+    assert "LAYER_ENV_DIR is required" in result.stderr
+    assert not called.exists()
 
 
 def _terraform_trigger_plan(tmp_path, changes):

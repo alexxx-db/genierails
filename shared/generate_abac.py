@@ -555,14 +555,11 @@ def configure_databricks_env(auth_cfg: dict):
 
 def databricks_config(auth_cfg: dict | None = None, **kwargs):
     """Build an SDK Config pinned to auth.auto.tfvars, never ambient auth."""
-    from databricks.sdk.config import Config
+    from scripts.auth_configured import oauth_config
 
     auth = auth_cfg if auth_cfg is not None else _ACTIVE_DATABRICKS_AUTH
-    return Config(
-        host=str(auth.get("databricks_workspace_host") or "").strip(),
-        client_id=str(auth.get("databricks_client_id") or "").strip(),
-        client_secret=str(auth.get("databricks_client_secret") or "").strip(),
-        auth_type="oauth-m2m",
+    return oauth_config(
+        auth,
         product=PRODUCT_NAME,
         product_version=PRODUCT_VERSION,
         **kwargs,
@@ -7216,6 +7213,9 @@ def main():
     if auth_state is AuthStatus.MALFORMED:
         print(f"ERROR: {auth_file} is not valid HCL", file=sys.stderr)
         sys.exit(1)
+    if auth_state is AuthStatus.UNREADABLE:
+        print(f"ERROR: {auth_file} can't be read", file=sys.stderr)
+        sys.exit(1)
     if auth_state is AuthStatus.INCOMPLETE:
         print(
             f"ERROR: fill in {auth_file} (workspace host, client ID, and client secret) before running generate",
@@ -8806,6 +8806,16 @@ Before you apply, tune for your business roles, security requirements, and Genie
         from governance_policies import mixed_override_warning
         for column in model.overridden_mixed:
             print(f"  WARNING: {mixed_override_warning(column)}")
+        # Warning-only name/comment heuristic; generated values stay unchanged.
+        from governance_policies import column_comments_from_ddl, free_text_partial_columns
+        advisory = free_text_partial_columns(
+            model.columns,
+            column_comments_from_ddl(ddl_text),
+        )
+        for column in advisory:
+            print(f"  WARNING: {column} is a STRING column whose name/comment suggests free text, but it "
+                  "keeps a partial mask; partial-tier readers may see a fragment. Review column_overrides / "
+                  "treatment_versions and use the redact treatment when fragments are unsafe.")
 
     # Genie mode: skip validation — the output intentionally has no groups/ABAC sections
     # and validate_abac.py would incorrectly report "groups is missing".

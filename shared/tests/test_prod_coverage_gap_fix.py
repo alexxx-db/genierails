@@ -306,7 +306,11 @@ def _configure_promoted_stg(repo):
     result = repo.make("setup", "ENV=stg")
     assert result.returncode == 0, _out(result)
     stg = repo.envs / "stg"
-    (stg / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://stg.example.invalid"\n')
+    # generate refuses an env auth file without host, client ID and secret.
+    (stg / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://stg.example.invalid"\n'
+        'databricks_client_id = "stg-client"\n'
+        'databricks_client_secret = "test-only-secret"\n')
     (stg / "env.auto.tfvars").write_text(
         'governance_mode = "deterministic"\n'
         'deployer_principal_id = "d0000000-0000-0000-0000-000000000003"\n'

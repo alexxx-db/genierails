@@ -195,28 +195,29 @@ def check_id_files(env_dir: Path, warn: bool, env_name: str = "", runner: str = 
 
 
 def load_auth(env_dir: Path) -> dict:
+    """Validate the env auth before any workspace client is created."""
+    from scripts.auth_configured import AuthStatus, auth_status
+    path = env_dir / "auth.auto.tfvars"
+    status = auth_status(path)
+    if status is AuthStatus.UNREADABLE:
+        raise ValueError(f"{path} can't be read") from None
+    if status is AuthStatus.MALFORMED:
+        raise ValueError(f"{path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
+        raise ValueError(f"fill in {path} (workspace host, client ID, and client secret)") from None
     import hcl2
-
-    with open(env_dir / "auth.auto.tfvars") as f:
-        try:
-            return hcl2.load(f)
-        except Exception:
-            pass
-    # Raised outside the handler with no parser text, which can echo a
-    # malformed secret (also via __context__).
-    raise ValueError(f"{env_dir / 'auth.auto.tfvars'} is not valid HCL") from None
+    with path.open() as handle:
+        config = hcl2.load(handle)
+    config["_auth_file"] = path
+    return config
 
 
 def get_status(auth: dict, agent_id: str) -> str:
     """GET the agent on the current workspace; return the HTTP status or error."""
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import NotFound, PermissionDenied, Unauthenticated
+    from scripts.auth_configured import workspace_client
 
-    w = WorkspaceClient(
-        host=auth["databricks_workspace_host"],
-        client_id=auth["databricks_client_id"],
-        client_secret=auth["databricks_client_secret"],
-    )
+    w = workspace_client(auth["_auth_file"])
     try:
         w.api_client.do("GET", f"/api/2.0/genie/spaces/{agent_id}")
         return "200"
@@ -266,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         auth = load_auth(env_dir)
         host = str(auth.get("databricks_workspace_host", "")).rstrip("/")
     except Exception as exc:
-        print(f"ERROR: cannot read {env_dir / 'auth.auto.tfvars'} ({type(exc).__name__}); nothing was applied.")
+        print(f"ERROR: {exc}; nothing was applied.", file=sys.stderr)
         return 1
 
     out(f"=== Genie adoption preflight ({env_dir.name}): {len(legacy)} legacy agent(s) on {host} ===")

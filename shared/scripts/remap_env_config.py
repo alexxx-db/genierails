@@ -56,6 +56,8 @@ def _str(v) -> str:
 
 
 def _promotion_setting(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
     if isinstance(value, dict):
         return "{ " + ", ".join(f"{json.dumps(str(k))} = {json.dumps(str(v))}" for k, v in value.items()) + " }"
     return json.dumps(_str(value))
@@ -128,22 +130,29 @@ def _promoted_governance_settings(cfg: dict, pairs: dict[str, str], known_column
     return result
 
 
-def _discover_from_genie_api(space_id: str, auth_cfg: dict) -> tuple[str, list[str]]:
+def _discover_from_genie_api(space_id: str, auth_path: Path | None) -> tuple[str, list[str]]:
     """Query Genie agent API to get name and tables.
 
     Returns (space_title, table_identifiers).
     """
-    host = _str(auth_cfg.get("databricks_workspace_host", ""))
-    client_id = _str(auth_cfg.get("databricks_client_id", ""))
-    client_secret = _str(auth_cfg.get("databricks_client_secret", ""))
-
-    if not host or not client_id:
+    if auth_path is None:
         return "", []
 
+    from scripts.auth_configured import AuthStatus, auth_status
+    status = auth_status(auth_path)
+    if status is AuthStatus.UNREADABLE:
+        raise RuntimeError(f"{auth_path} can't be read") from None
+    if status is AuthStatus.MALFORMED:
+        raise RuntimeError(f"{auth_path} is not valid HCL") from None
+    if status is AuthStatus.INCOMPLETE:
+        raise RuntimeError(
+            f"fill in {auth_path} (workspace host, client ID, and client secret)"
+        ) from None
+
     try:
-        from databricks.sdk import WorkspaceClient
-        w = WorkspaceClient(
-            host=host, client_id=client_id, client_secret=client_secret,
+        from scripts.auth_configured import workspace_client
+        w = workspace_client(
+            auth_path,
             product="genierails", product_version="0.1.0",
         )
         resp = w.api_client.do(
@@ -411,21 +420,21 @@ def main():
         sys.exit(1)
 
     # Load source auth for API queries
-    auth_cfg = {}
+    selected_auth_path = None
     for auth_path in [
         os.path.join(source_env_dir, "auth.auto.tfvars"),
         os.path.join(source_env_dir, "..", "auth.auto.tfvars"),
     ]:
         if os.path.exists(auth_path):
-            try:
-                auth_cfg = hcl2.load(open(auth_path))
-            except Exception:
-                auth_cfg = None
-            if auth_cfg is None:
-                # Reported outside the handler with no parser text, which can echo a
-                # malformed secret (also via __context__).
+            from scripts.auth_configured import AuthStatus, auth_status
+            status = auth_status(Path(auth_path))
+            if status is AuthStatus.UNREADABLE:
+                print(f"ERROR: {auth_path} can't be read; nothing was written.")
+                sys.exit(1)
+            if status is AuthStatus.MALFORMED:
                 print(f"ERROR: {auth_path} is not valid HCL; nothing was written.")
                 sys.exit(1)
+            selected_auth_path = Path(auth_path)
             break
 
     # Resolve canonical names before matching discovered table attribution.
@@ -474,8 +483,13 @@ def main():
             space["uc_tables"] = uc_tables
 
         if space_id and not pure and (not name or not uc_tables):
+            lookup_auth = selected_auth_path or Path(source_env_dir) / "auth.auto.tfvars"
             print(f"  Querying Genie agent {space_id} for name/tables...")
-            api_title, api_tables = _discover_from_genie_api(space_id, auth_cfg)
+            try:
+                api_title, api_tables = _discover_from_genie_api(space_id, lookup_auth)
+            except RuntimeError as exc:
+                print(f"ERROR: {exc}; nothing was written.")
+                sys.exit(1)
             if not name and api_title:
                 space["name"] = api_title
                 print(f"  Discovered name: {api_title}")
@@ -729,12 +743,15 @@ def main():
     promoted_readers = (_normalize_readers(dest_cfg.get("table_readers")) if "table_readers" in dest_cfg
                         else source_readers)
     preserved_exempt = [_str(p) for p in dest_cfg.get("raw_exempt_principals") or []]
-    # make promote-to's saved source env + catalog map belong to the destination.
+    # make promote-to's saved source env + catalog map belong to the destination,
+    # and so does the opt-in for a catalog mapped to itself (only the boolean true).
     preserved_promote = {
         name: dest_cfg[name]
         for name in ("promote_from", "catalog_map")
         if dest_cfg.get(name)
     }
+    if dest_cfg.get("allow_identity_catalog_map") is True:
+        preserved_promote["allow_identity_catalog_map"] = True
     promoted_verify_key = (
         _str(cfg.get("verify_key_column", ""))
         or _str(dest_cfg.get("verify_key_column", ""))
@@ -1009,7 +1026,10 @@ def main():
     if preserved_promote:
         lines.append("")
         lines.append("# Saved by make promote-to (source env + catalog map for the next promote).")
-        lines.extend(f"{name} = {_promotion_setting(value)}" for name, value in preserved_promote.items())
+        for name, value in preserved_promote.items():
+            if name == "allow_identity_catalog_map":
+                lines.append("# Separate metastores only: lets catalog_map map a catalog to itself.")
+            lines.append(f"{name} = {_promotion_setting(value)}")
 
     # Write
     os.makedirs(dest_env_dir, exist_ok=True)

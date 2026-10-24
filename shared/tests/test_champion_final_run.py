@@ -85,15 +85,15 @@ def test_real_layout_loads_current_credentials(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "auth_text, expected",
     [
-        (None, "credentials file not found"),
+        (None, "fill in"),
         ("databricks_client_id = \n", "is not valid HCL"),
         (AUTH_TEXT.replace('databricks_client_secret = "current-secret"\n', ""),
-         "no value for databricks_client_secret"),
-        (AUTH_TEXT.replace('"current-secret"', '""'), "no value for databricks_client_secret"),
+         "fill in"),
+        (AUTH_TEXT.replace('"current-secret"', '""'), "fill in"),
         (AUTH_TEXT.replace('databricks_client_id = "sp-client"\n', ""),
-         "no value for databricks_client_id"),
+         "fill in"),
         (AUTH_TEXT.replace(f'databricks_workspace_host = "{HOST}"\n', ""),
-         "no value for databricks_workspace_host"),
+         "fill in"),
         (AUTH_TEXT.replace(HOST, "https://other.cloud.databricks.com"),
          "sets databricks_workspace_host = https://other.cloud.databricks.com"),
     ],
@@ -443,7 +443,7 @@ printf '{{}}\\n200'
            "DATABRICKS_HOST": "https://ws", "DATABRICKS_TOKEN": "t",
            "GENIE_ID_FILE": str(id_file), "GENIE_TABLES_CSV": "cat.s.t",
            "GENIE_WAREHOUSE_ID": "wh", "GENIE_TITLE": "Agent"}
-    result = subprocess.run(["bash", str(GENIE_SCRIPT), "create"], env=env,
+    result = subprocess.run(["bash", str(GENIE_SCRIPT), "create", "https://ws", "t"], env=env,
                             capture_output=True, text=True, timeout=60)
     posts = [c for c in calls.read_text().splitlines() if " POST " in f" {c} "] if calls.exists() else []
     return result, posts, id_file
@@ -582,6 +582,7 @@ def test_state_loss_apply_adopts_existing_title_instead_of_posting(tmp_path):
     calls = tmp_path / "curl.log"
     (bin_dir / "curl").write_text(f'''#!/bin/bash
 echo "$*" >> {calls}
+if [[ "$*" == *"/oidc/v1/token"* ]]; then printf '{{"access_token":"sp-token"}}\\n200'; exit 0; fi
 if [[ " $* " == *" POST "* ]]; then printf '{{"space_id":"duplicate"}}\\n201'; exit 0; fi
 if [[ " $* " == *"/api/2.0/genie/spaces"* ]]; then
   printf '{{"spaces":[{{"space_id":"existing-by-title","title":"Agent"}}]}}\\n200'; exit 0
@@ -622,7 +623,8 @@ printf '{{}}\\n200'
     apply = _tf(root, "apply", "-input=false", "-auto-approve", *var_args, env=env)
     assert apply.returncode == 0, apply.stdout + apply.stderr
     assert (tmp_path / ".genie_space_id_agent").read_text().strip() == "existing-by-title"
-    assert not any(" POST " in f" {line} " for line in calls.read_text().splitlines())
+    assert not any(" POST " in f" {line} " and "/oidc/v1/token" not in line
+                   for line in calls.read_text().splitlines())
 
 
 # ── Adoption required during the migration (missing ID / 404 / auth) ────────
@@ -706,6 +708,7 @@ def _run_strict_create(tmp_path: Path, get_code: str, *, write_id: bool = True,
     calls = tmp_path / "curl.log"
     (bin_dir / "curl").write_text(f"""#!/bin/bash
 echo "$*" >> {calls}
+if [[ "$*" == *"/oidc/v1/token"* ]]; then printf '{{"access_token":"sp-token"}}\\n200'; exit 0; fi
 if [[ " $* " == *" POST "* ]]; then printf '{{"space_id":"01dupe"}}\\n200'; exit 0; fi
 if [[ " $* " == *"/api/2.0/genie/spaces/"* ]]; then printf '{get_code}'; exit 0; fi
 printf '{{}}\\n200'
@@ -713,13 +716,15 @@ printf '{{}}\\n200'
     (bin_dir / "curl").chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_HOST": HOST, "DATABRICKS_TOKEN": "t",
+           "DATABRICKS_CLIENT_ID": "selected-client",
+           "DATABRICKS_CLIENT_SECRET": "selected-secret",
            "GENIE_ID_FILE": str(env_dir / f".genie_space_id_{KEY}"),
            "GENIE_TABLES_CSV": "cat.s.t", "GENIE_WAREHOUSE_ID": "wh", "GENIE_TITLE": "Agent",
            **(extra_env or {})}
     result = subprocess.run(["bash", str(GENIE_SCRIPT), "create"], env=env,
                             capture_output=True, text=True, timeout=60)
     log = calls.read_text().splitlines() if calls.exists() else []
-    return result, [c for c in log if " POST " in f" {c} "], env_dir
+    return result, [c for c in log if " POST " in f" {c} " and "/oidc/v1/token" not in c], env_dir
 
 
 @pytest.mark.parametrize("code", ["404", "401", "403", "500"])
@@ -786,6 +791,20 @@ def _recipe(makefile: str, target: str) -> str:
     start = makefile.index(f"\n{target}:")
     body = makefile[start:]
     return body[: body.index("\n\n")]
+
+
+def _recipe_with_subtargets(makefile: str, target: str) -> str:
+    """target's recipe plus every private target it runs through $(MAKE), in order."""
+    seen, pending, recipes = set(), [target], []
+    while pending:
+        name = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        recipe = _recipe(makefile, name)
+        recipes.append(recipe)
+        pending += re.findall(r"\$\(MAKE\)[^;|&\n]*?\s(_[\w-]+)", recipe)
+    return "\n".join(recipes)
 
 
 def _logical_makefile_lines(text: str) -> list[str]:
@@ -940,8 +959,9 @@ def test_no_saved_plan_file_is_written_by_the_product():
     makefile = (SHARED / "Makefile.shared").read_text()
     roots = makefile[makefile.index("\n_release-plan-roots:"):]
     roots = roots[:roots.index("\n\n")]
-    account_plan = makefile[makefile.index("\naccount-plan:"):]
-    account_plan = account_plan[:account_plan.index("\n\n")]
+    # account-plan delegates to _account-plan-locked (and its guards); follow it.
+    account_plan = _recipe_with_subtargets(makefile, "account-plan")
+    assert "_account-plan-locked:" in account_plan
     apply_layer = makefile[makefile.index("\n_apply-layer:"):]
     apply_layer = apply_layer[:apply_layer.index("\n\n")]
     account_apply = apply_layer[apply_layer.index('elif [ "$$layer" = "account" ]; then'):]
@@ -952,6 +972,8 @@ def test_no_saved_plan_file_is_written_by_the_product():
                                          '-out="$$plan_dir/workspace.tfplan");']
     assert re.findall(tf_out, account_plan) == ['-out="$$plan_dir/account.tfplan");']
     assert "account-plan-dir" in account_plan
+    assert '(umask 077; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan");' in account_plan
+    assert 'if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir";' in account_plan
     assert re.findall(tf_out, account_apply) == ['-out="$$account_plan_dir/account.tfplan")']
     assert 'account_plan_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-apply.XXXXXX")"' in account_apply
     assert 'trap \'rm -rf "$$account_plan_dir"\' EXIT' in account_apply
@@ -973,6 +995,36 @@ def test_saved_plan_check_flags_terraform_out_but_not_a_script_out(monkeypatch, 
         with pytest.raises(AssertionError):
             test_no_saved_plan_file_is_written_by_the_product()
     else:
+        test_no_saved_plan_file_is_written_by_the_product()
+
+
+_ACCOUNT_PLAN_OUT = '-out="$$plan_dir/account.tfplan"); status=$$?; set -e; \\\n'
+
+
+@pytest.mark.parametrize("old, new", [
+    # A second saved plan hidden in the locked sub-target account-plan delegates to.
+    (_ACCOUNT_PLAN_OUT,
+     _ACCOUNT_PLAN_OUT + '\t"$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan -out="$$plan_dir/stray.tfplan"; \\\n'),
+    # The account plan is no longer owner-only from creation.
+    ('set +e; (umask 077; "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan', 'set +e; ("$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" plan'),
+    # A failed account plan leaves its saved plan behind.
+    ('if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then rm -rf "$$plan_dir"; echo "account-plan: planning failed',
+     'if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then echo "account-plan: planning failed'),
+    # The account apply no longer checks its temporary plan for tag-policy deletions.
+    ('$(_RELEASE_GATE) tag-policy-delete-guard --env-dir "$$env_dir" --env "$$target_env" '
+     '--show-json "$$account_plan_dir/account.json";', 'true;'),
+    # The account apply's temporary plan is no longer removed on exit.
+    ('trap \'rm -rf "$$account_plan_dir"\' EXIT', 'trap \'true\' EXIT'),
+])
+def test_saved_plan_check_flags_account_plan_breaks(monkeypatch, tmp_path, old, new):
+    makefile = (SHARED / "Makefile.shared").read_text()
+    assert makefile.count(old) == 1
+    layer = tmp_path / "scripts/terraform_layer.sh"
+    layer.parent.mkdir()
+    layer.write_text((SHARED / "scripts/terraform_layer.sh").read_text())
+    (tmp_path / "Makefile.shared").write_text(makefile.replace(old, new))
+    monkeypatch.setattr(sys.modules[__name__], "SHARED", tmp_path)
+    with pytest.raises(AssertionError):
         test_no_saved_plan_file_is_written_by_the_product()
 
 
@@ -1023,7 +1075,10 @@ def test_migration_with_missing_id_file_fails_and_creates_nothing(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     calls = tmp_path / "curl.log"
-    (bin_dir / "curl").write_text(f'#!/bin/bash\necho "$*" >> {calls}\nprintf \'{{"space_id":"01dupe"}}\\n200\'\n')
+    (bin_dir / "curl").write_text(
+        f'#!/bin/bash\necho "$*" >> {calls}\n'
+        'if [[ "$*" == *"/oidc/v1/token"* ]]; then printf \'{"access_token":"sp-token"}\\n200\'; exit 0; fi\n'
+        'printf \'{"space_id":"01dupe"}\\n200\'\n')
     (bin_dir / "curl").chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "DATABRICKS_TOKEN": "t", "TF_IN_AUTOMATION": "1"}
@@ -1037,7 +1092,10 @@ def test_migration_with_missing_id_file_fails_and_creates_nothing(tmp_path):
         apply = _tf(env_dir, "apply", "-input=false", "-auto-approve", *tfvars, env=env)
         assert apply.returncode != 0
         assert "Adoption required" in apply.stdout + apply.stderr
-    assert not calls.exists() or " POST " not in f" {calls.read_text()} "
+    assert not calls.exists() or not any(
+        " POST " in f" {line} " and "/oidc/v1/token" not in line
+        for line in calls.read_text().splitlines()
+    )
     assert not (env_dir / f".genie_space_id_{KEY}").exists()
     assert not (env_dir / "trash.log").exists()
     assert gap.marker_for(env_dir, KEY).exists()

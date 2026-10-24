@@ -159,28 +159,24 @@ def changed_fields(before: Any, after: Any, prefix: str = "") -> list[str]:
 
 def _api(env_dir: Path):
     """The workspace API client pinned to the env's auth.auto.tfvars."""
-    from databricks.sdk import WorkspaceClient
-    from databricks.sdk.config import Config
     from scripts.auth_configured import AuthStatus, auth_status
+    from scripts.auth_configured import workspace_client
 
     auth_path = env_dir / "auth.auto.tfvars"
     status = auth_status(auth_path)
     if status is AuthStatus.MALFORMED:
         raise AgentError(f"{auth_path} is not valid HCL") from None
+    if status is AuthStatus.UNREADABLE:
+        raise AgentError(f"{auth_path} can't be read") from None
     if status is AuthStatus.INCOMPLETE:
         raise AgentError(
             f"fill in {auth_path} (workspace host, client ID, and client secret) before reading a Genie agent"
         )
-    auth = agent_files._load_hcl(auth_path)
-    config = Config(
-        host=auth["databricks_workspace_host"],
-        client_id=auth["databricks_client_id"],
-        client_secret=auth["databricks_client_secret"],
-        auth_type="oauth-m2m",
+    return workspace_client(
+        auth_path,
         product="genierails",
         product_version="0.1.0",
-    )
-    return WorkspaceClient(config=config).api_client
+    ).api_client
 
 
 def _get_space(api, space_id: str) -> dict:

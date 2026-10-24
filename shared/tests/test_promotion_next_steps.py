@@ -331,6 +331,61 @@ def test_a_ready_cutover_rehearses_the_source_before_release_plan(tmp_path, name
         assert "release-plan" not in steps
 
 
+PLACEHOLDER_PROD = ('governance_mode = "deterministic"\n'
+                    'deployer_principal_id = "<your-deployer-principal-id>"\n'
+                    'access_tier_groups = ["<most-privileged-group>", "<least-privileged-group>"]\n'
+                    'genie_spaces = [{ name = "Inline", genie_space_id = "<inline-id>", acl_groups = ["<inline-group>"] }]\n')
+PLACEHOLDER_AGENT = 'genie_space_id = "<your-genie-space-id>"\nacl_groups = ["<group-that-may-run-the-agent>"]\n'
+
+
+def test_placeholder_errors_lists_every_problem_in_fix_order(tmp_path):
+    from genie_space_placeholder import agent_files_placeholder_errors, placeholder_error, placeholder_errors
+    import hcl2
+
+    env_dir = _env(tmp_path, "prod", PLACEHOLDER_PROD)
+    (env_dir / "agents").mkdir()
+    (env_dir / "agents/Finance.auto.tfvars").write_text(PLACEHOLDER_AGENT)
+    config = hcl2.loads(PLACEHOLDER_PROD)
+
+    errors = placeholder_errors(config, env_dir / "env.auto.tfvars")
+    assert [e.split(" in ")[0] for e in errors] == [
+        "replace placeholder <inline-id>", "replace placeholder <inline-group>",
+        "replace placeholder <your-deployer-principal-id>", "replace placeholder <most-privileged-group>"]
+    assert placeholder_error(config, env_dir / "env.auto.tfvars") == errors[0]
+    # A promoted env's tiers come from promotion; everything else is still reported.
+    assert placeholder_errors(config, env_dir / "env.auto.tfvars", allow_access_tier_placeholders=True) == errors[:3]
+    agent_errors = agent_files_placeholder_errors(env_dir)
+    assert len(agent_errors) == 2
+    assert "<your-genie-space-id> in envs/prod/agents/Finance.auto.tfvars" in agent_errors[0]
+    assert "<group-that-may-run-the-agent> in envs/prod/agents/Finance.auto.tfvars" in agent_errors[1]
+
+
+def test_promote_to_reports_every_unfilled_placeholder_at_once(tmp_path):
+    """promote-to refuses until the deployer and agent IDs are filled: one run names them all (finding #21)."""
+    env_dir = _env(tmp_path, "prod", PLACEHOLDER_PROD)
+    (env_dir / "agents").mkdir()
+    (env_dir / "agents/Finance.auto.tfvars").write_text(PLACEHOLDER_AGENT)
+
+    result = _make(tmp_path, "promote-to", "ENV=prod")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    errors = [line for line in result.stderr.splitlines() if line.startswith("ERROR: replace placeholder")]
+    placeholders = [re.match(r"ERROR: replace placeholder (<[^>]+>)", line).group(1) for line in errors]
+    assert placeholders == ["<your-genie-space-id>", "<group-that-may-run-the-agent>", "<inline-id>",
+                            "<inline-group>", "<your-deployer-principal-id>"], result.stderr
+    # The guard runs before promotion writes anything.
+    assert not (env_dir / "generated").exists()
+
+
+def test_prod_setup_banner_asks_for_the_deployer_before_promote_to():
+    makefile = (SHARED / "Makefile.shared").read_text()
+    banner = makefile[makefile.index("Next steps ($(ENV) promotion"):makefile.index("  4. In Catalog Explorer")]
+    assert (banner.index("Create or confirm the $(ENV) deployment SP")
+            < banner.index("deployer_note")
+            < banner.index("promote-to refuses while deployer_principal_id is still a placeholder")
+            < banner.index("make promote-to ENV=$(ENV)")), banner
+
+
 def test_prod_setup_says_set_group_map_not_replace_access_tier_groups():
     """promote-to writes prod's tiers from dev's through group_map, so prod's own tier names
     without a group_map are refused; README Prod step 1 and the setup banner say so."""
@@ -339,7 +394,7 @@ def test_prod_setup_says_set_group_map_not_replace_access_tier_groups():
     assert "group_map" in step and "Leave the `access_tier_groups` placeholders" in step, step
     assert "`access_tier_groups` placeholders, and set" not in step
     makefile = (SHARED / "Makefile.shared").read_text()
-    banner = makefile[makefile.index("Next steps ($(ENV) promotion"):makefile.index("  3. In $(_SETUP_ENV_REL)/env.auto.tfvars")]
+    banner = makefile[makefile.index("Next steps ($(ENV) promotion"):makefile.index("  2. In $(_SETUP_ENV_REL)/env.auto.tfvars")]
     assert "set group_map there" in banner and "leave those placeholders" in banner, banner
     assert "Replace this env's access_tier_groups placeholders" not in banner
     # promote-to (and the promote it wraps) accept the destination's tier placeholders it overwrites.
@@ -486,3 +541,11 @@ def test_a_prod_promoted_through_a_promoted_stg_maps_in_dev_and_never_hand_edits
             "(or column_overrides) in envs/dev/env.auto.tfvars" in text
         assert "envs/stg/env.auto.tfvars" not in text and "make generate ENV=stg" not in text
     assert f"Next: {builder}\n" in _scaffold_output(capsys, "prod", prod, dev)
+
+
+def test_rehearse_reuse_docs_warn_that_live_dev_is_not_rechecked():
+    for path in (ROOT / "REFERENCE.md", SHARED / "docs" / "design" / "deterministic-governance.md"):
+        text = " ".join(path.read_text().split())
+        assert "does **not** re-check live dev for out-of-band drift" in text
+        assert "revert the live change and run a real apply/rehearse" in text
+        assert "abandon/re-stage the unfinished policy change" in text

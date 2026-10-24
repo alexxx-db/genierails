@@ -18,8 +18,11 @@ from pathlib import Path
 
 import pytest
 
+from scripts import environment_lock
 from scripts import release_gate as rg
+from scripts import sticky_governance
 from tests import script_stubs
+from tests import test_prod_coverage_gap_fix as uc
 from tests.test_release_gate import EMPTY_ABAC, PROD_ENV, Repo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +37,7 @@ with open({log!r}, "a") as log:
     log.write(json.dumps(args) + "\n")
 if {fail!r} and {fail!r} in args:
     sys.exit(1)
-if set(args) & set({passthrough!r}):
+if set(args) & (set({passthrough!r}) | {{"_account-plan-locked"}}):
     # Run the real recipe (its own recursive makes come back to this stub via MAKEFLAGS).
     os.execvp("make", ["make", *args])
 if "_release-plan-roots" in args:
@@ -278,6 +281,29 @@ def test_account_plan_writes_an_immutable_manifest_from_clean_origin_main(make, 
     assert not (manifest.parent / "account.show.json").exists()
 
 
+def test_plain_account_plan_locks_the_account_env(make, repo):
+    result = make("account-plan", "dev")  # the public command's default workspace env
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "environment lock acquired (account, account-plan)" in result.stdout
+    assert "environment lock acquired (dev, account-plan)" not in result.stdout
+
+
+def test_account_plan_refuses_under_apply_account_lock_and_keeps_pending_plan(make, repo):
+    manifest = _account_planned(make)
+    plan = manifest.parent / "account.tfplan"
+    account = repo.cloud / "envs" / "account"
+    ok, message, _nonce = environment_lock.acquire(account, os.getpid(), "apply-account")
+    assert ok, message
+    try:
+        result = make("account-plan", "dev")
+    finally:
+        environment_lock.release_lock(account, os.getpid())
+    assert result.returncode != 0
+    assert "account is locked" in result.stderr and "held by make apply-account" in result.stderr
+    assert plan.is_file()
+    assert not [call for call in make.calls() if call[:4] == ["runner", "account", "account", "plan"]]
+
+
 def test_real_layer_runner_keeps_account_plan_show_json_clean(tmp_path, repo):
     """The real wrapper's diagnostics must not corrupt account-plan's JSON input."""
     secret = "regression-client-secret-must-not-persist"
@@ -295,8 +321,14 @@ if args[:2] == ["show", "-json"]:
 ''')
     terraform.chmod(0o755)
     make = Make(tmp_path, repo)
+    checkout_account = ROOT / "aws/envs/account"
+    existed = checkout_account.exists()
+    # account-plan runs the runner without LAYER_ENV_DIR, so the real runner
+    # would use CLOUD_ROOT/envs/account: this checkout's, not ACCOUNT_ENV_DIR.
     result = make("account-plan", "account", root_runner=ROOT / "shared/scripts/terraform_layer.sh",
-                  environ_extra={"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"})
+                  environ_extra={"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+                                 "LAYER_ENV_DIR": str(repo.cloud / "envs" / "account")})
+    assert checkout_account.exists() is existed
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = Path(next(line.split(":", 1)[1].strip() for line in result.stdout.splitlines()
                          if "Manifest (immutable):" in line))
@@ -491,13 +523,49 @@ def test_apply_account_pins_the_setup_layout_symlinked_auth_endpoint(tmp_path, r
     assert not rg.account_receipts(repo.cloud, "account")
 
 
-def test_apply_account_refuses_several_default_manifests_and_lists_ids(make, repo):
+def test_apply_account_selects_the_newest_manifest_after_the_older_plan_was_dropped(make, repo):
     first = _account_planned(make)
     second = _account_planned(make)
-    result = make("apply-account", "account")
+    assert rg.select_account_manifest(repo.cloud / "envs" / "account", "account") == second
+    assert not (first.parent / "account.tfplan").exists()
+
+
+def test_apply_account_explicitly_refuses_a_superseded_account_manifest(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    first = _account_planned(make)
+    second = _account_planned(make)
+    result = make("apply-account", "account", f"MANIFEST={first}")
     assert result.returncode != 0
-    assert "multiple unreceipted account manifests" in result.stderr
-    assert first.parent.name in result.stderr and second.parent.name in result.stderr
+    assert f"superseded by a newer account-plan ({second})" in result.stderr
+    assert "changed or is missing" not in result.stderr
+
+
+def test_apply_account_refuses_superseded_manifest_when_failed_delete_kept_its_plan(tmp_path, repo):
+    make = Make(tmp_path, repo, passthrough=("_apply-account-locked",))
+    first = _account_planned(make)
+    old_plan = first.parent / "account.tfplan"
+    os.chmod(first.parent, 0o500)
+    try:
+        second_result = make("account-plan", "account")
+    finally:
+        os.chmod(first.parent, 0o700)
+    assert second_result.returncode == 0, second_result.stdout + second_result.stderr
+    second = Path(next(line.split(":", 1)[1].strip() for line in second_result.stdout.splitlines()
+                       if "Manifest (immutable):" in line))
+    assert old_plan.is_file() and "contains credentials" in second_result.stderr
+
+    make.reset()
+    ambiguous = make("apply-account", "account")
+    assert ambiguous.returncode != 0
+    assert "multiple unreceipted account manifests" in ambiguous.stderr
+    assert first.parent.name in ambiguous.stderr and second.parent.name in ambiguous.stderr
+
+    make.reset()
+    explicit = make("apply-account", "account", f"MANIFEST={first}")
+    assert explicit.returncode != 0
+    assert f"superseded by a newer account-plan ({second})" in explicit.stderr
+    assert not rg.account_receipts(repo.cloud, "account")
+    assert not [call for call in make.calls() if call[:4] == ["runner", "account", "account", "apply-plan"]]
 
 
 def test_account_bootstrap_targets_do_not_use_the_account_manifest_flow():
@@ -565,6 +633,62 @@ def test_plain_release_through_the_release_target_uses_the_current_manifest(tmp_
     result = make("release", "prod")
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"  Manifest: {manifest}\n" in result.stdout
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
+
+
+def _fake_uc(tmp_path: Path, table: str) -> dict[str, str]:
+    """test_prod_coverage_gap_fix's fake Databricks SDK, answering ``table``'s DDL and class.* tags."""
+    sdk = tmp_path / "sdk" / "databricks" / "sdk"
+    (sdk / "service").mkdir(parents=True)
+    (sdk.parent / "__init__.py").write_text("")
+    (sdk / "__init__.py").write_text(uc.FAKE_SDK)
+    (sdk / "config.py").write_text("class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n")
+    (sdk / "useragent.py").write_text("")  # else generate_abac pip-upgrades the real SDK
+    (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
+    (sdk / "service" / "__init__.py").write_text("")
+    (sdk / "service" / "sql.py").write_text(uc.FAKE_SQL)
+    live = tmp_path / "uc.json"
+    live.write_text(json.dumps({"tables": {table: uc.COLUMNS}, "tags": uc._tags(table.split(".")[0])}))
+    return {"PYTHONPATH": str(tmp_path / "sdk"), "FAKE_UC": str(live), "PIP_NO_INDEX": "1"}
+
+
+def test_plan_between_release_plan_and_release_does_not_stale_the_manifest(tmp_path, repo):
+    """S9. The plan really re-derives prod from live tags and re-splits it; only the overlay may change."""
+    table = uc.PROD_TABLE
+    (repo.prod / "env.auto.tfvars").write_text(PROD_ENV + f'uc_tables = ["{table}"]\nsql_warehouse_id = "wh"\n')
+    (repo.prod / "generated" / "abac.auto.tfvars").write_text(
+        'groups = { analysts = { description = "A" }, viewers = { description = "V" } }\n' + EMPTY_ABAC)
+    sticky_governance.save_governed_tables(repo.prod, [table])  # what promote-to records
+    repo.commit({})
+    (repo.prod / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://prod.example.invalid"\n'
+                                                'databricks_client_id = "c"\ndatabricks_client_secret = "s"\n')
+
+    def committed_generated():  # the ignored .live_refresh.json and .runtime/ are the plan's to write
+        return {p.name: p.read_bytes() for p in (repo.prod / "generated").iterdir()
+                if p.is_file() and not p.name.startswith(".")}
+
+    committed = committed_generated()
+    live = _fake_uc(tmp_path, table)
+    # release-plan derives and splits for real too, so its manifest pins what the live tags give.
+    make = Make(tmp_path, repo, passthrough=("derive-assignments", "promote"))
+    assert make("rehearse", "dev").returncode == 0
+    result = make("release-plan", "prod", environ_extra=live)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = Path(result.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    gate = make._write("gate-full", '#!/bin/sh\n[ "$1" = needs-derive ] && echo full\nexit 0\n')
+    result = make("plan", "prod", stub_make=False, stubs={"coverage_gate.py": str(gate)}, environ_extra=live)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Derived 2 gr_treatment assignment(s)" in result.stdout
+    assert "=== Split generated/ to account + data_access + workspace (prod) ===" in result.stdout
+    # The live derive (not the committed, empty assignments) reached the overlay and the split.
+    derived = f'entity_name = "{table}.cvv"'
+    assert derived in (repo.prod / "generated" / ".runtime" / "abac.auto.tfvars").read_text()
+    assert derived in (repo.prod / "data_access" / "abac.auto.tfvars").read_text()
+    assert committed_generated() == committed
+    assert repo.git("status", "--porcelain") == ""
+    make.reset()
+    result = make("_release-manifest", "prod", f"MANIFEST={manifest}")
+    assert result.returncode == 0, result.stdout + result.stderr
     assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
 
 
@@ -774,6 +898,24 @@ def test_legacy_maintain_is_unchanged(make, repo):
     result = make("maintain", "prod")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "apply-governance" in make.names()
+
+
+def test_maintain_verify_key_failure_stops_before_mask_proof_and_apply(make, repo):
+    (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    proof = make._recorder("proof")
+    result = make(
+        "maintain",
+        "prod",
+        "VERIFY_SPEC=/tmp/verify-spec.json",
+        stubs={
+            "resolve_env_config.py verify-key": "false",
+            "release_helpers.py require-mask-proof": str(proof),
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "maintain: could not resolve the verification key" in result.stderr
+    assert "proof" not in make.names()
+    assert "apply-governance" not in make.names()
 
 
 # -- rehearse --------------------------------------------------------------------------
@@ -1066,3 +1208,28 @@ def test_a_failed_verify_key_stops_before_the_mask_proof_and_applies_nothing(mak
     assert not [c for c in make.calls() if c[0] in ("staged", "runner")]
     assert "_release-plan-roots" not in names and "derive-assignments" not in names
     assert not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
+
+
+@pytest.mark.parametrize("mode", ["legacy", "deterministic"])
+def test_maintain_stops_when_the_verify_config_path_cannot_be_resolved(make, repo, mode):
+    if mode == "legacy":
+        (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    else:
+        assert make("_release-manifest", "prod", f"MANIFEST={_planned(make)}").returncode == 0
+        make.reset()
+    proof = make._recorder("proof")
+    stubs = {"resolve_env_config.py verify-key": str(make._write("key", "#!/bin/sh\necho id\n")),
+             "release_helpers.py require-mask-proof": str(proof)}
+    # Control: with the path resolved, the proof gets it and governance applies.
+    result = make("maintain", "prod", "VERIFY_SPEC=masked", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    proofs = [c for c in make.calls() if c[0] == "proof"]
+    assert proofs and proofs[0][proofs[0].index("--tfvars") + 1] == str(repo.prod / "generated" / "abac.auto.tfvars")
+    assert "apply-governance" in make.names()
+    make.reset()
+
+    result = make("maintain", "prod", "VERIFY_SPEC=masked", stubs=stubs | {"runtime_overlay.py path": "false"})
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "maintain: could not resolve the generated ABAC config; governance was not applied." in result.stderr
+    assert "proof" not in make.names() and "apply-governance" not in make.names()
+    assert _no_lock(repo, "prod")

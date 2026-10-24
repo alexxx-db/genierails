@@ -106,6 +106,9 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        if status is AuthStatus.UNREADABLE:
+            print(f"ERROR: envs/{env_dir.name}/auth.auto.tfvars can't be read", file=sys.stderr)
+            return 1
         if status is AuthStatus.INCOMPLETE:
             print(
                 f"ERROR: fill in envs/{env_dir.name}/auth.auto.tfvars "

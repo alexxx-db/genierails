@@ -45,6 +45,10 @@ case "$LAYER" in
     ;;
 esac
 
+# Provisioners and the provider must resolve credentials from the same env.
+# Direct runner invocations do not come through make, so establish this here.
+export LAYER_ENV_DIR="${LAYER_ENV_DIR:-$ENV_DIR}"
+
 # The env dir that owns this layer's state and remote_state.hcl: the dir the
 # layer runs in (envs/<env>, or envs/account), never one rebuilt from
 # ENVS_DIR, so the CI guard (state_layout.py ci-allowed) and this runner read
@@ -53,6 +57,18 @@ STATE_ENV_DIR="$ENV_DIR"
 if [ "$LAYER" = "data_access" ] && [ "$(dirname "$ENV_DIR")" != "$ENVS_DIR" ]; then
   STATE_ENV_DIR="$(dirname "$ENV_DIR")"
 fi
+# A workspace env whose catalog_map maps a catalog to itself (finding S2) can't
+# adopt (import/apply) or destroy policies by name, even run by hand: they may
+# be the source env's. Only its own allow_identity_catalog_map = true lets it
+# through (scripts/saved_settings.py). The grep keeps every other call cheap.
+case "$LAYER:$COMMAND" in
+  data_access:import|data_access:apply|data_access:apply-plan|data_access:destroy|workspace:import|workspace:apply|workspace:apply-plan|workspace:destroy)
+    owner_env_file="$STATE_ENV_DIR/env.auto.tfvars"
+    if [ -f "$owner_env_file" ] && grep -qE '^[[:space:]]*catalog_map[[:space:]]*=' "$owner_env_file"; then
+      python3 "$SCRIPT_DIR/saved_settings.py" identity-check --env-file "$owner_env_file" || exit 1
+    fi
+    ;;
+esac
 # state-pull prints only the state on stdout (state_layout.py state_json reads it).
 if [ "$COMMAND" = "state-pull" ]; then
   exec 3>&1 1>&2

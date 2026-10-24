@@ -367,6 +367,24 @@ def promotion_targets(cloud_dir: Path, source: str) -> list[str]:
     return targets
 
 
+def identity_check(env_dir: Path, env: str) -> None:
+    """Refuse when ENV or an env promoted from it maps a catalog to itself (S2).
+
+    A rehearsal receipt vouches for the commit for every promotion target, so a
+    hand-edited target catalog_map is refused before the rehearsal locks or applies.
+    """
+    from scripts.saved_settings import env_identity_catalog_map_error
+
+    env_dir = Path(env_dir)
+    cloud_dir = cloud_dir_of(env_dir)
+    files = [env_dir / "env.auto.tfvars"] + [
+        cloud_dir / "envs" / target / "env.auto.tfvars" for target in promotion_targets(cloud_dir, env)]
+    for env_file in files:
+        error = env_identity_catalog_map_error(env_file)
+        if error:
+            raise Refused(error)
+
+
 def promoted_digest(cloud_dir: Path, makefile: Path, make: str, target: str) -> tuple[str | None, str]:
     """What promote-to ENV=<target> writes, from the committed files alone (a scratch copy)."""
     from scripts.check_env import CheckFailed, Scratch
@@ -1347,15 +1365,20 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     created = _now()
     manifest_id = f"{created.replace(':', '').replace('.', '').replace('-', '')}-{prov['commit'][:12]}-account"
     final_dir = manifests_dir(cloud_dir_of(env_dir), env) / manifest_id
-    plan_name = Path(info["file"]).name
+    plan_entry = {"changes": bool(info.get("changes")), "summary": summary}
+    if account_plan_noop(plan_entry, tag_sync["diff"]):
+        # No later operation applies or otherwise reads a no-op account plan.
+        # Keep the immutable result, but not the credential-bearing plan file.
+        plan.unlink()
+    else:
+        plan_entry |= {"file": Path(info["file"]).name, "sha256": sha256_file(plan)}
     manifest = {
         "kind": "account-manifest", "version": VERSION, "id": manifest_id, "env": env,
         "cloud": cloud_dir_of(env_dir).name, "commit": prov["commit"], "provenance": dict(prov),
         # account-plan does not lock state. Terraform's saved-plan stale-state
         # check is the final backstop if state changes after this serial read.
         "state_serial": account_state_serial(env_dir),
-        "plan": {"file": plan_name, "sha256": sha256_file(plan), "changes": bool(info.get("changes")),
-                 "summary": summary},
+        "plan": plan_entry,
         "inputs": account_input_hashes(env_dir),
         "tag_sync": tag_sync["diff"],
         # Approving the manifest approves exactly these removals; apply-account
@@ -1369,7 +1392,23 @@ def account_manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mappin
     for path in plan_dir.rglob("*"):
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)
+    drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
+
+
+def account_plan_noop(plan: Mapping, tag_diff) -> bool:
+    """True when applying the account manifest would change nothing.
+
+    The tag policies ignore their values in Terraform, so a plan whose only
+    effect is adding or (approved) removing tag values has no Terraform changes;
+    apply-account makes those changes in its tag sync after the plan. Only a
+    manifest with neither is a no-op.
+    """
+    return not plan.get("changes") and not tag_sync_changes(tag_diff)
+
+
+def account_manifest_noop(manifest: Mapping) -> bool:
+    return account_plan_noop(manifest.get("plan") or {}, manifest.get("tag_sync"))
 
 
 def load_account_manifest(path: Path, env: str) -> dict:
@@ -1389,21 +1428,39 @@ def account_manifest_paths(cloud_dir: Path, env: str = ACCOUNT_ENV) -> list[Path
     return sorted(manifests_dir(cloud_dir, env).glob("*/manifest.json"))
 
 
+def newer_account_manifest(cloud_dir: Path, env: str, manifest: Mapping) -> Path | None:
+    """Newest unreceipted account manifest written after ``manifest``, if any."""
+    older_key = (str(manifest.get("created_at") or ""), str(manifest.get("id") or ""))
+    newer = []
+    for path in account_manifest_paths(cloud_dir, env):
+        candidate = _read_json(path)
+        if (candidate and candidate.get("kind") == "account-manifest" and candidate.get("version") == VERSION
+                and candidate.get("env") == env
+                and (str(candidate.get("created_at") or ""), str(candidate.get("id") or "")) > older_key
+                and not account_manifest_used(cloud_dir, env, str(candidate.get("id") or ""))):
+            newer.append(path)
+    return newer[-1] if newer else None
+
+
 def select_account_manifest(env_dir: Path, env: str) -> Path:
     status = checkout_status(env_dir)
     cloud_dir = cloud_dir_of(env_dir)
     candidates = []
     for path in account_manifest_paths(cloud_dir, env):
         manifest = _read_json(path)
+        entry = (manifest or {}).get("plan") or {}
+        plan = path.parent / str(entry.get("file") or "")
         if (manifest and manifest.get("kind") == "account-manifest" and manifest.get("version") == VERSION
                 and manifest.get("env") == env and manifest.get("commit") == status["commit"]
+                and not account_manifest_noop(manifest)
+                and entry.get("file") == "account.tfplan" and plan.is_file()
                 and not account_manifest_used(cloud_dir, env, str(manifest.get("id") or ""))):
             candidates.append((path, manifest))
     if len(candidates) != 1:
         ids = [f"{m.get('id')} ({p})" for p, m in candidates]
         if not candidates:
-            raise Refused("make apply-account found no unreceipted account manifest for HEAD. "
-                          "Run make account-plan, get its manifest approved, then run make apply-account.")
+            raise Refused("make apply-account found no unreceipted account manifest for HEAD "
+                          "(a manifest that changes nothing is never selected). Run make account-plan, get its manifest approved, then run make apply-account.")
         raise Refused("make apply-account found multiple unreceipted account manifests for HEAD; "
                       "rerun with MANIFEST=<path> for one of:\n  - " + "\n  - ".join(ids))
     return candidates[0][0]
@@ -1432,11 +1489,20 @@ def account_manifest_check(env_dir: Path, env: str, manifest_path: Path, *, remo
         drift.append(f"the account state changed since account-plan (serial "
                      f"{(manifest.get('state_serial') or {}).get('serial')} -> {(serial or {}).get('serial')})")
     entry = manifest.get("plan") or {}
-    if entry.get("file") != "account.tfplan":
+    # A newer no-op manifest supersedes too: account-plan is the latest word on the account.
+    newer = newer_account_manifest(cloud_dir_of(env_dir), env, manifest)
+    if newer:
+        drift.append(f"the manifest was superseded by a newer account-plan ({newer})")
+    if account_manifest_noop(manifest):
+        drift.append("the manifest records no account changes (no Terraform changes and no tag values to "
+                     "add or remove), so it kept no saved plan and has nothing to apply")
+    elif entry.get("file") != "account.tfplan":
         drift.append(f"the manifest's account plan is {entry.get('file')!r}, not account.tfplan")
     else:
         path = plan_dir / entry["file"]
-        if not path.is_file() or sha256_file(path) != entry.get("sha256"):
+        if path.is_file() and sha256_file(path) != entry.get("sha256"):
+            drift.append(f"the saved account plan {path} changed or is missing")
+        elif not path.is_file() and not newer:
             drift.append(f"the saved account plan {path} changed or is missing")
     current_inputs = account_input_hashes(env_dir)
     if current_inputs != manifest.get("inputs"):
@@ -1594,6 +1660,7 @@ def manifest_write(env_dir: Path, env: str, plan_dir: Path, prov: Mapping, live:
         os.chmod(path, 0o400 if path.is_file() else 0o700)
     os.rename(plan_dir, final_dir)  # the manifest dir appears complete or not at all
     _set_current(cloud_dir_of(env_dir), env, manifest_id, created)  # supersedes the previous manifest
+    drop_superseded_saved_plans(env_dir, env, final_dir / "manifest.json")
     return final_dir / "manifest.json"
 
 
@@ -1630,8 +1697,13 @@ def manifest_check(env_dir: Path, env: str, manifest_path: Path, *, live: str | 
     # A released manifest's saved plans were deleted after its receipt (drop_saved_plans):
     # check_releasable below reports it as released, not as missing its plans.
     released = released_by(cloud_dir_of(env_dir), env, manifest["id"])
+    current = current_manifest_id(cloud_dir_of(env_dir), env)
+    superseded = current is not None and current != manifest["id"]
     for root, path, digest in _saved_plans(manifest_path, manifest):
-        if released and not path.exists():
+        # Successful releases and newer manifests deliberately remove these.
+        # Preserve the stronger released/superseded refusal below rather than
+        # misreporting the expected cleanup as drift.
+        if (released or superseded) and not path.exists():
             continue
         if not path.is_file() or sha256_file(path) != digest:
             drift.append(f"the saved {root} plan {path} changed or is missing")
@@ -1672,6 +1744,60 @@ def _saved_plans(manifest_path: Path, manifest: Mapping) -> list[tuple[str, Path
              for root in ("account", "workspace") if manifest["plans"][root].get("file")]
     return plans + [("data_access", plan_dir / "data_access" / step["file"], step.get("sha256"))
                     for step in manifest["plans"]["data_access"].get("steps") or [] if step.get("file")]
+
+
+def drop_superseded_saved_plans(env_dir: Path, env: str, current_path: Path) -> list[Path]:
+    """Delete only the credential-bearing plans superseded by ``current_path``.
+
+    The caller has completed the new immutable manifest and holds the env lock,
+    so an older unreceipted manifest cannot be entering apply concurrently.
+    Manifests and all non-plan audit records remain append-only.
+    """
+    env_dir, current_path = Path(env_dir), Path(current_path)
+    left = []
+    try:
+        current = _read_json(current_path) or {}
+        kind = current.get("kind")
+        current_key = (str(current.get("created_at") or ""), str(current.get("id") or ""))
+        cloud_dir = cloud_dir_of(env_dir)
+        for manifest_path in sorted(manifests_dir(cloud_dir, env).glob("*/manifest.json")):
+            try:
+                if manifest_path == current_path:
+                    continue
+                manifest = _read_json(manifest_path)
+                if not manifest or manifest.get("kind") != kind or manifest.get("env") != env:
+                    continue
+                # A cleanup may only move backward in manifest time. The env
+                # lock serializes writers, but this guard also protects a
+                # restored/copied future manifest from being treated as old.
+                manifest_key = (str(manifest.get("created_at") or ""), str(manifest.get("id") or ""))
+                if manifest_key >= current_key:
+                    continue
+                manifest_id = str(manifest.get("id") or "")
+                if kind == "release-manifest":
+                    if released_by(cloud_dir, env, manifest_id):
+                        continue
+                    paths = [path for _, path, _ in _saved_plans(manifest_path, manifest)]
+                elif kind == "account-manifest":
+                    if account_manifest_used(cloud_dir, env, manifest_id):
+                        continue
+                    entry = manifest.get("plan") or {}
+                    paths = [manifest_path.parent / entry["file"]] if entry.get("file") else []
+                else:
+                    continue
+                for path in paths:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        print(f"WARNING: superseded saved plan {path} contains credentials and could not be "
+                              "deleted; delete it by hand.", file=sys.stderr)
+                        left.append(path)
+            except Exception:
+                print(f"WARNING: superseded saved-plan cleanup failed for {manifest_path}", file=sys.stderr)
+                continue
+    except Exception:
+        print(f"WARNING: superseded saved-plan cleanup failed for {current_path}", file=sys.stderr)
+    return left
 
 
 def drop_saved_plans(env_dir: Path, env: str, manifest_path: Path) -> list[Path]:
@@ -1942,6 +2068,7 @@ def main(argv: list[str] | None = None) -> int:
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
     command("env-role")
+    command("identity-check")
     command("legacy-guard").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
     try:
@@ -2063,6 +2190,8 @@ def main(argv: list[str] | None = None) -> int:
             legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":
             print(env_role(args.env_dir))
+        elif args.command == "identity-check":
+            identity_check(args.env_dir, args.env)
         elif args.command == "maintain-check":
             last = maintain_check(args.env_dir, args.env)
             print(f"maintain: HEAD is the last released commit {last['commit'][:12]} (digests match).")

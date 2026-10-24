@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agent_files import AgentFileError, merged_config  # noqa: E402
 from deterministic_governance import validate_config  # noqa: E402
 from scripts.custom_masks import env_errors  # noqa: E402
+from scripts.scheduled_governance_scope import error as scheduled_governance_error  # noqa: E402
 
 
 def main() -> int:
@@ -32,6 +33,10 @@ def main() -> int:
         ack_weaken=os.environ.get("ACK_WEAKEN"),
         library=library,
     ) if library is not None else []
+    # GenieRails creates the scheduled-governance job only for legacy envs.
+    scheduled = scheduled_governance_error(cfg, path.resolve().parent.name)
+    if scheduled:
+        errors.append(scheduled)
     for warning in warnings:
         print(f"env config validation: WARNING: {warning}", file=sys.stderr)
     if errors:

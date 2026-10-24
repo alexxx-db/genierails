@@ -50,11 +50,17 @@ from pathlib import Path
 
 import hcl2
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from auth_tfvars import template_text  # noqa: E402
+
 TEMPLATE_KEYS = ("databricks_account_id", "databricks_client_id", "databricks_client_secret",
                  "databricks_workspace_id", "databricks_workspace_host")
 CREDENTIAL_KEYS = ("databricks_account_id", "databricks_client_id", "databricks_client_secret")
 REUSED_KEYS = (*CREDENTIAL_KEYS, "databricks_account_host")
 HOST, WORKSPACE_ID = "databricks_workspace_host", "databricks_workspace_id"
+# make setup in azure/ adds databricks_account_host to the template (auth_tfvars.py). A
+# destination holding that key is still template state only when it is byte-for-byte that file.
+AZURE_TEMPLATE = template_text(Path(__file__).resolve().parents[1] / "auth.auto.tfvars.example", "azure")
 PLACEHOLDERS = ("placeholder", "change_me", "changeme", "your_")
 
 
@@ -189,6 +195,8 @@ def prepare(source: Path, dest: Path, dest_env_file: Path | None, host: str, wor
         return (f"  REUSE_SOURCE_AUTH: {dest} is not a plain file (a symlink or missing); left unchanged.")
     dest_config = _parse(dest_data, dest)
     extra = sorted(set(dest_config) - set(TEMPLATE_KEYS))
+    if extra == ["databricks_account_host"] and dest_data == AZURE_TEMPLATE:
+        extra = []
     if extra or any(_text(dest_config, key) for key in CREDENTIAL_KEYS):
         return (f"  REUSE_SOURCE_AUTH: {dest} already holds credentials or settings; left unchanged.")
 

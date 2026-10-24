@@ -41,6 +41,7 @@ if str(SHARED_ROOT) not in sys.path:
     sys.path.insert(0, str(SHARED_ROOT))
 
 from scripts.sticky_governance import GovernedTablesError, _load_hcl, deterministic  # noqa: E402
+from scripts.release_gate import PROMOTED, env_role  # noqa: E402
 
 RESERVED_ENVS = ("account", "data_access")
 # Runtime files never enter the scratch copy: credentials, state, Terraform
@@ -168,6 +169,44 @@ def _copy_tracked_envs(source: Path, dest: Path) -> None:
         shutil.copyfile(src, target)
 
 
+def _uncommitted_env_files(cloud_dir: Path, env: str) -> tuple[list[str], list[str]]:
+    """(tracked files changed since the commit, untracked files) under envs/<env>.
+
+    Informational only, from one read-only git call (no optional index
+    refresh). Any git failure, including not being in a repo, returns nothing.
+    """
+    try:
+        out = subprocess.run(["git", "--no-optional-locks", "-C", str(cloud_dir / "envs" / env), "status",
+                              "--porcelain", "-z", "--untracked-files=all", "--", "."],
+                             capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return [], []
+    changed, untracked = [], []
+    fields = iter(os.fsdecode(out).split("\0"))
+    for entry in fields:
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        (untracked if status == "??" else changed).append(path)
+        if "R" in status or "C" in status:
+            next(fields, None)  # the rename/copy source follows its destination
+    return sorted(changed), sorted(untracked)
+
+
+def _note_uncommitted_env_files(cloud_dir: Path, env: str) -> None:
+    changed, untracked = _uncommitted_env_files(cloud_dir, env)
+    if changed:
+        print(f"  NOTE: make check passed against uncommitted working-tree content in envs/{env}:")
+        for path in changed:
+            print(f"    {path}")
+    if untracked:
+        print(f"  NOTE: untracked files in envs/{env} were not checked; commit them if they belong to the env:")
+        for path in untracked:
+            print(f"    {path}")
+    if changed or untracked:
+        print("  rehearse and release-plan use the commit, not these uncommitted changes.")
+
+
 def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
     """Relative path -> (kind, content) for every non-runtime file in the copy.
 
@@ -219,7 +258,7 @@ class Scratch:
         return subprocess.run(command, env=env).returncode
 
     def add_credentials(self, env_name: str) -> None:
-        """Copy the env's and account's auth files in for the plan step only."""
+        """Copy the env's and account's auth files into the throwaway copy."""
         for rel in (Path(env_name) / "auth.auto.tfvars",
                     Path(env_name) / "data_access" / "auth.auto.tfvars",
                     Path("account") / "auth.auto.tfvars"):
@@ -284,6 +323,7 @@ def _report(label: str, before: dict, after: dict, fix: str) -> None:
 def _promote_check(args) -> None:
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
     try:
+        scratch.add_credentials(args.env)
         before = _snapshot(scratch.envs)
         extra = [f"FROM={args.from_env}"] if args.from_env else []
         extra += [f"CATALOG_MAP={args.catalog_map}"] if args.catalog_map else []
@@ -301,7 +341,7 @@ def _check(args) -> None:
     env = args.env
     real_env_dir = args.cloud_dir / "envs" / env
     is_deterministic = deterministic(real_env_dir)
-    promotes = env == "prod" or bool(_load_hcl(real_env_dir / "env.auto.tfvars").get("promote_from"))
+    promotes = env_role(real_env_dir) == PROMOTED
     has_generated = (real_env_dir / "generated" / "abac.auto.tfvars").is_file()
     scratch = Scratch(args.cloud_dir, args.makefile, args.make)
     steps = 6
@@ -310,6 +350,13 @@ def _check(args) -> None:
         print(f"\n--- check {number}/{steps}: {title} ---")
 
     try:
+        # Validators run throughout the check, not only in the final plan. Give
+        # every scratch step the real runtime auth values so an empty-secret
+        # warning describes the caller's config. The files remain inside the
+        # private throwaway copy and are never included in comparisons. Copied
+        # inside the try: a copy that fails partway still leaves no secret in
+        # the scratch directory.
+        scratch.add_credentials(env)
         step(1, "validate")
         if not has_generated and not (scratch.envs / env / "abac.auto.tfvars").is_file():
             print(f"  NOTE: skipped: envs/{env} has not been generated; run make generate ENV={env}.")
@@ -385,7 +432,6 @@ def _check(args) -> None:
               "change a release would make. Live tags are not re-read, so new SELECT grants show as withheld.")
         print("  INFO: Genie CAN_RUN withheld in this empty-state pre-release plan is expected; ordinary "
               "plans and applies still fail when CAN_RUN is unexpectedly withheld.")
-        scratch.add_credentials(env)
         # The structural plan doesn't re-read live tags (a plan applies nothing;
         # the gate withholds new grants), so it hands the plan the one-time
         # token that skips the derive (scripts/exposure_token.py).
@@ -432,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
     except (CheckFailed, GovernedTablesError) as exc:
         print(f"\n=== {label}: FAILED ({exc}) ===", file=sys.stderr)
         return 1
+    if args.command == "check":
+        _note_uncommitted_env_files(args.cloud_dir, args.env)
     print(f"\n=== {label}: passed ===")
     return 0
 

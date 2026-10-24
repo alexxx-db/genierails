@@ -17,6 +17,8 @@ from pathlib import Path
 import hcl2
 import pytest
 
+from shared.scripts import check_env
+
 ROOT = Path(__file__).resolve().parents[2]
 SHARED = ROOT / "shared"
 
@@ -62,7 +64,8 @@ def _b64(value):
 
 
 # Answers the coverage check's and CAN_RUN check's terraform console queries
-# like an empty state would, and logs every plan; no provider ever runs.
+# like an empty state would, and logs every plan (noting the structural-check
+# variable terraform_layer.sh adds only for check's one-use token); no provider ever runs.
 FAKE_TERRAFORM = f"""#!/bin/sh
 case "$1" in
   console)
@@ -70,7 +73,10 @@ case "$1" in
       */data_access) echo '{_b64({"fingerprint": "f", "grant_tables": [], "acknowledged_columns": [], "needs_gate": False, "new_grants": []})}' ;;
       *) echo '{_b64({"groups": {}, "blocker": "no state", "widening": {}, "missing": {}, "applied": {}})}' ;;
     esac ;;
-  plan) echo "plan $(basename "$PWD")" >> "$FAKE_TF_LOG"; echo "FAKE PLAN" ;;
+  plan)
+    expected=""
+    for arg in "$@"; do [ "$arg" = "-var=expected_pre_release_withholding=true" ] && expected=" expected-withholding"; done
+    echo "plan $(basename "$PWD")$expected" >> "$FAKE_TF_LOG"; echo "FAKE PLAN" ;;
 esac
 exit 0
 """
@@ -191,7 +197,8 @@ def test_check_passes_on_a_clean_generated_tree_and_writes_nothing(repo, tmp_pat
     assert "--- check 5/6: mask-library unit tests ---" in out and " passed in " in out
     assert "=== make check ENV=dev: passed ===" in out
     assert "applying targets cannot run in CI" not in out
-    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access", "plan workspace"]
+    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access",
+                                                                  "plan workspace expected-withholding"]
     _assert_read_only(repo, before)
     assert _git(repo, "status", "--porcelain") == ""
 
@@ -266,6 +273,8 @@ def test_read_only_targets_never_post_classification_config(repo, tmp_path, targ
     env_file.write_text(env_file.read_text() + '\nenable_classification = true\n')
     (dev / "auth.auto.tfvars").write_text(
         'databricks_workspace_host = "https://example.invalid"\n'
+        'databricks_client_id = "client"\n'
+        'databricks_client_secret = "secret"\n'
         'serverless_usage_policy_id = "policy-123"\n'
     )
     _commit(repo, "classification configured")
@@ -276,6 +285,9 @@ def test_read_only_targets_never_post_classification_config(repo, tmp_path, targ
     (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
     (sdk / "useragent.py").write_text(
         "def with_extra(*args, **kwargs):\n    return None\n"
+    )
+    (sdk / "config.py").write_text(
+        "class Config:\n    def __init__(self, **kwargs):\n        self.__dict__.update(kwargs)\n"
     )
     (sdk / "__init__.py").write_text('''
 import os
@@ -563,8 +575,54 @@ def test_local_only_files_cannot_change_the_result(promoted, tmp_path, kind):
     _assert_check_prod_passes_offline(check_prod)
     assert check_dev.returncode == 0, check_dev.stdout + check_dev.stderr
     for result in (promote, check_prod, check_dev):
-        assert marker not in result.stdout + result.stderr
+        # check's non-failing NOTE may name an untracked file; its content still never reaches the result.
+        assert marker not in (result.stdout + result.stderr).replace(f"aws/envs/{rel}", "")
     _assert_read_only(promoted, before)
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_notes_modified_tracked_env_file_without_changing_exit(repo, tmp_path, ci):
+    env_file = _envs(repo) / "dev" / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + "\n# local review\n")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: make check passed against uncommitted working-tree content" in result.stdout
+    assert "aws/envs/dev/env.auto.tfvars" in result.stdout
+    assert "untracked files" not in result.stdout
+    assert "rehearse and release-plan use the commit" in result.stdout
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_notes_committable_untracked_env_file_without_changing_exit(repo, tmp_path, ci):
+    (_envs(repo) / "dev" / "review.txt").write_text("review me\n")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: untracked files in envs/dev were not checked" in result.stdout
+    assert "aws/envs/dev/review.txt" in result.stdout
+    assert "passed against uncommitted working-tree content" not in result.stdout
+    assert "rehearse and release-plan use the commit" in result.stdout
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_has_no_uncommitted_note_on_a_clean_tree(repo, tmp_path, ci):
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "uncommitted" not in result.stdout and "untracked files" not in result.stdout
+
+
+def test_uncommitted_note_is_silent_outside_git(tmp_path, capsys):
+    cloud = tmp_path / "aws"
+    (cloud / "envs" / "dev").mkdir(parents=True)
+    (cloud / "envs" / "dev" / "local.tfvars").write_text("x = 1\n")
+
+    check_env._note_uncommitted_env_files(cloud, "dev")
+
+    assert capsys.readouterr().out == ""
 
 
 def test_check_outside_a_git_checkout_is_refused(repo, tmp_path):
@@ -692,3 +750,42 @@ def test_check_never_runs_the_staged_policy_controller_or_any_apply(repo, tmp_pa
     assert not [c for c in commands if c.split()[1:2] in (["apply"], ["import"], ["destroy"])], commands
     assert any(c.startswith("data_access plan") and "-var=policy_stage=preview" in c for c in commands), commands
     _assert_read_only(repo, before)
+
+
+@pytest.mark.parametrize("secret, warns", [("filled-secret", False), ("", True)])
+def test_check_secret_warnings_reflect_the_real_auth_file(repo, tmp_path, secret, warns):
+    auth = _envs(repo) / "dev" / "auth.auto.tfvars"
+    auth.write_text('databricks_account_id = "account"\n'
+                    'databricks_client_id = "client"\n'
+                    f'databricks_client_secret = "{secret}"\n'
+                    'databricks_workspace_id = "workspace"\n'
+                    'databricks_workspace_host = "https://workspace.example"\n')
+    result = _make(repo, tmp_path, "check", "ENV=dev")
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert ("'databricks_client_secret' is empty" in out) is warns
+
+
+def test_check_removes_the_scratch_copy_when_copying_credentials_fails(repo, tmp_path, monkeypatch):
+    secret = "scratch-secret-value"
+    for env_name in ("dev", "account"):
+        (_envs(repo) / env_name / "auth.auto.tfvars").write_text(f'databricks_client_secret = "{secret}"\n')
+    scratch_tmp = tmp_path / "scratch-tmp"
+    scratch_tmp.mkdir()
+    monkeypatch.setattr(check_env.tempfile, "tempdir", str(scratch_tmp))
+    copyfile = check_env.shutil.copyfile
+
+    def failing_copyfile(source, dest, *args, **kwargs):
+        # The env's auth file is already copied in when the account's fails.
+        if Path(dest).parts[-2:] == ("account", "auth.auto.tfvars"):
+            raise OSError("disk full")
+        return copyfile(source, dest, *args, **kwargs)
+
+    monkeypatch.setattr(check_env.shutil, "copyfile", failing_copyfile)
+    args = check_env.argparse.Namespace(env="dev", cloud_dir=repo / "aws", makefile=repo / "aws" / "Makefile",
+                                        make="make")
+
+    with pytest.raises(OSError, match="disk full"):
+        check_env._check(args)
+
+    assert list(scratch_tmp.iterdir()) == []

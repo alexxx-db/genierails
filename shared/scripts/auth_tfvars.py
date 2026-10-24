@@ -16,6 +16,8 @@ _SECRET_RE = re.compile(
     r'(?m)^[ \t]*databricks_client_secret[ \t]*=[ \t]*"(?P<value>(?:[^"\\\r\n]|\\.)*)"[ \t]*(?:#[^\r\n]*)?\r?$'
 )
 _SECRET_KEY_RE = re.compile(r"(?m)^[ \t]*databricks_client_secret[ \t]*=")
+_ACCOUNT_HOST_RE = re.compile(r"(?m)^[ \t]*databricks_account_host[ \t]*=")
+AZURE_ACCOUNT_HOST = "https://accounts.azuredatabricks.net"
 
 
 def _mode(path: Path) -> int:
@@ -32,7 +34,15 @@ def _warn_tighten(path: Path, *, emit=print) -> None:
         os.chmod(path, AUTH_MODE)
 
 
-def ensure_template(path: Path, template: Path) -> None:
+def template_text(template: Path, cloud: str = "") -> bytes:
+    """The template's bytes; Azure also gets its account host (the roots default to AWS's)."""
+    data = template.read_bytes()
+    if cloud == "azure" and not _ACCOUNT_HOST_RE.search(data.decode("utf-8")):
+        data += f'databricks_account_host   = "{AZURE_ACCOUNT_HOST}"\n'.encode()
+    return data
+
+
+def ensure_template(path: Path, template: Path, cloud: str = "") -> None:
     if path.is_symlink():
         return
     if path.exists():
@@ -46,7 +56,7 @@ def ensure_template(path: Path, template: Path) -> None:
     try:
         os.fchmod(fd, AUTH_MODE)
         with os.fdopen(fd, "wb") as handle:
-            handle.write(template.read_bytes())
+            handle.write(template_text(template, cloud))
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
@@ -165,13 +175,14 @@ def _parser() -> argparse.ArgumentParser:
     ensure = sub.add_parser("ensure-template")
     ensure.add_argument("path", type=Path)
     ensure.add_argument("--template", required=True, type=Path)
+    ensure.add_argument("--cloud", default="", help="aws or azure; azure also writes databricks_account_host")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "ensure-template":
-        ensure_template(args.path, args.template)
+        ensure_template(args.path, args.template, args.cloud)
     return 0
 
 

@@ -28,4 +28,4 @@ After the first deployment: [one team doing both](shared/docs/playbooks/one-team
 
 **[Command and settings reference →](REFERENCE.md)** — every `make` target and every `env.auto.tfvars` / `auth.auto.tfvars` setting.
 
-Bootstrap note: `make bootstrap-sp` prints a new OAuth secret by default; `BOOTSTRAP_AUTH_ENV=<env>` writes a newly minted secret directly to that env's private `auth.auto.tfvars` instead. See the command reference for the guardrails.
+Bootstrap note: `make bootstrap-sp` prints a new OAuth secret by default; `BOOTSTRAP_AUTH_ENV=<env>` writes a newly minted secret directly to that env's private `auth.auto.tfvars` instead. See the command reference for the guardrails. It reuses an SP only by exact display name (`SP_NAME`, default `genierails-deployer`): pass `SP_NAME=<its name>` for an existing SP, or it creates a second one.

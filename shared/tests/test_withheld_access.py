@@ -225,7 +225,7 @@ def test_make_apply_reports_withheld_access_after_both_layers():
 # ── genie_space.sh revoke-acls (finding 6) ───────────────────────────────────
 
 FAKE_CURL = r"""#!/bin/bash
-method=GET; body=""
+method=GET; body=""; url="${!#}"
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
@@ -233,6 +233,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+if [[ "$url" == */oidc/v1/token ]]; then printf '{"access_token":"sp-token"}\n200'; exit 0; fi
 echo "$method" >> "$CURL_LOG"
 if [ "$method" = "PUT" ]; then printf '%s' "$body" > "$PUT_BODY"; printf '{}\n200'; exit 0; fi
 printf '%s\n%s' "$(cat "$ACL_JSON")" "${GET_STATUS:-200}"
@@ -255,11 +256,16 @@ def _revoke(tmp_path, groups, **env_extra):
     (bin_dir / "curl").write_text(FAKE_CURL)
     (bin_dir / "curl").chmod(0o755)
     (tmp_path / "acl.json").write_text(json.dumps(ACL))
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://ws"\n'
+        'databricks_client_id = "id"\n'
+        'databricks_client_secret = "secret"\n'
+    )
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "DATABRICKS_HOST": "https://ws",
            "DATABRICKS_TOKEN": "t", "GENIE_SPACE_OBJECT_ID": "space-1", "GENIE_REVOKE_GROUPS_CSV": groups,
+           "LAYER_ENV_DIR": str(tmp_path),
            "CURL_LOG": str(tmp_path / "curl.log"), "PUT_BODY": str(tmp_path / "put.json"),
            "ACL_JSON": str(tmp_path / "acl.json")}
-    env.pop("LAYER_ENV_DIR", None)
     env.update(env_extra)
     return subprocess.run(["bash", str(GENIE_SCRIPT), "revoke-acls"], env=env, text=True, capture_output=True)
 
@@ -305,6 +311,31 @@ def test_revoke_acls_reads_the_created_agent_id_and_credentials_from_the_layer(t
                      GENIE_ID_BASENAME=".genie_space_id_sales")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Revoking Genie CAN_RUN on agent space-9 for groups: analysts" in result.stdout
+
+
+def test_revoke_acls_refuses_ambient_sp_without_layer_env(tmp_path):
+    called = tmp_path / "curl-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text(f"#!/bin/sh\ntouch {called}\nexit 99\n")
+    curl.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "DATABRICKS_HOST": "https://wrong.example",
+        "DATABRICKS_CLIENT_ID": "ambient-id",
+        "DATABRICKS_CLIENT_SECRET": "ambient-secret",
+        "GENIE_SPACE_OBJECT_ID": "space-1",
+        "GENIE_REVOKE_GROUPS_CSV": "analysts",
+    }
+    env.pop("LAYER_ENV_DIR", None)
+    result = subprocess.run(
+        ["bash", str(GENIE_SCRIPT), "revoke-acls"], env=env, text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "LAYER_ENV_DIR is required" in result.stderr
+    assert not called.exists()
 
 
 # ── the ACL resources take back CAN_RUN when destroyed (finding 6) ───────────
