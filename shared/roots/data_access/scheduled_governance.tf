@@ -64,11 +64,11 @@ variable "scheduled_governance_catalog" {
 variable "scheduled_governance_config_source" {
   type        = string
   default     = ""
-  description = "Runtime-visible config source copied before scanning. Prefer an envs root with account/ and <env>/ to run both checks; an old flat target-env source remains compatible but check mode warns and skips rulebook audit. Required when enabled because envs/ is gitignored."
+  description = "Runtime-visible config source copied before scanning. Prefer an envs root with account/ and <env>/ to run both checks; an old flat target-env source remains compatible but check mode warns and skips rulebook audit. Required when enabled because the job's Git checkout has only committed files."
 
   validation {
     condition     = !var.enable_scheduled_governance || var.scheduled_governance_config_source != ""
-    error_message = "scheduled_governance_config_source must be set when enable_scheduled_governance = true — the Git checkout does not contain the .gitignore'd envs/<env>/ config."
+    error_message = "scheduled_governance_config_source must be set when enable_scheduled_governance = true — the job's Git checkout has only committed files, which may not include envs/<env>/."
   }
 }
 
@@ -159,10 +159,10 @@ resource "databricks_job" "scheduled_governance" {
   max_concurrent_runs = 1
 
   # Check out this repo so the tasks can invoke the existing entrypoints. The
-  # checkout provides the CODE only — the repo's envs/ is .gitignore'd, so the
-  # per-env config (auth/env/data_access/generated tfvars) is NOT present. The
-  # wrapper materializes it from scheduled_governance_config_source (a UC Volume
-  # / workspace path) into the env dir before scanning.
+  # checkout provides committed files only — the upstream repo doesn't commit
+  # envs/, so the per-env config (env/data_access/generated tfvars) may be
+  # missing. The wrapper materializes it from scheduled_governance_config_source
+  # (a UC Volume / workspace path) into the env dir before scanning.
   git_source {
     url      = var.scheduled_governance_git_url
     provider = var.scheduled_governance_git_provider

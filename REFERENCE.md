@@ -237,18 +237,18 @@ The settings the rules above depend on are explained in more depth, with the rul
 | `catalog_map` | any (map, or the legacy `"a=b,c=d"` string) | `{}` | In the destination env: source-to-destination catalog renames for `promote-to`. No resource reads it. |
 | `ai_helper_endpoint` | string | `""` | In `envs/dev`: the model serving endpoint the AI helpers call. Governance never reads it. |
 
-### `env.auto.tfvars`: scheduled governance (data_access root)
+### `env.auto.tfvars`: scheduled governance (data_access root; legacy envs only, deprecated)
 
-Off by default. See [scheduled governance](shared/docs/scheduled-governance.md) and [`scheduled_governance.auto.tfvars.example`](shared/scheduled_governance.auto.tfvars.example).
+Off by default, and legacy envs only: make refuses `enable_scheduled_governance = true` in a deterministic env, which schedules `make maintain` / `make audit-rulebook` / `make audit-schema` itself. See [scheduled governance](shared/docs/scheduled-governance.md) and [`scheduled_governance.auto.tfvars.example`](shared/scheduled_governance.auto.tfvars.example).
 
 | Setting | Type | Default | Meaning |
 |---|---|---|---|
-| `enable_scheduled_governance` | bool | `false` | Create a scheduled job that runs the read-only governance checks. |
+| `enable_scheduled_governance` | bool | `false` | Legacy envs only (deprecated): create a scheduled job that runs the read-only governance checks. Refused in a deterministic env. |
 | `scheduled_governance_mode` | string | `"check"` | `check` (read-only audits) or `legacy` (audit, generate-delta, then `validate_abac.py --coverage-gate` against the generated or split config; never apply). |
 | `scheduled_governance_env` | string | `"prod"` | The env the job checks. |
 | `scheduled_governance_cloud` | string | `"aws"` | `aws` or `azure`: the cloud dir holding that env. |
 | `scheduled_governance_catalog` | string | `""` | Legacy mode only: the catalog for generate-delta. |
-| `scheduled_governance_config_source` | string | `""` | Runtime-visible copy of `envs/` (for example a Volume path); required when enabled. |
+| `scheduled_governance_config_source` | string | `""` | Runtime-visible envs root with `account/` and the env (for example a Volume path); required when enabled, because the job's Git checkout has only committed files. Never put `auth.auto.tfvars` or another secret there. |
 | `scheduled_governance_cron` | string (Quartz cron) | `"0 0 6 * * ?"` | Schedule. |
 | `scheduled_governance_timezone` | string | `"UTC"` | Schedule timezone. |
 | `scheduled_governance_git_url` | string | `""` | Repo the job checks out for code; required when enabled. |

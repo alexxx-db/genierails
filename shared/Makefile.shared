@@ -237,9 +237,11 @@ _bootstrap:
 
 # _bootstrap for targets that consume env config. The placeholder guard is the
 # first recipe line (not a sibling prerequisite), so it finishes before any
-# _prepare-env side effect, even under make -j. setup/destroy/clean keep _bootstrap.
+# _prepare-env side effect, even under make -j. setup/destroy/clean keep _bootstrap
+# (setup runs only the scheduled-governance guard before it, the same way).
 _guarded-bootstrap:
 	@$(_GENIE_PLACEHOLDER_GUARD)
+	@$(_SCHEDULED_GOVERNANCE_GUARD)
 	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 
 _guard-workspace-target:
@@ -272,11 +274,17 @@ _guard-data-access-config:
 # promotion writes its tiers from the source's, through its group_map.
 override _GENIE_PLACEHOLDER_GUARD = GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$(if $(and $(filter generate,$(MAKECMDGOALS)),$(or $(findstring --groups,$(GENERATE_ARGS)),$(findstring --create-groups,$(GENERATE_ARGS)))),1,0) python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars" \
 	"$(SOURCE_ENV_DIR)/env.auto.tfvars"$(if $(DEST_ENV), && GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(DEST_ENV_DIR)/env.auto.tfvars",)
+# A deterministic env may not enable the Terraform-managed scheduled-governance
+# job (legacy only; docs/scheduled-governance.md). Runs next to the placeholder
+# guard (also on a cross-env promote's destination), and first in setup, so
+# it refuses before any plan or write.
+override _SCHEDULED_GOVERNANCE_GUARD = python3 "$(SHARED_ROOT)/scripts/scheduled_governance_scope.py" "$(ENV_DIR)/env.auto.tfvars"$(if $(DEST_ENV), "$(DEST_ENV_DIR)/env.auto.tfvars",)
 override _PROMOTE_TO_PLACEHOLDER_GUARD = $(if $(_PROMOTE_TO_FROM),python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(CLOUD_ROOT)/envs/$(_PROMOTE_TO_FROM)/env.auto.tfvars" && ,) \
 	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=1 python3 "$(SHARED_ROOT)/genie_space_placeholder.py" "$(ENV_DIR)/env.auto.tfvars"
 
 _guard-genie-placeholder:
 	@$(_GENIE_PLACEHOLDER_GUARD)
+	@$(_SCHEDULED_GOVERNANCE_GUARD)
 
 _guard-not-ci-apply:
 	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); is_ci=; \
@@ -329,7 +337,9 @@ _guard-workspace-config:
 _SETUP_ENV_REL = $(patsubst $(CLOUD_ROOT)/%,%,$(ENV_DIR))
 _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
-setup: _bootstrap ## Prepare the selected environment(s) and show next steps
+setup: ## Prepare the selected environment(s) and show next steps
+	@$(_SCHEDULED_GOVERNANCE_GUARD)
+	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 	@echo "=== Setup ($(ENV)) ==="
 	@allow=0; [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)" 2>/dev/null)" = promoted ] && allow=1; \
 	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$$allow python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
@@ -1622,6 +1632,7 @@ _PROMOTE_TO_MAP = $(if $(filter command line,$(origin CATALOG_MAP)),$(CATALOG_MA
 # credentials or state) and fails if the committed output differs.
 promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
 	@$(_PROMOTE_TO_PLACEHOLDER_GUARD)
+	@$(_SCHEDULED_GOVERNANCE_GUARD)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	if [ "$(CHECK)" = 1 ]; then \
@@ -1656,6 +1667,7 @@ override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
 	@$(_GENIE_PLACEHOLDER_GUARD)
+	@$(_SCHEDULED_GOVERNANCE_GUARD)
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	$(_CHECK_ENV) check
