@@ -487,3 +487,139 @@ def test_a_leftover_grant_that_can_t_be_revoked_refuses_the_post_grant_verify(ha
         vea.main(cli)
     # Refused before any grant or read.
     assert harness.uc.seen == {} and not [sql for sql in harness.uc.statements if sql.startswith("GRANT")]
+
+
+# -- (4) the live run after #226: verify-created stopped on ssn (partial = full) and never-raw cvv ------------
+# AWS dev-2 run 21fce9f7649e, resumed after #226: verify-created ran the real per-tier checks, 6 PASS and 3
+# INCONCLUSIVE. ssn gets partial = full = "redacted" under two differently named functions with identical
+# bodies; cvv is never raw, so its one policy masks everyone, the deployer too, and no raw value exists to
+# compare. Now identical functions verify by exact output and a never-raw column by its proven constant mask.
+REDACTED_DDL = "CREATE TABLE cat.sch.t (\n  ssn STRING,\n  cvv STRING\n);\n"
+REDACTED_CLASSES = {"ssn": ["us_ssn"], "cvv": ["card_security_code"]}
+
+
+def redacted_env(h, tmp_path, monkeypatch) -> dict:
+    """A fresh env: cat.sch.t.ssn (partial = full = redacted, two functions) and cat.sch.t.cvv (never raw)."""
+    real = staged.build_model
+    monkeypatch.setattr(staged, "build_model", lambda columns, *args, **kwargs: real(
+        {c: REDACTED_CLASSES[c.rsplit(".", 1)[1]] for c in columns}, *args, **kwargs))
+    gen = fresh(h, tmp_path, monkeypatch, ddl_text=REDACTED_DDL, columns=("ssn", "cvv"))
+    functions = {p["name"]: p["function_name"] for p in gen["fgac_policies"]}
+    ssn = gen["tags"]["cat.sch.t.ssn"]
+    assert (functions[f"gr_mask_cat_{ssn}_partial"], functions[f"gr_mask_cat_{ssn}_full"]) == (
+        f"gr_mask_{ssn}_partial", f"gr_mask_{ssn}_full")
+    [cvv] = [p for p in gen["fgac_policies"] if p["name"].startswith("gr_mask_cat_card_security_code")]
+    assert (cvv["to_principals"], cvv.get("except_principals") or []) == (["account users"], [])
+    return gen
+
+
+def redacting(h, monkeypatch) -> None:
+    """Unity Catalog's real answers for these masks: both bodies are redact_string ('[REDACTED]', NULL kept).
+
+    ``h.mask_proofs`` False is the verifier before this fix: it proves neither the identical functions nor
+    the never-raw mask, so both checks stay INCONCLUSIVE exactly as on main.
+    """
+    h.mask_proofs = False
+    read = FakeUnityCatalog.read
+    monkeypatch.setattr(FakeUnityCatalog, "read", lambda self, app, tier, table, column, keys: [
+        (k, "[REDACTED]" if ".gr_mask_" in value else value)
+        for k, value in read(self, app, tier, table, column, keys)])
+    base = vea.EffectiveAccessVerifier
+
+    class Verifier(base):
+        def expected_tier_values(self, principal, check, keys):
+            # The admin reads the column (the masked constant when it is never raw), then applies each function.
+            raw = h.uc.read(principal.application_id, principal.tier, check.table, check.column, keys)
+            return {"raw": raw, **{tier: [(k, None if v is None else "[REDACTED]") for k, v in raw]
+                                   for tier in ("partial", "full")}}
+
+        def function_equivalence_problem(self, principal, left, right):
+            if not h.mask_proofs:
+                raise AttributeError("no function_equivalence_problem before this fix")
+            assert {left.rsplit("_", 1)[1], right.rsplit("_", 1)[1]} == {"partial", "full"}
+            return ""
+
+        def never_raw_mask_proof(self, principal, check, policies):
+            if not h.mask_proofs:
+                raise AttributeError("no never_raw_mask_proof before this fix")
+            value = live_tags(live_state(h.env_dir))[f"{check.table}.{check.column}"]
+            masks = [p for p in live_policies(live_state(h.env_dir)) if _value_of(p) == value]
+            attached = [p for p in masks if p["to_principals"] == ["account users"] and not p["except_principals"]
+                        and p["column_mask"]["function_name"].lower() == check.full_function.lower()]
+            return (vea.NeverRawProof(vea.PASS, "", "[REDACTED]") if len(masks) == len(attached) == 1
+                    else vea.NeverRawProof(vea.FAIL, f"{len(attached)} of {len(masks)} live masks attached"))
+
+    monkeypatch.setattr(vea, "EffectiveAccessVerifier", Verifier)
+
+
+def _stopped_at_verify_created_like_the_live_run(h, tmp_path, monkeypatch, capsys) -> tuple[dict, str]:
+    """The live sequence: verify-switched without temporary access (#226), then the resume under main's verifier."""
+    gen = redacted_env(h, tmp_path, monkeypatch)
+    monkeypatch.setattr(spa, "PRE_GRANT_VERIFY", set(), raising=False)
+    assert h.apply() == 1
+    monkeypatch.setattr(spa, "PRE_GRANT_VERIFY", {"verify-created", "verify-switched"}, raising=False)
+    run_id = h.journal()["transition"]["run_id"]
+    capsys.readouterr()
+    h.calls.clear()
+    h.verifies.clear()
+    redacting(h, monkeypatch)
+    assert h.apply() == 1
+    out = capsys.readouterr()
+    assert f"resuming run {run_id} (failed at verify-switched)" in out.out
+    assert "INCONCLUSIVE" in out.out + out.err and "cannot be distinguished" in out.out + out.err
+    assert "could not prove the mask as the admin baseline" in out.out + out.err
+    t = h.journal()["transition"]
+    assert (t["run_id"], t["status"], t["failed_phase"]) == (run_id, "failed", "verify-created")
+    [verify] = h.verifies
+    assert (verify["stage"], verify["rc"], verify["pre_grant"], verify["business"]) == ("restore", 1, "1", set())
+    assert grant_keys(live_state(h.env_dir)) == DEPLOYER_GRANT  # fail-closed: nothing granted
+    h.calls.clear()
+    h.after.clear()
+    h.verifies.clear()
+    return gen, run_id
+
+
+def test_ssn_and_never_raw_cvv_verify_and_the_live_run_resumes_from_verify_created(harness, tmp_path,
+                                                                                  monkeypatch, capsys):
+    gen, run_id = _stopped_at_verify_created_like_the_live_run(harness, tmp_path, monkeypatch, capsys)
+    before = harness.journal()["transition"]
+    harness.mask_proofs = True
+    # Unchanged config: the same run resumes from verify-created to the end.
+    rc = harness.apply()
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert f"resuming run {run_id} (failed at verify-created)" in out
+    assert harness.calls == ["inventory:create/restore", "verify-access:restore", "switch", "inventory:switch",
+                             "verify-access:switch", "grant"]
+    assert [(v["stage"], v["rc"], v["pre_grant"], v["business"]) for v in harness.verifies] == [
+        ("restore", 0, "1", set()), ("switch", 0, "1", set())]
+    for verify in harness.verifies:
+        # Every tier read through its own temporary grant; cvv is masked for everyone, the deployer included.
+        assert verify["grantees"] == PRINCIPALS and not verify["grantees"] & set(TIERS)
+        assert {tier for (tier, column), mask in verify["seen"].items() if column == "cvv" and mask == "raw"} == set()
+        assert verify["seen"][(vea.DEFAULT_ADMIN_TIER, "cvv")] == "full"
+        assert verify["seen"][("raw", "ssn")] == "raw" and verify["seen"][("regional", "ssn")] == "partial"
+    for column in ("ssn", "cvv"):
+        assert out.count(f"✓ [PASS] column-mask cat.sch.t.{column} ") == 2
+    assert harness.after["grant"]["grants"] == BUSINESS | DEPLOYER_GRANT
+    journal = harness.journal()
+    assert journal["active"] == gen["fingerprint"] and journal["transition"] is None
+    assert journal["history"][-1]["run_id"] == run_id == before["run_id"]
+
+
+@pytest.mark.parametrize("broken", ["cvv-deployer-leak", "cvv-tier-leak", "ssn-leak"])
+def test_a_broken_ssn_or_cvv_mask_still_stops_the_resumed_run(harness, tmp_path, monkeypatch, capsys, broken):
+    _gen, run_id = _stopped_at_verify_created_like_the_live_run(harness, tmp_path, monkeypatch, capsys)
+    harness.mask_proofs = True
+    # A mask the fake drops: the tier (or the deployer baseline) reads raw.
+    harness.uc.leak = {"ssn-leak": {"regional"}, "cvv-tier-leak": {"masked"},
+                       "cvv-deployer-leak": {vea.DEFAULT_ADMIN_TIER}}[broken]
+    assert harness.apply() == 1
+    out = capsys.readouterr()
+    assert f"resuming run {run_id} (failed at verify-created)" in out.out
+    column = broken.split("-")[0]
+    assert f"✗ [FAIL] column-mask cat.sch.t.{column} " in out.out + out.err
+    t = harness.journal()["transition"]
+    assert (t["run_id"], t["failed_phase"]) == (run_id, "verify-created")
+    assert [(v["stage"], v["rc"]) for v in harness.verifies] == [("restore", 1)]
+    assert grant_keys(live_state(harness.env_dir)) == DEPLOYER_GRANT

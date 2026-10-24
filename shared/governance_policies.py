@@ -48,6 +48,17 @@ UNMAPPED_MARKER = "# gr.classification_unmapped:"
 MIXED_PARTIAL_MARKER = "# gr.classification_mixed_partial:"
 MIXED_PARTIAL_TREATMENT = "redact"
 
+# Warning-only heuristic.  Names and comments are deliberately not policy
+# inputs: they can suggest a review, but never choose a treatment.
+FREE_TEXT_NAME_HINTS = frozenset({
+    "notes", "comment", "description", "free_text", "memo", "remarks",
+    "message", "body", "text",
+})
+FREE_TEXT_COMMENT_RE = re.compile(
+    r"\b(?:free[\s-]?(?:text|form)|unstructured\s+(?:text|notes?)|notes?|comments?|remarks?)\b",
+    re.IGNORECASE,
+)
+
 _VALUE_RE = re.compile(
     r"(?P<treatment>[a-z0-9_]+?)__(?P<type>[a-z0-9_]+)__(?P<generation>[0-9a-f]{8})"
 )
@@ -217,6 +228,30 @@ def keeps_string_partial(value: str) -> bool:
                 and not is_never_raw(value))
 
 
+def suggests_free_text(column: str, comment: str = "") -> bool:
+    """Whether a column name/comment suggests prose (warning-only heuristic)."""
+    name = column.rsplit(".", 1)[-1].lower()
+    name_words = set(re.findall(r"[a-z0-9]+", name))
+    return ("free_text" in name or bool(FREE_TEXT_NAME_HINTS & name_words)
+            or bool(FREE_TEXT_COMMENT_RE.search(comment or "")))
+
+
+def free_text_partial_columns(
+    treatments: Mapping[str, ColumnTreatment], comments: Mapping[str, str] | None = None,
+) -> list[str]:
+    """String partial-mask columns whose name/comment suggests free text.
+
+    This is advisory only.  In particular, it must never participate in
+    treatment resolution or generated output.
+    """
+    notes = {str(k).lower(): str(v) for k, v in (comments or {}).items()}
+    return [
+        column for column, item in sorted(treatments.items())
+        if partial_tier_exposes_fragment(item)
+        and suggests_free_text(column, notes.get(column.lower(), ""))
+    ]
+
+
 def mixed_partial_problem(value: str, classes: Sequence[str], library: dict | None = None) -> list[str]:
     """The partial treatments a string column's ``classes`` mix, if its value keeps one.
 
@@ -249,6 +284,48 @@ def normalize_sql_type(sql_type: str) -> str:
     raise DeterministicGovernanceError(
         f"column type {sql_type!r} can't be masked deterministically; only scalar types are supported"
     )
+
+
+def partial_tier_exposes_fragment(item: ColumnTreatment) -> bool:
+    """Whether a middle tier sees something weaker than the full mask."""
+    return (item.sql_type == "STRING" and not item.never_raw
+            and item.partial_sql != item.full_sql)
+
+
+def treatment_value_column(
+    column: str, value: str, settings: Mapping, library: dict,
+) -> ColumnTreatment | None:
+    """Reconstruct a generated column treatment for coverage advisories."""
+    parsed = parse_treatment_value(value)
+    if not parsed:
+        return None
+    treatment, type_token, _generation = parsed
+    token_types = {re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_"): value
+                   for value in set(_SCALAR_TYPES.values())}
+    decimal = re.fullmatch(r"decimal_(\d+)_(\d+)", type_token)
+    exact_type = f"DECIMAL({decimal.group(1)},{decimal.group(2)})" if decimal else token_types.get(type_token)
+    if not exact_type or treatment not in library["treatments"]:
+        return None
+    configured = dict(normalize_column_overrides(settings.get("column_overrides")).get(column.lower()) or {})
+    configured["treatment"] = treatment
+    classes = list(library["treatments"][treatment].get("classes") or [])
+    if not classes:
+        classes = [next(c for item in library["treatments"].values() for c in item.get("classes", []))]
+    candidates = [configured]
+    # Mixed-class resolution deliberately forces redact/redacted after applying
+    # versions.  Try that unchanged resolver outcome as well; the value hash
+    # identifies which effective behavior the generated column actually uses.
+    if treatment == MIXED_PARTIAL_TREATMENT:
+        candidates.append({"treatment": treatment, "partial": "redacted"})
+    for override in candidates:
+        item = resolve_column(
+            column, classes, exact_type, library=library,
+            treatment_versions=settings.get("treatment_versions") or {},
+            column_overrides={column.lower(): override},
+        )
+        if item.value == value:
+            return item
+    return None
 
 
 def resolve_column(
@@ -418,38 +495,96 @@ _DDL_TABLE_RE = re.compile(
 )
 
 
-def column_types_from_ddl(ddl_text: str) -> dict[str, str]:
-    """``{catalog.schema.table.column (lowercase): SQL type}`` from fetched DDL."""
+def _ddl_column_definitions(ddl_text: str):
+    """Yield ``(table, definition)`` using a quote-aware fetched-DDL lexer."""
     text = ddl_text or ""
-    types: dict[str, str] = {}
     for match in _DDL_TABLE_RE.finditer(text):
         table = match.group(1).replace("`", "")
-        depth, current, parts = 1, "", []
-        for char in text[match.end():]:
-            if char in "(<":
-                depth += 1
-            elif char in ")>":
-                depth -= 1
-                if depth == 0:
+        parens, angles, quote, line_comment = 1, 0, "", False
+        current, parts, index = "", [], match.end()
+        while index < len(text):
+            char = text[index]
+            following = text[index + 1] if index + 1 < len(text) else ""
+            if line_comment:
+                current += char
+                line_comment = char != "\n"
+                index += 1
+                continue
+            if quote:
+                current += char
+                if char == quote:
+                    if following == quote:  # SQL escapes quotes by doubling them.
+                        current += following
+                        index += 2
+                        continue
+                    quote = ""
+                index += 1
+                continue
+            if char == "-" and following == "-":
+                current += "--"
+                line_comment = True
+                index += 2
+                continue
+            if char in "'\"`":
+                quote = char
+                current += char
+            elif char == "<":
+                angles += 1
+                current += char
+            elif char == ">" and angles:
+                angles -= 1
+                current += char
+            elif char == "(":
+                parens += 1
+                current += char
+            elif char == ")":
+                parens -= 1
+                if parens == 0:
+                    if current.strip():
+                        parts.append(current)
                     break
-            if char == "," and depth == 1:
+                current += char
+            elif char == "," and parens == 1 and angles == 0:
                 parts.append(current)
                 current = ""
             else:
                 current += char
-        parts.append(current)
+            index += 1
         for part in parts:
-            line = " ".join(
-                piece.strip() for piece in part.splitlines() if not piece.strip().startswith("--")
-            ).strip()
-            tokens = line.split(None, 1)
+            clean = " ".join(line.strip() for line in part.splitlines()
+                             if not line.strip().startswith("--")).strip()
+            tokens = clean.split(None, 1)
             if len(tokens) < 2 or tokens[0].upper() in {"CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK"}:
                 continue
-            sql_type = re.split(r"\s+(?:NOT\s+NULL|COMMENT|DEFAULT|GENERATED|MASK)\b", tokens[1],
-                                maxsplit=1, flags=re.IGNORECASE)[0].strip()
-            name = tokens[0].strip('`"')
-            types[f"{table}.{name}".lower()] = sql_type
+            yield table, tokens[0].strip('`"'), tokens[1]
+
+
+def column_types_from_ddl(ddl_text: str) -> dict[str, str]:
+    """``{catalog.schema.table.column (lowercase): SQL type}`` from fetched DDL."""
+    types: dict[str, str] = {}
+    for table, name, remainder in _ddl_column_definitions(ddl_text):
+        sql_type = re.split(r"\s+(?:NOT\s+NULL|COMMENT|DEFAULT|GENERATED|MASK)\b", remainder,
+                            maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        types[f"{table}.{name}".lower()] = sql_type
     return types
+
+
+_DDL_COMMENT_RE = re.compile(
+    r"\bCOMMENT\s+(?P<literal>'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")",
+    re.IGNORECASE,
+)
+
+
+def column_comments_from_ddl(ddl_text: str) -> dict[str, str]:
+    """Column comments from the same quote-aware parser used for fetched types."""
+    comments: dict[str, str] = {}
+    for table, name, remainder in _ddl_column_definitions(ddl_text):
+        match = _DDL_COMMENT_RE.search(remainder)
+        if match:
+            literal = match.group("literal")
+            quote = literal[0]
+            comments[f"{table}.{name}".lower()] = literal[1:-1].replace(quote * 2, quote)
+    return comments
 
 
 @dataclass(frozen=True)

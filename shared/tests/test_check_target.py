@@ -17,6 +17,8 @@ from pathlib import Path
 import hcl2
 import pytest
 
+from shared.scripts import check_env
+
 ROOT = Path(__file__).resolve().parents[2]
 SHARED = ROOT / "shared"
 
@@ -62,7 +64,8 @@ def _b64(value):
 
 
 # Answers the coverage check's and CAN_RUN check's terraform console queries
-# like an empty state would, and logs every plan; no provider ever runs.
+# like an empty state would, and logs every plan (noting the structural-check
+# variable terraform_layer.sh adds only for check's one-use token); no provider ever runs.
 FAKE_TERRAFORM = f"""#!/bin/sh
 case "$1" in
   console)
@@ -70,7 +73,10 @@ case "$1" in
       */data_access) echo '{_b64({"fingerprint": "f", "grant_tables": [], "acknowledged_columns": [], "needs_gate": False, "new_grants": []})}' ;;
       *) echo '{_b64({"groups": {}, "blocker": "no state", "widening": {}, "missing": {}, "applied": {}})}' ;;
     esac ;;
-  plan) echo "plan $(basename "$PWD")" >> "$FAKE_TF_LOG"; echo "FAKE PLAN" ;;
+  plan)
+    expected=""
+    for arg in "$@"; do [ "$arg" = "-var=expected_pre_release_withholding=true" ] && expected=" expected-withholding"; done
+    echo "plan $(basename "$PWD")$expected" >> "$FAKE_TF_LOG"; echo "FAKE PLAN" ;;
 esac
 exit 0
 """
@@ -191,7 +197,8 @@ def test_check_passes_on_a_clean_generated_tree_and_writes_nothing(repo, tmp_pat
     assert "--- check 5/6: mask-library unit tests ---" in out and " passed in " in out
     assert "=== make check ENV=dev: passed ===" in out
     assert "applying targets cannot run in CI" not in out
-    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access", "plan workspace"]
+    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access",
+                                                                  "plan workspace expected-withholding"]
     _assert_read_only(repo, before)
     assert _git(repo, "status", "--porcelain") == ""
 
@@ -563,8 +570,54 @@ def test_local_only_files_cannot_change_the_result(promoted, tmp_path, kind):
     _assert_check_prod_passes_offline(check_prod)
     assert check_dev.returncode == 0, check_dev.stdout + check_dev.stderr
     for result in (promote, check_prod, check_dev):
-        assert marker not in result.stdout + result.stderr
+        # check's non-failing NOTE may name an untracked file; its content still never reaches the result.
+        assert marker not in (result.stdout + result.stderr).replace(f"aws/envs/{rel}", "")
     _assert_read_only(promoted, before)
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_notes_modified_tracked_env_file_without_changing_exit(repo, tmp_path, ci):
+    env_file = _envs(repo) / "dev" / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text() + "\n# local review\n")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: make check passed against uncommitted working-tree content" in result.stdout
+    assert "aws/envs/dev/env.auto.tfvars" in result.stdout
+    assert "untracked files" not in result.stdout
+    assert "rehearse and release-plan use the commit" in result.stdout
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_notes_committable_untracked_env_file_without_changing_exit(repo, tmp_path, ci):
+    (_envs(repo) / "dev" / "review.txt").write_text("review me\n")
+
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NOTE: untracked files in envs/dev were not checked" in result.stdout
+    assert "aws/envs/dev/review.txt" in result.stdout
+    assert "passed against uncommitted working-tree content" not in result.stdout
+    assert "rehearse and release-plan use the commit" in result.stdout
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_check_has_no_uncommitted_note_on_a_clean_tree(repo, tmp_path, ci):
+    result = _make(repo, tmp_path, "check", "ENV=dev", **({"CI": ci} if ci else {}))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "uncommitted" not in result.stdout and "untracked files" not in result.stdout
+
+
+def test_uncommitted_note_is_silent_outside_git(tmp_path, capsys):
+    cloud = tmp_path / "aws"
+    (cloud / "envs" / "dev").mkdir(parents=True)
+    (cloud / "envs" / "dev" / "local.tfvars").write_text("x = 1\n")
+
+    check_env._note_uncommitted_env_files(cloud, "dev")
+
+    assert capsys.readouterr().out == ""
 
 
 def test_check_outside_a_git_checkout_is_refused(repo, tmp_path):

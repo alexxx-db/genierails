@@ -43,8 +43,10 @@ def _env(env, tables=("sales.customers", "sales.orders"), mode="deterministic"):
     (env / "generated").mkdir(parents=True, exist_ok=True)
     (env / "data_access").mkdir(exist_ok=True)
     # The deployer this machine applies with is the committed one (deployer_identity.py).
+    # generate refuses an auth file without host, client ID and secret.
     (env / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://unused.invalid"\n'
-                                          'databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n')
+                                          'databricks_client_id = "d0000000-0000-0000-0000-00000000d001"\n'
+                                          'databricks_client_secret = "test-only-secret"\n')
     listed = ", ".join(f'"{t}"' for t in tables)
     (env / "env.auto.tfvars").write_text(
         f'governance_mode = "{mode}"\nuc_catalog = "prod"\n'

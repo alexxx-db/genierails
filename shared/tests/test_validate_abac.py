@@ -300,6 +300,25 @@ def test_financial_compensation_columns_are_amount_category():
         assert _infer_column_categories(f"catalog.hr.employees.{column}") == {"amount"}
 
 
+def test_legacy_name_function_category_check_is_explicitly_skipped_only_in_deterministic_mode():
+    policy = {
+        "name": "phone", "policy_type": "POLICY_TYPE_COLUMN_MASK", "catalog": "cat",
+        "to_principals": ["analysts"], "except_principals": [],
+        "match_condition": "hasTagValue('pii', 'phone')", "match_alias": "masked_col",
+        "function_name": "mask_phone", "function_catalog": "cat", "function_schema": "sch",
+    }
+    assignment = {"entity_type": "columns", "entity_name": "cat.sch.t.free_text",
+                  "tag_key": "pii", "tag_value": "phone"}
+    base = {"fgac_policies": [policy], "tag_assignments": [assignment]}
+    legacy = _result()
+    validate_fgac_policies(base, {"analysts"}, {"pii": {"phone"}}, {"mask_phone"}, legacy)
+    assert any("expected only" in error for error in legacy.errors)
+    deterministic = _result()
+    validate_fgac_policies(base | {"governance_mode": "deterministic"}, {"analysts"},
+                           {"pii": {"phone"}}, {"mask_phone"}, deterministic)
+    assert not any("expected only" in error for error in deterministic.errors)
+
+
 # ===========================================================================
 #  validate_groups
 # ===========================================================================
