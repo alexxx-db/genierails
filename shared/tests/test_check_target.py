@@ -273,6 +273,8 @@ def test_read_only_targets_never_post_classification_config(repo, tmp_path, targ
     env_file.write_text(env_file.read_text() + '\nenable_classification = true\n')
     (dev / "auth.auto.tfvars").write_text(
         'databricks_workspace_host = "https://example.invalid"\n'
+        'databricks_client_id = "client"\n'
+        'databricks_client_secret = "secret"\n'
         'serverless_usage_policy_id = "policy-123"\n'
     )
     _commit(repo, "classification configured")
@@ -283,6 +285,9 @@ def test_read_only_targets_never_post_classification_config(repo, tmp_path, targ
     (sdk / "errors.py").write_text("class NotFound(Exception):\n    pass\n")
     (sdk / "useragent.py").write_text(
         "def with_extra(*args, **kwargs):\n    return None\n"
+    )
+    (sdk / "config.py").write_text(
+        "class Config:\n    def __init__(self, **kwargs):\n        self.__dict__.update(kwargs)\n"
     )
     (sdk / "__init__.py").write_text('''
 import os

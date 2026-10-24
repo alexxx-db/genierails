@@ -626,23 +626,12 @@ def adopt(env_dir: Path, name: str, force: bool = False) -> tuple[Path, str]:
 # ── live-check: rehearse and release ────────────────────────────────────────
 
 def workspace_client(auth_file: Path):
-    """A WorkspaceClient from the env's auth.auto.tfvars (unset values fall back to the SDK's own auth)."""
-    from databricks.sdk import WorkspaceClient
-
-    auth = {}
-    if auth_file.is_file():
-        try:
-            auth = hcl2.loads(auth_file.read_text())
-        except Exception:
-            auth = None
-        if auth is None:
-            # Raised outside the handler with no parser text, which can echo a
-            # malformed secret (also via __context__).
-            raise Refused(f"{auth_file} is not valid HCL") from None
-    kwargs = {key: str(auth.get(name) or "").strip() for key, name in (
-        ("host", "databricks_workspace_host"), ("client_id", "databricks_client_id"),
-        ("client_secret", "databricks_client_secret"))}
-    return WorkspaceClient(**{key: value for key, value in kwargs.items() if value})
+    """A WorkspaceClient pinned to the env's auth.auto.tfvars."""
+    from scripts.auth_configured import workspace_client as explicit_client
+    try:
+        return explicit_client(auth_file)
+    except RuntimeError as exc:
+        raise Refused(str(exc)) from None
 
 
 def run_cases(client, warehouse_id: str, sql_type: str, expression: str, cases: list) -> list[dict]:

@@ -45,6 +45,10 @@ case "$LAYER" in
     ;;
 esac
 
+# Provisioners and the provider must resolve credentials from the same env.
+# Direct runner invocations do not come through make, so establish this here.
+export LAYER_ENV_DIR="${LAYER_ENV_DIR:-$ENV_DIR}"
+
 # The env dir that owns this layer's state and remote_state.hcl: the dir the
 # layer runs in (envs/<env>, or envs/account), never one rebuilt from
 # ENVS_DIR, so the CI guard (state_layout.py ci-allowed) and this runner read

@@ -1235,6 +1235,11 @@ class TestDatabricksModelCompatibility:
 
         monkeypatch.setattr("databricks.sdk.WorkspaceClient", FakeWorkspaceClient)
         monkeypatch.setattr("databricks.sdk.config.Config", lambda **kwargs: object())
+        monkeypatch.setattr(generate_abac, "_ACTIVE_DATABRICKS_AUTH", {
+            "databricks_workspace_host": "https://example.invalid",
+            "databricks_client_id": "client",
+            "databricks_client_secret": "secret",
+        })
         return calls
 
     def test_claude_5_omits_temperature_and_normalizes_content_blocks(self, monkeypatch):

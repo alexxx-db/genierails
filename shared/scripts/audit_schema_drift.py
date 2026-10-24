@@ -179,15 +179,9 @@ def extract_fgac_policies(env_dir: Path) -> list[dict]:
 
 def _get_sdk_client(env_dir: Path):
     """Build a WorkspaceClient from auth.auto.tfvars."""
-    cfg = _load_hcl(env_dir / "auth.auto.tfvars")
-    host = _str(cfg.get("databricks_workspace_host", ""))
-    client_id = _str(cfg.get("databricks_client_id", ""))
-    client_secret = _str(cfg.get("databricks_client_secret", ""))
-    from databricks.sdk import WorkspaceClient
-    return WorkspaceClient(
-        host=host or None,
-        client_id=client_id or None,
-        client_secret=client_secret or None,
+    from scripts.auth_configured import workspace_client
+    return workspace_client(
+        env_dir / "auth.auto.tfvars",
         product="genierails",
         product_version="0.1.0",
     )

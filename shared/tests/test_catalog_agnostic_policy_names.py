@@ -342,6 +342,7 @@ def test_lister_is_unavailable_without_real_credentials(tmp_path, monkeypatch):
 
 def test_lister_api_error_is_unavailable(tmp_path, monkeypatch):
     import databricks.sdk
+    import databricks.sdk.config
     import databricks.sdk.core
 
     auth = tmp_path / "auth.auto.tfvars"
@@ -370,6 +371,7 @@ def test_lister_api_error_is_unavailable(tmp_path, monkeypatch):
 
     monkeypatch.setattr(databricks.sdk, "WorkspaceClient", Client)
     monkeypatch.setattr(databricks.sdk.core, "Config", Config)
+    monkeypatch.setattr(databricks.sdk.config, "Config", Config)
     lister = live_policy_lister(auth)
     assert lister(PROD_1) == {LEGACY_REMOTE}
     assert listed == [("CATALOG", PROD_1)]

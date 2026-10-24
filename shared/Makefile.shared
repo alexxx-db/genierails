@@ -542,6 +542,8 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	@status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(ENV_DIR)/auth.auto.tfvars" || status=$$?; \
 	if [ $$status -eq 2 ]; then \
 		echo "ERROR: $(_SETUP_ENV_REL)/auth.auto.tfvars is not valid HCL" >&2; exit 1; \
+	elif [ $$status -eq 3 ]; then \
+		echo "ERROR: $(_SETUP_ENV_REL)/auth.auto.tfvars can't be read" >&2; exit 1; \
 	elif [ $$status -ne 0 ]; then \
 		echo "ERROR: fill in $(_SETUP_ENV_REL)/auth.auto.tfvars (workspace host, client ID, and client secret) before running make generate" >&2; exit 1; \
 	fi
@@ -580,6 +582,8 @@ capture: _guard-workspace-target ## Export one dev Genie agent's config to envs/
 	@status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$(ENV_DIR)/auth.auto.tfvars" || status=$$?; \
 	if [ $$status -eq 2 ]; then \
 		echo "ERROR: $(_SETUP_ENV_REL)/auth.auto.tfvars is not valid HCL" >&2; exit 1; \
+	elif [ $$status -eq 3 ]; then \
+		echo "ERROR: $(_SETUP_ENV_REL)/auth.auto.tfvars can't be read" >&2; exit 1; \
 	elif [ $$status -ne 0 ]; then \
 		echo "ERROR: fill in $(_SETUP_ENV_REL)/auth.auto.tfvars (workspace host, client ID, and client secret) before running make capture" >&2; exit 1; \
 	fi
@@ -1552,6 +1556,8 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		status=0; python3 "$(SHARED_ROOT)/scripts/auth_configured.py" "$$dest_env_dir/auth.auto.tfvars" || status=$$?; \
 		if [ $$status -eq 2 ]; then \
 			echo "  Next: fix $$dest_env_dir/auth.auto.tfvars (not valid HCL)"; \
+		elif [ $$status -eq 3 ]; then \
+			echo "  Next: fix $$dest_env_dir/auth.auto.tfvars (can't be read)"; \
 		elif [ $$status -ne 0 ]; then \
 			echo "  Next: edit $$dest_env_dir/auth.auto.tfvars  ($(DEST_ENV) workspace credentials)"; \
 			echo "        (same service principal as $(SOURCE_ENV)? add REUSE_SOURCE_AUTH=1 WORKSPACE_HOST=<$(DEST_ENV) host> WORKSPACE_ID=<$(DEST_ENV) id>)"; \

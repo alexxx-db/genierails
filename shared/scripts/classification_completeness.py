@@ -103,16 +103,11 @@ def _value(config: Mapping[str, Any], key: str) -> str:
 
 
 def _live_classified_columns_query(env_dir: Path, deadline: float) -> set[str]:
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.sql import StatementState
+    from scripts.auth_configured import workspace_client
 
-    auth = _load_hcl(env_dir / "auth.auto.tfvars")
+    client = workspace_client(env_dir / "auth.auto.tfvars")
     env = _load_hcl(env_dir / "env.auto.tfvars")
-    client = WorkspaceClient(
-        host=_value(auth, "databricks_workspace_host"),
-        client_id=_value(auth, "databricks_client_id"),
-        client_secret=_value(auth, "databricks_client_secret"),
-    )
     warehouse = _value(env, "sql_warehouse_id")
     if not warehouse:
         raise RuntimeError("sql_warehouse_id is required to check production classification")

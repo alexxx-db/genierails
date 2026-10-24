@@ -171,6 +171,11 @@ class WorkspaceClient:
         self.tables = _Tables()
         self.policies = _Policies()
 ''',
+    "databricks/sdk/config.py": '''
+class Config:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+''',
 }
 # Terraform stand-in: every plan is empty and every apply succeeds; an apply
 # records whether the account lock was held at that moment.
@@ -214,7 +219,9 @@ class Repo:
         (self.account / "abac.auto.tfvars").write_text(DESIRED)
         (self.account / "auth.auto.tfvars").write_text(
             'databricks_account_id = "test-account"\n'
-            'databricks_workspace_host = "https://unused.invalid"\n')
+            'databricks_workspace_host = "https://unused.invalid"\n'
+            'databricks_client_id = "test-client"\n'
+            'databricks_client_secret = "test-secret"\n')
         (self.dev / "env.auto.tfvars").write_text(
             f'governance_mode = "{mode}"\n' if mode == "deterministic" else 'uc_tables = ["c.s.t"]\n')
         self.state_dir = tmp_path / "state-dir"

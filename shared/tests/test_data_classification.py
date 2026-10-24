@@ -345,6 +345,7 @@ def test_read_only_callers_never_create_classification_config(tmp_path, monkeypa
     )
     (env_dir / "auth.auto.tfvars").write_text(
         'databricks_workspace_host = "https://example.invalid"\n'
+        'databricks_client_id = "client"\ndatabricks_client_secret = "secret"\n'
         'serverless_usage_policy_id = "policy-123"\n'
     )
     spec = importlib.util.spec_from_file_location(
@@ -455,7 +456,10 @@ def test_prepare_classification_reports_malformed_discovery_cleanly(tmp_path, ca
     spec.loader.exec_module(module)
     (tmp_path / "data_access").mkdir()
     (tmp_path / "env.auto.tfvars").write_text("enable_classification = true\n")
-    (tmp_path / "auth.auto.tfvars").write_text("")
+    (tmp_path / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://example.invalid"\n'
+        'databricks_client_id = "client"\ndatabricks_client_secret = "secret"\n'
+    )
     (tmp_path / "data_access/discovered_uc_tables.auto.tfvars").write_text(
         'discovered_uc_tables = "cat.schema.table"\n'
     )
@@ -467,6 +471,31 @@ def test_prepare_classification_reports_malformed_discovery_cleanly(tmp_path, ca
         sys.argv = old_argv
     assert "ERROR: invalid discovered footprint" in capsys.readouterr().err
 
+
+
+def test_prepare_classification_refuses_ambient_credentials_without_env_auth(tmp_path, monkeypatch, capsys):
+    env_dir = tmp_path / "envs/dev"
+    (env_dir / "data_access").mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text(
+        'enable_classification = true\nuc_tables = ["catalog.schema.table"]\n'
+    )
+    (env_dir / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://example.invalid"\n')
+    spec = importlib.util.spec_from_file_location(
+        "prepare_classification_ambient_refusal",
+        SHARED / "scripts/prepare_classification_config.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    clients = []
+    monkeypatch.setattr(module, "WorkspaceClient", lambda **kwargs: clients.append(kwargs))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://ambient.example")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "ambient-token")
+    monkeypatch.setattr(module.sys, "argv", ["prepare", str(env_dir), "--read-only"])
+
+    assert module.main() == 1
+    assert f"fill in {env_dir.resolve() / 'auth.auto.tfvars'}" in capsys.readouterr().err
+    assert clients == []
 
 def _run_prepare_with_remote(tmp_path, monkeypatch, remote, *, auto_tagging_line=""):
     env_dir = tmp_path / "envs" / "prod"

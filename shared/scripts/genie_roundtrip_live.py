@@ -6,8 +6,8 @@
 Exports the agent's serialized_space exactly as make capture does, creates a
 scratch agent from it, exports the scratch agent, and fails unless the two
 exports are identical (field-level diff printed). The scratch agent is
-deleted in every case. Credentials come from the Databricks SDK's usual
-sources (DATABRICKS_HOST plus a token or OAuth, or a profile).
+deleted in every case. Credentials come only from the selected environment's
+auth.auto.tfvars.
 """
 
 from __future__ import annotations
@@ -42,14 +42,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--space-id", required=True)
     parser.add_argument("--warehouse-id", default="", help="warehouse for the scratch agent (default: the source's)")
+    parser.add_argument("--auth-file", type=Path, default=Path("auth.auto.tfvars"))
     args = parser.parse_args(argv)
     if os.environ.get("DATABRICKS_LIVE_TESTS") != "1":
         print("genie_roundtrip_live: live check; set DATABRICKS_LIVE_TESTS=1 to run it.", file=sys.stderr)
         return 2
 
-    from databricks.sdk import WorkspaceClient
-
-    api = WorkspaceClient().api_client
+    from scripts.auth_configured import workspace_client
+    api = workspace_client(args.auth_file).api_client
     source = api.do("GET", SPACE_API.format(args.space_id), query={"include_serialized_space": "true"})
     exported = payload_from_response(source)
     warehouse = args.warehouse_id or source.get("warehouse_id") or ""
