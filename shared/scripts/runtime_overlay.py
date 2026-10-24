@@ -197,6 +197,9 @@ def kept_policy_names(
         if src != dest:
             sources.setdefault(dest, []).append(src)
     managed = state_keys or set()
+    # Catalogs some source maps into: only there can a promoted name collide
+    # with a source env's policy (every source catalog must be mapped).
+    destinations = {dest.lower() for dest in catalog_map.values()}
     cache: dict[str, set[str] | None] = {}
     kept: dict[str, str] = {}
     for policy in policies:
@@ -207,6 +210,8 @@ def kept_policy_names(
         if catalog not in cache:
             cache[catalog] = live_names(catalog)
         live = cache[catalog]
+        if live is None and not older and catalog.lower() not in destinations:
+            continue
         if live is None:
             unknown = (f"{name} is deployed under an older name; refusing to plan a rename (#68)" if older else
                        f"{remote_policy_name(catalog, name)} is taken by a policy GenieRails doesn't manage; "

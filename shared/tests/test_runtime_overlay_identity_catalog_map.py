@@ -39,3 +39,11 @@ def test_no_older_name_fails_closed_when_policies_cant_be_listed():
         ro.kept_policy_names([_policy("gr_mask_paycat_v_full", "paycat")], {"paycat": "paycat"}, set(),
                              lambda c: None)
 
+
+
+def test_an_unmapped_unlistable_catalog_is_not_refused_but_is_still_checked_when_listed():
+    """Only catalogs the map maps into can collide with a source policy; others keep the old skip."""
+    policy = [_policy("gr_mask_prod_fin_v_full", "prod_fin")]
+    assert ro.kept_policy_names(policy, {"dev_cat": "prod_cat"}, set(), lambda c: None) == {}
+    with pytest.raises(ro.OverlayError, match="doesn't manage; remove it or import it"):
+        ro.kept_policy_names(policy, {"dev_cat": "prod_cat"}, set(), lambda c: {"prod_fin_gr_mask_prod_fin_v_full"})
