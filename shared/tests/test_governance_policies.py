@@ -9,13 +9,55 @@ import pytest
 
 from governance_policies import (
     FAILSAFE_TREATMENT, DeterministicGovernanceError, apply_model, base_treatment, build_model,
-    build_policies, column_types_from_ddl, expand_principals, model_fingerprint,
+    build_policies, column_comments_from_ddl, column_types_from_ddl, expand_principals,
+    free_text_partial_columns, model_fingerprint,
     parse_treatment_value, principal_sets_are_disjoint, replace_sql_library, resolve_column,
     sql_library_block,
 )
 from validate_abac import ValidationResult, validate_coverage_gate
 
 TIERS = ["raw", "regional", "masked"]
+
+
+def test_free_text_partial_heuristic_is_advisory_and_centralized():
+    classes = {
+        "cat.sch.t.notes": ["phone_number"],
+        "cat.sch.t.phone": ["phone_number"],
+        "cat.sch.t.remarks": ["email_address", "phone_number"],
+        "cat.sch.t.details": ["phone_number"],
+        "cat.sch.t.message": ["card_pin"],
+        "cat.sch.t.memo": ["compensation"],
+        "cat.sch.t.text": ["us_ssn"],
+    }
+    types = {name: "STRING" for name in classes} | {"cat.sch.t.memo": "BIGINT"}
+    model = _model(classes, types)
+    comments = column_comments_from_ddl(
+        "CREATE TABLE cat.sch.t (\n"
+        " details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc',\n"
+        " phone STRING COMMENT 'Mobile phone used for text messages'\n"
+        ");"
+    )
+    assert comments == {
+        "cat.sch.t.details": "Customer's free text, e.g. (a > b), etc",
+        "cat.sch.t.phone": "Mobile phone used for text messages",
+    }
+    assert column_types_from_ddl(
+        "CREATE TABLE cat.sch.t (details STRING COMMENT 'Customer''s free text, e.g. (a > b), etc');"
+    ) == {"cat.sch.t.details": "STRING"}
+    assert free_text_partial_columns(model.columns, comments) == ["cat.sch.t.details", "cat.sch.t.notes"]
+    assert model.columns["cat.sch.t.notes"].partial == "last4"
+    assert base_treatment(model.columns["cat.sch.t.remarks"].value) == "redact"
+
+
+@pytest.mark.parametrize("settings", [
+    {"treatment_versions": {"phone_partial": {"partial": "redacted"}}},
+    {"column_overrides": {"cat.sch.t.notes": {"partial": "redacted"}}},
+    {"column_overrides": {"cat.sch.t.notes": {"treatment": "redact"}}},
+])
+def test_free_text_advisory_clears_when_the_effective_partial_tier_is_fully_redacted(settings):
+    model = _model({"cat.sch.t.notes": ["phone_number"]}, **settings)
+    assert free_text_partial_columns(model.columns) == []
+    assert model.columns["cat.sch.t.notes"].partial_sql == model.columns["cat.sch.t.notes"].full_sql
 
 
 def _model(classes, types=None, **settings):
@@ -266,6 +308,48 @@ def test_an_override_to_redact_or_never_raw_is_kept_on_a_mixed_column():
                           treatment_versions={"ssn": {"partial": "last4"}})
     assert (item.treatment, item.partial) == ("redact", "redacted")
     assert resolve_column("c.s.t.ssn", ["us_ssn"], "STRING", treatment_versions={"ssn": {"partial": "last4"}}).partial == "last4"
+
+
+@pytest.mark.parametrize("partial", ["raw", "last4"])
+def test_redact_treatment_versions_cannot_open_a_mixed_column(partial):
+    item = resolve_column(
+        NOTES, ["email_address", "name", "phone_number"], "STRING",
+        treatment_versions={"redact": {"partial": partial}},
+    )
+    assert (item.value, item.partial, item.full) == (
+        "redact__string__df6fec27", "redacted", "redacted",
+    )
+    assert item.partial_sql == item.full_sql
+
+
+@pytest.mark.parametrize(("never_raw", "other", "expected"), [
+    ("card_security_code", "date_of_birth", "card_security_code__string__0ede9584"),
+    ("card_security_code", "medical_date", "card_security_code__string__0ede9584"),
+    ("card_security_code", "compensation", "card_security_code__string__0ede9584"),
+    ("card_security_code", "credit_score", "card_security_code__string__0ede9584"),
+    ("card_pin", "date_of_birth", "card_pin__string__9f963477"),
+    ("card_pin", "medical_date", "card_pin__string__9f963477"),
+    ("card_pin", "compensation", "card_pin__string__9f963477"),
+    ("card_pin", "credit_score", "card_pin__string__9f963477"),
+    ("card_track_data", "date_of_birth", "card_track_data__string__666ff6e2"),
+    ("card_track_data", "medical_date", "card_track_data__string__666ff6e2"),
+    ("card_track_data", "compensation", "card_track_data__string__666ff6e2"),
+    ("card_track_data", "credit_score", "card_track_data__string__666ff6e2"),
+])
+def test_resolve_column_keeps_main_values_for_never_raw_pairs(never_raw, other, expected):
+    item = resolve_column("cat.sch.t.c", [never_raw, other], "STRING")
+    assert item.value == expected
+    assert item.never_raw and item.partial == item.full == "null"
+
+
+@pytest.mark.parametrize(("sql_type", "expected"), [
+    ("DATE", "card_pin__date__70193ac9"),
+    ("BIGINT", "card_pin__bigint__c61464db"),
+    ("DECIMAL(12,2)", "card_pin__decimal_12_2__0542eeb4"),
+])
+def test_resolve_column_pins_never_raw_date_and_numeric_values(sql_type, expected):
+    item = resolve_column("cat.sch.t.c", ["card_pin", "date_of_birth"], sql_type)
+    assert item.value == expected and item.never_raw
 
 
 def test_coverage_check_blocks_a_mixed_column_that_keeps_a_partial_treatment():
