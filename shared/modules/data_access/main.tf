@@ -301,6 +301,7 @@ module "coverage_gate" {
   gate_file            = var.coverage_gate_file
   expected_fingerprint = local.coverage_gate_fingerprint
   max_age              = var.coverage_gate_max_age
+  import_walk          = var.import_walk
 }
 
 # Data Classification is opt-in because deleting this resource disables scans
