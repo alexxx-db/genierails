@@ -95,6 +95,17 @@
 
 ### Fixed
 
+- **Terraform authenticates only from the env's `auth.auto.tfvars`**: the
+  Databricks provider also read the shell's `DATABRICKS_*` and `ARM_*`
+  variables and `~/.databrickscfg`, so a stray `DATABRICKS_TOKEN` or
+  `ARM_CLIENT_SECRET` failed every plan with "more than one authorization
+  method", `DATABRICKS_AUTH_TYPE=pat` sent the operator's token instead of the
+  service principal's, and a `DATABRICKS_HOST` filled a host the env left
+  empty, sending the SP's credentials to that workspace.
+  `scripts/terraform_layer.sh` now runs Terraform (and so its provisioners)
+  with those variables unset and `DATABRICKS_CONFIG_FILE=/dev/null`. Kept: the
+  pipelines' `DATABRICKS_AUTH_TYPE=github-oidc` or `azure-devops-oidc`, and
+  the `ARM_*` identity an `azurerm` remote-state backend reads state with.
 - **An agent in `agents/` gets only an empty placeholder in `generated/`**
   (#225): its `genie_space_configs` entry in `generated/abac.auto.tfvars` is
   `{}` whether or not it was captured, and Terraform pushes nothing for an
