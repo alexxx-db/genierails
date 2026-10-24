@@ -917,7 +917,11 @@ def test_fresh_env_agent_without_acl_groups_stops_cleanly(env_dir, monkeypatch, 
 @pytest.mark.parametrize("mode", ["full", "governance", "genie"])
 @pytest.mark.parametrize(
     "bad_input",
-    ["deployer", "inline_acl", "agent_acl", "inline_prefix_collision", "agent_prefix_collision"],
+    [
+        "deployer", "inline_acl", "agent_acl", "inline_prefix_collision",
+        "agent_prefix_collision", "require_nonbool_agents_only",
+        "nondict_inline_then_bad_agent",
+    ],
 )
 def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
     env_dir, monkeypatch, capfd, mode, bad_input
@@ -947,7 +951,7 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
         )
         expected = "agent Payments has no acl_groups — set the groups allowed to run it"
         expected_file = "agents/Payments.auto.tfvars"
-    else:
+    elif bad_input in ("inline_prefix_collision", "agent_prefix_collision"):
         inline_name, agent_name = (
             ("Payments Agent", "Payments")
             if bad_input == "inline_prefix_collision"
@@ -976,6 +980,34 @@ def test_bad_deterministic_identity_or_agent_acl_stops_before_any_live_call(
             if bad_input == "inline_prefix_collision"
             else "agents/pay.auto.tfvars"
         )
+    elif bad_input == "require_nonbool_agents_only":
+        env_file.write_text(
+            ENV.replace(
+                f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
+                'require_acl_groups = "yes"\n',
+            )
+        )
+        agents = env_dir / "agents"
+        agents.mkdir()
+        (agents / "pay.auto.tfvars").write_text(
+            'name = "Payments"\nacl_groups = ["viewers"]\n'
+        )
+        expected = "require_acl_groups must be a boolean"
+        expected_file = "env.auto.tfvars"
+    else:
+        env_file.write_text(
+            ENV.replace(
+                f'genie_spaces = [{{ genie_space_id = "{SPACE_ID}", acl_groups = {json.dumps(TIERS)} }}]\n',
+                'genie_spaces = ["not an object"]\n',
+            )
+        )
+        agents = env_dir / "agents"
+        agents.mkdir()
+        (agents / "pay.auto.tfvars").write_text(
+            'name = "Payments"\nacl_groups = ["a", "a"]\n'
+        )
+        expected = "agent Payments acl_groups must not contain duplicates"
+        expected_file = "agents/pay.auto.tfvars"
 
     live_calls = []
 

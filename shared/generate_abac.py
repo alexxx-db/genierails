@@ -7299,8 +7299,16 @@ def main():
             spaces = auth_cfg.get("genie_spaces")
             agents = [agent for agent in load_all(auth_file.parent) if not agent["delete"]]
             with (auth_file.parent / "env.auto.tfvars").open() as handle:
-                inline = hcl2.load(handle).get("genie_spaces") or []
-            if isinstance(spaces, list):
+                raw_inline = hcl2.load(handle).get("genie_spaces") or []
+            inline = (
+                [space for space in raw_inline if isinstance(space, dict)]
+                if isinstance(raw_inline, list) else []
+            )
+            global_errors = genie_acl_group_errors({
+                "require_acl_groups": auth_cfg.get("require_acl_groups", False),
+                "genie_spaces": [] if isinstance(spaces, list) else spaces,
+            })
+            if not global_errors and isinstance(spaces, list):
                 require_acls = auth_cfg.get("require_acl_groups", False)
                 for index, space in enumerate(spaces):
                     entry_errors = genie_acl_group_errors({
