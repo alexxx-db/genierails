@@ -343,10 +343,14 @@ def test_generate_end_to_end_uses_env_role_for_rehearsal_stg(repo):
 
 
 def test_generate_role_failure_keeps_successful_output_and_uses_generic_hint(repo):
-    _configure_promoted_stg(repo)
-    # Only env-role fails: generate-guard (the recipe's first line) still passes.
-    (repo.shared / "scripts/release_gate.py").write_text(
-        'import sys\nraise SystemExit(1 if "env-role" in sys.argv else 0)\n')
+    _configure_promoted_stg(repo, promoted=False)
+    # Only the env-role command fails; the module itself (generate_abac.py imports
+    # its generate-guard) and every other command stay real.
+    gate = repo.shared / "scripts/release_gate.py"
+    head, rest = gate.read_text().split("from __future__ import annotations\n", 1)
+    gate.write_text(head + "from __future__ import annotations\n"
+                    'import sys as _sys\nif __name__ == "__main__" and _sys.argv[1:2] == ["env-role"]:\n'
+                    "    raise SystemExit(1)\n" + rest)
     result = repo.make("generate", "ENV=stg")
     out = _out(result)
     assert result.returncode == 0, out
