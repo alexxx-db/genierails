@@ -14,6 +14,10 @@ from typing import Any, Iterable, Mapping
 
 import hcl2
 
+SHARED = Path(__file__).resolve().parents[1]
+if str(SHARED) not in sys.path:
+    sys.path.insert(0, str(SHARED))  # run by path from make: `scripts.` imports need shared/
+
 
 def _load_hcl(path: Path) -> dict[str, Any]:
     try:
@@ -173,9 +177,6 @@ def live_classified_columns(env_dir: Path, timeout_seconds: int = 120) -> set[st
 
 def _release_steps(env_dir: Path) -> str:
     """What follows promote-to here (scripts/coverage_fix.py, for the env's mode)."""
-    shared = str(Path(__file__).resolve().parents[1])
-    if shared not in sys.path:
-        sys.path.insert(0, shared)
     from scripts.coverage_fix import release_steps
 
     return release_steps(env_dir.name, env_dir)

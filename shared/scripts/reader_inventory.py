@@ -18,6 +18,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Protocol, Sequence
 
+SHARED = Path(__file__).resolve().parents[1]
+if str(SHARED) not in sys.path:
+    sys.path.insert(0, str(SHARED))
+
 
 READ_PRIVILEGES = frozenset({"SELECT", "ALL PRIVILEGES"})
 GRANT_PRIVILEGES = frozenset({"MANAGE"})

@@ -43,6 +43,8 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 SHARED_ROOT = SCRIPTS_DIR.parent
 REPO_ROOT = SHARED_ROOT.parent
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
 
 LEGACY_STEPS = ("audit", "delta", "coverage")
 
@@ -212,8 +214,6 @@ def _coverage(env_dir: Path) -> int:
 
 def _release_steps(env: str, env_dir: Path) -> str:
     """What follows a re-promotion, for the env's mode (scripts/coverage_fix.py)."""
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from scripts.coverage_fix import release_steps
 
     return release_steps(env, env_dir)
@@ -221,8 +221,6 @@ def _release_steps(env: str, env_dir: Path) -> str:
 
 def _source_env(env_dir: Path) -> str:
     """The env a rule change starts in: this env's promote_from, else dev."""
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from scripts.coverage_fix import promote_source
 
     return promote_source(env_dir) or "dev"
