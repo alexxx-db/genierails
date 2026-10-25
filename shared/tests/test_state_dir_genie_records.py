@@ -50,7 +50,8 @@ def _created_state(id_file: str, space_id: str = "prod-1") -> dict:
     """The workspace state a create left: terraform_data.genie_space[sales] and the ID it recorded."""
     return {"version": 4, "serial": 3, "lineage": "l", "resources": [
         {"module": "module.workspace", "mode": "managed", "type": "terraform_data", "name": "genie_space",
-         "instances": [{"index_key": KEY, "attributes": {"id": CREATE_ID, "input": {"id_file": id_file}}}]},
+         "instances": [{"index_key": KEY, "attributes": {
+             "id": CREATE_ID, "input": {"value": {"id_file": id_file}, "type": ["object", {"id_file": "string"}]}}}]},
         {"module": "module.workspace", "mode": "data", "type": "external", "name": "genie_space_id",
          "instances": [{"index_key": KEY, "attributes": {
              "query": {"id_file": id_file}, "result": {"id": space_id, "id_file": id_file}}}]},

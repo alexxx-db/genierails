@@ -501,6 +501,40 @@ def test_failed_optional_import_continues_and_surfaces_failure(tmp_path):
     assert "second" in log
 
 
+def test_a_configuration_error_is_not_blamed_on_the_object(tmp_path):
+    """Terraform's Invalid for_each fails before the import looks for the object."""
+    data_access = tmp_path / "env" / "data_access"
+    data_access.mkdir(parents=True)
+    (tmp_path / "env" / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    (data_access / "abac.auto.tfvars").write_text(
+        'tag_assignments = [\n'
+        '  { entity_type = "tables", entity_name = "cat.sch.first", tag_key = "k", tag_value = "v" },\n'
+        '  { entity_type = "tables", entity_name = "cat.sch.second", tag_key = "k", tag_value = "v" }\n'
+        ']\n'
+    )
+    runner = tmp_path / "terraform-runner"
+    runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$3\" = state ]; then exit 0; fi\n"
+        "if [[ \"$*\" == *first* ]]; then echo 'Error: Invalid for_each argument'; exit 1; fi\n"
+        "echo 'Error: Cannot import non-existent remote object'; exit 1\n"
+    )
+    runner.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "python3").symlink_to(sys.executable)
+    env = os.environ | {"TERRAFORM_RUNNER": str(runner), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    result = subprocess.run(["bash", SCRIPT, "--tag-assignments-only"], cwd=data_access, env=env,
+                            text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    failed = [line for line in result.stdout.splitlines() if "Failed to import" in line]
+    assert len(failed) == 2, result.stdout
+    first, second = (next(line for line in failed if name in line) for name in ("first", "second"))
+    assert "couldn't evaluate the configuration" in first and "may not exist" not in first
+    assert second.endswith("(may not exist in Databricks)")
+
+
 @pytest.mark.parametrize(("manage_groups", "imports"), [("false", False), ("true", True)])
 def test_account_group_import_runs_only_when_groups_are_managed(tmp_path, manage_groups, imports):
     """Consume mode has no databricks_group.groups resource to import into."""

@@ -66,6 +66,19 @@ run "fresh_pass_passes" {
   }
 }
 
+# terraform import (the runner sets import_walk): a known status, never pass,
+# even for a current pass, since plantimestamp() is unknown there.
+run "import_walk_is_import" {
+  command = plan
+  variables {
+    import_walk = true
+  }
+  assert {
+    condition     = output.status == "import" && output.problem != "" && output.static_status == "pass"
+    error_message = "expected import (static pass), got ${output.status} (${output.static_status}): ${output.problem}"
+  }
+}
+
 run "other_fingerprint_is_stale" {
   command = plan
   variables {

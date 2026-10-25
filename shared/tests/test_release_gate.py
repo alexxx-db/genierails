@@ -788,6 +788,89 @@ def test_manifest_drift_live_snapshot(repo, manifest):
         rg.manifest_check(repo.prod, "prod", manifest, live="live-2")
 
 
+# A derive that prints progress to stdout, as derive_assignments.py does.
+_CHATTY_DERIVE = '''
+import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+out, ddl = Path(args[args.index("--out-dir") + 1]), Path(args[args.index("--write-ddl") + 1])
+print("Loaded environment from env.auto.tfvars")
+print("[SENSITIVITY] prodcat.s.t.ssn -> pii")
+print("Derived 9 gr_treatment assignment(s)", flush=True)
+if os.environ.get("FAKE_DERIVE_FAIL"):
+    sys.exit(3)
+(out / "abac.auto.tfvars").write_text("fgac_policies = []\\n")
+(out / "masking_functions.sql").write_text("-- masks\\n")
+ddl.write_text(os.environ.get("FAKE_LIVE_DDL", "CREATE TABLE prodcat.s.t (ssn STRING);\\n"))
+'''
+
+# The real release_gate.py CLI, with only the derive script and the live policy lister swapped.
+_LIVE_SNAPSHOT_CLI = '''
+import functools, sys
+sys.path[:0] = [sys.argv[1], sys.argv[1] + "/scripts"]
+from scripts import release_gate as rg
+rg.live_policies = lambda env_dir, catalogs: {}
+rg.live_snapshot = functools.partial(rg.live_snapshot, derive_script=sys.argv[2])
+sys.exit(rg.main(sys.argv[3:]))
+'''
+
+
+def _live_snapshot_cli(env_dir: Path, tmp_path: Path, *, rederive: bool = True, **env) -> subprocess.CompletedProcess:
+    derive = tmp_path / "chatty_derive.py"
+    derive.write_text(_CHATTY_DERIVE)
+    return subprocess.run(
+        [sys.executable, "-c", _LIVE_SNAPSHOT_CLI, str(SHARED), str(derive),
+         "live-snapshot", "--env-dir", str(env_dir), "--env", "prod", *(["--rederive"] if rederive else [])],
+        text=True, capture_output=True, env={**os.environ, **env}, check=False)
+
+
+def _expected_digest(tmp_path: Path, ddl: str = "CREATE TABLE prodcat.s.t (ssn STRING);\n") -> str:
+    want = tmp_path / "want"
+    want.mkdir(exist_ok=True)
+    (want / "abac.auto.tfvars").write_text("fgac_policies = []\n")
+    (want / "masking_functions.sql").write_text("-- masks\n")
+    (want / "_fetched.sql").write_text(ddl)
+    return rg.snapshot_digest(want / "abac.auto.tfvars", want / "masking_functions.sql", want / "_fetched.sql", {})
+
+
+def test_rederived_live_snapshot_stdout_is_exactly_the_digest(repo, tmp_path):
+    # make release captures live="$(release_gate.py live-snapshot --rederive)": the derive's
+    # progress must not land in it, or it never equals the manifest's digest.
+    result = _live_snapshot_cli(repo.prod, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == _expected_digest(tmp_path) + "\n"
+    assert "Derived 9 gr_treatment" in result.stderr  # diagnostics are kept, on stderr
+
+
+def test_rederived_live_snapshot_fails_closed_when_the_derive_fails(repo, tmp_path):
+    result = _live_snapshot_cli(repo.prod, tmp_path, FAKE_DERIVE_FAIL="1")
+    assert result.returncode == 1 and result.stdout == ""
+    assert "re-reading live UC for the live snapshot failed" in result.stderr
+    assert "Loaded environment from" in result.stderr
+
+
+def test_release_rederive_matches_the_release_plan_snapshot_and_a_live_change_refuses(repo, manifest, tmp_path):
+    # release-plan digests what the last derive wrote; release re-derives into a scratch dir.
+    ro.effective(repo.prod, "abac.auto.tfvars").write_text("fgac_policies = []\n")
+    ro.effective(repo.prod, "masking_functions.sql").write_text("-- masks\n")
+    (repo.prod / "ddl").mkdir(exist_ok=True)
+    (repo.prod / "ddl" / "_fetched.sql").write_text("CREATE TABLE prodcat.s.t (ssn STRING);\n")
+    planned = _live_snapshot_cli(repo.prod, tmp_path, rederive=False)
+    assert planned.returncode == 0 and planned.stdout == _expected_digest(tmp_path) + "\n"
+    live = planned.stdout.removesuffix("\n")  # what $(...) keeps
+    time.sleep(1.1)  # manifest ids are per second
+    current = rg.manifest_write(repo.prod, "prod", _plan_dir(repo), rg.provenance(repo.prod, "prod"), live,
+                                {"ok": True})
+    unchanged = _live_snapshot_cli(repo.prod, tmp_path)
+    assert unchanged.returncode == 0, unchanged.stderr
+    rg.manifest_check(repo.prod, "prod", current, live=unchanged.stdout.removesuffix("\n"))
+    changed = _live_snapshot_cli(repo.prod, tmp_path, FAKE_LIVE_DDL="CREATE TABLE prodcat.s.t (ssn INT);\n")
+    assert changed.returncode == 0 and changed.stdout == _expected_digest(
+        tmp_path, "CREATE TABLE prodcat.s.t (ssn INT);\n") + "\n"
+    with pytest.raises(rg.Refused, match="live Unity Catalog changed"):
+        rg.manifest_check(repo.prod, "prod", current, live=changed.stdout.removesuffix("\n"))
+
+
 def test_manifest_drift_effective_config(repo, manifest):
     (ro.overlay_dir(repo.prod) / "abac.auto.tfvars").write_text(EMPTY_ABAC + "# re-derived since\n")
     with pytest.raises(rg.Refused, match="effective config"):
@@ -1120,6 +1203,8 @@ def released_prod(tmp_path):
     env_dir = tmp_path / "envs" / "prod"
     (env_dir / "generated").mkdir(parents=True)
     _deploy(env_dir, _write_generated(env_dir))
+    rg._write_once(rg.release_dir(rg.cloud_dir_of(env_dir), "prod") / "released.json",
+                   {"kind": "release", "version": rg.VERSION, "commit": "0123456789", "created_at": rg._now()})
     return env_dir
 
 
@@ -1208,6 +1293,241 @@ def test_newly_governed_tables_get_the_reader_inventory(tmp_path):
     assert "prod:reader:prod_cat.sch.t:bi-sp" in unacked and "prod:reader:prod_cat.sch.t:analysts" not in unacked
     (env_dir / "ack.txt").write_text("".join(f"{k}\n" for k in sorted(unacked)))
     assert rg.reports(env_dir, "prod", reader_source=lambda: source)["ok"]
+
+
+# The live AWS prod first release (run 6): three tables, three tier groups from
+# table_readers, the env's deployer SP reading through SELECT, and a human who
+# is the metastore admin and owns the catalog, schema and tables.
+SHAPE_CATALOG, SHAPE_SCHEMA = "prod_cat", "dev_to_prod_demo"
+SHAPE_TABLES = [f"{SHAPE_CATALOG}.{SHAPE_SCHEMA}.{t}" for t in ("customers", "notes", "payments")]
+SHAPE_TIERS = ["dev_to_prod_payments_ops", "dev_to_prod_regional_analysts", "dev_to_prod_viewers"]
+SHAPE_DEPLOYER = "2169eb19-40e9-44ba-9cbc-50741dcb8e91"
+SHAPE_OWNER = "owner@example.com"
+
+
+def _write_shape(env_dir: Path, readers=None, *, exempt=()) -> dict:
+    readers = {t: list(SHAPE_TIERS) for t in SHAPE_TABLES} if readers is None else readers
+    settings = {"access_tier_groups": SHAPE_TIERS, "raw_exempt_principals": list(exempt)}
+    columns = {f"{t}.email": ["email_address"] for t in SHAPE_TABLES}
+    model = build_model(columns, {c: "STRING" for c in columns}, settings, deployer_principal=SHAPE_DEPLOYER)
+    generated = env_dir / "generated"
+    generated.mkdir(parents=True, exist_ok=True)
+    (generated / "abac.auto.tfvars").write_text(EMPTY_ABAC)
+    (generated / "masking_functions.sql").write_text("")
+    generate_abac.write_deterministic_model(generated / "abac.auto.tfvars", generated / "masking_functions.sql",
+                                            model)
+    (env_dir / "env.auto.tfvars").write_text(
+        f'governance_mode = "deterministic"\naccess_tier_groups = {json.dumps(SHAPE_TIERS)}\n'
+        f"raw_exempt_principals = {json.dumps(list(exempt))}\n"
+        f'deployer_principal_id = "{SHAPE_DEPLOYER}"\n'
+        "table_readers = {\n" + "".join(f'  "{t}" = {json.dumps(r)}\n' for t, r in readers.items()) + "}\n")
+    return pg.desired_generation(env_dir)
+
+
+def _shape_source(extra_grants=(), groups=None, *, listed_tiers=SHAPE_TIERS):
+    from reader_inventory import FakeSource, Grant
+
+    schema = f"{SHAPE_CATALOG}.{SHAPE_SCHEMA}"
+    grants = [Grant("CATALOG", SHAPE_CATALOG, SHAPE_DEPLOYER, "SELECT"),
+              Grant("CATALOG", SHAPE_CATALOG, SHAPE_DEPLOYER, "MANAGE"),
+              Grant("SCHEMA", schema, SHAPE_DEPLOYER, "SELECT")]
+    grants += [Grant("TABLE", t, SHAPE_DEPLOYER, "SELECT") for t in SHAPE_TABLES]
+    owners = {("CATALOG", SHAPE_CATALOG): SHAPE_OWNER, ("SCHEMA", schema): SHAPE_OWNER}
+    owners.update({("TABLE", t): SHAPE_OWNER for t in SHAPE_TABLES})
+    groups = {**{t: set() for t in listed_tiers}, **(groups or {})}  # the workspace lists the tier groups
+    return FakeSource(grant_rows=grants + list(extra_grants), owners=owners, groups=groups,
+                      admins={SHAPE_OWNER}, deployer=SHAPE_DEPLOYER)
+
+
+def _refusals(report) -> list[str]:
+    return sorted([f"weakening {w['ack_key']}" for w in report["weakening"]["unacknowledged"]]
+                  + [f"reader {f['ack_key']}" for c in report["readers"]["checks"] for f in c["unacknowledged"]])
+
+
+def _owner_refusals(tables=SHAPE_TABLES) -> list[str]:
+    return [f"reader prod:reader:{t}:{SHAPE_OWNER}" for t in tables]
+
+
+def _complete_release(env_dir: Path, generation: dict, grants) -> None:
+    _deploy(env_dir, generation, grants)
+    rg._write_once(rg.release_dir(rg.cloud_dir_of(env_dir), "prod") / "release.json",
+                   {"kind": "release", "version": rg.VERSION, "commit": "abcdef1234", "created_at": rg._now()})
+
+
+@pytest.fixture
+def first_prod(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    _write_shape(env_dir)
+    return env_dir
+
+
+def test_a_first_release_refuses_only_the_owner_not_its_own_contract_or_deployer(first_prod):
+    report = rg.reports(first_prod, "prod", reader_source=_shape_source)
+    # Before: 9 weakenings (the tiers' table_readers SELECT) + 3 deployer + 3 owner reader lines.
+    assert _refusals(report) == _owner_refusals() and not report["ok"]
+    (first_prod / "ack.txt").write_text("".join(f"prod:reader:{t}:{SHAPE_OWNER}\n" for t in SHAPE_TABLES))
+    report = rg.reports(first_prod, "prod", reader_source=_shape_source)
+    assert report["ok"], _refusals(report)
+
+
+def test_every_round_of_a_first_release_keeps_the_contract_baseline(first_prod):
+    # Round 1 applied the policies (the journal is active); SELECT is a later round.
+    (first_prod / "ack.txt").write_text("".join(f"prod:reader:{t}:{SHAPE_OWNER}\n" for t in SHAPE_TABLES))
+    _deploy(first_prod, pg.desired_generation(first_prod))
+    report = rg.reports(first_prod, "prod", reader_source=_shape_source)
+    # Every round re-inventories, so round 1's owner acknowledgements stay matched.
+    assert report["readers"]["tables"] == SHAPE_TABLES and report["ok"], _refusals(report)
+    # The SELECT round applied it all: the next round compares with what is deployed.
+    _deploy(first_prod, pg.desired_generation(first_prod), [(t, p) for t in SHAPE_TABLES for p in SHAPE_TIERS])
+    assert rg.reports(first_prod, "prod", reader_source=_shape_source)["ok"]
+    # Once any SELECT is deployed the receipt store alone can't prove a first release, so a SELECT
+    # round that stopped part-way fails closed: the rest of the contract is compared as widening.
+    _deploy(first_prod, pg.desired_generation(first_prod), [(SHAPE_TABLES[0], SHAPE_TIERS[0])])
+    report = rg.reports(first_prod, "prod", reader_source=_shape_source)
+    assert len(report["weakening"]["unacknowledged"]) == 8 and not report["ok"]
+
+
+def test_a_first_release_still_refuses_a_reader_outside_table_readers(first_prod):
+    from reader_inventory import Grant
+
+    source = _shape_source([Grant("TABLE", SHAPE_TABLES[1], "bi-sp", "SELECT"),
+                            Grant("SCHEMA", f"{SHAPE_CATALOG}.{SHAPE_SCHEMA}", "contractors", "SELECT")],
+                           groups={"contractors": {"contractor@example.com"}})
+    report = rg.reports(first_prod, "prod", reader_source=lambda: source)
+    refused = set(_refusals(report))
+    assert f"reader prod:reader:{SHAPE_TABLES[1]}:bi-sp" in refused
+    assert {f"reader prod:reader:{t}:{p}" for t in SHAPE_TABLES
+            for p in ("contractors", "contractor@example.com")} <= refused
+
+
+def test_a_first_release_still_refuses_a_contract_reader_outside_the_tiers(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    # A raw-exempt reader gets raw SELECT: its own reader line and its raw exemption both need an ack.
+    _write_shape(env_dir, {SHAPE_TABLES[0]: [SHAPE_TIERS[0], "etl-sp"]}, exempt=["etl-sp"])
+    keys = {w["ack_key"] for w in rg.reports(env_dir, "prod", reader_source=_shape_source)["weakening"]["unacknowledged"]}
+    assert f"prod:reader:{SHAPE_TABLES[0]}:etl-sp" in keys and f"prod:weaken:{SHAPE_TABLES[0]}:etl-sp" in keys
+    assert f"prod:reader:{SHAPE_TABLES[0]}:{SHAPE_TIERS[0]}" not in keys
+    # A reader neither a tier nor exempt (validation refuses it first) is never part of the baseline.
+    _write_shape(env_dir, {SHAPE_TABLES[0]: ["outsiders"]})
+    keys = {w["ack_key"] for w in rg.reports(env_dir, "prod", reader_source=_shape_source)["weakening"]["unacknowledged"]}
+    assert f"prod:reader:{SHAPE_TABLES[0]}:outsiders" in keys
+
+
+def test_widening_the_contract_after_a_complete_release_is_refused(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    first = {SHAPE_TABLES[0]: [SHAPE_TIERS[0]], SHAPE_TABLES[1]: [SHAPE_TIERS[0]]}
+    _complete_release(env_dir, _write_shape(env_dir, first), [(t, SHAPE_TIERS[0]) for t in first])
+    assert rg.reports(env_dir, "prod")["ok"]
+    widened = {SHAPE_TABLES[0]: SHAPE_TIERS[:2], SHAPE_TABLES[1]: [SHAPE_TIERS[0]],
+               SHAPE_TABLES[2]: [SHAPE_TIERS[2]]}
+    _write_shape(env_dir, widened)
+    report = rg.reports(env_dir, "prod", reader_source=_shape_source)
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == {
+        f"prod:reader:{SHAPE_TABLES[0]}:{SHAPE_TIERS[1]}", f"prod:reader:{SHAPE_TABLES[2]}:{SHAPE_TIERS[2]}"}
+
+
+def test_a_lost_receipt_and_state_cant_turn_a_released_env_into_a_first_release(tmp_path, capsys):
+    import shutil
+    from reader_inventory import Grant
+
+    env_dir = tmp_path / "envs" / "prod"
+    customers = SHAPE_TABLES[0]
+    _complete_release(env_dir, _write_shape(env_dir, {customers: [SHAPE_TIERS[0]]}), [(customers, SHAPE_TIERS[0])])
+    (env_dir / "ack.txt").write_text("".join(f"prod:reader:{t}:{SHAPE_OWNER}\n" for t in SHAPE_TABLES))
+    released = lambda: _shape_source([Grant("TABLE", customers, SHAPE_TIERS[0], "SELECT")])  # what it applied
+    _write_shape(env_dir, {customers: SHAPE_TIERS[:2]})
+    widened = f"prod:reader:{customers}:{SHAPE_TIERS[1]}"
+    report = rg.reports(env_dir, "prod", reader_source=released)
+    assert [w["ack_key"] for w in report["weakening"]["unacknowledged"]] == [widened] and not report["ok"]
+    # Only local files are lost: the receipt store and data_access state. Live SELECT still says released.
+    shutil.rmtree(rg.release_dir(rg.cloud_dir_of(env_dir), "prod"))
+    (env_dir / "data_access" / "terraform.tfstate").unlink()
+    report = rg.reports(env_dir, "prod", reader_source=released)
+    kept = f"prod:reader:{customers}:{SHAPE_TIERS[0]}"
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == {kept, widened} and not report["ok"]
+    assert report["first_release_refused"] == [f"{SHAPE_TIERS[0]} can read {customers} via SELECT on TABLE {customers}"]
+    rg.print_reports(report)
+    err = capsys.readouterr().err
+    assert "isn't treated as a first release" in err and "GENIERAILS_STATE_DIR" in err
+    # The recovery when the receipt can't be restored: review and acknowledge each SELECT.
+    with (env_dir / "ack.txt").open("a") as ack:
+        ack.write(f"{kept}\n{widened}\n")
+    assert rg.reports(env_dir, "prod", reader_source=released)["ok"]
+
+
+def _lost_receipt_widening(env_dir: Path, ack_lines=()) -> dict:
+    """No receipt or state; customers widened to tiers 0 and 1; the owner (and ack_lines) acknowledged."""
+    _write_shape(env_dir, {SHAPE_TABLES[0]: SHAPE_TIERS[:2]})
+    (env_dir / "ack.txt").write_text("".join(f"{k}\n" for k in [f"prod:reader:{t}:{SHAPE_OWNER}" for t in SHAPE_TABLES]
+                                             + list(ack_lines)))
+    return {f"prod:reader:{SHAPE_TABLES[0]}:{t}" for t in SHAPE_TIERS[:2]}
+
+
+def test_a_nested_tier_member_reading_live_is_evidence_of_a_release(tmp_path):
+    from reader_inventory import Grant
+
+    env_dir = tmp_path / "envs" / "prod"
+    tier_selects = _lost_receipt_widening(env_dir)
+    nested = "payments_child"  # check_readers accepts it as covered by tier0
+    source = _shape_source([Grant("TABLE", SHAPE_TABLES[0], nested, "SELECT")],
+                           groups={SHAPE_TIERS[0]: {nested}, nested: {"payer@example.com"}})
+    report = rg.reports(env_dir, "prod", reader_source=lambda: source)
+    assert any(e.startswith(f"{nested} can read") for e in report["first_release_refused"])
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == tier_selects and not report["ok"]
+
+
+def test_a_case_variant_of_a_tier_reading_live_is_evidence_of_a_release(tmp_path):
+    from reader_inventory import Grant
+
+    env_dir = tmp_path / "envs" / "prod"
+    variant = SHAPE_TIERS[0].upper()
+    # Acknowledging the mixed-case reader line doesn't acknowledge the table_readers SELECT.
+    tier_selects = _lost_receipt_widening(env_dir, [f"prod:reader:{SHAPE_TABLES[0]}:{variant}"])
+    source = _shape_source([Grant("TABLE", SHAPE_TABLES[0], variant, "SELECT")])
+    report = rg.reports(env_dir, "prod", reader_source=lambda: source)
+    assert any(e.startswith(f"{variant} can read") for e in report["first_release_refused"])
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == tier_selects and not report["ok"]
+
+
+def test_a_tier_whose_members_cant_be_listed_drops_the_first_release_baseline(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    tier_selects = _lost_receipt_widening(env_dir)
+    source = _shape_source(listed_tiers=SHAPE_TIERS[1:])
+    report = rg.reports(env_dir, "prod", reader_source=lambda: source)
+    assert report["first_release_refused"] == [f"{SHAPE_TIERS[0]}'s members couldn't be listed (not in the workspace groups)"]
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == tier_selects and not report["ok"]
+
+
+def test_a_real_first_release_with_no_tier_select_live_keeps_the_contract_baseline(first_prod):
+    report = rg.reports(first_prod, "prod", reader_source=_shape_source)
+    assert report["first_release_refused"] == [] and _refusals(report) == _owner_refusals()
+
+
+def test_a_released_env_that_granted_no_select_treats_new_readers_as_widening(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    _complete_release(env_dir, _write_shape(env_dir, {}), [])  # released with table_readers = {}
+    _write_shape(env_dir)
+    report = rg.reports(env_dir, "prod", reader_source=_shape_source)
+    assert len(report["weakening"]["unacknowledged"]) == 9
+
+
+def test_only_the_exact_deployer_id_is_accepted_as_a_reader(first_prod):
+    from reader_inventory import Grant
+
+    impostors = ["genierails-prod-deployer",  # the deployer SP's display name
+                 "2169eb19-40e9-44ba-9cbc-50741dcb8e92",  # another SP
+                 "deployers"]  # a group the deployer is in: the group and its other members still refuse
+    source = _shape_source([Grant("TABLE", SHAPE_TABLES[0], p, "SELECT") for p in impostors],
+                           groups={"deployers": {SHAPE_DEPLOYER, "someone@example.com"}})
+    refused = set(_refusals(rg.reports(first_prod, "prod", reader_source=lambda: source)))
+    assert {f"reader prod:reader:{SHAPE_TABLES[0]}:{p}" for p in [*impostors, "someone@example.com"]} <= refused
+    assert not any(SHAPE_DEPLOYER in line for line in refused)
+    # Without a committed deployer_principal_id, the deployer is a reader like any other.
+    env_file = first_prod / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace(f'deployer_principal_id = "{SHAPE_DEPLOYER}"\n', ""))
+    refused = _refusals(rg.reports(first_prod, "prod", reader_source=_shape_source))
+    assert [line for line in refused if SHAPE_DEPLOYER in line] == [
+        f"reader prod:reader:{t}:{SHAPE_DEPLOYER}" for t in SHAPE_TABLES]
 
 
 def test_group_map_acknowledgements_are_reconciled_with_the_rest(released_prod, monkeypatch):

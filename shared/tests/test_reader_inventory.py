@@ -128,6 +128,20 @@ def test_reader_check_refuses_uncovered_reader():
     assert any(item.principal == "external" for item in check.unacknowledged)
 
 
+def test_reader_check_accepts_only_the_exact_deployer_principal():
+    deployer = "2169eb19-40e9-44ba-9cbc-50741dcb8e91"
+    readers = [deployer, deployer.upper(), "genierails-prod-deployer", "deployers", "member"]
+    inventory = ri.inventory_readers(
+        _source(grant_rows=[ri.Grant("TABLE", "c.s.t", p, "SELECT") for p in readers],
+                groups={"deployers": {deployer, "member"}}), "c.s.t"
+    )
+    check = ri.check_readers(inventory, "prod", [], [], set(), deployer)
+    assert deployer in check.authorized
+    assert {deployer.upper(), "genierails-prod-deployer", "deployers", "member"} <= {
+        item.principal for item in check.unacknowledged}
+    assert deployer in {item.principal for item in ri.check_readers(inventory, "prod", [], [], set()).unacknowledged}
+
+
 def _statement(state="SUCCEEDED", rows=None, chunks=1, error=None):
     return SimpleNamespace(
         status=SimpleNamespace(state=state, error=error), statement_id="id",
@@ -186,6 +200,217 @@ def test_adapter_empty_dependent_views_is_a_valid_empty_result():
     execution = SimpleNamespace(execute_statement=lambda **kwargs: _statement(rows=[]))
     source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
     assert list(source.dependent_views("c.s.t")) == []
+
+
+def _deps(*tables, functions=()):
+    return SimpleNamespace(dependencies=[
+        *(SimpleNamespace(table=SimpleNamespace(table_full_name=t), function=None) for t in tables),
+        *(SimpleNamespace(table=None, function=SimpleNamespace(function_full_name=f)) for f in functions),
+    ])
+
+
+def _view_client(views, infos, functions=None, statements=None, chunks=None):
+    """A workspace whose information_schema has no view_table_usage, as on Databricks."""
+    statements = [] if statements is None else statements
+    rows = [list(view) for view in views]
+
+    def execute(**kwargs):
+        statement = kwargs["statement"]
+        statements.append(statement)
+        if "view_table_usage" in statement:
+            return _statement("FAILED", error="[TABLE_OR_VIEW_NOT_FOUND] view_table_usage cannot be found")
+        if chunks:
+            return _statement(rows=rows[:1], chunks=2)
+        return _statement(rows=rows)
+
+    def get(name):
+        if isinstance(infos.get(name), Exception):
+            raise infos[name]
+        return infos[name]
+
+    def get_function(name):
+        if isinstance((functions or {}).get(name), Exception):
+            raise functions[name]
+        return functions[name]
+
+    execution = SimpleNamespace(
+        execute_statement=execute,
+        get_statement_result_chunk_n=lambda *args: SimpleNamespace(data_array=rows[1:]),
+    )
+    return SimpleNamespace(
+        statement_execution=execution, tables=SimpleNamespace(get=get),
+        functions=SimpleNamespace(get=get_function),
+    )
+
+
+def test_dependent_views_come_from_uc_view_dependencies_not_view_table_usage():
+    # Fails on the old view_table_usage query, which Databricks doesn't provide.
+    statements = []
+    client = _view_client(
+        [("v", "vs", "v1", "VIEW"), ("m", "ms", "metric", "METRIC_VIEW"), ("o", "os", "other", "MATERIALIZED_VIEW")],
+        {"v.vs.v1": SimpleNamespace(view_dependencies=_deps("C.S.T")),
+         "m.ms.metric": SimpleNamespace(view_dependencies=_deps("c.s.t", "c.s.dim")),
+         "o.os.other": SimpleNamespace(view_dependencies=_deps("c.s.unrelated"))},
+        statements=statements,
+    )
+    source = ri.DatabricksSource("wh", client)
+    assert list(source.dependent_views("c.s.t")) == ["m.ms.metric", "v.vs.v1"]
+    assert list(source.dependent_views("c.s.unrelated")) == ["o.os.other"]
+    assert len(statements) == 1  # every view is read once, then reused for every table
+    statement = statements[0]
+    assert "view_table_usage" not in statement
+    assert statement.startswith(
+        "SELECT table_catalog, table_schema, table_name, table_type FROM system.information_schema.tables "
+    )
+    assert "table_type IN ('VIEW', 'MATERIALIZED_VIEW', 'METRIC_VIEW')" in statement
+    assert "table_catalog <> 'system' AND table_schema <> 'information_schema'" in statement
+
+
+def test_dependent_views_follow_views_of_views_and_functions_and_paged_listings():
+    client = _view_client(
+        [("v", "vs", "v1", "VIEW"), ("v", "vs", "v2", "VIEW"), ("v", "vs", "via_fn", "VIEW")],
+        {"v.vs.v1": SimpleNamespace(view_dependencies=_deps("c.s.t")),
+         "v.vs.v2": SimpleNamespace(view_dependencies=_deps("v.vs.v1")),
+         "v.vs.via_fn": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.outer"]))},
+        functions={
+            "f.fs.outer": SimpleNamespace(routine_dependencies=_deps(functions=["f.fs.inner", "f.fs.outer"])),
+            "f.fs.inner": SimpleNamespace(routine_dependencies=_deps("c.s.t")),
+        },
+        chunks=True,
+    )
+    source = ri.DatabricksSource("wh", client)
+    assert list(source.dependent_views("c.s.t")) == ["v.vs.v1", "v.vs.via_fn"]
+    assert list(source.dependent_views("v.vs.v1")) == ["v.vs.v2"]
+
+
+def test_truncated_result_fails_closed():
+    result = _statement(rows=[["v", "vs", "v1", "VIEW"]])
+    result.manifest.truncated = True
+    execution = SimpleNamespace(execute_statement=lambda **kwargs: result)
+    source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
+    with pytest.raises(RuntimeError, match="information_schema.tables.*truncated"):
+        list(source.dependent_views("c.s.t"))
+
+
+def test_failed_view_listing_names_the_source_and_fix():
+    execution = SimpleNamespace(execute_statement=lambda **kwargs: _statement("FAILED", error="PERMISSION_DENIED"))
+    source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
+    with pytest.raises(RuntimeError) as err:
+        list(source.dependent_views("c.s.t"))
+    message = str(err.value)
+    assert "system.information_schema.tables + Tables API view_dependencies" in message
+    assert "listing views failed" in message and "PERMISSION_DENIED" in message
+    assert "SELECT on system.information_schema" in message
+
+
+@pytest.mark.parametrize("infos, functions, match", [
+    ({"v.vs.v1": PermissionError("no access")}, None, "VIEW v.vs.v1 could not be read .no access"),
+    ({"v.vs.v1": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.fn"]))},
+     {"f.fs.fn": PermissionError("hidden")}, "function f.fs.fn could not be read .hidden"),
+])
+def test_unreadable_view_or_function_fails_closed(infos, functions, match):
+    source = ri.DatabricksSource("wh", _view_client([("v", "vs", "v1", "VIEW")], infos, functions))
+    with pytest.raises(RuntimeError, match=match):
+        list(source.dependent_views("c.s.t"))
+
+
+def test_malformed_listing_row_fails_closed():
+    execution = SimpleNamespace(execute_statement=lambda **kwargs: _statement(rows=[["v", None, "v1", "VIEW"]]))
+    source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
+    with pytest.raises(RuntimeError, match="unexpected row"):
+        list(source.dependent_views("c.s.t"))
+
+
+class _LiveViews(ri.DatabricksSource):
+    """Real view discovery over a fake workspace; grants and owners from FakeSource."""
+
+    def __init__(self, client, fake):
+        super().__init__("wh", client)
+        self.fake = fake
+
+    def grants(self, *scope):
+        return self.fake.grants(*scope)
+
+    def owner(self, *scope):
+        return self.fake.owner(*scope)
+
+    def group_members(self):
+        return self.fake.group_members()
+
+    def metastore_admins(self):
+        return self.fake.metastore_admins()
+
+    def current_principal(self):
+        return self.fake.current_principal()
+
+
+def _check(views, infos, functions=None, acks=frozenset()):
+    source = _LiveViews(_view_client(views, infos, functions), _source())
+    inventory = ri.inventory_readers(source, "c.s.t")
+    return inventory, ri.check_readers(inventory, "prod", ["c-owner", "c-s-owner", "c.s.t-owner", "meta-owner"],
+                                       [], set(acks))
+
+
+def test_function_without_recorded_dependencies_refuses_the_view():
+    # Codex repro: the function reads c.s.t, but Unity Catalog has no record of it.
+    infos = {"v.vs.v1": SimpleNamespace(view_dependencies=_deps(functions=["f.s.fn"]))}
+    functions = {"f.s.fn": SimpleNamespace(routine_dependencies=None, routine_definition="SELECT * FROM c.s.t")}
+    inventory, check = _check([("v", "vs", "v1", "VIEW")], infos, functions)
+    assert inventory.dependent_views == ()
+    assert not check.ok
+    [finding] = check.unacknowledged
+    assert finding.ack_key == "prod:reader:c.s.t:v.vs.v1"
+    assert "calls function f.s.fn, which has no recorded routine_dependencies" in finding.consequence
+    assert "acknowledge it with the line prod:reader:c.s.t:v.vs.v1 in ack.txt" in finding.consequence
+
+
+@pytest.mark.parametrize("info", [
+    SimpleNamespace(view_dependencies=None, view_definition="SELECT * FROM other.s.x"),
+    SimpleNamespace(view_dependencies=SimpleNamespace(dependencies=[]), view_definition="SELECT 1 AS one"),
+    SimpleNamespace(view_dependencies=None, view_definition=None),
+])
+def test_every_view_without_recorded_dependencies_is_refused_whatever_its_definition(info):
+    inventory, check = _check([("v", "vs", "v1", "METRIC_VIEW")], {"v.vs.v1": info})
+    assert inventory.unrecorded_views == {"v.vs.v1": "METRIC_VIEW v.vs.v1 has no recorded view_dependencies"}
+    assert [f.ack_key for f in check.unacknowledged] == ["prod:reader:c.s.t:v.vs.v1"]
+    assert "CREATE OR REPLACE" in check.unacknowledged[0].consequence
+
+
+def test_acknowledged_unrecorded_view_passes_with_the_existing_ack_format():
+    from ack_file import parse_line
+
+    key = "prod:reader:c.s.t:v.vs.v1"
+    assert parse_line(key, expected_env="prod").key == key  # a valid reader line, no new kind
+    infos = {"v.vs.v1": SimpleNamespace(view_dependencies=None, view_definition="SELECT 1")}
+    _, check = _check([("v", "vs", "v1", "VIEW")], infos, acks={key})
+    assert check.ok
+    assert [f.ack_key for f in check.acknowledged] == [key] and key in check.consequences
+
+
+def test_unrecorded_views_are_refused_per_inventoried_table():
+    source = _source(unrecorded={"v.vs.v1": "VIEW v.vs.v1 has no recorded view_dependencies"},
+                     owners=_owners("c.s.t", "c.s.u"))
+    keys = [f.ack_key for table in ("c.s.t", "c.s.u")
+            for f in ri.check_readers(ri.inventory_readers(source, table), "prod",
+                                      ["c-owner", "c-s-owner", f"{table}-owner", "meta-owner"], [], set()).unacknowledged]
+    assert keys == ["prod:reader:c.s.t:v.vs.v1", "prod:reader:c.s.u:v.vs.v1"]
+
+
+def test_function_dependencies_are_read_once_per_run():
+    calls = []
+    functions = {"f.fs.fn": SimpleNamespace(routine_dependencies=_deps("c.s.t"))}
+    client = _view_client(
+        [("v", "vs", "v1", "VIEW"), ("v", "vs", "v2", "VIEW")],
+        {"v.vs.v1": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.fn"])),
+         "v.vs.v2": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.fn"]))},
+        functions,
+    )
+    get = client.functions.get
+    client.functions.get = lambda name: (calls.append(name), get(name))[1]
+    source = ri.DatabricksSource("wh", client)
+    assert list(source.dependent_views("c.s.t")) == ["v.vs.v1", "v.vs.v2"]
+    assert source.unrecorded_views() == {}
+    assert calls == ["f.fs.fn"]
 
 
 def test_adapter_empty_group_list_is_a_valid_empty_mapping():
