@@ -139,7 +139,7 @@ case "$COMMAND" in
       if [ -f "$tfvars_path" ]; then RUNNER_VAR_FILES+=(--var-file "$tfvars_path"); fi
     done
     if ! python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" --env-dir "$STATE_ENV_DIR" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@"; then
-      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state), and policy_stage, held_access_grants and rebind_table_grants only by the staged policy controller (scripts/staged_policy_apply.py)." >&2
+      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state), import_walk only by it for terraform import, and policy_stage, held_access_grants and rebind_table_grants only by the staged policy controller (scripts/staged_policy_apply.py)." >&2
       exit 2
     fi
     ;;
@@ -348,6 +348,14 @@ fi
 if [ "$LAYER:$COMMAND" = "workspace:plan" ] && \
    python3 -c 'import os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from state_layout import STRUCTURAL_CHECK_TOKEN_ENV, consume_structural_check_token; raise SystemExit(0 if consume_structural_check_token(Path(sys.argv[2]), os.environ.get(STRUCTURAL_CHECK_TOKEN_ENV)) else 1)' "$SCRIPT_DIR" "$ENV_DIR"; then
   RUNNER_VARS+=(-var="expected_pre_release_withholding=true")
+fi
+# terraform import walks the whole configuration with no plan, so
+# plantimestamp() is unknown; on a passing coverage check that left every
+# for_each filtered on its status unknown and the import failed, writing
+# nothing. import_walk gives the checks a known status that never passes
+# (modules/coverage_gate_check). Only for import: plan and apply never get it.
+if [ "$LAYER" != "account" ] && { [ "$COMMAND" = "import" ] || { [ "$COMMAND" = "print-cmd" ] && [ "${1:-}" = "import" ]; }; }; then
+  RUNNER_VARS+=(-var="import_walk=true")
 fi
 # Genie ID files: with GENIERAILS_STATE_DIR, the env's records/ in the state
 # dir (state_layout.py records-dir refuses while any is still in the checkout).

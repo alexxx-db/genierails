@@ -791,7 +791,7 @@ def test_state_readers_import_the_helper_without_help_from_other_modules(tmp_pat
 # -- the runner's own variables can't be overridden --------------------------
 
 RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
-               "expected_pre_release_withholding")
+               "expected_pre_release_withholding", "import_walk")
 OVERRIDE_FORMS = ("-var=NAME=", "-var NAME=", "--var=NAME=", "-var-file=FILE", "-var-file FILE",
                   "env tfvars", "TF_CLI_ARGS", "TF_CLI_ARGS_plan")
 

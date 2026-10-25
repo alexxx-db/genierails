@@ -381,6 +381,14 @@ variable "deployer_principal_id" {
   default = ""
 }
 
+# Set only by scripts/terraform_layer.sh, on terraform import: both coverage
+# checks then have a known status (modules/coverage_gate_check), so a passing
+# result doesn't make the import fail with Invalid for_each.
+variable "import_walk" {
+  type    = bool
+  default = false
+}
+
 # Only make check opts in while planning committed config against empty state.
 # Ordinary plan/apply retains the failing check for unexpected withholding.
 variable "expected_pre_release_withholding" {
@@ -844,6 +852,7 @@ module "coverage_gate_check" {
   gate_file            = "${local.data_access_dir}/.coverage_gate.json"
   expected_fingerprint = try(local._applied_coverage_gate.fingerprint, "")
   max_age              = try(local._applied_coverage_gate.max_age, "")
+  import_walk          = var.import_walk
 }
 
 # The live agent coverage check's result must be for exactly these agents,
@@ -854,6 +863,7 @@ module "agent_coverage_check" {
   gate_file            = local.agent_coverage_file
   expected_fingerprint = local.agent_coverage_fingerprint
   max_age              = var.coverage_gate_max_age
+  import_walk          = var.import_walk
 }
 
 module "workspace" {

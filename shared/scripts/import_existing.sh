@@ -193,7 +193,13 @@ run_import() {
     echo "  ↩ Already managed: $address (skipping)"
   else
     echo "$import_out" >&2
-    echo "  ✗ Failed to import $address (may not exist in Databricks)"
+    # Terraform evaluates the whole configuration before it imports anything:
+    # an error there says nothing about whether the object exists.
+    if grep -qE "Invalid (for_each|count) argument" <<<"$import_out"; then
+      echo "  ✗ Failed to import $address: Terraform couldn't evaluate the configuration (see the error above); nothing was imported and the object may well exist in Databricks"
+    else
+      echo "  ✗ Failed to import $address (may not exist in Databricks)"
+    fi
     IMPORT_FAILURES=$((IMPORT_FAILURES + 1))
   fi
 }
