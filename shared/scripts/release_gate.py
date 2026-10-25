@@ -873,13 +873,47 @@ def governance_states(before: Mapping, after: Mapping):
     return states[0], states[1]
 
 
-def newly_covered(before: Mapping, after: Mapping) -> list[str]:
-    """Tables the reader check inventories: all on a first deterministic apply, else new ones."""
+def newly_covered(before: Mapping, after: Mapping, *, released: bool = True) -> list[str]:
+    """Tables the reader check inventories: all on a first deterministic apply, else new ones.
+
+    A first release runs one manifest per phase until "Release complete", so
+    every round before an env's first release receipt inventories all tables:
+    the reader acknowledgements the first round needed stay matched (not stale).
+    """
     after_tables = {c.rsplit(".", 1)[0].lower() for c in after["tags"]} | set(after["table_readers"])
-    if not before.get("has_generation"):
+    if not before.get("has_generation") or not released:
         return sorted(after_tables)
     before_tables = {c.rsplit(".", 1)[0].lower() for c in before["tags"]} | set(before["table_readers"])
     return sorted(after_tables - before_tables)
+
+
+def first_release_contract(env_dir: Path, before: Mapping, after: Mapping, *, released: bool) -> dict[str, set[str]]:
+    """The committed table_readers SELECT a first release isn't asked to acknowledge.
+
+    Refuse-weakening compares SELECT with what the last released prod grants
+    (data_access state). An env with no completed release (no release receipt;
+    each round of a first release is a phase until "Release complete"), no
+    SELECT granted through GenieRails yet and no legacy baseline has no released
+    contract: there the baseline is its own reviewed, committed table_readers,
+    for tier groups only (masked by the tier rule). A raw-exempt reader gets
+    raw SELECT and still needs its acknowledgement. Every later release, and an
+    env released with no table_readers, compares with what is deployed.
+    """
+    from scripts import migration
+
+    if released or before["table_readers"] or migration.baseline(Path(env_dir)) is not None:
+        return {}
+    tiers = set(after["settings"].get("access_tier_groups") or [])
+    contract = {t: set(r) & tiers for t, r in after["table_readers"].items()}
+    return {t: r for t, r in contract.items() if r}
+
+
+def _deployer_principal(settings: Mapping) -> str:
+    """The env's committed deployer_principal_id, or "" when unset or malformed."""
+    from deployer_identity import SETTING, validation_errors
+
+    value = settings.get(SETTING)
+    return str(value) if isinstance(value, str) and value and not validation_errors({SETTING: value}) else ""
 
 
 def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | None = None,
@@ -896,13 +930,16 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     entries = _ack_entries(env_dir, env)
     keys = {e.key for e in entries}
     before, after = _deployed(env_dir), _desired(env_dir)
-    weak = check_weakenings(*governance_states(before, after), env, keys)
+    released = last_release(cloud_dir_of(env_dir), env) is not None
+    contract = first_release_contract(env_dir, before, after, released=released)
+    baseline = {**before, "table_readers": contract} if contract else before
+    weak = check_weakenings(*governance_states(baseline, after), env, keys)
     # A migration from legacy: its revocations (and, once adopted, every
     # acknowledgement the adoption accepted, so none turns stale).
     migrated, unacked_revocations = migration.accounted(env_dir, env)
     if migration.baseline(env_dir) is not None:  # each lost SELECT is reported once, as its revocation
         weak = migration.without_revoked(weak, env, migrated)
-    tables = newly_covered(before, after)
+    tables = newly_covered(before, after, released=released)
     reader_reports, reader_checks, reader_consequences = [], [], {}
     if tables:
         if reader_source is None:
@@ -912,9 +949,10 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         managed = [Grant("TABLE", t, p, "SELECT") for t, ps in before["table_readers"].items() for p in ps]
         tiers = list(after["settings"].get("access_tier_groups") or [])
         exempt = list(after["settings"].get("raw_exempt_principals") or [])
+        deployer = _deployer_principal(after["settings"])
         for table in tables:
             inventory = inventory_readers(source, table, managed)
-            check = check_readers(inventory, env, tiers, exempt, keys)
+            check = check_readers(inventory, env, tiers, exempt, keys, deployer)
             reader_reports.append(inventory.to_dict())
             reader_checks.append(asdict(check))
             reader_consequences.update(check.consequences)

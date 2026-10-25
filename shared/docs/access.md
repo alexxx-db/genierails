@@ -34,6 +34,17 @@ table_readers = {
   dev (catalogs remapped, groups through `group_map`); later promotions keep prod's value and print how
   it differs from dev.
 - No `table_readers` means GenieRails grants no `SELECT`.
+- Adding a reader is a widening (refuse-weakening): `release-plan` compares
+  each table's readers with the `SELECT` the last released prod grants (its
+  data_access state) and stops until `envs/<env>/ack.txt` has
+  `<env>:reader:<table>:<principal>`. A **first release** has no released
+  contract: while the env has no release receipt ("Release complete"),
+  GenieRails has granted it no `SELECT` yet and it isn't migrating from
+  legacy, the baseline is its own reviewed, committed `table_readers`, so the
+  tier groups it lists need no ack in any round. A raw-exempt reader still
+  does (it gets raw `SELECT`), and so does every reader the reader check
+  finds outside the tiers. Once any `SELECT` is deployed, or the env has been
+  released (even with no `table_readers`), new readers are widening again.
 
 ## `acl_groups` and the agent check
 
@@ -134,6 +145,9 @@ not secret, in `envs/<env>/env.auto.tfvars`:
 deployer_principal_id = "5a7e0000-0000-0000-0000-00000000beef"   # databricks_client_id of this env's SP
 ```
 
+- The reader check accepts this exact principal (the env's own deployer SP
+  reads every governed table) and nothing else: not a principal with the
+  SP's display name, nor another SP, nor a group it belongs to.
 - Required in deterministic mode, and must be an application ID
   (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`); a group name such as
   `account users` is refused.

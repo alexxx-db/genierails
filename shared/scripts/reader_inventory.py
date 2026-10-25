@@ -294,8 +294,14 @@ def check_readers(
     tiers: Iterable[str],
     raw_exempt_principals: Iterable[str],
     acknowledgement_keys: set[str],
+    deployer_principal: str = "",
 ) -> ReaderCheck:
-    """Refuse every external reader not covered by a tier, exemption, or ACK."""
+    """Refuse every external reader not covered by a tier, exemption, or ACK.
+
+    ``deployer_principal`` is the env's committed deployer_principal_id: that
+    exact principal (never a display name, or a group it belongs to) is the
+    env's own deployer and is accepted.
+    """
     tiers = set(map(str, tiers))
     exemptions = set(map(str, raw_exempt_principals))
     tier_members = set(tiers)
@@ -309,7 +315,8 @@ def check_readers(
     unacknowledged: list[ReaderFinding] = []
     for evidence in inventory.readers:
         principal = evidence.principal
-        if principal in tier_members or principal in exempt_members:
+        if principal in tier_members or principal in exempt_members or (
+                deployer_principal and principal == deployer_principal):
             authorized.append(principal)
             continue
         key = f"{env}:reader:{inventory.table}:{principal}"
@@ -564,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env", required=True)
     parser.add_argument("--tier", action="append", default=[])
     parser.add_argument("--raw-exempt-principal", action="append", default=[])
+    parser.add_argument("--deployer-principal-id", default="",
+                        help="the env's committed deployer_principal_id, accepted as a reader")
     parser.add_argument("--ack-file", type=Path, required=True)
     parser.add_argument(
         "--consequences-out", type=Path,
@@ -582,7 +591,8 @@ def main(argv: list[str] | None = None) -> int:
         for table in args.tables:
             report = inventory_readers(source, table, managed)
             reports.append(report.to_dict())
-            checks.append(check_readers(report, args.env, args.tier, args.raw_exempt_principal, keys))
+            checks.append(check_readers(report, args.env, args.tier, args.raw_exempt_principal, keys,
+                                        args.deployer_principal_id))
         consequences: dict[str, str] = {}
         for check in checks:
             consequences.update(check.consequences)
