@@ -222,6 +222,14 @@ variable "env_dir" {
   type = string
 }
 
+# Set only by scripts/terraform_layer.sh, on terraform import: the coverage
+# check then has a known status (modules/coverage_gate_check), so a passing
+# result doesn't make the import fail with Invalid for_each.
+variable "import_walk" {
+  type    = bool
+  default = false
+}
+
 # Consumed by GenieRails validation/generation; accepted here because the
 # shared env.auto.tfvars is also passed to this root.
 variable "deployer_principal_id" {
@@ -627,6 +635,7 @@ module "data_access" {
   coverage_ddl_file                        = "${var.env_dir}/../ddl/_fetched.sql"
   coverage_acknowledged_columns            = var.coverage_acknowledged_columns
   coverage_gate_max_age                    = var.coverage_gate_max_age
+  import_walk                              = var.import_walk
   applied_table_grants                     = var.policy_stage == "rebind" ? distinct(concat(local.applied_table_grants, var.rebind_table_grants)) : local.applied_table_grants
   applied_protection_fingerprint           = local.applied_protection_fingerprint
   applied_protection                       = local.applied_protection
@@ -724,7 +733,10 @@ output "coverage_gate_inputs" {
 
 output "coverage_gate" {
   description = "Coverage check result this layer was applied with; the workspace layer reads it from state."
-  value       = module.data_access.coverage_gate
+  # terraform import writes root outputs too, but applies nothing: it keeps the
+  # last apply's record. (A tuple, not a conditional: the two objects' types
+  # can differ.)
+  value = [module.data_access.coverage_gate, local._applied_record][var.import_walk && local._applied_record != null ? 1 : 0]
 }
 
 output "legacy_unattributed_discovered_tables" {

@@ -281,3 +281,9 @@ variable "withhold_new_table_grants" {
   default     = false
   description = "Plan no new SELECT (grants already applied are kept). The root sets it for every staged policy phase but the final grant phase, so new access opens only after the new protection is switched in and verified."
 }
+
+variable "import_walk" {
+  type        = bool
+  default     = false
+  description = "true only under terraform import (the root's import_walk): the coverage check status is \"import\", known without plantimestamp()."
+}

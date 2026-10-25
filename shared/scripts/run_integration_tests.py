@@ -136,6 +136,8 @@ if not sys.stdout.line_buffering:
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
 MODULE_ROOT = SCRIPT_DIR.parent          # …/genie/shared/
+if str(MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODULE_ROOT))  # CI runs this by path; `scripts.` imports need shared/
 _default_cloud = os.environ.get("CLOUD_PROVIDER", "aws").lower()
 CLOUD_ROOT  = Path(os.environ.get("CLOUD_ROOT", MODULE_ROOT.parent / _default_cloud))
 
@@ -800,7 +802,6 @@ def _make(
                     if assembled.exists():
                         _preserve_existing_tag_policy_values(account_abac, assembled)
                     try:
-                        sys.path.insert(0, str(MODULE_ROOT))
                         from generate_abac import autofix_canonical_tag_vocabulary
                         for abac_file in [gen_abac, assembled, account_abac]:
                             if abac_file.exists():

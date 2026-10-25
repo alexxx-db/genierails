@@ -873,13 +873,76 @@ def governance_states(before: Mapping, after: Mapping):
     return states[0], states[1]
 
 
-def newly_covered(before: Mapping, after: Mapping) -> list[str]:
-    """Tables the reader check inventories: all on a first deterministic apply, else new ones."""
+def newly_covered(before: Mapping, after: Mapping, *, released: bool = True) -> list[str]:
+    """Tables the reader check inventories: all on a first deterministic apply, else new ones.
+
+    A first release runs one manifest per phase until "Release complete", so
+    every round before an env's first release receipt inventories all tables:
+    the reader acknowledgements the first round needed stay matched (not stale).
+    """
     after_tables = {c.rsplit(".", 1)[0].lower() for c in after["tags"]} | set(after["table_readers"])
-    if not before.get("has_generation"):
+    if not before.get("has_generation") or not released:
         return sorted(after_tables)
     before_tables = {c.rsplit(".", 1)[0].lower() for c in before["tags"]} | set(before["table_readers"])
     return sorted(after_tables - before_tables)
+
+
+def first_release_contract(env_dir: Path, before: Mapping, after: Mapping, *, released: bool) -> dict[str, set[str]]:
+    """The committed table_readers SELECT a first release isn't asked to acknowledge.
+
+    Refuse-weakening compares SELECT with what the last released prod grants
+    (data_access state). An env with no completed release (no release receipt;
+    each round of a first release is a phase until "Release complete"), no
+    SELECT granted through GenieRails yet and no legacy baseline has no released
+    contract: there the baseline is its own reviewed, committed table_readers,
+    for tier groups only (masked by the tier rule). A raw-exempt reader gets
+    raw SELECT and still needs its acknowledgement. Every later release, and an
+    env released with no table_readers, compares with what is deployed.
+
+    Receipts and state are local files, so their absence alone doesn't prove a
+    first release: reports() drops this baseline when the reader inventory shows
+    a tier group already reading live (live_release_evidence).
+    """
+    from scripts import migration
+
+    if released or before["table_readers"] or migration.baseline(Path(env_dir)) is not None:
+        return {}
+    tiers = set(after["settings"].get("access_tier_groups") or [])
+    contract = {t: set(r) & tiers for t, r in after["table_readers"].items()}
+    return {t: r for t, r in contract.items() if r}
+
+
+def live_release_evidence(after: Mapping, inventories) -> list[str]:
+    """Tier members that already read a governed table live: a first release can't have granted that.
+
+    SELECT is a first release's last round, so before it no tier reads. A tier
+    (or anyone check_readers counts as covered by one: a nested member, a
+    case variant) that does means prod was released (its receipt or
+    data_access state is missing) or was granted outside GenieRails. Neither is
+    trusted as a baseline: live grants made outside GenieRails would then pass
+    unreviewed. A tier whose membership the inventory couldn't list is evidence
+    too, since its nested readers can't be told apart.
+    """
+    from reader_inventory import group_members_of
+
+    tiers = sorted(set(after["settings"].get("access_tier_groups") or []))
+    evidence = []
+    for inv in inventories:
+        members = group_members_of(inv.group_closure, tiers, any_case=True)
+        evidence += [f"{r.principal} can read {inv.table} via " + "; ".join(r.reasons)
+                     for r in inv.readers if r.principal.casefold() in members]
+    listed = {str(g).casefold() for inv in inventories for g in inv.group_closure}
+    evidence += [f"{t}'s members couldn't be listed (not in the workspace groups)"
+                 for t in tiers if inventories and t.casefold() not in listed]
+    return evidence
+
+
+def _deployer_principal(settings: Mapping) -> str:
+    """The env's committed deployer_principal_id, or "" when unset or malformed."""
+    from deployer_identity import SETTING, validation_errors
+
+    value = settings.get(SETTING)
+    return str(value) if isinstance(value, str) and value and not validation_errors({SETTING: value}) else ""
 
 
 def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | None = None,
@@ -896,14 +959,9 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     entries = _ack_entries(env_dir, env)
     keys = {e.key for e in entries}
     before, after = _deployed(env_dir), _desired(env_dir)
-    weak = check_weakenings(*governance_states(before, after), env, keys)
-    # A migration from legacy: its revocations (and, once adopted, every
-    # acknowledgement the adoption accepted, so none turns stale).
-    migrated, unacked_revocations = migration.accounted(env_dir, env)
-    if migration.baseline(env_dir) is not None:  # each lost SELECT is reported once, as its revocation
-        weak = migration.without_revoked(weak, env, migrated)
-    tables = newly_covered(before, after)
-    reader_reports, reader_checks, reader_consequences = [], [], {}
+    released = last_release(cloud_dir_of(env_dir), env) is not None
+    tables = newly_covered(before, after, released=released)
+    reader_reports, reader_checks, reader_consequences, inventories = [], [], {}, []
     if tables:
         if reader_source is None:
             raise Refused(f"the reader check needs a SQL warehouse to inventory {len(tables)} newly governed "
@@ -912,12 +970,26 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         managed = [Grant("TABLE", t, p, "SELECT") for t, ps in before["table_readers"].items() for p in ps]
         tiers = list(after["settings"].get("access_tier_groups") or [])
         exempt = list(after["settings"].get("raw_exempt_principals") or [])
+        deployer = _deployer_principal(after["settings"])
         for table in tables:
             inventory = inventory_readers(source, table, managed)
-            check = check_readers(inventory, env, tiers, exempt, keys)
+            check = check_readers(inventory, env, tiers, exempt, keys, deployer)
+            inventories.append(inventory)
             reader_reports.append(inventory.to_dict())
             reader_checks.append(asdict(check))
             reader_consequences.update(check.consequences)
+    contract = first_release_contract(env_dir, before, after, released=released)
+    # Live evidence of a release fails closed: every SELECT is compared with what is deployed.
+    live_evidence = live_release_evidence(after, inventories) if contract else []
+    if live_evidence:
+        contract = {}
+    baseline = {**before, "table_readers": contract} if contract else before
+    weak = check_weakenings(*governance_states(baseline, after), env, keys)
+    # A migration from legacy: its revocations (and, once adopted, every
+    # acknowledgement the adoption accepted, so none turns stale).
+    migrated, unacked_revocations = migration.accounted(env_dir, env)
+    if migration.baseline(env_dir) is not None:  # each lost SELECT is reported once, as its revocation
+        weak = migration.without_revoked(weak, env, migrated)
     group_consequences = group_map.required_acks(env_dir, env, after["settings"])
     rollbacks = rollback_consequences(env_dir, env, entries)
     if rollback:
@@ -940,6 +1012,7 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         "weakening": {"acknowledged": [asdict(w) for w in weak.acknowledged],
                       "unacknowledged": [asdict(w) for w in weak.unacknowledged]},
         "readers": {"tables": tables, "inventories": reader_reports, "checks": reader_checks},
+        "first_release_refused": live_evidence,
         "group_map": group_consequences, "rollback": rollbacks, "agent_deletions": deletes,
         "unmatched_acknowledgements": [e.key for e in unmatched],
     }
@@ -954,6 +1027,14 @@ def print_reports(report: Mapping) -> None:
     tables = report["readers"]["tables"]
     print(f"  Reader check: {len(tables)} newly governed table(s) inventoried"
           + (f" ({', '.join(tables[:5])}{', ...' if len(tables) > 5 else ''})" if tables else ""))
+    evidence = report.get("first_release_refused") or []
+    if evidence:
+        print("ERROR: no release receipt and no SELECT in data_access state, yet a tier group already reads a "
+              "governed table live, so this isn't treated as a first release: every table_readers SELECT is "
+              "compared with what is deployed. Recover the receipt store (GENIERAILS_STATE_DIR) and the "
+              "data_access state if prod was released; otherwise review each SELECT below and acknowledge it "
+              "in ack.txt. Live evidence: " + "; ".join(evidence[:5]) + ("; ..." if len(evidence) > 5 else ""),
+              file=sys.stderr)
     for item in report["weakening"]["unacknowledged"]:
         print(f"ERROR: unacknowledged weakening {item['ack_key']}: {item['before']} -> {item['after']}",
               file=sys.stderr)
@@ -1015,10 +1096,11 @@ def live_snapshot(env_dir: Path, *, rederive: bool, derive_script: Path | None =
     with tempfile.TemporaryDirectory(prefix="genierails-live-") as tmp:
         out = Path(tmp)
         script = derive_script or SHARED / "scripts" / "derive_assignments.py"
+        # make captures this command's stdout as the digest: the derive's progress goes to stderr (fd 2).
         result = subprocess.run(
             [sys.executable, str(script), "--auth-file", "auth.auto.tfvars", "--env-file", "env.auto.tfvars",
              "--config", "generated/abac.auto.tfvars", "--out-dir", str(out), "--write-ddl",
-             str(out / "_fetched.sql")], cwd=env_dir, check=False)
+             str(out / "_fetched.sql")], cwd=env_dir, stdout=2, check=False)
         if result.returncode:
             raise Refused("re-reading live UC for the live snapshot failed (above)")
         _rename_kept(out / "abac.auto.tfvars", ro.load_kept_names(env_dir))

@@ -1,6 +1,7 @@
 """Regression tests for Terraform CLI argument precedence in the layer runner."""
 
 import os
+import re
 import signal
 import shlex
 import subprocess
@@ -118,6 +119,11 @@ def _runner_with_stale_lock(tmp_path, init_error):
     (scripts / "state_file_permissions.py").write_text(
         (RUNNER.parent / "state_file_permissions.py").read_text()
     )
+    # And every helper it sources (terraform_env.sh: the auth scrub before init).
+    sourced = re.findall(r'^\s*\. "\$SCRIPT_DIR/([^"]+)"', RUNNER.read_text(), re.M)
+    assert "terraform_env.sh" in sourced, sourced
+    for helper in sourced:
+        (scripts / helper).write_text((RUNNER.parent / helper).read_text())
     root = tmp_path / "project" / "roots" / "workspace"
     root.mkdir(parents=True)
     (root / ".terraform.lock.hcl").write_text(

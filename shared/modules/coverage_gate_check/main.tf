@@ -20,6 +20,18 @@ variable "expected_fingerprint" {
   description = "Fingerprint the result must record: the data_access inputs now (data_access), or the ones the last data_access apply used (workspace)."
 }
 
+# Set only by scripts/terraform_layer.sh, for terraform import. Import walks
+# the whole configuration but runs no plan, so plantimestamp() is unknown there
+# and a static pass would leave status unknown, and with it the for_each of
+# every resource filtered on it (Invalid for_each argument: nothing imported).
+# Import plans and applies nothing, so it gets the known status "import",
+# which never passes.
+variable "import_walk" {
+  type        = bool
+  default     = false
+  description = "true only under terraform import: status is \"import\", without the refresh-time checks."
+}
+
 variable "max_age" {
   type        = string
   description = "Oldest live refresh the pass may rest on, as a Terraform duration, at most local.max_age_ceiling."
@@ -56,6 +68,7 @@ locals {
   fresh_until  = try(timeadd(local._result.refreshed_at, var.max_age), "")
 
   status = (
+    var.import_walk ? "import" :
     local.static_status != "pass" ? local.static_status :
     # A missing or malformed refreshed_at, or one in the future (beyond clock
     # skew), is not a live refresh.
@@ -72,12 +85,13 @@ locals {
     failed          = "the last coverage check FAILED (see its report)"
     unrefreshed     = "the passing result records no live refresh of tags and DDL from Unity Catalog"
     expired         = "the live refresh of tags and DDL behind the pass is older than coverage_gate_max_age (${var.max_age})"
+    import          = "terraform import plans nothing, so it doesn't judge the result"
     pass            = ""
   }
 }
 
 output "status" {
-  description = "missing, unreadable, invalid_max_age, stale, failed, unrefreshed, expired or pass."
+  description = "missing, unreadable, invalid_max_age, stale, failed, unrefreshed, expired, import (terraform import only) or pass."
   value       = local.status
 }
 

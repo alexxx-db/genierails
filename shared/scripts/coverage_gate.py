@@ -69,6 +69,8 @@ from pathlib import Path
 import hcl2
 
 SHARED_ROOT = Path(__file__).resolve().parent.parent
+if str(SHARED_ROOT) not in sys.path:
+    sys.path.insert(0, str(SHARED_ROOT))
 RUNNER = SHARED_ROOT / "scripts" / "terraform_layer.sh"
 VALIDATOR = SHARED_ROOT / "validate_abac.py"
 GATE_FILENAME = ".coverage_gate.json"
@@ -303,8 +305,6 @@ def staged_migration_assignments(env_dir: Path, stage: str, old_fingerprint: str
     journal whose active generation and transition are that generation, and
     a snapshot whose content still hashes to it.
     """
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from governance_policies import TAG_KEY
     from scripts import migration, policy_generations as pg
     from scripts import staged_policy_apply as spa
@@ -352,8 +352,6 @@ def staged_migration_assignments(env_dir: Path, stage: str, old_fingerprint: str
 
 
 def _is_treatment(item: dict) -> bool:
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from governance_policies import TAG_KEY
 
     return item.get("entity_type") == "columns" and item.get("tag_key") == TAG_KEY
@@ -396,8 +394,6 @@ def staged_generation_assignments(env_dir: Path, stage: str, old_fingerprint: st
     column is then uncovered in that phase, so a phase that opens access
     refuses as above.
     """
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from governance_policies import TAG_KEY
     from scripts import policy_generations as pg
     from scripts import staged_policy_apply as spa
@@ -503,8 +499,6 @@ def pending_treatments(env_dir: Path, staged: dict | None) -> list | None:
 def staged_kept_assignments(env_dir: Path, stage: str, old_fingerprint: str, keep_new_tags: bool = False,
                             rebind_fingerprint: str = "", opens_access: bool = False) -> tuple[list, list, dict]:
     """(desired, staged, kept) of a phase that keeps the active generation's values: legacy or deterministic."""
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from scripts import migration
 
     if old_fingerprint.startswith(migration.LEGACY_PREFIX):
@@ -546,8 +540,6 @@ def _live_refresh(env_dir: Path, tfvars: Path, staged: dict | None = None) -> tu
         if not staged:
             return None, ("the data_access tag_assignments don't match the last live refresh "
                           f"(promote hasn't re-split it, or it was edited); {hint}"), {}
-        if str(SHARED_ROOT) not in sys.path:
-            sys.path.insert(0, str(SHARED_ROOT))
         from scripts.migration import LEGACY_PREFIX
 
         stage, old = staged["stage"], staged["old_fingerprint"]
@@ -623,8 +615,6 @@ def _is_for_this_deployment(state: dict, layer_dir: Path) -> bool:
 
 
 def _layer_state(layer_dir: Path, layer: str | None = None) -> dict | None:
-    if str(SHARED_ROOT) not in sys.path:
-        sys.path.insert(0, str(SHARED_ROOT))
     from scripts.state_layout import state_json
     layer_dir = Path(layer_dir)
     resolved_layer = layer or ("data_access" if layer_dir.name == data_access_subdir() else "workspace")
