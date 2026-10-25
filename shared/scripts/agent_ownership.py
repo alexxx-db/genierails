@@ -495,6 +495,21 @@ def _same_path(a: object, b: Path) -> bool:
     return bool(a) and Path(str(a)).resolve() == Path(b).resolve()
 
 
+def create_id_file(attrs: dict, key: str) -> str:
+    """The ID file the create resource terraform_data.genie_space[key] names, from its state attributes.
+
+    Terraform stores terraform_data's input as {"value": {"id_file": ...}, "type": ...}; the flat
+    {"id_file": ...} is accepted too. Any other shape is refused rather than read as no ID file.
+    """
+    raw = attrs.get("input")
+    value = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
+    if not isinstance(value, dict) or not isinstance(value.get("id_file"), str):
+        raise AgentError(f"can't read the ID file from the create resource terraform_data.genie_space[{key!r}]: "
+                         f"its input in state is {json.dumps(raw)[:200]}, not "
+                         '{"value": {"id_file": "<path>"}, "type": ...}')
+    return value["id_file"]
+
+
 def _names_id_file(env_dir: Path, recorded: object, path: Path) -> bool:
     """The state's recorded ID file path is ``path``, or the in-checkout one make migrate-state-dir
     moved to ``path`` (state_layout.genie_id_moves) and the next apply re-records."""
@@ -535,13 +550,13 @@ def verify_created(env_dir: Path, name: str, key: str, expected: str | None) -> 
     created = create_instance(env_dir, key)
     if created is None:
         elsewhere = [k for k, attrs in _instances(env_dir, "managed", "terraform_data", "genie_space").items()
-                     if _names_id_file(env_dir, (attrs.get("input") or {}).get("id_file"), path)]
+                     if _names_id_file(env_dir, create_id_file(attrs, k), path)]
         if elsewhere:
             raise AgentError(f"the create resource for {name!r}'s ID file is in state under key "
                              f"{elsewhere[0]!r}, not {key!r}; its config was not pushed")
         raise AgentError(f"the saved workspace plan didn't create {name!r}: no create resource "
                          f"terraform_data.genie_space[{key!r}] in state; its config was not pushed")
-    named = (created.get("input") or {}).get("id_file")
+    named = create_id_file(created, key)
     if not _names_id_file(env_dir, named, path):
         raise AgentError(f"the create resource for {name!r} names the ID file {named}, not {path}; "
                          "its config was not pushed")
@@ -643,9 +658,9 @@ def restore_ids(env_dir: Path, env: str, api=None) -> list[str]:
             if created.get("id") != resource_id:
                 raise AgentError(f"{refusal}: the receipt names create resource {resource_id}, the state holds "
                                  f"{created.get('id')}. {manual}")
-            if not _names_id_file(env_dir, (created.get("input") or {}).get("id_file"), path):
-                raise AgentError(f"{refusal}: its create resource names the ID file "
-                                 f"{(created.get('input') or {}).get('id_file')}, not {path}. {manual}")
+            named = create_id_file(created, key)
+            if not _names_id_file(env_dir, named, path):
+                raise AgentError(f"{refusal}: its create resource names the ID file {named}, not {path}. {manual}")
             state_id = ((recorded_id(env_dir, key) or {}).get("result") or {}).get("id")
             if state_id and state_id != recorded:
                 raise AgentError(f"{refusal}: its create resource recorded {state_id} in state. {manual}")
@@ -946,9 +961,9 @@ def _check_entry(env_dir: Path, env: str, name: str, entry: dict, api, *, applie
         if (created or {}).get("id") != entry["create_resource_id"]:
             raise AgentError(f"{name!r}'s create resource is now {(created or {}).get('id')}, the manifest planned "
                              f"{entry['create_resource_id']}; {stale}")
-        if not _names_id_file(env_dir, (created.get("input") or {}).get("id_file"), id_file(env_dir, name)):
-            raise AgentError(f"{name!r}'s create resource names the ID file "
-                             f"{(created.get('input') or {}).get('id_file')}, not {id_file(env_dir, name)}")
+        named = create_id_file(created, entry["key"])
+        if not _names_id_file(env_dir, named, id_file(env_dir, name)):
+            raise AgentError(f"{name!r}'s create resource names the ID file {named}, not {id_file(env_dir, name)}")
         state_id = ((recorded_id(env_dir, entry["key"]) or {}).get("result") or {}).get("id")
         if state_id and state_id != space_id:
             raise AgentError(f"{id_file(env_dir, name).name} holds {space_id}, but {name!r}'s create resource "
