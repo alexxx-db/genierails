@@ -7213,6 +7213,16 @@ def main():
 
     args = parser.parse_args()
 
+    # The same refusal as make generate, before any write or live call: a
+    # deterministic promoted env's generated/ comes only from promote-to.
+    from scripts.release_gate import Refused, generate_guard
+    guard_dir = Path(args.auth_file).resolve().parent
+    try:
+        generate_guard(guard_dir, guard_dir.name)
+    except Refused as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     auth_file = Path(args.auth_file)
     from scripts.auth_configured import AuthStatus, auth_status
     auth_state = auth_status(auth_file)
