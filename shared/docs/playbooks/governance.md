@@ -250,6 +250,7 @@ rehearse the source env (`promote_from`, dev by default) on the merged commit,
 |---|---|
 | coverage check failed, or an unmapped class | [map the class](#map-a-new-class) |
 | reader check: a current reader isn't in a tier | add it to a tier or `raw_exempt_principals`, or [acknowledge](#acknowledge-an-exception) it |
+| reader check: cannot list the views that read governed tables | the deployer needs `SELECT` on `system.information_schema` and must be able to read every view, materialized view and metric view it can see (metastore admin, or owner/`MANAGE`/`BROWSE` on the view's catalog); a view with no recorded dependencies that names the table: `CREATE OR REPLACE VIEW` it, or drop it ([design](../design/deterministic-governance.md#6-safety-rules)) |
 | refuse-weakening | revert the change, or [acknowledge](#acknowledge-an-exception) it |
 | a mask GenieRails didn't create is on a governed table | remove it; GenieRails supports only governance it generates |
 | prod has a column classified in dev but no `class.*` tag | finish prod's classification review, wait, re-run |

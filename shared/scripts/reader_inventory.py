@@ -7,11 +7,20 @@ a failed or timed-out query, or a deployer without authority to see every
 grant on each securable (owner, MANAGE, or metastore admin) stops the run.
 Delta Sharing recipients and file paths (READ FILES on external locations or
 volumes) are not covered.
+
+Dependent views come from Unity Catalog's own dependency record: every view,
+materialized view and metric view the deployer can see
+(system.information_schema.tables), each read with the Tables API, whose
+view_dependencies lists the tables, views and functions it reads. Databricks
+has no view_table_usage view, and lineage (system.access.table_lineage, the
+lineage-tracking API) only records views that have been queried since lineage
+started, so neither is used.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -315,6 +324,8 @@ class DatabricksSource:
         self.timeout_seconds = timeout_seconds
         self._groups: dict[str, set[str]] | None = None
         self._names: dict[tuple[str, str], str] = {}
+        self._reads: dict[str, set[str] | None] | None = None
+        self._definitions: dict[str, str] = {}
 
     @staticmethod
     def _literal(value: str) -> str:
@@ -337,6 +348,8 @@ class DatabricksSource:
         state = str(getattr(result.status, "state", "")).split(".")[-1]
         if state != "SUCCEEDED":
             raise RuntimeError(f"reader inventory SQL failed ({state}): {getattr(result.status, 'error', '')}")
+        if getattr(getattr(result, "manifest", None), "truncated", False):
+            raise RuntimeError("reader inventory SQL result was truncated; the inventory would be incomplete")
         rows = list(getattr(result.result, "data_array", None) or [])
         chunks = int(getattr(getattr(result, "manifest", None), "total_chunk_count", 1) or 1)
         for index in range(1, chunks):
@@ -380,14 +393,92 @@ class DatabricksSource:
         rows = self._query(query)
         return str(rows[0][0]) if rows and rows[0][0] else None
 
-    def dependent_views(self, object_name: str) -> Iterable[str]:
-        catalog, schema, table = object_name.split(".")
-        rows = self._query(
-            "SELECT view_catalog, view_schema, view_name FROM system.information_schema.view_table_usage WHERE "
-            f"table_catalog={self._literal(catalog)} AND table_schema={self._literal(schema)} "
-            f"AND table_name={self._literal(table)}"
+    VIEW_TYPES = ("VIEW", "MATERIALIZED_VIEW", "METRIC_VIEW")
+    VIEW_SOURCE = "system.information_schema.tables + Tables API view_dependencies"
+
+    VIEW_ACCESS_FIX = (
+        "the deployer needs SELECT on system.information_schema and must be able to read every view, "
+        "materialized view and metric view it can see through the Unity Catalog Tables API "
+        "(metastore admin, or owner/MANAGE/BROWSE on the view's catalog)"
+    )
+
+    def _views_refused(self, detail: str, fix: str = VIEW_ACCESS_FIX) -> RuntimeError:
+        return RuntimeError(
+            f"cannot list the views that read governed tables ({self.VIEW_SOURCE}): {detail}; {fix}"
         )
-        return [".".join(map(str, row[:3])) for row in rows]
+
+    def _function_tables(self, name: str, seen: set[str]) -> set[str]:
+        """Tables a SQL function reads, following the functions it calls."""
+        if name in seen:
+            return set()
+        seen.add(name)
+        try:
+            info = self.client.functions.get(name)
+        except Exception as exc:
+            raise self._views_refused(f"function {name} could not be read ({exc})") from exc
+        tables: set[str] = set()
+        deps = getattr(getattr(info, "routine_dependencies", None), "dependencies", None) or []
+        for dep in deps:
+            if getattr(dep, "table", None) is not None:
+                tables.add(str(dep.table.table_full_name).lower())
+            if getattr(dep, "function", None) is not None:
+                tables |= self._function_tables(str(dep.function.function_full_name).lower(), seen)
+        return tables
+
+    def _view_reads(self) -> dict[str, set[str] | None]:
+        """view -> every table or view it reads, for all views the deployer can see (built once)."""
+        if self._reads is not None:
+            return self._reads
+        try:
+            rows = self._query(
+                "SELECT table_catalog, table_schema, table_name, table_type FROM system.information_schema.tables "
+                "WHERE table_type IN (" + ", ".join(map(self._literal, self.VIEW_TYPES)) + ") "
+                "AND table_catalog <> 'system' AND table_schema <> 'information_schema'"
+            )
+        except Exception as exc:
+            raise self._views_refused(f"listing views failed ({exc})") from exc
+        reads: dict[str, set[str] | None] = {}
+        for row in rows:
+            if len(row) < 4 or not all(row[:3]):
+                raise self._views_refused(f"unexpected row {row!r} from system.information_schema.tables")
+            view = ".".join(map(str, row[:3])).lower()
+            try:
+                info = self.client.tables.get(view)
+            except Exception as exc:
+                raise self._views_refused(f"{row[3]} {view} could not be read ({exc})") from exc
+            deps = getattr(getattr(info, "view_dependencies", None), "dependencies", None)
+            if not deps:
+                # No record (e.g. SELECT 1, or an old view): unknown, checked per table below.
+                reads[view] = None
+                self._definitions[view] = str(getattr(info, "view_definition", None) or "")
+                continue
+            targets: set[str] = set()
+            for dep in deps:
+                if getattr(dep, "table", None) is not None:
+                    targets.add(str(dep.table.table_full_name).lower())
+                if getattr(dep, "function", None) is not None:
+                    targets |= self._function_tables(str(dep.function.function_full_name).lower(), set())
+            reads[view] = targets
+        self._reads = reads
+        return reads
+
+    def dependent_views(self, object_name: str) -> Iterable[str]:
+        wanted = object_name.lower()
+        views = []
+        for view, targets in self._view_reads().items():
+            if targets is None:
+                definition = self._definitions.get(view, "").lower()
+                name = wanted.rsplit(".", 1)[-1]
+                # Whole-identifier match: `t` or c.s.t, but not the t in SELECT.
+                if not definition or re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", definition):
+                    raise self._views_refused(
+                        f"{view} has no recorded view_dependencies and its definition "
+                        + (f"mentions {name}" if definition else "is not visible") + f", so it may read {wanted}",
+                        "recreate the view (CREATE OR REPLACE VIEW) so Unity Catalog records what it reads, or drop it",
+                    )
+            elif wanted in targets:
+                views.append(view)
+        return sorted(views)
 
     def _member_name(self, member: object) -> str:
         """Resolve a SCIM member to the name Unity Catalog grants use."""

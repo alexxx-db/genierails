@@ -188,6 +188,144 @@ def test_adapter_empty_dependent_views_is_a_valid_empty_result():
     assert list(source.dependent_views("c.s.t")) == []
 
 
+def _deps(*tables, functions=()):
+    return SimpleNamespace(dependencies=[
+        *(SimpleNamespace(table=SimpleNamespace(table_full_name=t), function=None) for t in tables),
+        *(SimpleNamespace(table=None, function=SimpleNamespace(function_full_name=f)) for f in functions),
+    ])
+
+
+def _view_client(views, infos, functions=None, statements=None, chunks=None):
+    """A workspace whose information_schema has no view_table_usage, as on Databricks."""
+    statements = [] if statements is None else statements
+    rows = [list(view) for view in views]
+
+    def execute(**kwargs):
+        statement = kwargs["statement"]
+        statements.append(statement)
+        if "view_table_usage" in statement:
+            return _statement("FAILED", error="[TABLE_OR_VIEW_NOT_FOUND] view_table_usage cannot be found")
+        if chunks:
+            return _statement(rows=rows[:1], chunks=2)
+        return _statement(rows=rows)
+
+    def get(name):
+        if isinstance(infos.get(name), Exception):
+            raise infos[name]
+        return infos[name]
+
+    def get_function(name):
+        if isinstance((functions or {}).get(name), Exception):
+            raise functions[name]
+        return functions[name]
+
+    execution = SimpleNamespace(
+        execute_statement=execute,
+        get_statement_result_chunk_n=lambda *args: SimpleNamespace(data_array=rows[1:]),
+    )
+    return SimpleNamespace(
+        statement_execution=execution, tables=SimpleNamespace(get=get),
+        functions=SimpleNamespace(get=get_function),
+    )
+
+
+def test_dependent_views_come_from_uc_view_dependencies_not_view_table_usage():
+    # Fails on the old view_table_usage query, which Databricks doesn't provide.
+    statements = []
+    client = _view_client(
+        [("v", "vs", "v1", "VIEW"), ("m", "ms", "metric", "METRIC_VIEW"), ("o", "os", "other", "MATERIALIZED_VIEW")],
+        {"v.vs.v1": SimpleNamespace(view_dependencies=_deps("C.S.T")),
+         "m.ms.metric": SimpleNamespace(view_dependencies=_deps("c.s.t", "c.s.dim")),
+         "o.os.other": SimpleNamespace(view_dependencies=_deps("c.s.unrelated"))},
+        statements=statements,
+    )
+    source = ri.DatabricksSource("wh", client)
+    assert list(source.dependent_views("c.s.t")) == ["m.ms.metric", "v.vs.v1"]
+    assert list(source.dependent_views("c.s.unrelated")) == ["o.os.other"]
+    assert len(statements) == 1  # every view is read once, then reused for every table
+    statement = statements[0]
+    assert "view_table_usage" not in statement
+    assert statement.startswith(
+        "SELECT table_catalog, table_schema, table_name, table_type FROM system.information_schema.tables "
+    )
+    assert "table_type IN ('VIEW', 'MATERIALIZED_VIEW', 'METRIC_VIEW')" in statement
+    assert "table_catalog <> 'system' AND table_schema <> 'information_schema'" in statement
+
+
+def test_dependent_views_follow_views_of_views_and_functions_and_paged_listings():
+    client = _view_client(
+        [("v", "vs", "v1", "VIEW"), ("v", "vs", "v2", "VIEW"), ("v", "vs", "via_fn", "VIEW")],
+        {"v.vs.v1": SimpleNamespace(view_dependencies=_deps("c.s.t")),
+         "v.vs.v2": SimpleNamespace(view_dependencies=_deps("v.vs.v1")),
+         "v.vs.via_fn": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.outer"]))},
+        functions={
+            "f.fs.outer": SimpleNamespace(routine_dependencies=_deps(functions=["f.fs.inner", "f.fs.outer"])),
+            "f.fs.inner": SimpleNamespace(routine_dependencies=_deps("c.s.t")),
+        },
+        chunks=True,
+    )
+    source = ri.DatabricksSource("wh", client)
+    assert list(source.dependent_views("c.s.t")) == ["v.vs.v1", "v.vs.via_fn"]
+    assert list(source.dependent_views("v.vs.v1")) == ["v.vs.v2"]
+
+
+def test_truncated_result_fails_closed():
+    result = _statement(rows=[["v", "vs", "v1", "VIEW"]])
+    result.manifest.truncated = True
+    execution = SimpleNamespace(execute_statement=lambda **kwargs: result)
+    source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
+    with pytest.raises(RuntimeError, match="information_schema.tables.*truncated"):
+        list(source.dependent_views("c.s.t"))
+
+
+def test_failed_view_listing_names_the_source_and_fix():
+    execution = SimpleNamespace(execute_statement=lambda **kwargs: _statement("FAILED", error="PERMISSION_DENIED"))
+    source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
+    with pytest.raises(RuntimeError) as err:
+        list(source.dependent_views("c.s.t"))
+    message = str(err.value)
+    assert "system.information_schema.tables + Tables API view_dependencies" in message
+    assert "listing views failed" in message and "PERMISSION_DENIED" in message
+    assert "SELECT on system.information_schema" in message
+
+
+@pytest.mark.parametrize("infos, functions, match", [
+    ({"v.vs.v1": PermissionError("no access")}, None, "VIEW v.vs.v1 could not be read .no access"),
+    ({"v.vs.v1": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.fn"]))},
+     {"f.fs.fn": PermissionError("hidden")}, "function f.fs.fn could not be read .hidden"),
+])
+def test_unreadable_view_or_function_fails_closed(infos, functions, match):
+    source = ri.DatabricksSource("wh", _view_client([("v", "vs", "v1", "VIEW")], infos, functions))
+    with pytest.raises(RuntimeError, match=match):
+        list(source.dependent_views("c.s.t"))
+
+
+def test_malformed_listing_row_fails_closed():
+    execution = SimpleNamespace(execute_statement=lambda **kwargs: _statement(rows=[["v", None, "v1", "VIEW"]]))
+    source = ri.DatabricksSource("wh", SimpleNamespace(statement_execution=execution))
+    with pytest.raises(RuntimeError, match="unexpected row"):
+        list(source.dependent_views("c.s.t"))
+
+
+@pytest.mark.parametrize("definition, match", [
+    ("SELECT * FROM c.s.t", "definition mentions t, so it may read c.s.t"),
+    ("SELECT * FROM `c`.`s`.`T` AS x", "definition mentions t"),
+    (None, "definition is not visible"),
+])
+def test_view_without_recorded_dependencies_that_may_read_the_table_fails_closed(definition, match):
+    info = SimpleNamespace(view_dependencies=None, view_definition=definition)
+    source = ri.DatabricksSource("wh", _view_client([("v", "vs", "v1", "VIEW")], {"v.vs.v1": info}))
+    with pytest.raises(RuntimeError, match=match) as err:
+        list(source.dependent_views("c.s.t"))
+    assert "CREATE OR REPLACE VIEW" in str(err.value)
+
+
+def test_view_without_recorded_dependencies_that_cannot_name_the_table_is_not_dependent():
+    info = SimpleNamespace(view_dependencies=SimpleNamespace(dependencies=[]), view_definition="SELECT 1 AS one")
+    source = ri.DatabricksSource("wh", _view_client([("v", "vs", "v1", "VIEW")], {"v.vs.v1": info}))
+    assert list(source.dependent_views("c.s.t")) == []
+
+
 def test_adapter_empty_group_list_is_a_valid_empty_mapping():
     client = SimpleNamespace(groups=SimpleNamespace(list=lambda **kwargs: []))
     source = ri.DatabricksSource("wh", client)
