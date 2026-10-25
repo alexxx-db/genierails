@@ -1342,6 +1342,40 @@ def test_widening_the_contract_after_a_complete_release_is_refused(tmp_path):
         f"prod:reader:{SHAPE_TABLES[0]}:{SHAPE_TIERS[1]}", f"prod:reader:{SHAPE_TABLES[2]}:{SHAPE_TIERS[2]}"}
 
 
+def test_a_lost_receipt_and_state_cant_turn_a_released_env_into_a_first_release(tmp_path, capsys):
+    import shutil
+    from reader_inventory import Grant
+
+    env_dir = tmp_path / "envs" / "prod"
+    customers = SHAPE_TABLES[0]
+    _complete_release(env_dir, _write_shape(env_dir, {customers: [SHAPE_TIERS[0]]}), [(customers, SHAPE_TIERS[0])])
+    (env_dir / "ack.txt").write_text("".join(f"prod:reader:{t}:{SHAPE_OWNER}\n" for t in SHAPE_TABLES))
+    released = lambda: _shape_source([Grant("TABLE", customers, SHAPE_TIERS[0], "SELECT")])  # what it applied
+    _write_shape(env_dir, {customers: SHAPE_TIERS[:2]})
+    widened = f"prod:reader:{customers}:{SHAPE_TIERS[1]}"
+    report = rg.reports(env_dir, "prod", reader_source=released)
+    assert [w["ack_key"] for w in report["weakening"]["unacknowledged"]] == [widened] and not report["ok"]
+    # Only local files are lost: the receipt store and data_access state. Live SELECT still says released.
+    shutil.rmtree(rg.release_dir(rg.cloud_dir_of(env_dir), "prod"))
+    (env_dir / "data_access" / "terraform.tfstate").unlink()
+    report = rg.reports(env_dir, "prod", reader_source=released)
+    kept = f"prod:reader:{customers}:{SHAPE_TIERS[0]}"
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == {kept, widened} and not report["ok"]
+    assert report["first_release_refused"] == [f"{SHAPE_TIERS[0]} can read {customers} via SELECT on TABLE {customers}"]
+    rg.print_reports(report)
+    err = capsys.readouterr().err
+    assert "isn't treated as a first release" in err and "GENIERAILS_STATE_DIR" in err
+    # The recovery when the receipt can't be restored: review and acknowledge each SELECT.
+    with (env_dir / "ack.txt").open("a") as ack:
+        ack.write(f"{kept}\n{widened}\n")
+    assert rg.reports(env_dir, "prod", reader_source=released)["ok"]
+
+
+def test_a_real_first_release_with_no_tier_select_live_keeps_the_contract_baseline(first_prod):
+    report = rg.reports(first_prod, "prod", reader_source=_shape_source)
+    assert report["first_release_refused"] == [] and _refusals(report) == _owner_refusals()
+
+
 def test_a_released_env_that_granted_no_select_treats_new_readers_as_widening(tmp_path):
     env_dir = tmp_path / "envs" / "prod"
     _complete_release(env_dir, _write_shape(env_dir, {}), [])  # released with table_readers = {}

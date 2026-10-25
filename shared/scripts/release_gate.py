@@ -898,6 +898,10 @@ def first_release_contract(env_dir: Path, before: Mapping, after: Mapping, *, re
     for tier groups only (masked by the tier rule). A raw-exempt reader gets
     raw SELECT and still needs its acknowledgement. Every later release, and an
     env released with no table_readers, compares with what is deployed.
+
+    Receipts and state are local files, so their absence alone doesn't prove a
+    first release: reports() drops this baseline when the reader inventory shows
+    a tier group already reading live (live_release_evidence).
     """
     from scripts import migration
 
@@ -906,6 +910,19 @@ def first_release_contract(env_dir: Path, before: Mapping, after: Mapping, *, re
     tiers = set(after["settings"].get("access_tier_groups") or [])
     contract = {t: set(r) & tiers for t, r in after["table_readers"].items()}
     return {t: r for t, r in contract.items() if r}
+
+
+def live_release_evidence(after: Mapping, inventories) -> list[str]:
+    """Tier groups that already read a governed table live: a first release can't have granted that.
+
+    SELECT is a first release's last round, so before it no tier reads. A tier
+    that does means prod was released (its receipt or data_access state is
+    missing) or was granted outside GenieRails. Neither is trusted as a
+    baseline: live grants made outside GenieRails would then pass unreviewed.
+    """
+    tiers = set(after["settings"].get("access_tier_groups") or [])
+    return [f"{r.principal} can read {inv.table} via " + "; ".join(r.reasons)
+            for inv in inventories for r in inv.readers if r.principal in tiers]
 
 
 def _deployer_principal(settings: Mapping) -> str:
@@ -931,16 +948,8 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
     keys = {e.key for e in entries}
     before, after = _deployed(env_dir), _desired(env_dir)
     released = last_release(cloud_dir_of(env_dir), env) is not None
-    contract = first_release_contract(env_dir, before, after, released=released)
-    baseline = {**before, "table_readers": contract} if contract else before
-    weak = check_weakenings(*governance_states(baseline, after), env, keys)
-    # A migration from legacy: its revocations (and, once adopted, every
-    # acknowledgement the adoption accepted, so none turns stale).
-    migrated, unacked_revocations = migration.accounted(env_dir, env)
-    if migration.baseline(env_dir) is not None:  # each lost SELECT is reported once, as its revocation
-        weak = migration.without_revoked(weak, env, migrated)
     tables = newly_covered(before, after, released=released)
-    reader_reports, reader_checks, reader_consequences = [], [], {}
+    reader_reports, reader_checks, reader_consequences, inventories = [], [], {}, []
     if tables:
         if reader_source is None:
             raise Refused(f"the reader check needs a SQL warehouse to inventory {len(tables)} newly governed "
@@ -953,9 +962,22 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         for table in tables:
             inventory = inventory_readers(source, table, managed)
             check = check_readers(inventory, env, tiers, exempt, keys, deployer)
+            inventories.append(inventory)
             reader_reports.append(inventory.to_dict())
             reader_checks.append(asdict(check))
             reader_consequences.update(check.consequences)
+    contract = first_release_contract(env_dir, before, after, released=released)
+    # Live evidence of a release fails closed: every SELECT is compared with what is deployed.
+    live_evidence = live_release_evidence(after, inventories) if contract else []
+    if live_evidence:
+        contract = {}
+    baseline = {**before, "table_readers": contract} if contract else before
+    weak = check_weakenings(*governance_states(baseline, after), env, keys)
+    # A migration from legacy: its revocations (and, once adopted, every
+    # acknowledgement the adoption accepted, so none turns stale).
+    migrated, unacked_revocations = migration.accounted(env_dir, env)
+    if migration.baseline(env_dir) is not None:  # each lost SELECT is reported once, as its revocation
+        weak = migration.without_revoked(weak, env, migrated)
     group_consequences = group_map.required_acks(env_dir, env, after["settings"])
     rollbacks = rollback_consequences(env_dir, env, entries)
     if rollback:
@@ -978,6 +1000,7 @@ def reports(env_dir: Path, env: str, *, reader_source: Callable[[], object] | No
         "weakening": {"acknowledged": [asdict(w) for w in weak.acknowledged],
                       "unacknowledged": [asdict(w) for w in weak.unacknowledged]},
         "readers": {"tables": tables, "inventories": reader_reports, "checks": reader_checks},
+        "first_release_refused": live_evidence,
         "group_map": group_consequences, "rollback": rollbacks, "agent_deletions": deletes,
         "unmatched_acknowledgements": [e.key for e in unmatched],
     }
@@ -992,6 +1015,14 @@ def print_reports(report: Mapping) -> None:
     tables = report["readers"]["tables"]
     print(f"  Reader check: {len(tables)} newly governed table(s) inventoried"
           + (f" ({', '.join(tables[:5])}{', ...' if len(tables) > 5 else ''})" if tables else ""))
+    evidence = report.get("first_release_refused") or []
+    if evidence:
+        print("ERROR: no release receipt and no SELECT in data_access state, yet a tier group already reads a "
+              "governed table live, so this isn't treated as a first release: every table_readers SELECT is "
+              "compared with what is deployed. Recover the receipt store (GENIERAILS_STATE_DIR) and the "
+              "data_access state if prod was released; otherwise review each SELECT below and acknowledge it "
+              "in ack.txt. Live evidence: " + "; ".join(evidence[:5]) + ("; ..." if len(evidence) > 5 else ""),
+              file=sys.stderr)
     for item in report["weakening"]["unacknowledged"]:
         print(f"ERROR: unacknowledged weakening {item['ack_key']}: {item['before']} -> {item['after']}",
               file=sys.stderr)

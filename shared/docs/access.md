@@ -45,6 +45,12 @@ table_readers = {
   does (it gets raw `SELECT`), and so does every reader the reader check
   finds outside the tiers. Once any `SELECT` is deployed, or the env has been
   released (even with no `table_readers`), new readers are widening again.
+  Receipts and state are local files, so their absence alone doesn't make a
+  first release: if the reader check finds a tier group already reading a
+  governed table live, `release-plan` refuses the first-release baseline and
+  compares every `table_readers` `SELECT` with what is deployed. Restore the
+  receipt store (`GENIERAILS_STATE_DIR`) and the data_access state if prod was
+  released; otherwise review and acknowledge each `SELECT` it lists.
 
 ## `acl_groups` and the agent check
 
