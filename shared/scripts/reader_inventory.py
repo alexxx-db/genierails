@@ -7,6 +7,17 @@ a failed or timed-out query, or a deployer without authority to see every
 grant on each securable (owner, MANAGE, or metastore admin) stops the run.
 Delta Sharing recipients and file paths (READ FILES on external locations or
 volumes) are not covered.
+
+Dependent views come from Unity Catalog's own dependency record: every view,
+materialized view and metric view the deployer can see
+(system.information_schema.tables), each read with the Tables API, whose
+view_dependencies lists the tables, views and functions it reads. Databricks
+has no view_table_usage view, and lineage (system.access.table_lineage, the
+lineage-tracking API) only records views that have been queried since lineage
+started, so neither is used. A view with no dependency record, or that calls a
+function with none (routine_dependencies), may read any table: it is refused
+for every inventoried table unless acknowledged as
+<env>:reader:<table>:<view>.
 """
 from __future__ import annotations
 
@@ -45,6 +56,7 @@ class InventorySource(Protocol):
     def grants(self, securable_type: str, securable_name: str) -> Iterable[Grant]: ...
     def owner(self, securable_type: str, securable_name: str) -> str | None: ...
     def dependent_views(self, object_name: str) -> Iterable[str]: ...
+    def unrecorded_views(self) -> Mapping[str, str]: ...
     def group_members(self) -> Mapping[str, Iterable[str]]: ...
     def metastore_admins(self) -> Iterable[str]: ...
     def current_principal(self) -> str | None: ...
@@ -63,6 +75,8 @@ class Inventory:
     readers: tuple[PrincipalEvidence, ...]
     granters: tuple[PrincipalEvidence, ...]
     group_closure: dict[str, tuple[str, ...]]
+    # view -> why what it reads is unknown; each may read this table.
+    unrecorded_views: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -74,6 +88,7 @@ class FakeSource:
     grant_rows: list[Grant] = field(default_factory=list)
     owners: dict[tuple[str, str], str] = field(default_factory=dict)
     dependencies: dict[str, set[str]] = field(default_factory=dict)
+    unrecorded: dict[str, str] = field(default_factory=dict)
     groups: dict[str, set[str]] = field(default_factory=dict)
     admins: set[str] = field(default_factory=set)
     deployer: str | None = None
@@ -87,6 +102,9 @@ class FakeSource:
 
     def dependent_views(self, object_name: str) -> Iterable[str]:
         return self.dependencies.get(object_name.lower(), set())
+
+    def unrecorded_views(self) -> Mapping[str, str]:
+        return self.unrecorded
 
     def group_members(self) -> Mapping[str, Iterable[str]]:
         return self.groups
@@ -263,9 +281,10 @@ def inventory_readers(
         str(group): tuple(sorted(_expand(str(group), groups)))
         for group in sorted(groups)
     }
+    unrecorded = {str(view).lower(): str(reason) for view, reason in source.unrecorded_views().items()}
     return Inventory(
         normalized_table, tuple(sorted(views)), evidence(reader_reasons),
-        evidence(granter_reasons), closure,
+        evidence(granter_reasons), closure, dict(sorted(unrecorded.items())),
     )
 
 
@@ -299,6 +318,16 @@ def check_readers(
             f"{principal} can read {inventory.table} via " + "; ".join(evidence.reasons),
         )
         (acknowledged if key in acknowledgement_keys else unacknowledged).append(finding)
+    for view, reason in sorted(inventory.unrecorded_views.items()):
+        # Unknown reads are never assumed safe; only a reviewed ACK accepts the view.
+        key = f"{env}:reader:{inventory.table}:{view}"
+        finding = ReaderFinding(
+            key, view,
+            f"view {view} may read {inventory.table}: {reason}. Recreate it (CREATE OR REPLACE) so Unity "
+            f"Catalog records what it reads, drop it, or, once reviewed, acknowledge it with the line "
+            f"{key} in ack.txt",
+        )
+        (acknowledged if key in acknowledgement_keys else unacknowledged).append(finding)
     return ReaderCheck(tuple(sorted(authorized)), tuple(acknowledged), tuple(unacknowledged))
 
 
@@ -315,6 +344,9 @@ class DatabricksSource:
         self.timeout_seconds = timeout_seconds
         self._groups: dict[str, set[str]] | None = None
         self._names: dict[tuple[str, str], str] = {}
+        self._reads: dict[str, set[str]] | None = None
+        self._unrecorded: dict[str, str] = {}
+        self._functions: dict[str, tuple[set[str], set[str]] | None] = {}
 
     @staticmethod
     def _literal(value: str) -> str:
@@ -337,6 +369,8 @@ class DatabricksSource:
         state = str(getattr(result.status, "state", "")).split(".")[-1]
         if state != "SUCCEEDED":
             raise RuntimeError(f"reader inventory SQL failed ({state}): {getattr(result.status, 'error', '')}")
+        if getattr(getattr(result, "manifest", None), "truncated", False):
+            raise RuntimeError("reader inventory SQL result was truncated; the inventory would be incomplete")
         rows = list(getattr(result.result, "data_array", None) or [])
         chunks = int(getattr(getattr(result, "manifest", None), "total_chunk_count", 1) or 1)
         for index in range(1, chunks):
@@ -380,14 +414,100 @@ class DatabricksSource:
         rows = self._query(query)
         return str(rows[0][0]) if rows and rows[0][0] else None
 
-    def dependent_views(self, object_name: str) -> Iterable[str]:
-        catalog, schema, table = object_name.split(".")
-        rows = self._query(
-            "SELECT view_catalog, view_schema, view_name FROM system.information_schema.view_table_usage WHERE "
-            f"table_catalog={self._literal(catalog)} AND table_schema={self._literal(schema)} "
-            f"AND table_name={self._literal(table)}"
+    VIEW_TYPES = ("VIEW", "MATERIALIZED_VIEW", "METRIC_VIEW")
+    VIEW_SOURCE = "system.information_schema.tables + Tables API view_dependencies"
+
+    def _views_refused(self, detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"cannot list the views that read governed tables ({self.VIEW_SOURCE}): {detail}; "
+            "the deployer needs SELECT on system.information_schema and must be able to read every view, "
+            "materialized view and metric view it can see, and the functions they call, through the Unity "
+            "Catalog API (metastore admin, or owner/MANAGE/BROWSE on the view's catalog)"
         )
-        return [".".join(map(str, row[:3])) for row in rows]
+
+    def _function_record(self, name: str) -> tuple[set[str], set[str]] | None:
+        """(tables, functions) a function reads directly, or None with no record. Read once per run."""
+        if name not in self._functions:
+            try:
+                info = self.client.functions.get(name)
+            except Exception as exc:
+                raise self._views_refused(f"function {name} could not be read ({exc})") from exc
+            deps = getattr(getattr(info, "routine_dependencies", None), "dependencies", None)
+            self._functions[name] = None if not deps else (
+                {str(d.table.table_full_name).lower() for d in deps if getattr(d, "table", None) is not None},
+                {str(d.function.function_full_name).lower() for d in deps
+                 if getattr(d, "function", None) is not None},
+            )
+        return self._functions[name]
+
+    def _function_reads(self, name: str) -> tuple[set[str], str | None]:
+        """Tables a function reads, following the functions it calls, and the first
+        function found with no dependency record (then what it reads is unknown)."""
+        tables: set[str] = set()
+        seen, queue = {name}, [name]
+        while queue:
+            current = queue.pop(0)
+            record = self._function_record(current)
+            if record is None:
+                return tables, current
+            tables |= record[0]
+            for called in sorted(record[1] - seen):
+                seen.add(called)
+                queue.append(called)
+        return tables, None
+
+    def _view_reads(self) -> dict[str, set[str]]:
+        """view -> every table or view it reads, for all views the deployer can see (built once).
+
+        Views whose reads are unknown are kept in self._unrecorded instead."""
+        if self._reads is not None:
+            return self._reads
+        try:
+            rows = self._query(
+                "SELECT table_catalog, table_schema, table_name, table_type FROM system.information_schema.tables "
+                "WHERE table_type IN (" + ", ".join(map(self._literal, self.VIEW_TYPES)) + ") "
+                "AND table_catalog <> 'system' AND table_schema <> 'information_schema'"
+            )
+        except Exception as exc:
+            raise self._views_refused(f"listing views failed ({exc})") from exc
+        reads: dict[str, set[str]] = {}
+        for row in rows:
+            if len(row) < 4 or not all(row[:3]):
+                raise self._views_refused(f"unexpected row {row!r} from system.information_schema.tables")
+            view = ".".join(map(str, row[:3])).lower()
+            try:
+                info = self.client.tables.get(view)
+            except Exception as exc:
+                raise self._views_refused(f"{row[3]} {view} could not be read ({exc})") from exc
+            deps = getattr(getattr(info, "view_dependencies", None), "dependencies", None)
+            if not deps:
+                self._unrecorded[view] = f"{row[3]} {view} has no recorded view_dependencies"
+                continue
+            targets: set[str] = set()
+            unknown: str | None = None
+            for dep in deps:
+                if getattr(dep, "table", None) is not None:
+                    targets.add(str(dep.table.table_full_name).lower())
+                if getattr(dep, "function", None) is not None:
+                    more, missing = self._function_reads(str(dep.function.function_full_name).lower())
+                    targets |= more
+                    unknown = unknown or missing
+            if unknown:
+                self._unrecorded[view] = (
+                    f"{row[3]} {view} calls function {unknown}, which has no recorded routine_dependencies"
+                )
+                continue
+            reads[view] = targets
+        self._reads = reads
+        return reads
+
+    def dependent_views(self, object_name: str) -> Iterable[str]:
+        wanted = object_name.lower()
+        return sorted(view for view, targets in self._view_reads().items() if wanted in targets)
+
+    def unrecorded_views(self) -> Mapping[str, str]:
+        self._view_reads()
+        return dict(self._unrecorded)
 
     def _member_name(self, member: object) -> str:
         """Resolve a SCIM member to the name Unity Catalog grants use."""
