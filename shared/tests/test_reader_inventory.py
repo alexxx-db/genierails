@@ -128,6 +128,20 @@ def test_reader_check_refuses_uncovered_reader():
     assert any(item.principal == "external" for item in check.unacknowledged)
 
 
+def test_reader_check_accepts_only_the_exact_deployer_principal():
+    deployer = "2169eb19-40e9-44ba-9cbc-50741dcb8e91"
+    readers = [deployer, deployer.upper(), "genierails-prod-deployer", "deployers", "member"]
+    inventory = ri.inventory_readers(
+        _source(grant_rows=[ri.Grant("TABLE", "c.s.t", p, "SELECT") for p in readers],
+                groups={"deployers": {deployer, "member"}}), "c.s.t"
+    )
+    check = ri.check_readers(inventory, "prod", [], [], set(), deployer)
+    assert deployer in check.authorized
+    assert {deployer.upper(), "genierails-prod-deployer", "deployers", "member"} <= {
+        item.principal for item in check.unacknowledged}
+    assert deployer in {item.principal for item in ri.check_readers(inventory, "prod", [], [], set()).unacknowledged}
+
+
 def _statement(state="SUCCEEDED", rows=None, chunks=1, error=None):
     return SimpleNamespace(
         status=SimpleNamespace(state=state, error=error), statement_id="id",
