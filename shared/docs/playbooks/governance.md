@@ -216,6 +216,7 @@ fails closed:
 prod:weaken:prod_finance.payments.customers.email:etl-sp
 prod:unclassified:prod_finance.payments.customers.notes
 prod:reader:prod_finance.payments.customers:bi-sp
+prod:reader:prod_finance.payments.customers:prod_finance.marts.legacy_view
 prod:rollback:<commit>
 prod:delete-agent:<agent key>
 ```
@@ -249,8 +250,10 @@ rehearse the source env (`promote_from`, dev by default) on the merged commit,
 | Message | What to do |
 |---|---|
 | coverage check failed, or an unmapped class | [map the class](#map-a-new-class) |
+| reader check sees only the views the deployer can see, in catalogs bound to the workspace it runs in | run prod's `release-plan` as the metastore admin from a workspace bound to every catalog that could hold views over governed tables; a view it can't see isn't reported ([design](../design/deterministic-governance.md#6-safety-rules)) |
 | reader check: a current reader isn't in a tier | add it to a tier or `raw_exempt_principals`, or [acknowledge](#acknowledge-an-exception) it |
-| reader check: cannot list the views that read governed tables | the deployer needs `SELECT` on `system.information_schema` and must be able to read every view, materialized view and metric view it can see (metastore admin, or owner/`MANAGE`/`BROWSE` on the view's catalog); a view with no recorded dependencies that names the table: `CREATE OR REPLACE VIEW` it, or drop it ([design](../design/deterministic-governance.md#6-safety-rules)) |
+| reader check: cannot list the views that read governed tables | the deployer needs `SELECT` on `system.information_schema` and must be able to read every view, materialized view and metric view it can see, and the functions they call (metastore admin, or owner/`MANAGE`/`BROWSE` on the view's catalog) |
+| reader check: view `<view>` may read `<table>` (no recorded `view_dependencies`, or it calls a function with no recorded `routine_dependencies`) | recreate it (`CREATE OR REPLACE VIEW` / `FUNCTION`) or drop it; once reviewed, [acknowledge](#acknowledge-an-exception) it as `<env>:reader:<table>:<view>` |
 | refuse-weakening | revert the change, or [acknowledge](#acknowledge-an-exception) it |
 | a mask GenieRails didn't create is on a governed table | remove it; GenieRails supports only governance it generates |
 | prod has a column classified in dev but no `class.*` tag | finish prod's classification review, wait, re-run |

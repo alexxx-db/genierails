@@ -307,23 +307,96 @@ def test_malformed_listing_row_fails_closed():
         list(source.dependent_views("c.s.t"))
 
 
-@pytest.mark.parametrize("definition, match", [
-    ("SELECT * FROM c.s.t", "definition mentions t, so it may read c.s.t"),
-    ("SELECT * FROM `c`.`s`.`T` AS x", "definition mentions t"),
-    (None, "definition is not visible"),
+class _LiveViews(ri.DatabricksSource):
+    """Real view discovery over a fake workspace; grants and owners from FakeSource."""
+
+    def __init__(self, client, fake):
+        super().__init__("wh", client)
+        self.fake = fake
+
+    def grants(self, *scope):
+        return self.fake.grants(*scope)
+
+    def owner(self, *scope):
+        return self.fake.owner(*scope)
+
+    def group_members(self):
+        return self.fake.group_members()
+
+    def metastore_admins(self):
+        return self.fake.metastore_admins()
+
+    def current_principal(self):
+        return self.fake.current_principal()
+
+
+def _check(views, infos, functions=None, acks=frozenset()):
+    source = _LiveViews(_view_client(views, infos, functions), _source())
+    inventory = ri.inventory_readers(source, "c.s.t")
+    return inventory, ri.check_readers(inventory, "prod", ["c-owner", "c-s-owner", "c.s.t-owner", "meta-owner"],
+                                       [], set(acks))
+
+
+def test_function_without_recorded_dependencies_refuses_the_view():
+    # Codex repro: the function reads c.s.t, but Unity Catalog has no record of it.
+    infos = {"v.vs.v1": SimpleNamespace(view_dependencies=_deps(functions=["f.s.fn"]))}
+    functions = {"f.s.fn": SimpleNamespace(routine_dependencies=None, routine_definition="SELECT * FROM c.s.t")}
+    inventory, check = _check([("v", "vs", "v1", "VIEW")], infos, functions)
+    assert inventory.dependent_views == ()
+    assert not check.ok
+    [finding] = check.unacknowledged
+    assert finding.ack_key == "prod:reader:c.s.t:v.vs.v1"
+    assert "calls function f.s.fn, which has no recorded routine_dependencies" in finding.consequence
+    assert "acknowledge it with the line prod:reader:c.s.t:v.vs.v1 in ack.txt" in finding.consequence
+
+
+@pytest.mark.parametrize("info", [
+    SimpleNamespace(view_dependencies=None, view_definition="SELECT * FROM other.s.x"),
+    SimpleNamespace(view_dependencies=SimpleNamespace(dependencies=[]), view_definition="SELECT 1 AS one"),
+    SimpleNamespace(view_dependencies=None, view_definition=None),
 ])
-def test_view_without_recorded_dependencies_that_may_read_the_table_fails_closed(definition, match):
-    info = SimpleNamespace(view_dependencies=None, view_definition=definition)
-    source = ri.DatabricksSource("wh", _view_client([("v", "vs", "v1", "VIEW")], {"v.vs.v1": info}))
-    with pytest.raises(RuntimeError, match=match) as err:
-        list(source.dependent_views("c.s.t"))
-    assert "CREATE OR REPLACE VIEW" in str(err.value)
+def test_every_view_without_recorded_dependencies_is_refused_whatever_its_definition(info):
+    inventory, check = _check([("v", "vs", "v1", "METRIC_VIEW")], {"v.vs.v1": info})
+    assert inventory.unrecorded_views == {"v.vs.v1": "METRIC_VIEW v.vs.v1 has no recorded view_dependencies"}
+    assert [f.ack_key for f in check.unacknowledged] == ["prod:reader:c.s.t:v.vs.v1"]
+    assert "CREATE OR REPLACE" in check.unacknowledged[0].consequence
 
 
-def test_view_without_recorded_dependencies_that_cannot_name_the_table_is_not_dependent():
-    info = SimpleNamespace(view_dependencies=SimpleNamespace(dependencies=[]), view_definition="SELECT 1 AS one")
-    source = ri.DatabricksSource("wh", _view_client([("v", "vs", "v1", "VIEW")], {"v.vs.v1": info}))
-    assert list(source.dependent_views("c.s.t")) == []
+def test_acknowledged_unrecorded_view_passes_with_the_existing_ack_format():
+    from ack_file import parse_line
+
+    key = "prod:reader:c.s.t:v.vs.v1"
+    assert parse_line(key, expected_env="prod").key == key  # a valid reader line, no new kind
+    infos = {"v.vs.v1": SimpleNamespace(view_dependencies=None, view_definition="SELECT 1")}
+    _, check = _check([("v", "vs", "v1", "VIEW")], infos, acks={key})
+    assert check.ok
+    assert [f.ack_key for f in check.acknowledged] == [key] and key in check.consequences
+
+
+def test_unrecorded_views_are_refused_per_inventoried_table():
+    source = _source(unrecorded={"v.vs.v1": "VIEW v.vs.v1 has no recorded view_dependencies"},
+                     owners=_owners("c.s.t", "c.s.u"))
+    keys = [f.ack_key for table in ("c.s.t", "c.s.u")
+            for f in ri.check_readers(ri.inventory_readers(source, table), "prod",
+                                      ["c-owner", "c-s-owner", f"{table}-owner", "meta-owner"], [], set()).unacknowledged]
+    assert keys == ["prod:reader:c.s.t:v.vs.v1", "prod:reader:c.s.u:v.vs.v1"]
+
+
+def test_function_dependencies_are_read_once_per_run():
+    calls = []
+    functions = {"f.fs.fn": SimpleNamespace(routine_dependencies=_deps("c.s.t"))}
+    client = _view_client(
+        [("v", "vs", "v1", "VIEW"), ("v", "vs", "v2", "VIEW")],
+        {"v.vs.v1": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.fn"])),
+         "v.vs.v2": SimpleNamespace(view_dependencies=_deps(functions=["f.fs.fn"]))},
+        functions,
+    )
+    get = client.functions.get
+    client.functions.get = lambda name: (calls.append(name), get(name))[1]
+    source = ri.DatabricksSource("wh", client)
+    assert list(source.dependent_views("c.s.t")) == ["v.vs.v1", "v.vs.v2"]
+    assert source.unrecorded_views() == {}
+    assert calls == ["f.fs.fn"]
 
 
 def test_adapter_empty_group_list_is_a_valid_empty_mapping():

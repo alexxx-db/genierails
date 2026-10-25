@@ -217,19 +217,26 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 - Dependent views are found from Unity Catalog's own record of what each view
   reads: every view, materialized view and metric view the deployer can see in
   `system.information_schema.tables`, each read with the Tables API, whose
-  `view_dependencies` lists the tables, views and SQL functions it reads
-  (functions are followed to the tables they read). It is computed once per
-  run. Databricks has no `view_table_usage` view, and lineage
-  (`system.access.table_lineage`, the lineage-tracking API) only records a view
-  once it has been queried after lineage started, so neither is used. The check
-  fails, naming the source, if the listing fails or is truncated, or a view or
-  function can't be read. A view with no recorded dependencies (for example
-  one created before Unity Catalog recorded them) stops the run when its
-  definition names the governed table, or when its definition isn't visible;
-  recreate it with `CREATE OR REPLACE VIEW`. A view in a catalog the deployer
-  can't see, or in a catalog not bound to the workspace the check runs in, is
-  not found; run the check as the metastore admin from a workspace bound to
-  every catalog that may hold such views.
+  `view_dependencies` lists the tables, views and functions it reads.
+  Functions are followed through their `routine_dependencies` to the tables
+  they read. Views and functions are read once per run. Databricks has no
+  `view_table_usage` view, and lineage (`system.access.table_lineage`, the
+  lineage-tracking API) only records a view once it has been queried after
+  lineage started, so neither is used. The check fails, naming the source, if
+  the listing fails or is truncated, or a view or function can't be read.
+- A view with no recorded `view_dependencies`, or that calls a function with no
+  recorded `routine_dependencies`, may read anything, so it stops the run for
+  every inventoried table, whatever its definition says. Recreate it
+  (`CREATE OR REPLACE VIEW` / `FUNCTION`) so Unity Catalog records what it
+  reads, or drop it. If you have reviewed it and accept it, acknowledge it with
+  the existing reader line `<env>:reader:<table>:<view>` in `ack.txt`, one per
+  governed table.
+- **The view search only sees what the deployer can see from the workspace the
+  check runs in.** A view in a catalog the deployer can't see, or in a catalog
+  not bound to that workspace, is not found and is not reported. Run prod's
+  `release-plan` as a principal (the metastore admin) from a workspace that is
+  bound to, and can see, every catalog that could hold views over governed
+  tables.
 - Delta Sharing recipients and file-level paths such as `READ FILES` are not
   covered by the v1 table-reader inventory. Govern those paths separately and
   do not treat this report as proof that they are absent.
