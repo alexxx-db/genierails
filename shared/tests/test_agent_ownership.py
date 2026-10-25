@@ -1303,14 +1303,23 @@ def test_make_release_fails_without_a_receipt_when_the_agent_push_fails(tmp_path
 
 # ── Review fixes (PR #129): preflight before any mutation, ID identity, delete acks ──
 
+def _create_attributes(resource_id: str, named: str, input_shape: str = "terraform") -> dict:
+    """terraform_data.genie_space's attributes as Terraform writes them (a redacted AWS prod state): input,
+    output and triggers_replace are each {"value": ..., "type": ...}. "flat" is the bare-map input shape."""
+    wrapped = {"value": {"id_file": named}, "type": ["object", {"id_file": "string"}]}
+    return {"id": resource_id, "input": wrapped if input_shape == "terraform" else {"id_file": named},
+            "output": wrapped, "triggers_replace": {"value": {"host": "https://dbc-00000000-0000.cloud.databricks.com"},
+                                                    "type": ["object", {"host": "string"}]}}
+
+
 def _created(env_dir: Path, key: str, space_id: str, *, record: str | None = "same", id_file: Path | None = None,
-             resource_id: str | None = None) -> None:
+             resource_id: str | None = None, input_shape: str = "terraform") -> None:
     """What a create resource leaves: terraform_data.genie_space[key] and the agent ID it recorded in state
     (data.external.genie_space_id[key]) in the workspace state, and the ID file. Merged into any state."""
     path = _ws_state(env_dir)
     state = json.loads(path.read_text()) if path.is_file() else {"version": 4, "serial": 1, "resources": []}
     named = str(id_file or _rec(env_dir, f".genie_space_id_{key}"))
-    entries = {("managed", "terraform_data"): {"id": resource_id or f"tfdata-{key}", "input": {"id_file": named}}}
+    entries = {("managed", "terraform_data"): _create_attributes(resource_id or f"tfdata-{key}", named, input_shape)}
     if record is not None:
         entries[("data", "external")] = {"query": {"id_file": named},
                                          "result": {"id": space_id if record == "same" else record, "id_file": named}}
@@ -1410,6 +1419,66 @@ def test_a_planned_new_agent_is_pushed_only_if_the_saved_create_made_it(tmp_path
     with pytest.raises(ownership.AgentError, match="adopted an existing agent"):
         ownership.sync_manifest(prod, "prod", manifest, api)
     assert "PATCH" not in api.methods()
+
+
+def test_a_first_create_is_verified_from_the_create_input_terraform_actually_stores(tmp_path, monkeypatch,
+                                                                                 release_lock):
+    """AWS prod-2 release round 5: Terraform keeps terraform_data's input as {"value": {"id_file": ...},
+    "type": ...}. Read flat, the ID file was None and every first create failed 'its config was not pushed'."""
+    prod, api, manifest = _new_agent_manifest(tmp_path, monkeypatch)
+    ownership.preflight(prod, "prod", manifest, api)
+    named = str(_rec(prod, ".genie_space_id_sales"))
+    _ws_state(prod).write_text(json.dumps({"version": 4, "serial": 7, "resources": [
+        {"module": "module.workspace", "mode": "data", "type": "external", "name": "genie_space_id",
+         "instances": [{"index_key": "sales", "attributes": {
+             "query": {"id_file": named}, "result": {"id": "01f1-created", "id_file": named}}}]},
+        {"module": "module.workspace", "mode": "managed", "type": "terraform_data", "name": "genie_space",
+         "instances": [{"index_key": "sales", "attributes": {
+             "id": "c449bee6-0000-0000-0000-000000000000",
+             "input": {"value": {"id_file": named}, "type": ["object", {"id_file": "string"}]},
+             "output": {"value": {"id_file": named}, "type": ["object", {"id_file": "string"}]},
+             "triggers_replace": {"value": {"host": "https://dbc-00000000-0000.cloud.databricks.com"},
+                                  "type": ["object", {"host": "string"}]}}}]},
+    ]}))
+    _rec(prod, ".genie_space_id_sales").write_text("01f1-created\n")
+    api.spaces["01f1-created"] = {}
+    assert ownership.verify_created(prod, "Sales", "sales", None) == "01f1-created"
+    ownership.sync_manifest(prod, "prod", manifest, api)
+    assert api.spaces["01f1-created"] == _payload()
+
+
+def test_a_flat_create_input_is_still_read(tmp_path, monkeypatch, release_lock):
+    prod, api, manifest = _new_agent_manifest(tmp_path, monkeypatch)
+    ownership.preflight(prod, "prod", manifest, api)
+    _created(prod, "sales", "created-1", input_shape="flat")
+    api.spaces["created-1"] = {}
+    assert ownership.verify_created(prod, "Sales", "sales", None) == "created-1"
+    _created(prod, "sales", "created-1", input_shape="flat", id_file=tmp_path / "attacker" / ".genie_space_id_sales")
+    with pytest.raises(ownership.AgentError, match="names the ID file .*attacker"):
+        ownership.verify_created(prod, "Sales", "sales", None)
+
+
+@pytest.mark.parametrize("raw", [None, "x", [], {}, {"value": None, "type": "dynamic"}, {"value": "x"},
+                                 {"value": {"id_file": 7}}, {"value": {}}, {"id_file": None}])
+def test_a_create_input_of_any_other_shape_is_refused_not_read_as_no_id_file(tmp_path, monkeypatch, release_lock,
+                                                                            raw):
+    prod, api, manifest = _new_agent_manifest(tmp_path, monkeypatch)
+    ownership.preflight(prod, "prod", manifest, api)
+    _created(prod, "sales", "created-1")
+    state = json.loads(_ws_state(prod).read_text())
+    state["resources"][0]["instances"][0]["attributes"]["input"] = raw
+    _ws_state(prod).write_text(json.dumps(state))
+    api.spaces["created-1"] = {}
+    with pytest.raises(ownership.AgentError, match=r"can't read the ID file from the create resource "
+                                                    r"terraform_data.genie_space\['sales'\]"):
+        ownership.sync_manifest(prod, "prod", manifest, api)
+    assert "PATCH" not in api.methods()
+
+
+def test_ownership_reads_no_create_input_but_through_create_id_file():
+    """Every read of terraform_data.genie_space's input goes through the one shape-aware helper."""
+    source = (Path(ownership.__file__)).read_text()
+    assert source.count('.get("input")') == 1 and 'attrs.get("input")' in source
 
 
 def test_a_planned_new_agent_refuses_a_live_agent_with_its_title(tmp_path, monkeypatch, release_lock):
