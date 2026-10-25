@@ -1053,10 +1053,11 @@ def live_snapshot(env_dir: Path, *, rederive: bool, derive_script: Path | None =
     with tempfile.TemporaryDirectory(prefix="genierails-live-") as tmp:
         out = Path(tmp)
         script = derive_script or SHARED / "scripts" / "derive_assignments.py"
+        # make captures this command's stdout as the digest: the derive's progress goes to stderr (fd 2).
         result = subprocess.run(
             [sys.executable, str(script), "--auth-file", "auth.auto.tfvars", "--env-file", "env.auto.tfvars",
              "--config", "generated/abac.auto.tfvars", "--out-dir", str(out), "--write-ddl",
-             str(out / "_fetched.sql")], cwd=env_dir, check=False)
+             str(out / "_fetched.sql")], cwd=env_dir, stdout=2, check=False)
         if result.returncode:
             raise Refused("re-reading live UC for the live snapshot failed (above)")
         _rename_kept(out / "abac.auto.tfvars", ro.load_kept_names(env_dir))
