@@ -240,11 +240,12 @@ _bootstrap:
 # _prepare-env side effect, even under make -j. setup/destroy/clean keep _bootstrap
 # (setup runs only the scheduled-governance guard before it, the same way).
 # With generate among the goals, generate-guard runs here too, so a
-# deterministic promoted env is refused before anything is written.
+# deterministic promoted env, or any env but $(DEFAULT_ENV) with no
+# env.auto.tfvars yet (make setup writes it), is refused before anything is written.
 _guarded-bootstrap:
 	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
-	@$(if $(filter generate,$(MAKECMDGOALS)),$(_RELEASE_GATE) generate-guard --env-dir "$(ENV_DIR)" --env "$(ENV)",:)
+	@$(if $(filter generate,$(MAKECMDGOALS)),$(_RELEASE_GATE) generate-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --default-env "$(DEFAULT_ENV)",:)
 	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 
 _guard-workspace-target:

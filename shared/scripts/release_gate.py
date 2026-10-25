@@ -2027,16 +2027,29 @@ def _generate_refused(env_dir: Path) -> bool:
     return deterministic(env_dir) and env_role(env_dir) == PROMOTED
 
 
-def generate_guard(env_dir: Path, env: str) -> None:
+def generate_guard(env_dir: Path, env: str, default_env: str | None = None) -> None:
     """make generate (and generate_abac.py run directly) refuses a deterministic promoted
     env: its generated/ comes only from promote-to, and release-plan refuses a regenerated
     one as a stale promotion. Legacy promoted envs have no release-plan and still generate
     (e.g. genie-only prod). A regular env file that can't be read is refused; one that
-    doesn't parse, or isn't a regular file, is left to generate's own checks. The advice starts where the promotion chain
-    does, the first env up promote_from whose generate isn't refused; a cycle, a missing
-    source env or an unusable promote_from refuses as a malformed chain, with no advice."""
+    doesn't parse, or isn't a regular file, is left to generate's own checks. The advice
+    starts where the promotion chain does, the first env up promote_from whose generate
+    isn't refused; a cycle, a missing source env or an unusable promote_from refuses as a
+    malformed chain, with no advice.
+
+    ``default_env`` (make passes DEFAULT_ENV) is for the call before _bootstrap: with no
+    env file, bootstrap would write one seeded as promoted from default_env, so any env
+    but default_env (and the account/data_access dirs _guard-workspace-target refuses)
+    is refused before that write, naming make setup. default_env itself bootstraps as
+    before. generate_abac.py run directly passes none: with no env file it writes
+    nothing here and runs as before."""
     env_dir = Path(env_dir)
     path = env_dir / "env.auto.tfvars"
+    if default_env and not path.exists() and env not in (default_env, ACCOUNT_ENV, data_access_subdir()):
+        raise Refused(f"make generate ENV={env} refused: envs/{env}/env.auto.tfvars doesn't exist, so its role "
+                      f"can't be read. Run make setup ENV={env} first (it writes that file, seeded as an env "
+                      f"promoted from {default_env}). A deterministic promoted env never runs generate: its "
+                      f"generated/ comes only from make promote-to ENV={env}.")
     try:
         if path.is_file():
             path.read_bytes()
@@ -2213,7 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
     command("env-role")
-    command("generate-guard")
+    command("generate-guard").add_argument("--default-env", default="")
     command("identity-check")
     command("legacy-guard").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
@@ -2337,7 +2350,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "env-role":
             print(env_role(args.env_dir))
         elif args.command == "generate-guard":
-            generate_guard(args.env_dir, args.env)
+            generate_guard(args.env_dir, args.env, args.default_env or None)
         elif args.command == "identity-check":
             identity_check(args.env_dir, args.env)
         elif args.command == "maintain-check":

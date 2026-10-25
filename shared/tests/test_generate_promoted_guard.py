@@ -8,9 +8,12 @@ that doesn't parse keeps generate's own handling; one that can't be read is
 refused.
 
 The refusal runs in _guarded-bootstrap, before _prepare-env, so a
-never-bootstrapped env gets no scaffolding; generate_abac.py run directly
-refuses the same way. The advice starts at the root of the promotion chain,
-and a cycle or a missing source refuses as a malformed chain.
+never-bootstrapped env gets no scaffolding, and any env but dev with no
+env.auto.tfvars at all is refused there too (make setup writes it); dev's first
+run bootstraps as on main. generate_abac.py run directly refuses the same way,
+before its package check can pip install anything. The advice starts at the
+root of the promotion chain, and a cycle or a missing source refuses as a
+malformed chain.
 """
 
 import os
@@ -23,7 +26,7 @@ import pytest
 from scripts import release_gate
 from tests.test_check_target import _snapshot
 from tests.test_deterministic_check_promote import (  # noqa: F401  (repo, promoted are fixtures)
-    DEPLOYER, _envs, _make, _prod_env, promoted, repo,
+    DEPLOYER, ROOT, SHARED, _envs, _make, _prod_env, promoted, repo,
 )
 
 pytestmark = pytest.mark.gnu_make
@@ -92,6 +95,62 @@ def test_generate_refuses_a_never_bootstrapped_promoted_prod_and_writes_nothing(
 
     _assert_refused(_make(repo, tmp_path, "generate", "ENV=prod"), "prod", "dev", repo, before)
     assert sorted(p.name for p in prod.iterdir()) == ["env.auto.tfvars"]
+
+
+@pytest.fixture
+def bare(tmp_path):
+    """A checkout before any make setup: aws/Makefile and shared/, no envs/ at all."""
+    repo = tmp_path / "bare"
+    (repo / "aws").mkdir(parents=True)
+    (repo / "aws" / "Makefile").write_bytes((ROOT / "aws" / "Makefile").read_bytes())
+    (repo / "shared").symlink_to(SHARED)
+    (tmp_path / "bin").mkdir()
+    return repo
+
+
+@pytest.mark.parametrize("jobs", [[], ["-j4"]], ids=["serial", "make-j"])
+@pytest.mark.parametrize("env", ["stg", "prod"])
+def test_generate_with_no_env_file_refuses_before_bootstrap_writes_anything(bare, tmp_path, env, jobs):
+    """No envs/<env>/env.auto.tfvars: bootstrap would write one seeded as promoted from dev
+    (plus auth templates, dirs, symlinks and the account env), so it is refused first."""
+    before = _snapshot(bare)  # before the first call
+
+    result = _make(bare, tmp_path, *jobs, "generate", f"ENV={env}")
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert (f"ERROR: make generate ENV={env} refused: envs/{env}/env.auto.tfvars doesn't exist, so its role "
+            f"can't be read. Run make setup ENV={env} first") in result.stderr, out
+    assert f"its generated/ comes only from make promote-to ENV={env}" in result.stderr, out
+    assert "=== Generate ABAC Config" not in out and "Traceback" not in out, out
+    assert _snapshot(bare) == before
+    assert not (bare / "aws" / "envs").exists()
+
+
+def test_generate_with_no_dev_env_file_bootstraps_as_on_main(bare, tmp_path):
+    """dev's first run is unchanged: it bootstraps dev and account, then stops at the empty auth
+    file. The tree is exactly what main 57a86ca writes for the same run."""
+    result = _make(bare, tmp_path, "generate", "ENV=dev")
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert out.startswith("=== Generate ABAC Config (dev) ===\n"), out
+    assert "ERROR: fill in envs/dev/auth.auto.tfvars (workspace host, client ID, and client secret) " \
+           "before running make generate" in result.stderr, out
+    assert "refused" not in out, out
+    written = sorted(str(p.relative_to(bare)) for p in (bare / "aws" / "envs").rglob("*"))
+    assert written == [
+        "aws/envs/account", "aws/envs/account/auth.auto.tfvars", "aws/envs/account/env.auto.tfvars",
+        "aws/envs/dev", "aws/envs/dev/auth.auto.tfvars", "aws/envs/dev/data_access",
+        "aws/envs/dev/data_access/auth.auto.tfvars", "aws/envs/dev/data_access/env.auto.tfvars",
+        "aws/envs/dev/ddl", "aws/envs/dev/env.auto.tfvars", "aws/envs/dev/generated",
+    ]
+
+
+def test_generate_with_no_account_env_file_is_left_to_the_workspace_target_guard(bare, tmp_path):
+    result = _make(bare, tmp_path, "generate", "ENV=account")
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "refused" not in out, out
+    assert "This command is workspace-driven. Use ENV=<workspace> instead of ENV=account." in out, out
 
 
 def test_generate_names_a_promote_from_other_than_dev(promoted, tmp_path):
@@ -202,33 +261,79 @@ def _full_auth(env_dir):
         f'databricks_client_id = "{DEPLOYER}"\ndatabricks_client_secret = "test-only-secret"\n')
 
 
-def _run_generator_directly(repo, tmp_path, env):
-    sdk = tmp_path / "fake_sdk"
-    for rel, text in FAKE_SDK.items():
-        (sdk / rel).parent.mkdir(parents=True, exist_ok=True)
-        (sdk / rel).write_text(text)
-    log = tmp_path / "sdk.log"
+# python -m pip resolves to this stub (first on PYTHONPATH): it logs the call and installs nothing.
+FAKE_PIP = {
+    "pip/__init__.py": "",
+    "pip/__main__.py": ("import os, sys\n"
+                        "with open(os.environ['FAKE_PIP_LOG'], 'a') as handle:\n"
+                        "    handle.write(' '.join(sys.argv[1:]) + '\\n')\n"
+                        "sys.exit('fake pip: no install in this test')\n"),
+}
+
+
+def _run_generator_directly(repo, tmp_path, env, *, sdk_has_useragent=True):
+    """Returns (result, SDK objects built, pip calls). Without useragent in the fake SDK,
+    generate_abac's import-time package check wants to pip upgrade databricks-sdk."""
+    sdk, pip = tmp_path / "fake_sdk", tmp_path / "fake_pip"
+    for root, files in ((sdk, FAKE_SDK), (pip, FAKE_PIP)):
+        for rel, text in files.items():
+            if rel.endswith("useragent.py") and not sdk_has_useragent:
+                continue
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+    log, pip_log = tmp_path / "sdk.log", tmp_path / "pip.log"
     environ = {k: v for k, v in os.environ.items() if not k.startswith("DATABRICKS_")}
-    environ.update(PYTHONPATH=os.pathsep.join([str(sdk), environ.get("PYTHONPATH", "")]),
-                   FAKE_SDK_LOG=str(log), PIP_NO_INDEX="1", PIP_REQUIRE_VIRTUALENV="1",
-                   PYTHONDONTWRITEBYTECODE="1")
+    environ.update(PYTHONPATH=os.pathsep.join([str(pip), str(sdk), environ.get("PYTHONPATH", "")]),
+                   FAKE_SDK_LOG=str(log), FAKE_PIP_LOG=str(pip_log), PIP_NO_INDEX="1",
+                   PIP_REQUIRE_VIRTUALENV="1", PYTHONDONTWRITEBYTECODE="1")
     # The repro: cd aws/envs/<env>; python ../../../shared/generate_abac.py
     result = subprocess.run([sys.executable, "../../../shared/generate_abac.py"], cwd=_envs(repo) / env,
                             text=True, capture_output=True, env=environ, timeout=300)
-    return result, (log.read_text().split() if log.exists() else [])
+    return (result, log.read_text().split() if log.exists() else [],
+            pip_log.read_text().splitlines() if pip_log.exists() else [])
 
 
 def test_generate_abac_run_directly_refuses_a_promoted_prod_and_builds_no_client(promoted, tmp_path):
     _full_auth(_envs(promoted) / "prod")
     before = _snapshot(promoted)
 
-    result, live = _run_generator_directly(promoted, tmp_path, "prod")
+    result, live, pip_calls = _run_generator_directly(promoted, tmp_path, "prod")
     out = result.stdout + result.stderr
     assert result.returncode == 1, out
     assert _refusal("prod", "dev") in result.stderr, out
     assert "ABAC Configuration Generator" not in out, out
+    assert live == [] and pip_calls == [], out
+    assert _snapshot(promoted) == before
+
+
+def test_generate_abac_run_directly_refuses_before_its_package_check_can_pip_install(promoted, tmp_path):
+    """The SDK here lacks databricks.sdk.useragent, so the import-time package check would
+    pip upgrade databricks-sdk; the refusal comes first and pip is never run."""
+    _full_auth(_envs(promoted) / "prod")
+    before = _snapshot(promoted)
+
+    result, live, pip_calls = _run_generator_directly(promoted, tmp_path, "prod", sdk_has_useragent=False)
+    out = result.stdout + result.stderr
+    assert result.returncode == 1, out
+    assert _refusal("prod", "dev") in result.stderr, out
+    assert pip_calls == [], pip_calls
+    assert "Upgrading databricks-sdk" not in out and "Installing missing packages" not in out, out
     assert live == [], out
     assert _snapshot(promoted) == before
+
+
+def test_generate_abac_run_directly_still_runs_the_package_check_in_a_legacy_promoted_prod(promoted, tmp_path):
+    """The control for the test above: the same run in a legacy prod reaches the (stubbed) installer."""
+    prod = _envs(promoted) / "prod"
+    _full_auth(prod)
+    env_file = prod / "env.auto.tfvars"
+    env_file.write_text(env_file.read_text().replace('governance_mode = "deterministic"', 'governance_mode = "legacy"'))
+
+    result, _live, pip_calls = _run_generator_directly(promoted, tmp_path, "prod", sdk_has_useragent=False)
+    out = result.stdout + result.stderr
+    assert "make generate ENV=prod refused" not in out, out
+    assert "Upgrading databricks-sdk (need databricks.sdk.useragent)" in out, out
+    assert pip_calls == ["install --quiet --upgrade databricks-sdk"], (pip_calls, out)
 
 
 def test_generate_abac_run_directly_still_reaches_the_sdk_in_a_legacy_promoted_prod(promoted, tmp_path):
@@ -238,10 +343,10 @@ def test_generate_abac_run_directly_still_reaches_the_sdk_in_a_legacy_promoted_p
     env_file = prod / "env.auto.tfvars"
     env_file.write_text(env_file.read_text().replace('governance_mode = "deterministic"', 'governance_mode = "legacy"'))
 
-    result, live = _run_generator_directly(promoted, tmp_path, "prod")
+    result, live, pip_calls = _run_generator_directly(promoted, tmp_path, "prod")
     out = result.stdout + result.stderr
     assert "make generate ENV=prod refused" not in out, out
-    assert live, out
+    assert live and pip_calls == [], out
 
 
 # ── promotion chains (generate-guard on its own) ───────────────────────────
@@ -346,6 +451,22 @@ def test_an_unreadable_env_file_refuses_fail_closed(tmp_path, capsys):
         env_file.chmod(0o644)
     assert rc == 1, err
     assert "make generate ENV=prod refused: can't read" in err, err
+
+
+@pytest.mark.parametrize("name, default_env, refused", [
+    ("stg", "dev", True), ("prod", "dev", True), ("dev", "dev", False), ("main", "main", False),
+    ("account", "dev", False), ("data_access", "dev", False), ("prod", None, False), ("stg", None, False),
+], ids=["stg", "prod", "dev", "custom-default", "account", "data-access", "direct-prod", "direct-stg"])
+def test_generate_guard_with_no_env_file(tmp_path, capsys, name, default_env, refused):
+    """Only make's call (before _bootstrap, with DEFAULT_ENV) refuses a missing file; a direct
+    generate_abac.py run writes nothing at this point and keeps its own handling."""
+    envs = tmp_path / "envs"
+    argv = ["generate-guard", "--env-dir", str(envs / name), "--env", name]
+    rc = release_gate.main(argv + (["--default-env", default_env] if default_env else []))
+    err = capsys.readouterr().err
+    assert rc == (1 if refused else 0), err
+    assert (f"Run make setup ENV={name} first" in err) is refused, err
+    assert not envs.exists()
 
 
 @pytest.mark.parametrize("name, text, refused", [
