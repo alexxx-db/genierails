@@ -260,7 +260,8 @@ def _prod_policies():
     ) for policy in rendered]
 
 
-def _prod_client(monkeypatch, *, policies=None, list_error=None, masks=(), filters=()):
+def _prod_client(monkeypatch, *, policies=None, list_error=None, masks=(), filters=(), table_tags=(),
+                 table_tags_error=None):
     calls = []
 
     class Response:
@@ -281,6 +282,10 @@ def _prod_client(monkeypatch, *, policies=None, list_error=None, masks=(), filte
                 return Response([list(row) for row in masks])
             if "information_schema.row_filters" in statement:
                 return Response([list(row) for row in filters])
+            if "information_schema.table_tags" in statement:
+                if table_tags_error:
+                    raise table_tags_error
+                return Response([list(row) for row in table_tags])
             return Response([])
 
     class Policies:
@@ -320,6 +325,7 @@ def test_abac_policies_protect_ssn_and_cvv_without_information_schema_masks(monk
     assert calls == [("TABLE", table, True) for table in PROD_TABLES]
     assert state["masks"] == [] and state["policies"] == []
     assert state["abac_policy_listing"] == {"status": "complete", "tables": 2, "policies": 15}
+    assert state["abac_policies_not_evaluated"] == []
 
     ssn = _evidence(report, "prod_retail.crm.customers.ssn")
     assert ssn["applied_mask"] is None
@@ -395,32 +401,139 @@ def test_policy_listing_error_writes_no_evidence(monkeypatch, tmp_path, capsys):
         collect_live_state([], PROD_TABLES, "warehouse-1", _auth_file(tmp_path))
 
 
+def _mask(name, *, condition=f"hasTagValue('gr_treatment', '{SSN}')", on_column="masked_col",
+          matches=None, when=None, on=PROD_CATALOG):
+    from databricks.sdk.service.catalog import ColumnMaskOptions, MatchColumn, PolicyInfo, PolicyType, SecurableType
+
+    return PolicyInfo(
+        name=name, to_principals=["account users"], policy_type=PolicyType.POLICY_TYPE_COLUMN_MASK,
+        for_securable_type=SecurableType.TABLE, on_securable_fullname=on, when_condition=when,
+        column_mask=ColumnMaskOptions(function_name="prod_retail.crm.ext_mask", on_column=on_column),
+        match_columns=matches if matches is not None else [MatchColumn(alias=on_column, condition=condition)])
+
+
+def _not_attached(report, name):
+    return all(name not in item["applied_policies"]
+               and name not in {p["name"] for p in item["applied_abac_policies"]} for item in report["evidence"])
+
+
+def test_unevaluated_when_condition_is_not_shown_as_protection(monkeypatch, tmp_path):
+    """Codex repro 1: an inherited mask gated on a table tag nothing shows the table has."""
+    _prod_client(monkeypatch, policies=_prod_policies() + [
+        _mask("regional_ssn", when="hasTagValue('region', 'us')")])
+    state, report = _prod_report(tmp_path)
+    assert _not_attached(report, "regional_ssn")
+    # No table carries region=us, so the policy doesn't apply: it is neither
+    # protection nor an unevaluated mapping.
+    assert state["abac_policies_not_evaluated"] == []
+    assert len(_evidence(report, "prod_retail.crm.customers.ssn")["applied_abac_policies"]) == 2
+
+
+def test_unparseable_when_condition_is_listed_not_evaluated(monkeypatch, tmp_path):
+    _prod_client(monkeypatch, policies=_prod_policies() + [
+        _mask("regional_ssn", when="NOT hasTagValue('region', 'eu')")])
+    state, report = _prod_report(tmp_path)
+    assert _not_attached(report, "regional_ssn")
+    assert state["abac_policy_listing"]["status"] == "incomplete"
+    assert [(item["table"], item["policy"]) for item in state["abac_policies_not_evaluated"]] == [
+        ("prod_retail.crm.customers", "regional_ssn"), ("prod_retail.payments.cards", "regional_ssn")]
+    assert "when_condition" in state["abac_policies_not_evaluated"][0]["reason"]
+
+
+def test_when_condition_matching_table_tags_attaches_and_non_matching_does_not(monkeypatch, tmp_path):
+    _prod_client(monkeypatch, policies=_prod_policies() + [
+        _mask("us_ssn", when="hasTagValue('region', 'us') OR hasTag('us_only')"),
+        _mask("eu_ssn", when="hasTagValue('region', 'eu')")],
+        table_tags=[["prod_retail", "crm", "customers", "region", "us"]])
+    state, report = _prod_report(tmp_path)
+    ssn = _evidence(report, "prod_retail.crm.customers.ssn")
+    assert "us_ssn" in ssn["applied_policies"]
+    us = next(p for p in ssn["applied_abac_policies"] if p["name"] == "us_ssn")
+    assert us["when_condition"] == "hasTagValue('region', 'us') OR hasTag('us_only')"
+    assert _not_attached(report, "eu_ssn")
+    assert state["abac_policies_not_evaluated"] == []
+    assert state["abac_policy_listing"]["status"] == "complete"
+
+
+def test_mask_without_a_match_alias_for_on_column_is_not_mapped(monkeypatch, tmp_path):
+    """Codex repro 2: no match column's alias is the mask's on_column."""
+    from databricks.sdk.service.catalog import MatchColumn
+
+    _prod_client(monkeypatch, policies=_prod_policies() + [
+        _mask("misbound", on_column="target", matches=[
+            MatchColumn(alias="other", condition=f"hasTagValue('gr_treatment', '{SSN}')")])])
+    state, report = _prod_report(tmp_path)
+    assert _not_attached(report, "misbound")
+    assert state["abac_policy_listing"]["status"] == "incomplete"
+    reasons = {item["reason"] for item in state["abac_policies_not_evaluated"] if item["policy"] == "misbound"}
+    assert reasons and all("on_column" in reason for reason in reasons)
+
+
 @pytest.mark.parametrize("condition", [
     "NOT hasTagValue('gr_treatment', 'x')",
     "hasTagValue('gr_treatment', 'x') AND hasTag('pii')",
     "",
 ])
-def test_unevaluable_mask_condition_fails_closed(monkeypatch, tmp_path, condition):
-    from databricks.sdk.service.catalog import ColumnMaskOptions, MatchColumn, PolicyInfo, PolicyType, SecurableType
-
-    policy = PolicyInfo(
-        name="external_mask", to_principals=["account users"], policy_type=PolicyType.POLICY_TYPE_COLUMN_MASK,
-        for_securable_type=SecurableType.TABLE, on_securable_fullname=PROD_CATALOG,
-        column_mask=ColumnMaskOptions(function_name="prod_retail.crm.f", on_column="c"),
-        match_columns=[MatchColumn(alias="c", condition=condition)])
-    _prod_client(monkeypatch, policies=_prod_policies() + [policy])
-    with pytest.raises(evidence_report.EvidenceUnavailable, match="external_mask"):
-        collect_live_state([], PROD_TABLES, "warehouse-1", _auth_file(tmp_path))
+def test_unevaluable_match_condition_is_listed_not_evaluated(monkeypatch, tmp_path, condition):
+    _prod_client(monkeypatch, policies=_prod_policies() + [_mask("external_mask", condition=condition)])
+    state, report = _prod_report(tmp_path)
+    assert _not_attached(report, "external_mask")
+    assert {item["policy"] for item in state["abac_policies_not_evaluated"]} == {"external_mask"}
+    assert state["abac_policy_listing"]["status"] == "incomplete"
+    # The governed columns keep their own, fully evaluated protection.
+    assert len(_evidence(report, "prod_retail.payments.cards.cvv")["applied_abac_policies"]) == 1
 
 
-def test_unknown_policy_type_fails_closed(monkeypatch, tmp_path):
+def test_unknown_policy_type_is_listed_not_evaluated_and_flagged_in_markdown(monkeypatch, tmp_path):
     from databricks.sdk.service.catalog import PolicyInfo, PolicyType, SecurableType
 
     policy = PolicyInfo(name="deny_all", to_principals=["account users"], policy_type=PolicyType.POLICY_TYPE_DENY,
                         for_securable_type=SecurableType.TABLE, on_securable_fullname=PROD_CATALOG)
-    _prod_client(monkeypatch, policies=[policy])
-    with pytest.raises(evidence_report.EvidenceUnavailable, match="deny_all"):
+    _prod_client(monkeypatch, policies=_prod_policies() + [policy])
+    env_dir = tmp_path / "prod"
+    env_dir.mkdir()
+    _auth_file(env_dir)
+    (env_dir / "env.auto.tfvars").write_text(f"uc_tables = {json.dumps(PROD_TABLES)}\n")
+    monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
+    assert main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"]) == 0
+    out = env_dir / "generated/evidence"
+    artifact = json.loads((out / "compliance-evidence-v1.0.json").read_text())
+    assert artifact["abac_policy_listing"] == {"status": "incomplete", "tables": 2, "policies": 16}
+    assert {item["policy"] for item in artifact["abac_policies_not_evaluated"]} == {"deny_all"}
+    assert _not_attached(artifact, "deny_all")
+    markdown = (out / "compliance-evidence-v1.0.md").read_text()
+    assert "- ABAC policies: `incomplete`" in markdown
+    assert "WARNING: 2 effective ABAC policy mapping(s) could not be evaluated" in markdown
+    assert "NOT shown as protection" in markdown
+    assert "| prod_retail.crm.customers | deny_all | prod_retail |" in markdown
+
+
+def test_table_tags_read_failure_writes_no_evidence(monkeypatch, tmp_path, capsys):
+    _prod_client(monkeypatch, table_tags_error=RuntimeError("TABLE_OR_VIEW_NOT_FOUND table_tags"))
+    with pytest.raises(evidence_report.EvidenceUnavailable, match="table tags"):
         collect_live_state([], PROD_TABLES, "warehouse-1", _auth_file(tmp_path))
+    env_dir = tmp_path / "prod"
+    env_dir.mkdir()
+    _auth_file(env_dir)
+    (env_dir / "env.auto.tfvars").write_text(f"uc_tables = {json.dumps(PROD_TABLES)}\n")
+    monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
+    assert main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"]) == 2
+    assert "could not read the table tags" in capsys.readouterr().err
+    assert not (env_dir / "generated/evidence").exists()
+
+
+def test_listing_error_message_is_sanitized_and_capped(monkeypatch, tmp_path):
+    # Built at runtime: a fake token, but shaped like a real one.
+    token = "dapi" + "0123456789abcdef" * 2
+    error = RuntimeError(f"403 Forbidden. Request headers: Authorization: Bearer {token} "
+                         f"Cookie: session=abc; {'x' * 500}")
+    _prod_client(monkeypatch, list_error=error)
+    with pytest.raises(evidence_report.EvidenceUnavailable) as caught:
+        collect_live_state([], PROD_TABLES, "warehouse-1", _auth_file(tmp_path))
+    message = str(caught.value)
+    assert "RuntimeError: 403 Forbidden." in message
+    assert token not in message and "session=abc" not in message and "x" * 250 not in message
+    assert len(message) < 400
 
 
 def test_legacy_information_schema_masks_unchanged_and_shown_beside_abac(monkeypatch, tmp_path):

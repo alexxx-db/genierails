@@ -8,10 +8,13 @@ Catalog state through a Databricks SQL warehouse.
 Live mode reads two kinds of mask: table-attached masks and row filters from
 information_schema (legacy envs), and the ABAC policies the policies API lists
 as effective on each governed table (catalog, schema and table level), which is
-how deterministic governance masks columns. A column carries every ABAC column
-mask whose match condition its tags satisfy, with the policy's TO and EXCEPT
-principals. A policy listing that fails, or a policy this report can't evaluate,
-stops the run (exit 2) rather than writing a report that claims no protection.
+how deterministic governance masks columns. A column carries an ABAC policy
+only when the mapping is fully evaluated: the table's tags satisfy its
+when_condition and, for a column mask, the column's tags satisfy the match
+condition bound to its on_column. A policy it can't evaluate exactly is listed
+under abac_policies_not_evaluated (listing status "incomplete"), never shown as
+protection. A listing that fails (policies or table tags) stops the run
+(exit 2) rather than writing a report that claims no protection.
 """
 
 from __future__ import annotations
@@ -39,8 +42,22 @@ _TAG_REF = re.compile(r"hasTagValue\(\s*'[^']+'\s*,\s*'[^']+'\s*\)|hasTag\(\s*'[
 _ONLY_OR = re.compile(r"(?i)[\s()]*(?:\bOR\b[\s()]*)*")
 
 
+_SECRETISH = re.compile(
+    r"(?i)(authorization|bearer|token|secret|password|cookie|api[_-]?key)(\S*\s*[:=]?\s*)\S+"
+    r"|\b(?:dapi|dose|dkea)[0-9a-f-]+\b|\b[A-Za-z0-9+/_\-]{32,}={0,2}")
+
+
 class EvidenceUnavailable(RuntimeError):
     """Live protection state couldn't be read completely, so no report is written."""
+
+
+def _safe_error(exc: BaseException, limit: int = 200) -> str:
+    """The exception type and a redacted, length-capped message (never headers or tokens verbatim)."""
+    message = " ".join(str(exc).split())
+    message = _SECRETISH.sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]" if m.group(1) else "[redacted]", message)
+    if len(message) > limit:
+        message = message[:limit] + "…"
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
 def _utc(value: datetime | None = None) -> str:
@@ -150,6 +167,16 @@ def render_markdown(report: dict[str, Any]) -> str:
     if "abac_policy_listing" in report:
         listing = report["abac_policy_listing"]
         lines.append(f"- ABAC policies: `{listing['status']}` ({listing['policies']} effective on {listing['tables']} tables)")
+    not_evaluated = report.get("abac_policies_not_evaluated") or []
+    if not_evaluated:
+        lines.extend([
+            f"- **WARNING: {len(not_evaluated)} effective ABAC policy mapping(s) could not be evaluated. "
+            "They are listed below and are NOT shown as protection on any column.**",
+            "", "| Table | Policy | On | Reason |", "|---|---|---|---|",
+        ])
+        for item in not_evaluated:
+            values = [item["table"], item["policy"], item["on_securable"], item["reason"]]
+            lines.append("| " + " | ".join(str(value).replace("|", "\\|") for value in values) + " |")
     lines.extend([
         "", "| Table | Column | Scan status | Scanned at | Tags | Applied mask / policies | Grants |",
         "|---|---|---|---|---|---|---|",
@@ -229,65 +256,82 @@ def _sql_identifier(value: str) -> str:
     return "`" + value.replace("`", "``") + "`"
 
 
-def _target_conditions(policy: Any) -> list[str]:
-    """The match conditions of the column a policy masks (agent_coverage's choice)."""
-    from scripts.staged_policy_verify import _get
+def _evaluate(condition: str, tags: set[tuple[str, str]]) -> bool | None:
+    """Whether ``tags`` satisfy an exact OR of hasTagValue/hasTag checks; None if it's anything else."""
+    from scripts.audit_schema_drift import _parse_condition_tag_refs
 
-    mask = _get(policy, "column_mask")
-    on_column = _get(mask, "on_column") if mask else None
-    matches = list(_get(policy, "match_columns") or [])
-    chosen = [m for m in matches if on_column and _get(m, "alias") == on_column] or matches
-    return [str(_get(m, "condition") or "") for m in chosen]
+    if not condition.strip() or _ONLY_OR.fullmatch(_TAG_REF.sub(" ", condition)) is None:
+        return None
+    value_refs, key_refs = _parse_condition_tag_refs(condition)
+    return bool(tags & value_refs or {key for key, _ in tags} & key_refs)
 
 
 def abac_policy_rows(table: str, policies: Iterable[Any], columns: list[dict[str, Any]],
-                     column_tags: dict[str, set[tuple[str, str]]]) -> list[dict[str, Any]]:
-    """One row per (column, effective ABAC policy that applies to it) on ``table``.
+                     column_tags: dict[str, set[tuple[str, str]]],
+                     table_tags: set[tuple[str, str]] = frozenset()) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """(rows, not_evaluated) for the effective ABAC policies on ``table``.
 
-    A column mask applies to a column whose tags satisfy one of its match
-    conditions (hasTagValue/hasTag, parsed as audit-rulebook and agent coverage
-    do); a row filter applies to every column of the table. Anything this can't
-    evaluate exactly raises EvidenceUnavailable instead of being dropped.
+    rows: one per (column, policy) whose mapping is fully evaluated and
+    matches: the table's tags satisfy the policy's when_condition (none means
+    always), and for a column mask the column's tags satisfy the condition of
+    the match column whose alias is the mask's on_column; a row filter covers
+    every column. Conditions are exact ORs of hasTagValue/hasTag checks, parsed
+    as audit-rulebook and agent coverage do. Any policy this can't evaluate
+    exactly is never attached to a column; it is returned in not_evaluated
+    with the reason.
     """
-    from scripts.audit_schema_drift import _parse_condition_tag_refs
     from scripts.staged_policy_verify import _get, normalize_policy
 
-    rows = []
+    rows, not_evaluated = [], []
     for policy in policies:
         live = normalize_policy(policy)
         kind = live["policy_type"].upper()
+        on = live["on"] or table
+
+        def skip(reason: str) -> None:
+            not_evaluated.append({"table": table, "policy": live["name"] or "(unnamed)",
+                                  "on_securable": on, "reason": reason})
+
         if not live["name"] or kind not in COLUMN_MASK_TYPES | ROW_FILTER_TYPES:
-            raise EvidenceUnavailable(
-                f"{table}: effective policy {live['name'] or '(unnamed)'} has policy type "
-                f"{live['policy_type'] or '(none)'}, which this report can't evaluate")
+            skip(f"policy type {live['policy_type'] or '(none)'} is not a column mask or row filter")
+            continue
+        matches = list(_get(policy, "match_columns") or [])
+        when = str(_get(policy, "when_condition") or "")
         record = {
             "name": live["name"], "policy_type": "COLUMN_MASK" if kind in COLUMN_MASK_TYPES else "ROW_FILTER",
-            "on_securable": live["on"] or table, "function": live["function"],
-            "match_conditions": [str(_get(m, "condition") or "") for m in _get(policy, "match_columns") or []],
-            "when_condition": str(_get(policy, "when_condition") or ""),
-            "to_principals": live["to"], "except_principals": live["except"],
+            "on_securable": on, "function": live["function"],
+            "match_conditions": [str(_get(m, "condition") or "") for m in matches],
+            "when_condition": when, "to_principals": live["to"], "except_principals": live["except"],
         }
+        applies = _evaluate(when, table_tags) if when.strip() else True
+        if applies is None:
+            skip("when_condition is not an exact OR of hasTagValue/hasTag checks")
+            continue
+        if not applies:
+            continue
         if kind in ROW_FILTER_TYPES:
             rows.extend({**column, **record} for column in columns)
             continue
-        conditions = _target_conditions(policy)
-        if not live["function"] or not conditions or any(
-                not condition.strip() or _ONLY_OR.fullmatch(_TAG_REF.sub(" ", condition)) is None
-                for condition in conditions):
-            raise EvidenceUnavailable(
-                f"{table}: column-mask policy {live['name']} has a function or match condition "
-                "this report can't evaluate exactly")
-        value_refs: set[tuple[str, str]] = set()
-        key_refs: set[str] = set()
-        for condition in conditions:
-            values, keys = _parse_condition_tag_refs(condition)
-            value_refs |= values
-            key_refs |= keys
+        mask = _get(policy, "column_mask")
+        on_column = _get(mask, "on_column") if mask else None
+        if not live["function"] or not on_column:
+            skip("column mask has no function or no on_column")
+            continue
+        bound = [m for m in matches if _get(m, "alias") == on_column]
+        if len(bound) != 1:
+            skip(f"{len(bound)} match columns have alias {on_column!r} (the mask's on_column); expected exactly 1")
+            continue
+        if len(matches) != 1:
+            skip("the mask binds more match columns than its on_column, which this report can't evaluate")
+            continue
+        condition = str(_get(bound[0], "condition") or "")
+        if _evaluate(condition, set()) is None:
+            skip("match condition is not an exact OR of hasTagValue/hasTag checks")
+            continue
         for column in columns:
-            tags = column_tags.get(_fqn(column), set())
-            if tags & value_refs or {key for key, _ in tags} & key_refs:
+            if _evaluate(condition, column_tags.get(_fqn(column), set())):
                 rows.append({**column, **record})
-    return rows
+    return rows, not_evaluated
 
 
 def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehouse_id: str,
@@ -375,6 +419,8 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
     for row in policy_rows:
         for column in by_table[".".join(str(value) for value in row[:3])]:
             result["policies"].append({**column, "name": row[3]})
+    from scripts.staged_policy_verify import normalize_policy
+
     # Deterministic governance masks through catalog-level ABAC policies, which
     # neither information_schema view above lists. Read the effective set per
     # table (include_inherited: catalog, schema and table level) through the
@@ -382,20 +428,34 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
     column_tags: dict[str, set[tuple[str, str]]] = defaultdict(set)
     for row in tag_rows:
         column_tags[_fqn(base(row))].add((str(row[4]), str(row[5])))
-    from scripts.staged_policy_verify import normalize_policy
-
+    # A policy's when_condition is evaluated against its table's tags.
+    try:
+        table_tag_rows = query("SELECT catalog_name, schema_name, table_name, tag_name, tag_value FROM system.information_schema.table_tags WHERE concat(catalog_name, '.', schema_name, '.', table_name) IN (" + table_key_sql + ")")
+    except Exception as exc:
+        raise EvidenceUnavailable(
+            f"could not read the table tags ABAC when_conditions are evaluated against ({_safe_error(exc)}); "
+            "the report would wrongly show policies as applied or not") from exc
+    table_tags: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    for row in table_tag_rows:
+        table_tags[".".join(str(value) for value in row[:3])].add((str(row[3]), str(row[4])))
     result["abac_policies"] = []
+    result["abac_policies_not_evaluated"] = []
     listed: set[tuple[str, str]] = set()
     for table, table_columns in sorted(by_table.items()):
         try:
             policies = list(client.policies.list_policies("TABLE", table, include_inherited=True))
         except Exception as exc:
             raise EvidenceUnavailable(
-                f"could not list the ABAC policies effective on {table} ({type(exc).__name__}: {exc}); "
+                f"could not list the ABAC policies effective on {table} ({_safe_error(exc)}); "
                 "the report would wrongly show its columns unprotected") from exc
-        result["abac_policies"].extend(abac_policy_rows(table, policies, table_columns, column_tags))
+        rows, not_evaluated = abac_policy_rows(table, policies, table_columns, column_tags, table_tags[table])
+        result["abac_policies"].extend(rows)
+        result["abac_policies_not_evaluated"].extend(not_evaluated)
         listed.update((live["on"] or table, live["name"]) for live in map(normalize_policy, policies))
-    result["abac_policy_listing"] = {"status": "complete", "tables": len(by_table), "policies": len(listed)}
+    result["abac_policy_listing"] = {
+        "status": "incomplete" if result["abac_policies_not_evaluated"] else "complete",
+        "tables": len(by_table), "policies": len(listed),
+    }
     try:
         class_rows = query("SELECT catalog_name, schema_name, table_name, column_name, class_tag, latest_detected_time FROM system.data_classification.results WHERE concat(catalog_name, '.', schema_name, '.', table_name, '.', column_name) IN (" + keys + ")")
         classification_available = True
@@ -447,6 +507,7 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
         report["column_privileges_availability"] = state.get("column_privileges_availability", {})
         if "abac_policy_listing" in state:
             report["abac_policy_listing"] = state["abac_policy_listing"]
+            report["abac_policies_not_evaluated"] = state.get("abac_policies_not_evaluated", [])
     else:
         report = assemble_report(columns, tags=tags, approved_by=args.approved_by, approved_at=args.approved_at)
     paths = write_report(report, args.output_dir or args.env_dir / "generated" / "evidence")
