@@ -788,6 +788,89 @@ def test_manifest_drift_live_snapshot(repo, manifest):
         rg.manifest_check(repo.prod, "prod", manifest, live="live-2")
 
 
+# A derive that prints progress to stdout, as derive_assignments.py does.
+_CHATTY_DERIVE = '''
+import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+out, ddl = Path(args[args.index("--out-dir") + 1]), Path(args[args.index("--write-ddl") + 1])
+print("Loaded environment from env.auto.tfvars")
+print("[SENSITIVITY] prodcat.s.t.ssn -> pii")
+print("Derived 9 gr_treatment assignment(s)", flush=True)
+if os.environ.get("FAKE_DERIVE_FAIL"):
+    sys.exit(3)
+(out / "abac.auto.tfvars").write_text("fgac_policies = []\\n")
+(out / "masking_functions.sql").write_text("-- masks\\n")
+ddl.write_text(os.environ.get("FAKE_LIVE_DDL", "CREATE TABLE prodcat.s.t (ssn STRING);\\n"))
+'''
+
+# The real release_gate.py CLI, with only the derive script and the live policy lister swapped.
+_LIVE_SNAPSHOT_CLI = '''
+import functools, sys
+sys.path[:0] = [sys.argv[1], sys.argv[1] + "/scripts"]
+from scripts import release_gate as rg
+rg.live_policies = lambda env_dir, catalogs: {}
+rg.live_snapshot = functools.partial(rg.live_snapshot, derive_script=sys.argv[2])
+sys.exit(rg.main(sys.argv[3:]))
+'''
+
+
+def _live_snapshot_cli(env_dir: Path, tmp_path: Path, *, rederive: bool = True, **env) -> subprocess.CompletedProcess:
+    derive = tmp_path / "chatty_derive.py"
+    derive.write_text(_CHATTY_DERIVE)
+    return subprocess.run(
+        [sys.executable, "-c", _LIVE_SNAPSHOT_CLI, str(SHARED), str(derive),
+         "live-snapshot", "--env-dir", str(env_dir), "--env", "prod", *(["--rederive"] if rederive else [])],
+        text=True, capture_output=True, env={**os.environ, **env}, check=False)
+
+
+def _expected_digest(tmp_path: Path, ddl: str = "CREATE TABLE prodcat.s.t (ssn STRING);\n") -> str:
+    want = tmp_path / "want"
+    want.mkdir(exist_ok=True)
+    (want / "abac.auto.tfvars").write_text("fgac_policies = []\n")
+    (want / "masking_functions.sql").write_text("-- masks\n")
+    (want / "_fetched.sql").write_text(ddl)
+    return rg.snapshot_digest(want / "abac.auto.tfvars", want / "masking_functions.sql", want / "_fetched.sql", {})
+
+
+def test_rederived_live_snapshot_stdout_is_exactly_the_digest(repo, tmp_path):
+    # make release captures live="$(release_gate.py live-snapshot --rederive)": the derive's
+    # progress must not land in it, or it never equals the manifest's digest.
+    result = _live_snapshot_cli(repo.prod, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == _expected_digest(tmp_path) + "\n"
+    assert "Derived 9 gr_treatment" in result.stderr  # diagnostics are kept, on stderr
+
+
+def test_rederived_live_snapshot_fails_closed_when_the_derive_fails(repo, tmp_path):
+    result = _live_snapshot_cli(repo.prod, tmp_path, FAKE_DERIVE_FAIL="1")
+    assert result.returncode == 1 and result.stdout == ""
+    assert "re-reading live UC for the live snapshot failed" in result.stderr
+    assert "Loaded environment from" in result.stderr
+
+
+def test_release_rederive_matches_the_release_plan_snapshot_and_a_live_change_refuses(repo, manifest, tmp_path):
+    # release-plan digests what the last derive wrote; release re-derives into a scratch dir.
+    ro.effective(repo.prod, "abac.auto.tfvars").write_text("fgac_policies = []\n")
+    ro.effective(repo.prod, "masking_functions.sql").write_text("-- masks\n")
+    (repo.prod / "ddl").mkdir(exist_ok=True)
+    (repo.prod / "ddl" / "_fetched.sql").write_text("CREATE TABLE prodcat.s.t (ssn STRING);\n")
+    planned = _live_snapshot_cli(repo.prod, tmp_path, rederive=False)
+    assert planned.returncode == 0 and planned.stdout == _expected_digest(tmp_path) + "\n"
+    live = planned.stdout.removesuffix("\n")  # what $(...) keeps
+    time.sleep(1.1)  # manifest ids are per second
+    current = rg.manifest_write(repo.prod, "prod", _plan_dir(repo), rg.provenance(repo.prod, "prod"), live,
+                                {"ok": True})
+    unchanged = _live_snapshot_cli(repo.prod, tmp_path)
+    assert unchanged.returncode == 0, unchanged.stderr
+    rg.manifest_check(repo.prod, "prod", current, live=unchanged.stdout.removesuffix("\n"))
+    changed = _live_snapshot_cli(repo.prod, tmp_path, FAKE_LIVE_DDL="CREATE TABLE prodcat.s.t (ssn INT);\n")
+    assert changed.returncode == 0 and changed.stdout == _expected_digest(
+        tmp_path, "CREATE TABLE prodcat.s.t (ssn INT);\n") + "\n"
+    with pytest.raises(rg.Refused, match="live Unity Catalog changed"):
+        rg.manifest_check(repo.prod, "prod", current, live=changed.stdout.removesuffix("\n"))
+
+
 def test_manifest_drift_effective_config(repo, manifest):
     (ro.overlay_dir(repo.prod) / "abac.auto.tfvars").write_text(EMPTY_ABAC + "# re-derived since\n")
     with pytest.raises(rg.Refused, match="effective config"):
