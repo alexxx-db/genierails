@@ -1241,7 +1241,7 @@ def _write_shape(env_dir: Path, readers=None, *, exempt=()) -> dict:
     return pg.desired_generation(env_dir)
 
 
-def _shape_source(extra_grants=(), groups=None):
+def _shape_source(extra_grants=(), groups=None, *, listed_tiers=SHAPE_TIERS):
     from reader_inventory import FakeSource, Grant
 
     schema = f"{SHAPE_CATALOG}.{SHAPE_SCHEMA}"
@@ -1251,7 +1251,8 @@ def _shape_source(extra_grants=(), groups=None):
     grants += [Grant("TABLE", t, SHAPE_DEPLOYER, "SELECT") for t in SHAPE_TABLES]
     owners = {("CATALOG", SHAPE_CATALOG): SHAPE_OWNER, ("SCHEMA", schema): SHAPE_OWNER}
     owners.update({("TABLE", t): SHAPE_OWNER for t in SHAPE_TABLES})
-    return FakeSource(grant_rows=grants + list(extra_grants), owners=owners, groups=groups or {},
+    groups = {**{t: set() for t in listed_tiers}, **(groups or {})}  # the workspace lists the tier groups
+    return FakeSource(grant_rows=grants + list(extra_grants), owners=owners, groups=groups,
                       admins={SHAPE_OWNER}, deployer=SHAPE_DEPLOYER)
 
 
@@ -1369,6 +1370,49 @@ def test_a_lost_receipt_and_state_cant_turn_a_released_env_into_a_first_release(
     with (env_dir / "ack.txt").open("a") as ack:
         ack.write(f"{kept}\n{widened}\n")
     assert rg.reports(env_dir, "prod", reader_source=released)["ok"]
+
+
+def _lost_receipt_widening(env_dir: Path, ack_lines=()) -> dict:
+    """No receipt or state; customers widened to tiers 0 and 1; the owner (and ack_lines) acknowledged."""
+    _write_shape(env_dir, {SHAPE_TABLES[0]: SHAPE_TIERS[:2]})
+    (env_dir / "ack.txt").write_text("".join(f"{k}\n" for k in [f"prod:reader:{t}:{SHAPE_OWNER}" for t in SHAPE_TABLES]
+                                             + list(ack_lines)))
+    return {f"prod:reader:{SHAPE_TABLES[0]}:{t}" for t in SHAPE_TIERS[:2]}
+
+
+def test_a_nested_tier_member_reading_live_is_evidence_of_a_release(tmp_path):
+    from reader_inventory import Grant
+
+    env_dir = tmp_path / "envs" / "prod"
+    tier_selects = _lost_receipt_widening(env_dir)
+    nested = "payments_child"  # check_readers accepts it as covered by tier0
+    source = _shape_source([Grant("TABLE", SHAPE_TABLES[0], nested, "SELECT")],
+                           groups={SHAPE_TIERS[0]: {nested}, nested: {"payer@example.com"}})
+    report = rg.reports(env_dir, "prod", reader_source=lambda: source)
+    assert any(e.startswith(f"{nested} can read") for e in report["first_release_refused"])
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == tier_selects and not report["ok"]
+
+
+def test_a_case_variant_of_a_tier_reading_live_is_evidence_of_a_release(tmp_path):
+    from reader_inventory import Grant
+
+    env_dir = tmp_path / "envs" / "prod"
+    variant = SHAPE_TIERS[0].upper()
+    # Acknowledging the mixed-case reader line doesn't acknowledge the table_readers SELECT.
+    tier_selects = _lost_receipt_widening(env_dir, [f"prod:reader:{SHAPE_TABLES[0]}:{variant}"])
+    source = _shape_source([Grant("TABLE", SHAPE_TABLES[0], variant, "SELECT")])
+    report = rg.reports(env_dir, "prod", reader_source=lambda: source)
+    assert any(e.startswith(f"{variant} can read") for e in report["first_release_refused"])
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == tier_selects and not report["ok"]
+
+
+def test_a_tier_whose_members_cant_be_listed_drops_the_first_release_baseline(tmp_path):
+    env_dir = tmp_path / "envs" / "prod"
+    tier_selects = _lost_receipt_widening(env_dir)
+    source = _shape_source(listed_tiers=SHAPE_TIERS[1:])
+    report = rg.reports(env_dir, "prod", reader_source=lambda: source)
+    assert report["first_release_refused"] == [f"{SHAPE_TIERS[0]}'s members couldn't be listed (not in the workspace groups)"]
+    assert {w["ack_key"] for w in report["weakening"]["unacknowledged"]} == tier_selects and not report["ok"]
 
 
 def test_a_real_first_release_with_no_tier_select_live_keeps_the_contract_baseline(first_prod):

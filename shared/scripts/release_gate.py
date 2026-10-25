@@ -913,16 +913,28 @@ def first_release_contract(env_dir: Path, before: Mapping, after: Mapping, *, re
 
 
 def live_release_evidence(after: Mapping, inventories) -> list[str]:
-    """Tier groups that already read a governed table live: a first release can't have granted that.
+    """Tier members that already read a governed table live: a first release can't have granted that.
 
     SELECT is a first release's last round, so before it no tier reads. A tier
-    that does means prod was released (its receipt or data_access state is
-    missing) or was granted outside GenieRails. Neither is trusted as a
-    baseline: live grants made outside GenieRails would then pass unreviewed.
+    (or anyone check_readers counts as covered by one: a nested member, a
+    case variant) that does means prod was released (its receipt or
+    data_access state is missing) or was granted outside GenieRails. Neither is
+    trusted as a baseline: live grants made outside GenieRails would then pass
+    unreviewed. A tier whose membership the inventory couldn't list is evidence
+    too, since its nested readers can't be told apart.
     """
-    tiers = set(after["settings"].get("access_tier_groups") or [])
-    return [f"{r.principal} can read {inv.table} via " + "; ".join(r.reasons)
-            for inv in inventories for r in inv.readers if r.principal in tiers]
+    from reader_inventory import group_members_of
+
+    tiers = sorted(set(after["settings"].get("access_tier_groups") or []))
+    evidence = []
+    for inv in inventories:
+        members = group_members_of(inv.group_closure, tiers, any_case=True)
+        evidence += [f"{r.principal} can read {inv.table} via " + "; ".join(r.reasons)
+                     for r in inv.readers if r.principal.casefold() in members]
+    listed = {str(g).casefold() for inv in inventories for g in inv.group_closure}
+    evidence += [f"{t}'s members couldn't be listed (not in the workspace groups)"
+                 for t in tiers if inventories and t.casefold() not in listed]
+    return evidence
 
 
 def _deployer_principal(settings: Mapping) -> str:

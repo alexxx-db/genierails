@@ -288,6 +288,28 @@ def inventory_readers(
     )
 
 
+def group_members_of(group_closure: Mapping[str, Iterable[str]], groups: Iterable[str], *,
+                     any_case: bool = False) -> set[str]:
+    """The groups and every transitively nested member: who check_readers counts as covered by them.
+
+    any_case matches names that differ only in case (Unity Catalog principal
+    names are case-insensitive) and returns casefolded names. Authorization
+    stays exact; any_case is for evidence, where matching more fails closed.
+    """
+    groups = set(map(str, groups))
+    if not any_case:
+        members = set(groups)
+        for group in groups:
+            members.update(group_closure.get(group, ()))
+        return members
+    wanted = {g.casefold() for g in groups}
+    members = set(wanted)
+    for group, closure in group_closure.items():
+        if str(group).casefold() in wanted:
+            members.update(str(m).casefold() for m in closure)
+    return members
+
+
 def check_readers(
     inventory: Inventory,
     env: str,
@@ -302,14 +324,8 @@ def check_readers(
     exact principal (never a display name, or a group it belongs to) is the
     env's own deployer and is accepted.
     """
-    tiers = set(map(str, tiers))
-    exemptions = set(map(str, raw_exempt_principals))
-    tier_members = set(tiers)
-    for tier in tiers:
-        tier_members.update(inventory.group_closure.get(tier, ()))
-    exempt_members = set(exemptions)
-    for exempt in exemptions:
-        exempt_members.update(inventory.group_closure.get(exempt, ()))
+    tier_members = group_members_of(inventory.group_closure, tiers)
+    exempt_members = group_members_of(inventory.group_closure, raw_exempt_principals)
     authorized: list[str] = []
     acknowledged: list[ReaderFinding] = []
     unacknowledged: list[ReaderFinding] = []
