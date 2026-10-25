@@ -295,6 +295,90 @@ def test_promote_refuses_override_absent_from_generated_classification(repo, tmp
     assert (prod / "env.auto.tfvars").read_bytes() == before
 
 
+def _write_prod(repo, text):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(text)
+    return prod
+
+
+def _direct_promote_args():
+    return ("promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=paycat=ppay")
+
+
+@pytest.mark.parametrize("ci", ["", "true"])
+def test_direct_promote_refuses_deterministic_destination_without_writing(repo, tmp_path, ci):
+    _write_prod(repo, PROD_ENV)
+    before = _state(repo)
+
+    result = _make(repo, tmp_path, *_direct_promote_args(), **({"CI": ci} if ci else {}))
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused for deterministic destinations" in out
+    assert "make promote-to ENV=prod" in out
+    assert "Cross-env promote" not in out
+    assert _state(repo) == before
+
+
+@pytest.mark.parametrize("how", ["env", "makeflags", "cmdline"])
+def test_direct_promote_marker_cannot_be_forged_from_user_inputs(repo, tmp_path, how):
+    _write_prod(repo, PROD_ENV)
+    before = _state(repo)
+    token = tmp_path / "fake-token"
+    # Match the real token's shape. Merely naming a file through any Make input
+    # is insufficient without a live issuing wrapper in the process ancestry.
+    token.write_text(json.dumps({
+        "env_dir": str((_envs(repo) / "prod").resolve()),
+        "issuer": 2 ** 31 - 1,
+    }) + "\n")
+    token.chmod(0o600)
+    args = list(_direct_promote_args())
+    env = {}
+    if how == "env":
+        env["GENIERAILS_PROMOTE_TO_TOKEN"] = str(token)
+    elif how == "makeflags":
+        env["MAKEFLAGS"] = f"GENIERAILS_PROMOTE_TO_TOKEN={token}"
+    else:
+        args.append(f"GENIERAILS_PROMOTE_TO_TOKEN={token}")
+
+    result = _make(repo, tmp_path, *args, **env)
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "make promote-to ENV=prod" in out
+    assert token.exists(), how
+    assert _state(repo) == before
+
+
+@pytest.mark.parametrize("contents", [None, 'governance_mode = "future"\n'])
+def test_direct_promote_fails_closed_when_destination_mode_is_not_readable(repo, tmp_path, contents):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    if contents is not None:
+        (prod / "env.auto.tfvars").write_text(contents)
+    before = _state(repo)
+
+    result = _make(repo, tmp_path, *_direct_promote_args())
+
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "refusing make promote" in out
+    assert "make promote-to ENV=prod" in out
+    assert "Cross-env promote" not in out
+    assert _state(repo) == before
+
+
+def test_direct_promote_to_legacy_destination_keeps_the_existing_path(repo, tmp_path):
+    _write_prod(repo, PROD_ENV.replace('"deterministic"', '"legacy"'))
+
+    result = _make(repo, tmp_path, *_direct_promote_args())
+
+    out = result.stdout + result.stderr
+    assert "=== Cross-env promote: dev -> prod ===" in out
+    assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused" not in out
+
+
 def test_live_derivation_refuses_override_for_column_absent_from_prod():
     settings = hcl2.loads(DEV_ENV +
         'column_overrides = { "paycat.s.t.missing" = { treatment = "redact" } }\n')
@@ -783,6 +867,30 @@ def test_the_exposure_token_works_once_and_only_for_its_env(tmp_path, monkeypatc
     good = mint(env)
     link.symlink_to(good)
     assert not consume(env, str(link)) and good.exists()  # never through a link
+    assert not consume(env, None) and not consume(env, "")
+    good.unlink()
+
+
+def test_the_promote_to_token_works_once_and_only_for_its_env(tmp_path):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from promote_token import consume, mint
+
+    env, other = tmp_path / "prod", tmp_path / "dev"
+    env.mkdir()
+    other.mkdir()
+    token = mint(env)
+    assert oct(token.stat().st_mode & 0o777) == "0o600"
+    assert not consume(other, str(token)) and token.exists()
+    assert consume(env, str(token)) and not token.exists()
+    assert not consume(env, str(token))
+    forged = tmp_path / "forged"
+    forged.write_text(f"{env.resolve()}\n")
+    forged.chmod(0o644)
+    assert not consume(env, str(forged))
+    link = tmp_path / "link"
+    good = mint(env)
+    link.symlink_to(good)
+    assert not consume(env, str(link)) and good.exists()
     assert not consume(env, None) and not consume(env, "")
     good.unlink()
 

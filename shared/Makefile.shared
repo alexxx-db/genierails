@@ -854,6 +854,7 @@ override _ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --comman
 # Before any lock: a deterministic env applies only with the SP its policies
 # exempt (auth.auto.tfvars databricks_client_id = deployer_principal_id).
 override _EXPOSURE_TOKEN = python3 "$(SHARED_ROOT)/scripts/exposure_token.py"
+override _PROMOTE_TO_TOKEN = python3 "$(SHARED_ROOT)/scripts/promote_token.py"
 override _DEPLOYER_CHECK = python3 "$(SHARED_ROOT)/deployer_identity.py" check --env-dir "$(ENV_DIR)" --command-name
 override _GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 override _GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
@@ -1521,6 +1522,24 @@ promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into lay
 		if [ "$(SOURCE_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(SOURCE_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: SOURCE_ENV must be a workspace environment, not $(SOURCE_ENV)."; exit 1; \
 		fi; \
+		if ! dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; then \
+			echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; \
+			echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+			exit 1; \
+		fi; \
+		case "$$dest_mode" in \
+			legacy) ;; \
+			deterministic) \
+				if ! $(_PROMOTE_TO_TOKEN) consume --env-dir "$(DEST_ENV_DIR)"; then \
+					echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; \
+					echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+					exit 1; \
+				fi ;; \
+			*) \
+				echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; \
+				echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+				exit 1 ;; \
+		esac; \
 		if [ ! -f "$(SOURCE_ENV_DIR)/generated/abac.auto.tfvars" ]; then \
 			echo "=== Skipping promote (no $(SOURCE_ENV_DIR)/generated/abac.auto.tfvars — genie-only workflow) ==="; \
 			exit 0; \
@@ -1665,7 +1684,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	$(call _PROMOTION_TXN_BEGIN,"$$dest_dir" "$(ACCOUNT_ENV_DIR)"); \
 	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/custom_masks.py" promote --source-dir "$$src_dir" --dest-dir "$$dest_dir" || exit 1; \
-	$(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
+	$(_PROMOTE_TO_TOKEN) run --env-dir "$$dest_dir" -- $(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
 		DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" write --source "$$src_dir/generated/abac.auto.tfvars" \
 		--destination "$$dest_dir/generated/expected_classification.json" --catalog-map "$$map" || exit 1; \
