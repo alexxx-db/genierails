@@ -4,6 +4,14 @@
 Offline mode (the default) uses local configuration only and never imports the
 Databricks SDK. Set GENIERAILS_EVIDENCE_INTEGRATION=1 to collect live Unity
 Catalog state through a Databricks SQL warehouse.
+
+Live mode reads two kinds of mask: table-attached masks and row filters from
+information_schema (legacy envs), and the ABAC policies the policies API lists
+as effective on each governed table (catalog, schema and table level), which is
+how deterministic governance masks columns. A column carries every ABAC column
+mask whose match condition its tags satisfy, with the policy's TO and EXCEPT
+principals. A policy listing that fails, or a policy this report can't evaluate,
+stops the run (exit 2) rather than writing a report that claims no protection.
 """
 
 from __future__ import annotations
@@ -11,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -21,6 +31,16 @@ from scripts.footprint import resolve_footprint
 
 SCHEMA_VERSION = "1.0"
 INTEGRATION_ENV = "GENIERAILS_EVIDENCE_INTEGRATION"
+COLUMN_MASK_TYPES = {"COLUMN_MASK", "POLICY_TYPE_COLUMN_MASK"}
+ROW_FILTER_TYPES = {"ROW_FILTER", "POLICY_TYPE_ROW_FILTER"}
+# What may remain of a match condition once its tag references are removed for
+# "any reference matches" to be its exact meaning: OR, parentheses, whitespace.
+_TAG_REF = re.compile(r"hasTagValue\(\s*'[^']+'\s*,\s*'[^']+'\s*\)|hasTag\(\s*'[^']+'\s*\)")
+_ONLY_OR = re.compile(r"(?i)[\s()]*(?:\bOR\b[\s()]*)*")
+
+
+class EvidenceUnavailable(RuntimeError):
+    """Live protection state couldn't be read completely, so no report is written."""
 
 
 def _utc(value: datetime | None = None) -> str:
@@ -41,6 +61,7 @@ def assemble_report(
     tags: Iterable[dict[str, Any]] = (),
     masks: Iterable[dict[str, Any]] = (),
     policies: Iterable[dict[str, Any]] = (),
+    abac_policies: Iterable[dict[str, Any]] = (),
     grants: Iterable[dict[str, Any]] = (),
     generated_at: datetime | None = None,
     approved_by: str = "unapproved",
@@ -54,6 +75,19 @@ def assemble_report(
     mask_map = {_fqn(row): str(row["name"]) for row in masks}
     policy_map: dict[str, list[str]] = defaultdict(list)
     for row in policies:
+        policy_map[_fqn(row)].append(str(row["name"]))
+    abac_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in abac_policies:
+        abac_map[_fqn(row)].append({
+            "name": str(row["name"]),
+            "policy_type": str(row["policy_type"]),
+            "on_securable": str(row.get("on_securable", "")),
+            "function": str(row.get("function", "")),
+            "match_conditions": sorted(str(item) for item in row.get("match_conditions", [])),
+            "when_condition": str(row.get("when_condition", "")),
+            "to_principals": sorted(str(item) for item in row.get("to_principals", [])),
+            "except_principals": sorted(str(item) for item in row.get("except_principals", [])),
+        })
         policy_map[_fqn(row)].append(str(row["name"]))
     class_map = {_fqn(row): row for row in classifications}
     grant_map: dict[str, list[dict[str, str]]] = defaultdict(list)
@@ -80,6 +114,7 @@ def assemble_report(
             "detected_tags": sorted(tag_map.get(key, []), key=lambda item: (item["name"], item["value"])),
             "applied_mask": mask_map.get(key),
             "applied_policies": sorted(set(policy_map.get(key, []))),
+            "applied_abac_policies": sorted(abac_map.get(key, []), key=lambda item: (item["name"], item["on_securable"])),
             "grants": sorted(grant_map.get(key, []), key=lambda item: (item["principal"], item["privilege"], item["scope"])),
         })
 
@@ -112,6 +147,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         availability = report["column_privileges_availability"]
         detail = ", ".join(f"{catalog}={status}" for catalog, status in sorted(availability.items())) or "not queried"
         lines.append(f"- Column privileges: `{detail}`")
+    if "abac_policy_listing" in report:
+        listing = report["abac_policy_listing"]
+        lines.append(f"- ABAC policies: `{listing['status']}` ({listing['policies']} effective on {listing['tables']} tables)")
     lines.extend([
         "", "| Table | Column | Scan status | Scanned at | Tags | Applied mask / policies | Grants |",
         "|---|---|---|---|---|---|---|",
@@ -122,7 +160,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         grants = ", ".join(
             f"{grant['principal']}:{grant['privilege']} ({grant['scope']})" for grant in item["grants"]
         ) or "—"
-        protections = ", ".join(([item["applied_mask"]] if item["applied_mask"] else []) + item["applied_policies"]) or "—"
+        abac = item.get("applied_abac_policies", [])
+        abac_names = {policy["name"] for policy in abac}
+        protections = ", ".join(
+            ([item["applied_mask"]] if item["applied_mask"] else [])
+            + [name for name in item["applied_policies"] if name not in abac_names]
+            + [f"{policy['name']} (to: {', '.join(policy['to_principals']) or 'none'}; "
+               f"except: {', '.join(policy['except_principals']) or 'none'})" for policy in abac]
+        ) or "—"
         values = [table, item["column"], item["classification"]["status"],
                   item["classification"]["scanned_at"] or "—", tags,
                   protections, grants]
@@ -182,6 +227,67 @@ def _sql_literal(value: str) -> str:
 
 def _sql_identifier(value: str) -> str:
     return "`" + value.replace("`", "``") + "`"
+
+
+def _target_conditions(policy: Any) -> list[str]:
+    """The match conditions of the column a policy masks (agent_coverage's choice)."""
+    from scripts.staged_policy_verify import _get
+
+    mask = _get(policy, "column_mask")
+    on_column = _get(mask, "on_column") if mask else None
+    matches = list(_get(policy, "match_columns") or [])
+    chosen = [m for m in matches if on_column and _get(m, "alias") == on_column] or matches
+    return [str(_get(m, "condition") or "") for m in chosen]
+
+
+def abac_policy_rows(table: str, policies: Iterable[Any], columns: list[dict[str, Any]],
+                     column_tags: dict[str, set[tuple[str, str]]]) -> list[dict[str, Any]]:
+    """One row per (column, effective ABAC policy that applies to it) on ``table``.
+
+    A column mask applies to a column whose tags satisfy one of its match
+    conditions (hasTagValue/hasTag, parsed as audit-rulebook and agent coverage
+    do); a row filter applies to every column of the table. Anything this can't
+    evaluate exactly raises EvidenceUnavailable instead of being dropped.
+    """
+    from scripts.audit_schema_drift import _parse_condition_tag_refs
+    from scripts.staged_policy_verify import _get, normalize_policy
+
+    rows = []
+    for policy in policies:
+        live = normalize_policy(policy)
+        kind = live["policy_type"].upper()
+        if not live["name"] or kind not in COLUMN_MASK_TYPES | ROW_FILTER_TYPES:
+            raise EvidenceUnavailable(
+                f"{table}: effective policy {live['name'] or '(unnamed)'} has policy type "
+                f"{live['policy_type'] or '(none)'}, which this report can't evaluate")
+        record = {
+            "name": live["name"], "policy_type": "COLUMN_MASK" if kind in COLUMN_MASK_TYPES else "ROW_FILTER",
+            "on_securable": live["on"] or table, "function": live["function"],
+            "match_conditions": [str(_get(m, "condition") or "") for m in _get(policy, "match_columns") or []],
+            "when_condition": str(_get(policy, "when_condition") or ""),
+            "to_principals": live["to"], "except_principals": live["except"],
+        }
+        if kind in ROW_FILTER_TYPES:
+            rows.extend({**column, **record} for column in columns)
+            continue
+        conditions = _target_conditions(policy)
+        if not live["function"] or not conditions or any(
+                not condition.strip() or _ONLY_OR.fullmatch(_TAG_REF.sub(" ", condition)) is None
+                for condition in conditions):
+            raise EvidenceUnavailable(
+                f"{table}: column-mask policy {live['name']} has a function or match condition "
+                "this report can't evaluate exactly")
+        value_refs: set[tuple[str, str]] = set()
+        key_refs: set[str] = set()
+        for condition in conditions:
+            values, keys = _parse_condition_tag_refs(condition)
+            value_refs |= values
+            key_refs |= keys
+        for column in columns:
+            tags = column_tags.get(_fqn(column), set())
+            if tags & value_refs or {key for key, _ in tags} & key_refs:
+                rows.append({**column, **record})
+    return rows
 
 
 def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehouse_id: str,
@@ -269,6 +375,27 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
     for row in policy_rows:
         for column in by_table[".".join(str(value) for value in row[:3])]:
             result["policies"].append({**column, "name": row[3]})
+    # Deterministic governance masks through catalog-level ABAC policies, which
+    # neither information_schema view above lists. Read the effective set per
+    # table (include_inherited: catalog, schema and table level) through the
+    # same env-only client; the SDK follows every page of the listing.
+    column_tags: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    for row in tag_rows:
+        column_tags[_fqn(base(row))].add((str(row[4]), str(row[5])))
+    from scripts.staged_policy_verify import normalize_policy
+
+    result["abac_policies"] = []
+    listed: set[tuple[str, str]] = set()
+    for table, table_columns in sorted(by_table.items()):
+        try:
+            policies = list(client.policies.list_policies("TABLE", table, include_inherited=True))
+        except Exception as exc:
+            raise EvidenceUnavailable(
+                f"could not list the ABAC policies effective on {table} ({type(exc).__name__}: {exc}); "
+                "the report would wrongly show its columns unprotected") from exc
+        result["abac_policies"].extend(abac_policy_rows(table, policies, table_columns, column_tags))
+        listed.update((live["on"] or table, live["name"]) for live in map(normalize_policy, policies))
+    result["abac_policy_listing"] = {"status": "complete", "tables": len(by_table), "policies": len(listed)}
     try:
         class_rows = query("SELECT catalog_name, schema_name, table_name, column_name, class_tag, latest_detected_time FROM system.data_classification.results WHERE concat(catalog_name, '.', schema_name, '.', table_name, '.', column_name) IN (" + keys + ")")
         classification_available = True
@@ -311,9 +438,15 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
     if live:
         if not args.warehouse_id:
             parser.error(f"--warehouse-id or DATABRICKS_WAREHOUSE_ID is required when {INTEGRATION_ENV}=1")
-        state = collector(columns, tables, args.warehouse_id, args.env_dir / "auth.auto.tfvars")
-        report = assemble_report(state["columns"], classifications=state["classifications"], tags=state["tags"], masks=state["masks"], policies=state["policies"], grants=state["grants"], approved_by=args.approved_by, approved_at=args.approved_at, source="databricks-live")
+        try:
+            state = collector(columns, tables, args.warehouse_id, args.env_dir / "auth.auto.tfvars")
+        except EvidenceUnavailable as exc:
+            print(f"ERROR: {exc}. No evidence was written.", file=sys.stderr)
+            return 2
+        report = assemble_report(state["columns"], classifications=state["classifications"], tags=state["tags"], masks=state["masks"], policies=state["policies"], abac_policies=state.get("abac_policies", []), grants=state["grants"], approved_by=args.approved_by, approved_at=args.approved_at, source="databricks-live")
         report["column_privileges_availability"] = state.get("column_privileges_availability", {})
+        if "abac_policy_listing" in state:
+            report["abac_policy_listing"] = state["abac_policy_listing"]
     else:
         report = assemble_report(columns, tags=tags, approved_by=args.approved_by, approved_at=args.approved_at)
     paths = write_report(report, args.output_dir or args.env_dir / "generated" / "evidence")
