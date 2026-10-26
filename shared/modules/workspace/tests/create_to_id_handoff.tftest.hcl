@@ -1,3 +1,9 @@
+# Teardown destroys the created space, whose destroy-time provisioner runs the
+# real ../../scripts/genie_space.sh trash. It refuses without LAYER_ENV_DIR (the
+# env auth file, never ambient credentials), so run this suite through pytest
+# (tests/test_exposure_gating.py), which provides a fake env and ID dir, or set
+# LAYER_ENV_DIR (a fake auth.auto.tfvars) and GENIERAILS_GENIE_ID_DIR=tests/.tmp/handoff.
+
 mock_provider "databricks" {
   alias = "account"
 }
