@@ -402,3 +402,199 @@ run "rebind_variables_in_rebind" {
     held_access_grants = ["terraform_sp_manage_catalog|cat"]
   }
 }
+
+# A staged phase whose coverage check genuinely doesn't pass warns as a plain
+# plan does, and points a deterministic env at rehearse (a promoted one at
+# make check), never at make apply. Each file below has its own
+# state, so it rewrites only the gate result and keeps the applied state.
+run "readers_gate_fails" {
+  state_key = "gate_fail"
+  module {
+    source = "./tests/file_writer"
+  }
+  variables {
+    files = {
+      "tests/.tmp/staged/data_access/.coverage_gate.json" = jsonencode({ status = "fail", fingerprint = run.readers_gate_inputs.coverage_gate_inputs.fingerprint, refreshed_at = "@NOW@" })
+    }
+  }
+}
+
+run "create_with_failed_gate_warns_rehearse" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "create"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "failed"
+    error_message = "a failed gate withholds new SELECT in a staged phase"
+  }
+  assert {
+    condition     = local.business_select_withheld_next_step == "Run this layer through make (make rehearse ENV=staged), which refreshes live tags and DDL and runs the coverage check."
+    error_message = "a deterministic dev env is pointed at make rehearse: ${local.business_select_withheld_next_step}"
+  }
+  assert {
+    condition     = endswith(local.business_select_withheld_message, "Removals and existing grants still apply. Run this layer through make (make rehearse ENV=staged), which refreshes live tags and DDL and runs the coverage check.") && !strcontains(local.business_select_withheld_message, "make apply")
+    error_message = "the warning must not advise make apply: ${local.business_select_withheld_message}"
+  }
+}
+
+run "retire_with_failed_gate_in_promoted_env_warns_check" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "retire"
+    promote_from  = "dev"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = module.data_access.withheld_table_grants.status == "failed"
+    error_message = "the gate file says fail"
+  }
+  assert {
+    condition     = local.business_select_withheld_next_step == "ENV=staged is promoted, so make apply and make rehearse refuse it: run make check ENV=staged, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "a promoted env is pointed at make check: ${local.business_select_withheld_next_step}"
+  }
+  assert {
+    condition     = length(regexall("make (rehearse|apply|release-plan|release) ENV=", local.business_select_withheld_message)) == 0
+    error_message = "the warning must name no command make refuses here: ${local.business_select_withheld_message}"
+  }
+}
+
+run "readers_gate_stale" {
+  state_key = "gate_stale"
+  module {
+    source = "./tests/file_writer"
+  }
+  variables {
+    files = {
+      "tests/.tmp/staged/data_access/.coverage_gate.json" = jsonencode({ status = "pass", fingerprint = "an-older-config", refreshed_at = "@NOW@" })
+    }
+  }
+}
+
+run "switch_with_stale_gate_warns_rehearse" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "switch"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = join(",", module.data_access.withheld_table_grants.grants) == "cat.sch.orders|raw" && module.data_access.withheld_table_grants.status == "stale"
+    error_message = "a stale gate withholds new SELECT in a staged phase"
+  }
+  assert {
+    condition     = local.business_select_withheld_next_step == "Run this layer through make (make rehearse ENV=staged), which refreshes live tags and DDL and runs the coverage check."
+    error_message = "a deterministic dev env is pointed at make rehearse: ${local.business_select_withheld_next_step}"
+  }
+}
+
+run "abandon_with_stale_gate_in_promoted_env_warns_check" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "abandon"
+    promote_from  = "test"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = module.data_access.withheld_table_grants.status == "stale"
+    error_message = "the gate fingerprint is stale"
+  }
+  assert {
+    condition     = local.business_select_withheld_next_step == "ENV=staged is promoted, so make apply and make rehearse refuse it: run make check ENV=staged, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "a promoted env is pointed at make check: ${local.business_select_withheld_next_step}"
+  }
+}
+
+run "readers_gate_missing" {
+  state_key = "gate_missing"
+  module {
+    source = "./tests/file_writer"
+  }
+  variables {
+    files = {
+      "tests/.tmp/staged/data_access/.coverage_gate.json" = null
+    }
+  }
+}
+
+run "tighten_with_missing_gate_warns_rehearse" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    policy_stage  = "tighten"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = module.data_access.withheld_table_grants.status == "missing" && local.business_select_withheld_next_step == "Run this layer through make (make rehearse ENV=staged), which refreshes live tags and DDL and runs the coverage check."
+    error_message = "a missing gate points a deterministic dev env at make rehearse: ${local.business_select_withheld_next_step}"
+  }
+}
+
+# Legacy envs keep the make apply advice, byte for byte.
+run "legacy_missing_gate_keeps_apply_advice" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    governance_mode = "legacy"
+    policy_stage    = ""
+    promote_from    = "dev"
+  }
+  assert {
+    condition     = local.business_select_withheld_message == "Coverage check ${module.data_access.withheld_table_grants.status}: ${module.data_access.withheld_table_grants.problem}. New business SELECT withheld: ${join(", ", module.data_access.withheld_table_grants.grants)}. Removals and existing grants still apply. Run this layer through make (make apply ENV=staged), which refreshes live tags and DDL and runs the coverage check."
+    error_message = "legacy advice changed: ${local.business_select_withheld_message}"
+  }
+}
+
+# prod is promoted even without promote_from (release_gate.env_role).
+run "prod_setup" {
+  state_key = "prod_files"
+  module {
+    source = "./tests/file_writer"
+  }
+  variables {
+    files = {
+      "tests/.tmp/prod/data_access/masking_functions.sql" = "SELECT 1;\n"
+    }
+  }
+}
+
+run "prod_missing_gate_warns_check" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    env_dir       = "tests/.tmp/prod/data_access"
+    policy_stage  = "create"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = module.data_access.withheld_table_grants.status == "missing" && local.business_select_withheld_next_step == "ENV=prod is promoted, so make apply and make rehearse refuse it: run make check ENV=prod, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "prod is pointed at make check: ${local.business_select_withheld_next_step}"
+  }
+}
+
+# dev -> stg -> prod: prod's source stg is itself promoted, so make rehearse
+# refuses it (and release-plan ENV=prod would need it rehearsed). The advice
+# names no rehearse, apply or release-plan, only make check ENV=prod, which
+# prints the fix from the chain's root (coverage_fix.recovery_steps).
+run "prod_promoted_through_stg_names_no_refused_command" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    env_dir       = "tests/.tmp/prod/data_access"
+    policy_stage  = "create"
+    promote_from  = "stg"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = local.business_select_withheld_next_step == "ENV=prod is promoted, so make apply and make rehearse refuse it: run make check ENV=prod, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "a prod promoted through stg is pointed at make check: ${local.business_select_withheld_next_step}"
+  }
+  assert {
+    condition     = length(regexall("make (rehearse|apply|release-plan|release) ENV=", local.business_select_withheld_message)) == 0 && strcontains(local.business_select_withheld_message, "run make check ENV=prod")
+    error_message = "the warning must name no command make refuses here: ${local.business_select_withheld_message}"
+  }
+}
