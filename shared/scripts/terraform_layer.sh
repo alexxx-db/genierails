@@ -349,15 +349,13 @@ RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
   RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
 fi
-# genierails_terraform_env keeps DATABRICKS_AUTH_TYPE only as a pipeline job's
-# own OIDC; the providers' auth_type takes it from here (it outranks the env
-# variable, so without it a secret in the auth file would pin oauth-m2m).
-if [ -n "${DATABRICKS_AUTH_TYPE:-}" ]; then
-  RUNNER_VARS+=(-var="databricks_pipeline_auth_type=$DATABRICKS_AUTH_TYPE")
-fi
+# The runner-only switches always get a value from here, false or empty too:
+# a root file (an *_override.tf default, say) must never decide them.
 if [ "$LAYER:$COMMAND" = "workspace:plan" ] && \
    python3 -c 'import os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from state_layout import STRUCTURAL_CHECK_TOKEN_ENV, consume_structural_check_token; raise SystemExit(0 if consume_structural_check_token(Path(sys.argv[2]), os.environ.get(STRUCTURAL_CHECK_TOKEN_ENV)) else 1)' "$SCRIPT_DIR" "$ENV_DIR"; then
   RUNNER_VARS+=(-var="expected_pre_release_withholding=true")
+elif [ "$LAYER" = "workspace" ]; then
+  RUNNER_VARS+=(-var="expected_pre_release_withholding=false")
 fi
 # terraform import walks the whole configuration with no plan, so
 # plantimestamp() is unknown; on a passing coverage check that left every
@@ -366,6 +364,8 @@ fi
 # (modules/coverage_gate_check). Only for import: plan and apply never get it.
 if [ "$LAYER" != "account" ] && { [ "$COMMAND" = "import" ] || { [ "$COMMAND" = "print-cmd" ] && [ "${1:-}" = "import" ]; }; }; then
   RUNNER_VARS+=(-var="import_walk=true")
+elif [ "$LAYER" != "account" ]; then
+  RUNNER_VARS+=(-var="import_walk=false")
 fi
 # Genie ID files: with GENIERAILS_STATE_DIR, the env's records/ in the state
 # dir (state_layout.py records-dir refuses while any is still in the checkout).
@@ -418,6 +418,12 @@ if [ "$LAYER" != "account" ] && [ "$USE_STATE_LAYOUT" = 1 ]; then
       ;;
   esac
 fi
+
+# genierails_terraform_env keeps DATABRICKS_AUTH_TYPE only as a pipeline job's
+# own OIDC; the providers' auth_type takes it from here (it outranks the env
+# variable, so without it a secret in the auth file would pin oauth-m2m). Last,
+# and empty outside a pipeline job.
+RUNNER_VARS+=(-var="databricks_pipeline_auth_type=${DATABRICKS_AUTH_TYPE:-}")
 
 # Terraform reads options only before a command's positional arguments
 # (import: ADDR ID), so the runner's variables go after the caller's options

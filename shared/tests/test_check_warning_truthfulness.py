@@ -45,7 +45,8 @@ def test_runner_owns_structural_withholding_exemption(tmp_path):
         [RUNNER, "workspace", "dev", "plan"], env=env, text=True, capture_output=True,
     )
     assert ordinary.returncode == 0, ordinary.stdout + ordinary.stderr
-    assert "expected_pre_release_withholding" not in log.read_text()
+    assert "-var=expected_pre_release_withholding=false" in log.read_text()
+    assert "expected_pre_release_withholding=true" not in log.read_text()
 
     token = mint_structural_check_token(env_dir)
     structural = subprocess.run(

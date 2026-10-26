@@ -15,6 +15,7 @@ machine: the hosts are .invalid.
 """
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -120,10 +121,10 @@ def _plan(roots, layer: str, *, secret: str = "env-sp-secret", backend: str = "a
     (root / "auth.auto.tfvars").write_text(
         "".join(f'{k} = "{v}"\n' for k, v in values.items() if k in variables))
     # The runner's scrub (terraform_layer.sh passes "azurerm" when the env's
-    # remote_state.hcl selects that backend) and the -var it then adds for a
-    # kept pipeline OIDC, then the real provider.
+    # remote_state.hcl selects that backend) and the -var it always adds last
+    # (the kept pipeline OIDC, else empty), then the real provider.
     script = (f'. "{TERRAFORM_ENV}"; genierails_terraform_env {backend}; exec terraform plan -input=false -no-color'
-              ' ${DATABRICKS_AUTH_TYPE:+"-var=databricks_pipeline_auth_type=$DATABRICKS_AUTH_TYPE"}')
+              ' "-var=databricks_pipeline_auth_type=${DATABRICKS_AUTH_TYPE:-}"')
     env = {k: v for k, v in env.items() if not k.startswith(("DATABRICKS_", "ARM_", "TF_VAR_"))}
     proc = subprocess.run(["bash", "-c", script], cwd=root, text=True, capture_output=True,
                           env={**env, "HOME": str(root), **ARM, **shell}, timeout=600)
@@ -169,3 +170,62 @@ def test_azure_devops_oidc_wins_in_an_azure_pipelines_job(roots, secret):
 ])
 def test_a_local_shell_cannot_pick_the_pipeline_auth_type(roots, shell):
     assert _plan(roots, "workspace", **shell) == ["oauth-m2m", "oauth-m2m"]
+
+
+# The real runner on the account root's provider blocks: the variable's value
+# comes only from its own last -var, whatever a root file declares as default.
+RUNNER = ROOT / "shared" / "scripts" / "terraform_layer.sh"
+OVERRIDES = {
+    "override.tf": 'variable "databricks_pipeline_auth_type" {\n  default = "github-oidc"\n}\n',
+    "main_override.tf": 'variable "databricks_pipeline_auth_type" {\n  default = "github-oidc"\n}\n',
+    "override.tf.json": '{"variable": {"databricks_pipeline_auth_type": {"default": "github-oidc"}}}\n',
+    "main_override.tf.json": '{"variable": {"databricks_pipeline_auth_type": {"default": "github-oidc"}}}\n',
+}
+
+
+def _runner_plan(roots, tmp_path, *, files: dict[str, str] = {}, **shell: str) -> list[str]:
+    source, env, aliases, variables = roots["account"]
+    project = tmp_path / "project"
+    shutil.copytree(RUNNER.parent, project / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    root = project / "roots" / "account"
+    root.mkdir(parents=True)
+    # The runner inits the local backend at the env's state path.
+    (root / "main.tf").write_text((source / "main.tf").read_text().replace(
+        "terraform {\n", 'terraform {\n  backend "local" {}\n', 1))
+    shutil.copy(source / ".terraform.lock.hcl", root)
+    for name, text in files.items():
+        (root / name).write_text(text)
+    env_dir = tmp_path / "envs" / "account"
+    env_dir.mkdir(parents=True)
+    values = {**AUTH_VALUES, "databricks_client_secret": "env-sp-secret"}
+    (env_dir / "auth.auto.tfvars").write_text(
+        "".join(f'{k} = "{v}"\n' for k, v in values.items() if k in variables))
+    env = {k: v for k, v in env.items() if not k.startswith(("DATABRICKS_", "ARM_", "TF_VAR_"))}
+    env.pop("TF_DATA_DIR", None)  # the runner keeps its own beside the state
+    proc = subprocess.run([str(project / "scripts" / RUNNER.name), "account", "account", "plan", "-no-color"],
+                          text=True, capture_output=True, timeout=600,
+                          env={**env, "HOME": str(tmp_path), "LAYER_ENV_DIR": str(env_dir), **ARM, **shell})
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "+ terraform plan" in output, output
+    methods = _methods(output)
+    assert len(methods) == len(aliases), output
+    return methods
+
+
+@pytest.mark.parametrize("name", OVERRIDES)
+def test_a_root_override_default_cannot_pick_pipeline_oidc_locally(roots, tmp_path, name):
+    # Outside a pipeline job the runner still passes the variable (empty), so
+    # an override file's default never reaches the providers' auth_type.
+    assert _runner_plan(roots, tmp_path, files={name: OVERRIDES[name]}) == ["oauth-m2m", "oauth-m2m"]
+
+
+@pytest.mark.parametrize("auth_type,ci_context", [
+    ("github-oidc", {"GITHUB_ACTIONS": "true"}),
+    ("azure-devops-oidc", {"TF_BUILD": "True"}),
+])
+def test_the_runner_hands_a_pipeline_job_its_oidc(roots, tmp_path, auth_type, ci_context):
+    # Even over a secret in the auth file and an override default naming the other OIDC.
+    other = "azure-devops-oidc" if auth_type == "github-oidc" else "github-oidc"
+    methods = _runner_plan(roots, tmp_path, files={"override.tf": OVERRIDES["override.tf"].replace("github-oidc", other)},
+                           DATABRICKS_AUTH_TYPE=auth_type, **ci_context)
+    assert methods == [auth_type, auth_type]

@@ -26,7 +26,7 @@ from tests.terraform_helpers import TIMEOUT, shared_copy
 real_terraform = pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
 
 RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
-               "expected_pre_release_withholding", "import_walk")
+               "expected_pre_release_withholding", "import_walk", "databricks_pipeline_auth_type")
 ADDR = "terraform_data.adopted"
 ID = "0f6e2c4a-1111-2222-3333-444455556666"
 
@@ -58,6 +58,16 @@ variable "genie_id_dir" {
 variable "import_walk" {
   type    = bool
   default = false
+}
+
+variable "expected_pre_release_withholding" {
+  type    = bool
+  default = false
+}
+
+variable "databricks_pipeline_auth_type" {
+  type    = string
+  default = ""
 }
 
 resource "terraform_data" "adopted" {}
@@ -127,7 +137,8 @@ def test_import_puts_every_option_before_addr_and_id(layer, tmp_path, layout, op
     assert all(a.startswith("-") for a in options_part), argv
     runner = [i for i, a in enumerate(options_part) if a.startswith("-var=") and a[5:].split("=")[0] in RUNNER_VARS]
     caller = [i for i, a in enumerate(options_part) if a in options]
-    assert len(runner) == (5 if state_dir else 2), argv  # env_dir, import_walk + genie_id_dir
+    # env_dir, the import_walk, withholding and pipeline auth switches, + genie_id_dir and the state files
+    assert len(runner) == (7 if state_dir else 4), argv
     assert runner == list(range(len(options_part) - len(runner), len(options_part))), argv  # last option
     assert not caller or max(caller) < min(runner), argv
 
@@ -217,7 +228,8 @@ def test_print_cmd_shows_the_import_argv_terraform_accepts(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     argv = shlex.split(result.stdout.split(")", 1)[1])
     assert argv == [f"-var-file={env_dir}/env.auto.tfvars", "-input=false", f"-var=env_dir={env_dir}",
-                    "-var=import_walk=true", ADDR, ID]
+                    "-var=expected_pre_release_withholding=false", "-var=import_walk=true",
+                    "-var=databricks_pipeline_auth_type=", ADDR, ID]
 
 
 # A terraform stand-in that parses import as Terraform's flag package does:
@@ -261,4 +273,5 @@ def test_import_argv_parses_as_terraform_parses_it(tmp_path, layout):
     argv = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)[:1] == ["import"]][-1]
     runner = [a for a in argv if a.startswith("-var=") and a[5:].split("=")[0] in RUNNER_VARS]
     assert argv[-2:] == [ADDR, ID] and argv[-2 - len(runner):-2] == runner, argv
-    assert len(runner) == (5 if layout == "state dir" else 2), argv  # env_dir, import_walk + genie_id_dir
+    # env_dir, the import_walk, withholding and pipeline auth switches, + genie_id_dir and the state files
+    assert len(runner) == (7 if layout == "state dir" else 4), argv

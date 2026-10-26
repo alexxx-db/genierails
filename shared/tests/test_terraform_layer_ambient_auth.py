@@ -131,7 +131,8 @@ def test_pipeline_oidc_auth_reaches_terraform_only_in_its_ci_job(tmp_path, auth_
         assert "TF_VAR_databricks_pipeline_auth_type" not in auth_env, argv
         # The providers' auth_type (it outranks DATABRICKS_AUTH_TYPE) gets the
         # kept OIDC from the runner, as its own -var.
-        assert ("-var=databricks_pipeline_auth_type=" + auth_type in argv.split()) == (not argv.startswith("init ")), argv
+        if not argv.startswith("init "):
+            assert _var_options(argv)[-1] == "-var=databricks_pipeline_auth_type=" + auth_type, argv
         assert {k: auth_env.get(k) for k in token_vars} == {k: AMBIENT[k] for k in token_vars}, argv
         other = (GITHUB_TOKEN_VARS | ADO_TOKEN_VARS) - token_vars
         assert not other & set(auth_env), argv
@@ -152,7 +153,8 @@ def test_a_local_shell_cannot_present_pipeline_oidc(tmp_path, auth_type, ci_cont
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type, **ci_context)
     for argv, auth_env in calls:
         assert "DATABRICKS_AUTH_TYPE" not in auth_env, argv
-        assert "databricks_pipeline_auth_type" not in argv, argv
+        if not argv.startswith("init "):
+            assert _var_options(argv)[-1] == "-var=databricks_pipeline_auth_type=", argv
         if "GITHUB_ACTIONS" not in ci_context or ci_context["GITHUB_ACTIONS"] != "true":
             assert not GITHUB_TOKEN_VARS & set(auth_env), argv
         if "TF_BUILD" not in ci_context:
@@ -163,6 +165,42 @@ def test_a_local_shell_cannot_present_pipeline_oidc(tmp_path, auth_type, ci_cont
 def test_other_ambient_auth_types_are_dropped(tmp_path, auth_type):
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type)
     assert all("DATABRICKS_AUTH_TYPE" not in auth_env for _, auth_env in calls)
+
+
+def _var_options(argv: str) -> list[str]:
+    return [arg for arg in argv.split() if arg.startswith("-var=")]
+
+
+@pytest.mark.parametrize("layer,command,args", [
+    ("workspace", "plan", ()),
+    ("workspace", "apply", ("-auto-approve",)),
+    ("workspace", "destroy", ("-auto-approve",)),
+    ("workspace", "import", ("databricks_group.g", "123")),
+    ("workspace", "console", ()),
+    ("data_access", "plan", ()),
+    ("data_access", "import", ("databricks_grant.g", "x")),
+    ("account", "plan", ()),
+    ("account", "apply", ("-auto-approve",)),
+])
+def test_the_runner_always_sets_its_switches_last(tmp_path, layer, command, args):
+    # Not left to a variable default a root file could override
+    # (override.tf, *_override.tf[.json]): false or empty unless it sets them.
+    env_dir = tmp_path / "envs" / {"account": "account", "data_access": "dev/data_access"}.get(layer, "dev")
+    calls = _run(tmp_path, layer, command, *args, env_dir=env_dir)
+    runner_call = [argv for argv, _ in calls if argv.startswith(command + " ")]
+    assert len(runner_call) == 1, calls
+    options = _var_options(runner_call[0])
+    assert options[-1] == f"-var={PIPELINE_VAR}=", options
+    switches = {o.split("=")[1]: o.split("=", 2)[2] for o in options
+                if o.split("=")[1] in ("import_walk", "expected_pre_release_withholding")}
+    expected = {}
+    if layer != "account":
+        expected["import_walk"] = "true" if command == "import" else "false"
+    if layer == "workspace":
+        expected["expected_pre_release_withholding"] = "false"
+    assert switches == expected, options
+    if command == "import":
+        assert runner_call[0].split()[-2:] == list(args)
 
 
 def _project(tmp_path) -> Path:
@@ -234,7 +272,7 @@ def test_a_root_dir_tfvars_without_runner_variables_still_runs(tmp_path):
     project = _project(tmp_path)
     (project / "roots" / "workspace" / "caller.auto.tfvars").write_text('coverage_gate_max_age = "1h"\n')
     calls = _run(tmp_path, "workspace", "plan", runner=project / "scripts" / RUNNER.name)
-    assert all(PIPELINE_VAR not in argv for argv, _ in calls)
+    assert _var_options(calls[1][0])[-1] == f"-var={PIPELINE_VAR}="
 
 
 def test_azurerm_backend_keeps_the_arm_identity_it_reads_state_with(tmp_path):
