@@ -9,8 +9,8 @@ sets it unless OFFLINE=1.
 The report is a runtime file, never committed: it is written (0600, in a 0700
 directory) to the env's state dir, ``$GENIERAILS_STATE_DIR/<cloud>/<env>/evidence/``
 or ``<cloud>/.genierails-state/<env>/evidence/`` (git-ignored), where the
-release-gate receipts live. A folder that resolves (symlinks followed) inside the
-env's git checkout without being git-ignored is refused (exit 2, nothing written). Nothing goes under envs/<env>/, so the clean
+release-gate receipts live. A folder that resolves (symlinks followed) inside any
+git work tree that doesn't ignore it is refused (exit 2, nothing written). Nothing goes under envs/<env>/, so the clean
 checkout and the env/generated digests that maintain and release-plan check
 never see it.
 
@@ -504,29 +504,55 @@ def report_names(schema_version: str = SCHEMA_VERSION) -> tuple[str, str]:
     return f"{stem}.json", f"{stem}.md"
 
 
-def refuse_committable(output_dir: Path, env_dir: Path) -> None:
-    """Refuse an evidence folder git could commit: inside the env's checkout and not ignored.
+def _git_env() -> dict[str, str]:
+    """The environment for the ignore check: no GIT_* variable (GIT_DIR, GIT_WORK_TREE,
+    GIT_INDEX_FILE, GIT_COMMON_DIR, GIT_CEILING_DIRECTORIES, GIT_CONFIG_*, ...) can point git
+    at another repo, index or config."""
+    return {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+
+
+def enclosing_work_trees(path: Path) -> list[Path]:
+    """Every git work tree containing ``path`` (resolved), innermost first.
+
+    Found on the filesystem, not by asking git: ``path`` and each of its ancestors that
+    holds a ``.git`` entry (a directory, or the file of a linked worktree or submodule).
+    A nested repo never hides the one around it, and the walk follows the filesystem's
+    own lookup, so a case alias of a repo's path (macOS) still finds the repo.
+    """
+    target = Path(path).resolve()
+    return [folder for folder in (target, *target.parents) if os.path.lexists(folder / ".git")]
+
+
+def refuse_committable(output_dir: Path) -> None:
+    """Refuse an evidence folder that any enclosing git work tree could commit.
 
     The default <cloud>/.genierails-state is ignored; a GENIERAILS_STATE_DIR (or a
-    symlink) can still point into the work tree. Symlinks are resolved first, and
-    only read-only git runs (rev-parse, check-ignore). A tracked report counts as
-    not ignored. Outside any checkout there is nothing to protect.
+    symlink) can still point into a work tree. The folder is resolved (symlinks
+    followed); then, in every work tree around it, both report paths must be
+    ignored by that repo's own rules (.gitignore files and .git/info/exclude, not a
+    per-user core.excludesFile) and untracked (git check-ignore reports a tracked
+    path as not ignored). Any failure, git missing included, refuses. Read-only git
+    only, with a scrubbed environment (_git_env) and an explicit -C.
     """
     target = Path(output_dir).resolve()
-    top = subprocess.run(["git", "-C", str(Path(env_dir).resolve()), "rev-parse", "--show-toplevel"],
-                         text=True, capture_output=True)
-    if top.returncode:
-        return
-    repo = Path(top.stdout.strip()).resolve()
-    if target != repo and repo not in target.parents:
-        return
-    probes = [(target / name).relative_to(repo).as_posix() for name in report_names()]
-    ignored = subprocess.run(["git", "-C", str(repo), "check-ignore", "--", *probes], text=True, capture_output=True)
-    if ignored.returncode not in (0, 1) or set(ignored.stdout.split()) != set(probes):
-        raise EvidenceUnavailable(
-            f"the evidence folder {target} is inside the git checkout {repo} and not git-ignored, so the "
-            "record could be committed. Point GENIERAILS_STATE_DIR outside the checkout (or git-ignore that "
-            "folder) and run make evidence again")
+    for tree in enclosing_work_trees(target):
+        probes = [(target / name).relative_to(tree).as_posix() for name in report_names()]
+        try:
+            result = subprocess.run(["git", "-C", str(tree), "-c", f"core.excludesFile={os.devnull}",
+                                     "check-ignore", "-z", "--stdin"], input="\0".join(probes) + "\0",
+                                    text=True, capture_output=True, env=_git_env())
+        except OSError as exc:
+            raise EvidenceUnavailable(
+                f"the evidence folder {target} is inside the git work tree {tree}, and git can't be run "
+                f"({exc.strerror or type(exc).__name__}) to confirm the record is git-ignored. Install git, or "
+                "point GENIERAILS_STATE_DIR outside every git checkout") from None
+        ignored = set(filter(None, result.stdout.split("\0")))
+        if result.returncode not in (0, 1) or ignored != set(probes):
+            reason = "git couldn't check it" if result.returncode not in (0, 1) else "not git-ignored"
+            raise EvidenceUnavailable(
+                f"the evidence folder {target} is inside the git work tree {tree} and {reason}, so the record "
+                "could be committed. Point GENIERAILS_STATE_DIR outside every git checkout (or git-ignore that "
+                "folder in each one) and run make evidence again")
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -564,7 +590,7 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
     tables = configured_tables(args.env_dir)
     try:
         output_dir = args.output_dir or evidence_dir(args.env_dir)
-        refuse_committable(output_dir, args.env_dir)
+        refuse_committable(output_dir)
     except RuntimeError as exc:  # StateError (GENIERAILS_STATE_DIR set but missing) or EvidenceUnavailable
         print(f"ERROR: {exc}. No evidence was written.", file=sys.stderr)
         return 2

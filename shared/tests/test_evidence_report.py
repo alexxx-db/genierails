@@ -193,7 +193,7 @@ def _git_status(repo):
 
 def _refused(capsys, tmp_path):
     err = capsys.readouterr().err
-    assert "inside the git checkout" in err and "not git-ignored" in err and "No evidence was written" in err
+    assert "inside the git work tree" in err and "not git-ignored" in err and "No evidence was written" in err
     assert not list(tmp_path.rglob("compliance-evidence-*"))
 
 
@@ -239,6 +239,72 @@ def test_a_tracked_report_in_an_ignored_folder_is_refused(tmp_path, monkeypatch,
     monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
     assert main(["--env-dir", str(env_dir)]) == 2
     assert "not git-ignored" in capsys.readouterr().err and tracked.read_text() == "{}"
+
+
+def test_git_env_variables_cannot_point_the_check_at_another_repo(tmp_path, monkeypatch, capsys):
+    """Bypass 1: GIT_DIR/GIT_WORK_TREE once sent discovery to another repo, so the record was written."""
+    import subprocess
+
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    (other / ".gitignore").write_text("*\n")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(repo))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_a_nested_repo_around_the_env_does_not_hide_the_customer_repo(tmp_path, monkeypatch, capsys):
+    """Bypass 2: only the innermost repo (around env_dir) was checked."""
+    import subprocess
+
+    repo, _ = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    nested = repo / "nested"
+    env_dir = _offline_env(nested, monkeypatch)
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (repo / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+    # Inside both: ignored by the outer repo is not enough when the nested one would commit it...
+    (repo / ".gitignore").write_text("/aws/.genierails-state/\n/nested/custom-state/\n")
+    (nested / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(nested / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+    # ...and passes once every work tree around it ignores it.
+    (nested / ".gitignore").write_text("/custom-state/\n")
+    assert main(["--env-dir", str(env_dir)]) == 0
+
+
+def test_a_case_alias_of_the_checkout_path_is_still_inside_it(tmp_path, monkeypatch, capsys):
+    """Bypass 3: on a case-insensitive filesystem, <Repo> spelled in another case passed a string prefix test."""
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    alias = tmp_path / "REPO"
+    if not alias.exists():
+        pytest.skip("case-sensitive filesystem: no case alias exists")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(alias / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_missing_git_refuses_cleanly_inside_a_work_tree(tmp_path, monkeypatch, capsys):
+    """Bypass 4: no git on PATH once raised a traceback (exit 1); it must refuse with exit 2."""
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-git"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    err = capsys.readouterr().err
+    assert "git can't be run" in err and "No evidence was written" in err and "Traceback" not in err
+    assert not list(tmp_path.rglob("compliance-evidence-*"))
+    # Outside every work tree git isn't needed.
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    assert main(["--env-dir", str(env_dir)]) == 0
 
 
 def test_a_state_dir_outside_the_checkout_and_the_ignored_default_are_allowed(tmp_path, monkeypatch):
