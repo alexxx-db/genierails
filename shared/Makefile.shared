@@ -1,4 +1,4 @@
-.PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
+.PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-promote-destination _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access _verify-access-gate verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan _account-plan-locked apply-account check policy-status policy-abandon policy-rebind status next
@@ -243,10 +243,35 @@ _bootstrap:
 # deterministic promoted env, or any env but $(DEFAULT_ENV) with no
 # env.auto.tfvars yet (make setup writes it), is refused before anything is written.
 _guarded-bootstrap:
+	@$(if $(and $(filter promote,$(MAKECMDGOALS)),$(strip $(DEST_ENV))),$(MAKE) --no-print-directory _guard-promote-destination DEST_ENV="$(DEST_ENV)" DEST_ENV_DIR="$(DEST_ENV_DIR)",:)
 	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
 	@$(if $(filter generate,$(MAKECMDGOALS)),$(_RELEASE_GATE) generate-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --default-env "$(DEFAULT_ENV)",:)
 	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
+
+# Cross-env promote's destination guard is an ordered recipe step, never a
+# sibling prerequisite: it completes before _bootstrap can create auth/config
+# files or directories, including with make -j. promote-to supplies a distinct,
+# destination-bound, one-shot accident token to its nested promote.
+_guard-promote-destination:
+	@if ! dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; then \
+		echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; \
+		echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+		exit 1; \
+	fi; \
+	case "$$dest_mode" in \
+		legacy) ;; \
+		deterministic) \
+			if ! $(_PROMOTE_TO_TOKEN) consume --env-dir "$(DEST_ENV_DIR)"; then \
+				echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; \
+				echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+				exit 1; \
+			fi ;; \
+		*) \
+			echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; \
+			echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+			exit 1 ;; \
+	esac
 
 _guard-workspace-target:
 	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -861,6 +886,7 @@ override _ACCESS_CHECK = $(_TABLE_READERS) check --env-dir "$(ENV_DIR)" --comman
 # Before any lock: a deterministic env applies only with the SP its policies
 # exempt (auth.auto.tfvars databricks_client_id = deployer_principal_id).
 override _EXPOSURE_TOKEN = python3 "$(SHARED_ROOT)/scripts/exposure_token.py"
+override _PROMOTE_TO_TOKEN = python3 "$(SHARED_ROOT)/scripts/promote_token.py"
 override _DEPLOYER_CHECK = python3 "$(SHARED_ROOT)/deployer_identity.py" check --env-dir "$(ENV_DIR)" --command-name
 override _GROUP_CHECK = python3 "$(SHARED_ROOT)/group_map.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name
 override _GROUP_MAP_RECORD = python3 "$(SHARED_ROOT)/group_map.py" record --env-dir "$(ENV_DIR)" --env "$(ENV)"
@@ -1672,7 +1698,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 	$(call _PROMOTION_TXN_BEGIN,"$$dest_dir" "$(ACCOUNT_ENV_DIR)"); \
 	python3 "$(SHARED_ROOT)/scripts/agent_promote.py" --source-dir "$$src_dir" --dest-dir "$$dest_dir" --catalog-map "$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/custom_masks.py" promote --source-dir "$$src_dir" --dest-dir "$$dest_dir" || exit 1; \
-	$(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
+	$(_PROMOTE_TO_TOKEN) run --env-dir "$$dest_dir" -- $(MAKE) --no-print-directory promote ENV="$$src" ENV_DIR="$$src_dir" SOURCE_ENV="$$src" SOURCE_ENV_DIR="$$src_dir" \
 		DEST_ENV="$(ENV)" DEST_ENV_DIR="$$dest_dir" DEST_CATALOG_MAP="$$map" || exit 1; \
 	python3 "$(SHARED_ROOT)/scripts/classification_completeness.py" write --source "$$src_dir/generated/abac.auto.tfvars" \
 		--destination "$$dest_dir/generated/expected_classification.json" --catalog-map "$$map" || exit 1; \
