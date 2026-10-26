@@ -1986,6 +1986,18 @@ def phase_record(env_dir: Path, env: str, manifest_path: Path) -> Path:
     return _write_once(env_state(cloud_dir, env) / "receipts" / "phases" / f"{manifest['id']}.json", record)
 
 
+def phase_records(cloud_dir: Path, env: str, commit: str) -> list[dict]:
+    """The phase records made at ``commit`` since the last release receipt.
+
+    Not what a release receipt links: a release's phases can be planned at
+    several commits (release_phases).
+    """
+    last = last_release(cloud_dir, env)
+    since = str((last or {}).get("created_at", ""))
+    return [r for r in _receipts(env_state(cloud_dir, env) / "receipts" / "phases")
+            if r.get("commit") == commit and str(r.get("created_at", "")) > since]
+
+
 def _phase_problem(cloud_dir: Path, env: str, path: Path, record: Mapping) -> str:
     """Why a phase record can't be verified ('' when it can): its fields, and its manifest's hash."""
     record_id = str(record.get("id") or "")
