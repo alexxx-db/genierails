@@ -459,8 +459,8 @@ def reuse_candidates(cloud_dir: Path, env: str, fingerprint: str, repo: Path,
     """
     found, rejected = None, []
     for receipt in rehearse_receipts(cloud_dir, env):
-        if receipt.get("fingerprint") != fingerprint:
-            continue
+        if receipt.get("fingerprint") != fingerprint or receipt.get("result") != "passed":
+            continue  # a failed run is never a candidate; one edited to "passed" is, and is refused below
         why = reuse_problem(receipt, env) or (
             None if is_ancestor(repo, str(receipt.get("commit")), commit)
             else f"{str(receipt.get('commit'))[:12]} is not an ancestor of {commit[:12]} (a divergent branch)")
