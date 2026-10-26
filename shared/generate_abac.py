@@ -144,6 +144,27 @@ def _ensure_packages():
         )
 
 
+def _refuse_promoted_env(auth_file) -> None:
+    """make generate's refusal (release_gate.generate_guard), for generate_abac.py run directly:
+    a deterministic promoted env's generated/ comes only from promote-to."""
+    from scripts.release_gate import Refused, generate_guard
+
+    env_dir = Path(auth_file).resolve().parent
+    try:
+        generate_guard(env_dir, env_dir.name)
+    except Refused as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Before the package check below, which can pip install or upgrade: a refused run
+    # reaches no installer. (With python-hcl2 itself missing the env can't be read, so
+    # the check installs it and main() refuses after.)
+    _pre_args = argparse.ArgumentParser(add_help=False)
+    _pre_args.add_argument("--auth-file", default=str(DEFAULT_AUTH_FILE))
+    _refuse_promoted_env(_pre_args.parse_known_args()[0].auth_file)
+
 _ensure_packages()
 
 COUNTRIES_DIR = SCRIPT_DIR / "countries"
@@ -7212,6 +7233,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # The same refusal as make generate, before any write or live call (also when
+    # main() is called without running the module as a script).
+    _refuse_promoted_env(args.auth_file)
 
     auth_file = Path(args.auth_file)
     from scripts.auth_configured import AuthStatus, auth_status

@@ -74,6 +74,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -2021,6 +2022,81 @@ def env_role(env_dir: Path) -> str:
     return REHEARSE if deterministic(env_dir) else LEGACY
 
 
+def _generate_refused(env_dir: Path) -> bool:
+    """Whether generate refuses this env: a deterministic promoted one."""
+    return deterministic(env_dir) and env_role(env_dir) == PROMOTED
+
+
+def generate_guard(env_dir: Path, env: str, default_env: str | None = None) -> None:
+    """make generate (and generate_abac.py run directly) refuses a deterministic promoted
+    env: its generated/ comes only from promote-to, and release-plan refuses a regenerated
+    one as a stale promotion. Legacy promoted envs have no release-plan and still generate
+    (e.g. genie-only prod). A regular env file that can't be read is refused; one that
+    doesn't parse, or isn't a regular file, is left to generate's own checks. The advice
+    starts where the promotion chain does, the first env up promote_from whose generate
+    isn't refused; a cycle, a missing source env or an unusable promote_from refuses as a
+    malformed chain, with no advice.
+
+    ``default_env`` (make passes DEFAULT_ENV) is for the call before _bootstrap: with no
+    env file, bootstrap would write one seeded as promoted from default_env, so any env
+    but default_env (and the account/data_access dirs _guard-workspace-target refuses)
+    is refused before that write, naming make setup. default_env itself bootstraps as
+    before. generate_abac.py run directly passes none: with no env file it writes
+    nothing here and runs as before."""
+    env_dir = Path(env_dir)
+    path = env_dir / "env.auto.tfvars"
+    if default_env and not path.exists() and env not in (default_env, ACCOUNT_ENV, data_access_subdir()):
+        raise Refused(f"make generate ENV={env} refused: envs/{env}/env.auto.tfvars doesn't exist, so its role "
+                      f"can't be read. Run make setup ENV={env} first (it writes that file, seeded as an env "
+                      f"promoted from {default_env}). A deterministic promoted env never runs generate: its "
+                      f"generated/ comes only from make promote-to ENV={env}.")
+    try:
+        if path.is_file():
+            path.read_bytes()
+    except OSError as exc:
+        raise Refused(f"make generate ENV={env} refused: can't read {path} ({exc.strerror or exc})") from exc
+    try:
+        if not _generate_refused(env_dir):
+            return
+    except Exception:
+        return
+    from scripts.coverage_fix import promoted_release_steps
+
+    def malformed(detail: str) -> Refused:
+        return Refused(f"make generate ENV={env} refused: malformed promotion chain "
+                       f"{' -> '.join([env, *chain[1:]])}: {detail}")
+
+    chain, current = [env_dir.name], env_dir
+    while True:
+        here = f"envs/{current.name}/env.auto.tfvars"
+        try:
+            upstream = source_env(current)
+        except Exception as exc:
+            raise malformed(f"{here}: {exc}") from exc
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", upstream):
+            raise malformed(f"promote_from = {upstream!r} in {here} is not an env name")
+        if upstream in chain:
+            chain.append(upstream)
+            raise malformed(f"a cycle (promote_from in {here} names {upstream} again)")
+        chain.append(upstream)
+        upstream_dir = env_dir.parent / upstream
+        if not (upstream_dir / "env.auto.tfvars").is_file():
+            raise malformed(f"{here} promotes from {upstream}, and envs/{upstream}/env.auto.tfvars doesn't exist")
+        try:
+            if not _generate_refused(upstream_dir):
+                break
+        except Exception as exc:
+            raise malformed(f"envs/{upstream}/env.auto.tfvars can't be read ({type(exc).__name__})") from exc
+        current = upstream_dir
+    source, root, hops = chain[1], chain[-1], [*reversed(chain[1:-1]), env]
+    raise Refused(f"make generate ENV={env} refused: ENV={env} is a deterministic env promoted from {source}, "
+                  f"so envs/{env}/generated/ comes only from promote-to (release-plan refuses a regenerated "
+                  f"one as a stale promotion). Change the rules in {root}: make generate ENV={root}, "
+                  f"commit, make rehearse ENV={root}, then "
+                  + ", then ".join(f"make promote-to ENV={hop}" for hop in hops)
+                  + f", then {promoted_release_steps(env, source)}.")
+
+
 def apply_guard(env_dir: Path, env: str, target: str) -> None:
     from scripts.environment_lock import held_by_ancestor
 
@@ -2150,6 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
     command("apply-guard").add_argument("--target", required=True)
     command("destroy-guard").add_argument("--confirm", default="")
     command("env-role")
+    command("generate-guard").add_argument("--default-env", default="")
     command("identity-check")
     command("legacy-guard").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
@@ -2272,6 +2349,8 @@ def main(argv: list[str] | None = None) -> int:
             legacy_guard(args.env_dir, args.env, args.command_name)
         elif args.command == "env-role":
             print(env_role(args.env_dir))
+        elif args.command == "generate-guard":
+            generate_guard(args.env_dir, args.env, args.default_env or None)
         elif args.command == "identity-check":
             identity_check(args.env_dir, args.env)
         elif args.command == "maintain-check":
