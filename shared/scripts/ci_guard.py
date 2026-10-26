@@ -14,10 +14,14 @@ non-empty value. In CI the applying targets refuse, except:
 - ``make rehearse ENV=dev`` with configured, locked remote state
   (state_layout.ci_allowed).
 
-Commands (exit 0 allowed / not CI, 1 refused / CI):
-  apply --cloud-dir D --cloud-root R --env-dir E --env N   _guard-not-ci-apply
-  rebind                                                     _guard-not-ci-rebind
-  in-ci [--allow-opt-out]   0 when this is CI (and, with --allow-opt-out, not opted out)
+Commands. Every exit code but 0 refuses: a missing or failing script never
+reads as "not CI", so callers fail closed (never a bare shell ``if`` on it).
+  apply --cloud-dir D --cloud-root R --env-dir E --env N   _guard-not-ci-apply: 0 allowed, 1 refused
+  rebind                                                     _guard-not-ci-rebind: 0 allowed, 1 refused
+  ci-status [--allow-opt-out]   0 not CI (or, with --allow-opt-out, opted out), 10 CI; Makefile.shared's
+                                _CI_STATUS refuses on any other code, so a crash (1), a missing script
+                                (2) or anything unexpected never reads as either answer
+An internal error exits ERROR (3) with a message.
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ from typing import Callable, Mapping
 
 CI_MARKERS = ("TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI")
 CI_VALUES = ("true", "1", "yes")
+NOT_CI, CI, ERROR = 0, 10, 3  # ci-status; apply and rebind refuse with REFUSED
+REFUSED = 1
 ALLOW_CI_APPLY = "GENIERAILS_ALLOW_CI_APPLY"
 APPLY_REFUSED = (
     "ERROR: applying targets cannot run in CI (except make rehearse ENV=dev with configured remote state and "
@@ -81,21 +87,30 @@ def main(argv: list[str] | None = None) -> int:
     apply.add_argument("--env-dir", type=Path, required=True)
     apply.add_argument("--env", required=True)
     sub.add_parser("rebind")
-    check = sub.add_parser("in-ci")
+    check = sub.add_parser("ci-status")
     check.add_argument("--allow-opt-out", action="store_true")
     args = parser.parse_args(argv)
-    if args.command == "in-ci":
-        return 0 if in_ci() and not (args.allow_opt_out and opted_out()) else 1
+    try:
+        return _run(args)
+    except Exception as exc:  # fail closed: an error is never "not CI"
+        print(f"ERROR: scripts/ci_guard.py {args.command} failed ({type(exc).__name__}: {exc}); refusing.",
+              file=sys.stderr)
+        return ERROR
+
+
+def _run(args) -> int:
+    if args.command == "ci-status":
+        return CI if in_ci() and not (args.allow_opt_out and opted_out()) else NOT_CI
     if args.command == "rebind":
         if in_ci():
             print(REBIND_REFUSED, file=sys.stderr)
-            return 1
+            return REFUSED
         return 0
     if apply_allowed(dev_rehearse=lambda: dev_rehearse_allowed(args.env_dir, args.env, args.cloud_dir,
                                                                 args.cloud_root)):
         return 0
     print(APPLY_REFUSED, file=sys.stderr)
-    return 1
+    return REFUSED
 
 
 if __name__ == "__main__":

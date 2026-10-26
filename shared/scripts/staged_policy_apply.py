@@ -81,8 +81,7 @@ SHARED = Path(__file__).resolve().parents[1]
 if str(SHARED) not in sys.path:
     sys.path.insert(0, str(SHARED))
 
-from scripts import ci_guard, environment_lock  # noqa: E402
-from scripts.ci_guard import CI_MARKERS  # noqa: E402,F401  (make's own list)
+from scripts import environment_lock  # noqa: E402
 from scripts import policy_generations as pg  # noqa: E402
 
 JOURNAL_VERSION = 1
@@ -1393,7 +1392,12 @@ class Controller:
 
 def _in_ci(environ: dict, *, opt_out: bool = True) -> bool:
     """CI, as make's _guard-not-ci-apply sees it (GENIERAILS_ALLOW_CI_APPLY=1 opts out when ``opt_out``)."""
-    return ci_guard.in_ci(environ) and not (opt_out and ci_guard.opted_out(environ))
+    try:
+        from scripts import ci_guard
+
+        return ci_guard.in_ci(environ) and not (opt_out and ci_guard.opted_out(environ))
+    except Exception:  # fail closed: a missing or failing CI check counts as CI
+        return True
 
 
 def _table_keys(grants) -> list[str]:

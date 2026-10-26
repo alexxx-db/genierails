@@ -324,6 +324,12 @@ _guard-genie-placeholder:
 # with locked remote state is state_layout.ci_allowed). make next reads the
 # same module and the guarded targets below, so it never suggests one CI refuses.
 override _CI_GUARD = python3 "$(SHARED_ROOT)/scripts/ci_guard.py"
+# Sets ci_rc to 0 (not CI, or GENIERAILS_ALLOW_CI_APPLY=1) or 10 (CI). Any other
+# code (ci_guard.py missing or failing) refuses here, in CI or not: fail closed.
+override _CI_STATUS = ci_rc=0; $(_CI_GUARD) ci-status --allow-opt-out || ci_rc=$$?; \
+	if [ "$$ci_rc" != 0 ] && [ "$$ci_rc" != 10 ]; then \
+		echo "ERROR: the CI check ($(SHARED_ROOT)/scripts/ci_guard.py ci-status) failed (exit $$ci_rc); refusing, as in CI." >&2; exit 1; \
+	fi
 _guard-not-ci-apply:
 	@GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" $(_CI_GUARD) apply --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)"
 
@@ -951,7 +957,8 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 # real account state: envs/account/remote_state.hcl (read-only here; only
 # the approved account-plan/apply-account flow applies it).
 _guard-account-plan-empty:
-	@if $(_CI_GUARD) in-ci --allow-opt-out && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
+	@$(_CI_STATUS); \
+	if [ "$$ci_rc" = 10 ] && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
 		echo "ERROR: in CI the account plan needs $(ACCOUNT_ENV_DIR)/remote_state.hcl, so it plans against the real account state (not the runner's empty state)." >&2; exit 1; \
 	fi; \
 	set +e; LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
@@ -1082,7 +1089,8 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result failed --reason "a rehearse step failed (above)" $(_RELEASE_GATE_MAKE); \
 		exit 1; \
 	fi; \
-	if $(_CI_GUARD) in-ci --allow-opt-out; then \
+	$(_CI_STATUS); \
+	if [ "$$ci_rc" = 10 ]; then \
 		echo "rehearse: ENV=$(ENV) uses legacy governance, which the CI dev pipeline doesn't run (its applies take no env lock); set governance_mode = \"deterministic\" in envs/$(ENV)/env.auto.tfvars, or rehearse on the deployment machine." >&2; exit 1; \
 	fi; \
 	$(_LEGACY_GUARD) rehearse || exit 1; \

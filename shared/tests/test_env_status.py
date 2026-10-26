@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts import env_status, environment_lock
+from scripts import ci_guard, env_status, environment_lock
 from scripts import policy_generations as pg
 from scripts import release_gate as rg
 from tests import script_stubs
@@ -524,7 +524,7 @@ def test_ci_never_suggests_release_plan(world, repo, ci):
     command, why = world.next("prod", ci)
     assert command == deployment_machine("make release-plan ENV=prod")
     assert why.endswith("but make release-plan refuses applying targets in CI "
-                        f"({env_status.ci_guard.ci_markers(ci)[0]}) unless GENIERAILS_ALLOW_CI_APPLY=1 "
+                        f"({ci_guard.ci_markers(ci)[0]}) unless GENIERAILS_ALLOW_CI_APPLY=1 "
                         "(isolated integration-test workflows only)")
     assert world.next("dev", ci)[0] == deployment_machine("make release-plan ENV=prod")
 
@@ -627,20 +627,19 @@ def test_ci_dev_rehearse_exemption_follows_the_guard(world, repo):
 def test_make_and_next_share_one_ci_detection():
     """No inline CI check is left in Makefile.shared: every one runs scripts/ci_guard.py, which make next imports."""
     text = (ROOT / "shared" / "Makefile.shared").read_text()
-    assert "TF_BUILD" not in text and "ci_value" not in text
+    assert "TF_BUILD" not in text and "ci_value" not in text and "in-ci" not in text
     assert "\n_guard-not-ci-apply:\n\t@GENIERAILS_MAKE_GOALS=\"$(MAKECMDGOALS)\" $(_CI_GUARD) apply " in text
     assert "\n_guard-not-ci-rebind:\n\t@$(_CI_GUARD) rebind\n" in text
-    from scripts import staged_policy_apply
-
-    assert staged_policy_apply.CI_MARKERS is env_status.ci_guard.CI_MARKERS
+    assert "CI_MARKERS" not in (ROOT / "shared" / "scripts" / "staged_policy_apply.py").read_text()
     guarded = env_status.ci_guarded_targets()
     assert {"rehearse", "release", "release-plan", "maintain", "apply-account", "policy-abandon"} <= set(guarded)
     assert guarded["policy-rebind"] == "rebind"
+    assert {"_release-manifest", "_apply-layer", "_destroy-layer"} <= set(guarded)  # underscore targets too
     assert not {"account-plan", "promote-to", "setup", "generate", "check", "status", "next"} & set(guarded)
 
 
 @pytest.mark.parametrize("ci", [*CI_RUNS, OPTED_OUT, {"CI": "false"}, {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "0"}],
                          ids=lambda ci: ",".join(f"{k}={v}" for k, v in ci.items()))
 def test_the_real_guard_and_ci_guard_agree(world, ci):
-    expected = env_status.ci_guard.apply_allowed(ci)
+    expected = ci_guard.apply_allowed(ci)
     assert guard_accepts(world, "make release ENV=prod", ci) is expected

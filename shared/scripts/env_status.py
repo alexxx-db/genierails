@@ -41,7 +41,6 @@ for _path in (SHARED, SHARED / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from scripts import ci_guard  # noqa: E402
 from scripts import release_gate as rg  # noqa: E402
 from scripts.auth_configured import AuthStatus, auth_status  # noqa: E402
 from scripts.coverage_fix import promotion_chain  # noqa: E402
@@ -49,7 +48,8 @@ from scripts.state_layout import data_access_subdir, remote_configured  # noqa: 
 
 EVIDENCE = Path("generated") / "evidence"
 MAKEFILE = SHARED / "Makefile.shared"
-_TARGET_LINE = re.compile(r"^([a-z][a-z0-9_-]*):(?!=)([^#]*)")
+_TARGET_LINE = re.compile(r"^([a-z_][a-z0-9_-]*):(?!=)([^#]*)")
+ALLOW_CI_APPLY = "GENIERAILS_ALLOW_CI_APPLY"
 _MAKE_COMMAND = re.compile(r"^make ([a-z][a-z0-9_-]*)(?: ENV=(\S+))?")
 
 
@@ -68,9 +68,18 @@ def ci_guarded_targets(makefile: Path = MAKEFILE) -> dict[str, str]:
 
 
 def _ci(cloud_dir: Path, makefile_cloud_dir: Path) -> dict:
-    """What _guard-not-ci-apply would see (scripts/ci_guard.py), and its dev rehearse exemption."""
-    markers = ci_guard.ci_markers()
-    out = {"detected": bool(markers), "markers": markers, "allow_ci_apply": ci_guard.opted_out()}
+    """What _guard-not-ci-apply would see (scripts/ci_guard.py), and its dev rehearse exemption.
+
+    A missing or failing ci_guard counts as CI with no opt-out, as make's guards then refuse.
+    """
+    try:
+        from scripts import ci_guard
+
+        markers = ci_guard.ci_markers()
+        out = {"detected": bool(markers), "markers": markers, "allow_ci_apply": ci_guard.opted_out()}
+    except Exception as exc:
+        return {"detected": True, "markers": ["ci_guard.py failed"], "allow_ci_apply": False,
+                "dev_rehearse_allowed": False, "error": f"{type(exc).__name__}: {exc}"}
     if markers:
         saved = os.environ.get("GENIERAILS_MAKE_GOALS")
         os.environ["GENIERAILS_MAKE_GOALS"] = "rehearse"  # the goal make next would suggest
@@ -94,13 +103,13 @@ def ci_refusal(command: str, ci: dict, cloud_dir: Path) -> str:
     guard = ci_guarded_targets().get(target)
     where = ", ".join(ci["markers"])
     if guard == "rebind":
-        return f"make {target} refuses in CI ({where}), even with {ci_guard.ALLOW_CI_APPLY}=1"
+        return f"make {target} refuses in CI ({where}), even with {ALLOW_CI_APPLY}=1"
     if guard != "apply" or ci["allow_ci_apply"]:
         return ""
     if target == "rehearse" and env == "dev" and ci.get("dev_rehearse_allowed") \
             and rg.deterministic(cloud_dir / "envs" / "dev"):
         return ""
-    return (f"make {target} refuses applying targets in CI ({where}) unless {ci_guard.ALLOW_CI_APPLY}=1 "
+    return (f"make {target} refuses applying targets in CI ({where}) unless {ALLOW_CI_APPLY}=1 "
             "(isolated integration-test workflows only)"
             + ("; make rehearse ENV=dev runs in CI only for a deterministic dev with configured, locked "
                "remote state" if target == "rehearse" else ""))
@@ -665,7 +674,7 @@ def _text(report: dict) -> list[str]:
     ci = report["ci"]
     lines.append("  CI:          " + ("not detected" if not ci["detected"] else
                                      f"detected ({', '.join(ci['markers'])}); "
-                                     + (f"{ci_guard.ALLOW_CI_APPLY}=1: applying targets may run"
+                                     + (f"{ALLOW_CI_APPLY}=1: applying targets may run"
                                         if ci["allow_ci_apply"] else "applying targets refuse")))
     lock = report["lock"]
     if lock.get("error"):
