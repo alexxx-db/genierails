@@ -15,6 +15,12 @@ rehearse-start / rehearse-finish
     rehearse writes a receipt for the new commit without re-applying (the
     promote-to digests are still recomputed).
 
+rehearse-reuse
+    ``make release-plan`` first does that same reuse for its source env when
+    HEAD has no passing receipt yet (a promotion or ack.txt commit), under the
+    source env's lock, never applying. When reuse isn't valid it prints why and
+    the command to run, and provenance refuses as before.
+
 provenance
     ``make release-plan``: HEAD has a passing clean rehearse receipt, the tree
     is clean, HEAD is on freshly fetched origin/main, the fingerprint and the
@@ -480,6 +486,14 @@ def rehearse_start(env_dir: Path, env: str, makefile: Path, make: str) -> str:
     earlier = reusable_receipt(cloud_dir, env, fp["fingerprint"])
     if earlier is None:
         return "run"
+    _write_reused(cloud_dir, env, status, fp, earlier, makefile, make)
+    pending.unlink(missing_ok=True)
+    return "reused"
+
+
+def _write_reused(cloud_dir: Path, env: str, status: Mapping, fp: Mapping, earlier: Mapping,
+                  makefile: Path, make: str) -> Path:
+    """The receipt for HEAD that reuses ``earlier`` (same fingerprint): nothing is applied."""
     receipt = {
         "kind": "rehearse", "version": VERSION, "env": env, "cloud": cloud_dir.name,
         "commit": status["commit"], "clean_tree": status["clean_tree"], "dirty": status["dirty"],
@@ -489,13 +503,72 @@ def rehearse_start(env_dir: Path, env: str, makefile: Path, make: str) -> str:
         "host": socket.gethostname(), "created_at": _now(),
     }
     path = _write_rehearse(cloud_dir, env, receipt)
-    pending.unlink(missing_ok=True)
     print(f"=== Rehearse ({env}): code and {env} inputs are unchanged since the passing rehearsal of "
           f"{earlier['commit'][:12]}; wrote a receipt for {status['commit'][:12]} without re-applying ===")
     print(f"  Receipt: {path}")
     _print_unclean(status)
     _print_targets(receipt["targets"])
-    return "reused"
+    return path
+
+
+def rehearse_reuse(env_dir: Path, env: str, makefile: Path, make: str) -> str | None:
+    """release-plan's reuse of its source env's rehearsal for HEAD; never applies anything.
+
+    With no passing receipt of the source env for HEAD, writes the receipt
+    ``make rehearse ENV=<source>`` would write without re-applying (same rule:
+    a clean checkout whose fingerprint matches an earlier passing clean receipt
+    of this store), under the source env's lock. Returns None when there is
+    nothing to say (a receipt exists now, or provenance names the problem),
+    else why reuse wasn't valid and what to run; provenance then refuses.
+    """
+    from scripts import environment_lock
+
+    env_dir = Path(env_dir)
+    cloud_dir = cloud_dir_of(env_dir)
+    try:
+        source = source_env(env_dir)
+    except Refused:
+        return None
+    source_dir = cloud_dir / "envs" / source
+    if not (source_dir / "env.auto.tfvars").is_file() or not deterministic(source_dir):
+        return None
+    if passing_receipt(cloud_dir, source, head(repo_root(source_dir))):
+        return None
+    rehearse_cmd = f"run make rehearse ENV={source} on this commit (it applies {source})"
+    if env_role(source_dir) == PROMOTED:
+        return (f"envs/{source} is itself promoted (promote_from is set), and make rehearse refuses a promoted "
+                f"env, so there is no {source} rehearsal to reuse (a multi-hop chain). Release ENV={env} from "
+                f"the rehearsed root instead: set promote_from to it in envs/{env}/env.auto.tfvars, then make "
+                f"promote-to ENV={env}")
+    ok, message, _nonce = environment_lock.acquire(source_dir, os.getpid(), "release-plan")
+    if not ok:
+        raise Refused(f"release-plan could not lock {source} to reuse its rehearsal: {message}")
+    try:
+        status = checkout_status(source_dir)
+        if not status["clean_tree"]:
+            return ("the checkout is not clean, and only a clean checkout's rehearsal counts; commit or remove "
+                    f"the changes, then re-run make release-plan ENV={env}")
+        fp = inputs_fingerprint(Path(status["repo"]), cloud_dir, source)
+        earlier = reusable_receipt(cloud_dir, source, fp["fingerprint"])
+        if earlier is None:
+            passed = [r for r in rehearse_receipts(cloud_dir, source)
+                      if r.get("result") == "passed" and r.get("clean_tree") is True]
+            if passed:
+                last = passed[-1]
+                changed = [k for k in ("code", "env", "account")
+                           if (last.get("fingerprint_parts") or {}).get(k) != fp[k]]
+                return (f"{', '.join(changed) or 'the'} inputs of {source} changed since its last passing "
+                        f"rehearsal ({last['commit'][:12]}); {rehearse_cmd}")
+            if any(r.get("result") == "passed" for r in rehearse_receipts(cloud_dir, source, any_store=True)):
+                return (f"the only passing {source} rehearsals were written by another store (a CI run or a "
+                        f"copied artifact), which never count here; {rehearse_cmd} on this machine")
+            return f"{source} has no earlier passing rehearsal to reuse; {rehearse_cmd}"
+        print(f"=== release-plan ({env}): HEAD has no {source} rehearsal receipt; reusing {source}'s passing "
+              f"rehearsal of {earlier['commit'][:12]} (nothing is applied) ===")
+        _write_reused(cloud_dir, source, status, fp, earlier, makefile, make)
+        return None
+    finally:
+        environment_lock.release_lock(source_dir, os.getpid())
 
 
 def rehearse_finish(env_dir: Path, env: str, result: str, makefile: Path, make: str, reason: str = "") -> dict:
@@ -633,8 +706,9 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
                             f"({target.get('error', f'{env} was not a promotion target then')})")
         elif target["digest"] != committed:
             problems.append(f"envs/{env}/generated doesn't match what promote-to produces from this commit "
-                            f"(stale promotion): run make promote-to ENV={env}, open a PR, then make rehearse "
-                            f"ENV={source} on its merge commit and re-run make release-plan ENV={env}")
+                            f"(stale promotion): run make promote-to ENV={env}, open a PR, then re-run make "
+                            f"release-plan ENV={env} on its merge commit (it reuses the {source} rehearsal "
+                            f"while {source}'s inputs are unchanged)")
     last = last_release(cloud_dir, env)
     rollback = None
     if last and last.get("commit") and last["commit"] != commit:
@@ -2162,7 +2236,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd
 
     command("state-dir")
-    for name in ("rehearse-start", "rehearse-finish"):
+    for name in ("rehearse-start", "rehearse-finish", "rehearse-reuse"):
         cmd = command(name)
         cmd.add_argument("--makefile", type=Path, required=True)
         cmd.add_argument("--make", default="make")
@@ -2236,6 +2310,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "rehearse-start":
             # 10: a receipt was written without re-applying (inputs unchanged).
             return 10 if rehearse_start(args.env_dir, args.env, args.makefile, args.make) == "reused" else 0
+        elif args.command == "rehearse-reuse":
+            why = rehearse_reuse(args.env_dir, args.env, args.makefile, args.make)
+            if why:
+                print(f"release-plan: did not reuse a rehearsal for this commit: {why}", file=sys.stderr)
         elif args.command == "rehearse-finish":
             receipt = rehearse_finish(args.env_dir, args.env, args.result, args.makefile, args.make, args.reason)
             return 0 if receipt["result"] == "passed" else 1

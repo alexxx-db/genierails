@@ -23,7 +23,7 @@ from scripts import release_gate as rg
 from scripts import sticky_governance
 from tests import script_stubs
 from tests import test_prod_coverage_gap_fix as uc
-from tests.test_release_gate import EMPTY_ABAC, PROD_ENV, Repo
+from tests.test_release_gate import DEV_ENV, EMPTY_ABAC, PROD_ENV, Repo
 
 ROOT = Path(__file__).resolve().parents[2]
 LEGACY_ENV = 'promote_from = "dev"\n'
@@ -249,6 +249,100 @@ def test_release_plan_refused_by_the_reports_writes_no_manifest(make, repo):
 def test_release_plan_refuses_in_ci(tmp_path, repo, cloud):
     result = Make(tmp_path, repo, cloud)("release-plan", "prod", ci=True)
     assert result.returncode != 0 and "applying targets cannot run in CI" in result.stderr
+
+
+# -- release-plan reuses the source env's rehearsal --------------------------------------
+
+_PLAN_STEPS = ["inventory", "classification", "derive-assignments", "validate-generated", "coverage-gate",
+               "promote", "verify-access-keys", "audit-rulebook", "reports", "_release-plan-roots", "live"]
+_APPLYING = {"apply", "_verify-access-gate", "_derive-before-exposure", "apply-governance", "_release-manifest"}
+
+
+def test_release_plan_on_a_promotion_commit_reuses_the_dev_rehearsal_without_applying(make, repo):
+    """No second make rehearse ENV=dev: release-plan writes the reused dev receipt itself."""
+    assert make("rehearse", "dev").returncode == 0
+    first = rg.passing_receipt(repo.cloud, "dev", repo.head())
+    promoted = repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"},
+                           message="Promote the rules to prod")
+    make.reset()
+    result = make("release-plan", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"reusing dev's passing rehearsal of {first['commit'][:12]} (nothing is applied)" in result.stdout
+    # Exactly the release-plan steps: nothing applied dev (or anything else).
+    assert make.names() == _PLAN_STEPS and not _APPLYING & set(make.names())
+    receipt = rg.passing_receipt(repo.cloud, "dev", promoted)
+    assert receipt["applied"] is False and receipt["reused_from"] == first["commit"]
+    assert len([r for r in rg.rehearse_receipts(repo.cloud, "dev") if r.get("applied")]) == 1
+    manifest = json.loads(rg.current_manifest(repo.prod, "prod").read_text())
+    assert manifest["commit"] == promoted and manifest["provenance"]["receipt"] == receipt["_path"]
+    assert _no_lock(repo, "dev") and _no_lock(repo, "prod")
+
+
+def _stg_chain(repo) -> None:
+    stg = PROD_ENV.replace('catalog_map = { "dev_cat" = "prod_cat" }', 'catalog_map = { "dev_cat" = "stg_cat" }')
+    repo.commit({"aws/envs/stg/env.auto.tfvars": stg, "aws/envs/stg/generated/abac.auto.tfvars": EMPTY_ABAC,
+                 "aws/envs/prod/env.auto.tfvars": PROD_ENV.replace('promote_from = "dev"', 'promote_from = "stg"')})
+
+
+def _foreign_store(repo) -> None:
+    receipt = rg.passing_receipt(repo.cloud, "dev", repo.head())
+    path = Path(receipt["_path"])
+    data = json.loads(path.read_text()) | {"store": "ci-runner-store"}
+    path.chmod(0o600)
+    path.unlink()
+    rg._write_once(path, data)
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+
+
+@pytest.mark.parametrize(("case", "setup", "why"), [
+    ("inputs changed", lambda repo: repo.commit({"aws/envs/dev/env.auto.tfvars": DEV_ENV + "# new\n"}),
+     "env inputs of dev changed since its last passing rehearsal"),
+    ("code changed", lambda repo: repo.commit({"shared/scripts/code.py": "x = 2\n"}),
+     "code inputs of dev changed since its last passing rehearsal"),
+    ("dirty tree", lambda repo: (repo.commit({"aws/envs/prod/ack.txt": "# none\n"}),
+                                 (repo.root / "aws" / "notes.txt").write_text("untracked\n")),
+     "the checkout is not clean"),
+    ("rehearsed only in CI", _foreign_store, "written by another store"),
+    ("multi-hop", _stg_chain, "envs/stg is itself promoted"),
+])
+def test_release_plan_refuses_when_the_dev_rehearsal_cannot_be_reused(make, repo, case, setup, why):
+    assert make("rehearse", "dev").returncode == 0
+    setup(repo)
+    before = len(rg.rehearse_receipts(repo.cloud, "dev", any_store=True))
+    make.reset()
+    result = make("release-plan", "prod")
+    assert result.returncode != 0, case
+    assert "release-plan: did not reuse a rehearsal for this commit: " in result.stderr and why in result.stderr
+    assert "release-plan refused:" in result.stderr  # then provenance refuses exactly as before
+    named = "make release-plan ENV=prod" if case == "dirty tree" else (
+        "make promote-to ENV=prod" if case == "multi-hop" else "make rehearse ENV=dev")
+    assert named in result.stderr.split("did not reuse")[1].splitlines()[0], result.stderr
+    assert make.calls() == [] and len(rg.rehearse_receipts(repo.cloud, "dev", any_store=True)) == before
+    assert _no_lock(repo, "dev") and _no_lock(repo, "prod")
+
+
+def test_release_plan_refuses_without_any_dev_rehearsal_and_names_the_command(make, repo):
+    result = make("release-plan", "prod")
+    assert result.returncode != 0
+    assert ("did not reuse a rehearsal for this commit: dev has no earlier passing rehearsal to reuse; run make "
+            "rehearse ENV=dev on this commit (it applies dev)") in result.stderr
+    assert "no passing rehearsal of" in result.stderr and make.calls() == []
+    assert not rg.rehearse_receipts(repo.cloud, "dev", any_store=True)
+
+
+def test_release_plan_waits_for_a_running_dev_rehearse(make, repo):
+    assert make("rehearse", "dev").returncode == 0
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    ok, _, _ = environment_lock.acquire(repo.dev, os.getppid(), "rehearse")
+    assert ok
+    make.reset()
+    try:
+        result = make("release-plan", "prod")
+    finally:
+        environment_lock.release_lock(repo.dev, os.getppid())
+    assert result.returncode != 0 and "could not lock dev to reuse its rehearsal" in result.stderr
+    assert make.calls() == [] and rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+    assert _no_lock(repo, "prod")
 
 
 # -- account-plan / apply-account -------------------------------------------------------

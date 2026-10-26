@@ -271,6 +271,157 @@ def test_the_promotion_commit_needs_its_own_dev_rehearse_which_reuses_the_apply(
     assert rg.provenance(repo.prod, "prod")["commit"] == promoted
 
 
+# -- rehearse-reuse (release-plan reuses the source env's rehearsal) ----------------------
+
+def _reuse(repo: Repo, env_dir: Path | None = None, env: str = "prod") -> str | None:
+    return rg.rehearse_reuse(env_dir or repo.prod, env, Path("Makefile"), "make")
+
+
+def _dev_receipts(repo: Repo) -> list[dict]:
+    return rg.rehearse_receipts(repo.cloud, "dev", any_store=True)
+
+
+def test_release_plan_reuse_writes_rehearses_receipt_for_a_promotion_commit_without_applying(repo, capsys):
+    """The second make rehearse ENV=dev on the promotion commit is no longer needed."""
+    first = rehearse(repo)
+    promoted = repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"},
+                           message="Promote the rules to prod")
+    capsys.readouterr()
+    assert _reuse(repo) is None
+    out = capsys.readouterr().out
+    assert "reusing dev's passing rehearsal of " + first["commit"][:12] + " (nothing is applied)" in out, out
+    receipt = rg.passing_receipt(repo.cloud, "dev", promoted)
+    assert receipt["applied"] is False and receipt["reused_from"] == first["commit"]
+    assert receipt["targets"]["prod"]["digest"] == rg.generated_digest(repo.prod / "generated")
+    # The same receipt make rehearse ENV=dev writes when it reuses.
+    again = repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "reused"
+    assert set(rg.passing_receipt(repo.cloud, "dev", again)) == set(receipt)
+    assert not (rg.env_state(repo.cloud, "dev") / "rehearse.pending.json").exists()
+    rg.provenance(repo.prod, "prod")
+
+
+def test_release_plan_reuse_takes_and_releases_the_source_env_lock(repo, monkeypatch):
+    from scripts import environment_lock
+
+    rehearse(repo)
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    held = []
+    monkeypatch.setattr(rg, "_write_reused", lambda cloud, env, *a: held.append(
+        environment_lock.owns_lock(repo.dev, os.getpid())))
+    assert _reuse(repo) is None
+    assert held == [True] and not environment_lock.lock_path(repo.dev).exists()
+
+
+def test_release_plan_reuse_refuses_while_the_source_env_is_locked(repo):
+    from scripts import environment_lock
+
+    rehearse(repo)
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    ok, _, _ = environment_lock.acquire(repo.dev, os.getppid(), "rehearse")
+    assert ok
+    try:
+        with pytest.raises(rg.Refused, match="could not lock dev to reuse its rehearsal: .*held by make rehearse"):
+            _reuse(repo)
+    finally:
+        environment_lock.release_lock(repo.dev, os.getppid())
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+
+
+def test_release_plan_reuse_is_a_no_op_when_head_was_rehearsed(repo):
+    rehearse(repo)
+    before = len(_dev_receipts(repo))
+    assert _reuse(repo) is None and len(_dev_receipts(repo)) == before
+
+
+def test_release_plan_reuse_refuses_changed_source_inputs(repo):
+    rehearse(repo)
+    repo.commit({"aws/envs/dev/env.auto.tfvars": DEV_ENV + "# new\n"})
+    why = _reuse(repo)
+    assert why and "env inputs of dev changed since its last passing rehearsal" in why
+    assert "run make rehearse ENV=dev on this commit" in why
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+    with pytest.raises(rg.Refused, match="no passing rehearsal of"):
+        rg.provenance(repo.prod, "prod")
+
+
+def test_release_plan_reuse_refuses_changed_code(repo):
+    rehearse(repo)
+    repo.commit({"shared/scripts/code.py": "x = 2\n"})
+    why = _reuse(repo)
+    assert why and why.startswith("code inputs of dev changed") and "make rehearse ENV=dev" in why
+
+
+@pytest.mark.parametrize("prior", [None, "failed"])
+def test_release_plan_reuse_refuses_without_an_earlier_passing_rehearsal(repo, prior):
+    if prior:
+        rehearse(repo, prior)
+        repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    why = _reuse(repo)
+    assert why == "dev has no earlier passing rehearsal to reuse; run make rehearse ENV=dev on this commit (it applies dev)"
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+
+
+@pytest.mark.parametrize("rel, text", [
+    ("aws/.gitignore", GITIGNORE + "/envs/prod/abac.auto.tfvars\n"),
+    ("shared/scratch.txt", "untracked\n"),
+    ("aws/envs/prod/ack.txt", "# uncommitted\n"),
+])
+def test_release_plan_reuse_refuses_a_dirty_checkout_and_writes_nothing(repo, rel, text):
+    rehearse(repo)
+    repo.commit({"aws/envs/prod/generated/masking_functions.sql": "-- promoted\n"})
+    before = len(_dev_receipts(repo))
+    (repo.root / rel).write_text(text)
+    why = _reuse(repo)
+    assert why and "the checkout is not clean" in why and "re-run make release-plan ENV=prod" in why
+    assert len(_dev_receipts(repo)) == before
+
+
+def test_release_plan_reuse_never_counts_a_receipt_from_another_store(repo):
+    """Dev rehearsed only in CI: its receipts (a downloaded artifact) never count on this machine."""
+    receipt = rehearse(repo)
+    path = Path(receipt["_path"])
+    foreign = {k: v for k, v in json.loads(path.read_text()).items()} | {"store": "ci-runner-store"}
+    path.chmod(0o600)
+    path.unlink()
+    rg._write_once(path, foreign)
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    why = _reuse(repo)
+    assert why and "written by another store" in why and "make rehearse ENV=dev on this commit" in why
+    assert "on this machine" in why
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+
+
+def test_release_plan_reuse_refuses_a_multi_hop_chain(repo):
+    rehearse(repo)
+    stg_env = PROD_ENV.replace('catalog_map = { "dev_cat" = "prod_cat" }', 'catalog_map = { "dev_cat" = "stg_cat" }')
+    repo.commit({"aws/envs/stg/env.auto.tfvars": stg_env,
+                 "aws/envs/stg/generated/abac.auto.tfvars": EMPTY_ABAC,
+                 "aws/envs/prod/env.auto.tfvars": PROD_ENV.replace('promote_from = "dev"', 'promote_from = "stg"')})
+    before = len(_dev_receipts(repo))
+    why = _reuse(repo)
+    assert why and "envs/stg is itself promoted" in why and "multi-hop" in why
+    assert "make promote-to ENV=prod" in why
+    assert len(_dev_receipts(repo)) == before and not rg.rehearse_receipts(repo.cloud, "stg", any_store=True)
+    with pytest.raises(rg.Refused, match="no passing rehearsal of"):
+        rg.provenance(repo.prod, "prod")
+
+
+def test_release_plan_reuse_leaves_a_legacy_or_missing_source_to_provenance(repo):
+    repo.commit({"aws/envs/prod/env.auto.tfvars": PROD_ENV.replace('promote_from = "dev"', 'promote_from = "typo"')})
+    assert _reuse(repo) is None
+    repo.commit({"aws/envs/prod/env.auto.tfvars": PROD_ENV,
+                 "aws/envs/dev/env.auto.tfvars": 'uc_tables = ["dev_catalog.s.t"]\n'})
+    assert _reuse(repo) is None and not _dev_receipts(repo)
+
+
+def test_the_rehearse_reuse_cli_prints_why_and_exits_zero_for_provenance_to_refuse(repo, capsys):
+    rc = rg.main(["rehearse-reuse", "--env-dir", str(repo.prod), "--env", "prod", "--makefile", "Makefile"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "release-plan: did not reuse a rehearsal for this commit: dev has no earlier passing rehearsal" in err
+
+
 @pytest.mark.parametrize("rel, text", [
     # make setup ENV=prod adds prod's lines to the cloud .gitignore.
     ("aws/.gitignore", GITIGNORE + "/envs/prod/abac.auto.tfvars\n"),
@@ -359,8 +510,8 @@ def test_provenance_refuses_a_prod_generated_digest_mismatch(repo, monkeypatch):
     rehearse(repo)
     with pytest.raises(rg.Refused, match="stale promotion") as refused:
         rg.provenance(repo.prod, "prod")
-    assert ("open a PR, then make rehearse ENV=dev on its merge commit and re-run make release-plan ENV=prod"
-            in str(refused.value))
+    assert ("open a PR, then re-run make release-plan ENV=prod on its merge commit (it reuses the dev "
+            "rehearsal while dev's inputs are unchanged)" in str(refused.value))
 
 
 def test_provenance_refuses_a_receipt_without_a_digest_for_the_env(repo, monkeypatch):

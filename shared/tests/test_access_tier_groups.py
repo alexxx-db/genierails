@@ -605,27 +605,30 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     assert "**Preferred:**" in ref and "**Also accepted:**" in ref
 
 
-def test_champion_walkthrough_rehearses_dev_on_the_promotion_commit():
-    """release-plan needs a passing dev rehearsal of HEAD; the promotion commit is newer than dev step 6's."""
+def test_champion_walkthrough_lets_release_plan_reuse_the_dev_rehearsal_on_the_promotion_commit():
+    """release-plan needs a passing dev rehearsal of HEAD and writes it itself from dev step 6's (dev unchanged)."""
     readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
     gate = (SHARED / "scripts/release_gate.py").read_text()
     flow = readme[readme.index("## The whole flow"):readme.index("## Before you start")]
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
     gap = prod[prod.index("**Reuse an existing mask**"):prod.index("**A new kind of mask**")]
 
-    # The whole flow: promote, commit and push, then rehearse dev again before release-plan.
+    # The whole flow: promote, commit and push, then release-plan (no second dev rehearse).
     promoted = flow.index('git commit -m "Promote the rules to prod" && git push')
-    assert flow.index("make promote-to ENV=prod") < promoted
-    assert promoted < flow.index("make rehearse ENV=dev", promoted) < flow.index("make release-plan ENV=prod")
+    assert flow.index("make promote-to ENV=prod") < promoted < flow.index("make release-plan ENV=prod")
+    assert "make rehearse ENV=dev" not in flow[promoted:]
 
-    # Prod: push the promoted files, then rehearse dev on that commit, then plan.
-    steps = ["Commit and push the promoted files to `main`", "**3. Check, rehearse, plan, release.**",
-             "make check ENV=prod", "make rehearse ENV=dev", "make release-plan ENV=prod", "make release ENV=prod"]
+    # Prod: push the promoted files, then plan; release-plan reuses dev's rehearsal.
+    steps = ["Commit and push the promoted files to `main`", "**3. Check, plan, release.**",
+             "make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod"]
     positions = [prod.index(step) for step in steps]
     assert positions == sorted(positions)
+    step3 = prod[prod.index("**3. Check, plan, release.**"):]
+    assert "make rehearse ENV=dev" not in step3[:step3.index("make release ENV=prod")]
     # What the user sees, in release_gate.py's own words.
-    for quoted in ("no passing rehearsal of", "without re-applying"):
-        assert quoted in gate and quoted in prod
+    for quoted in ("no passing rehearsal of", "without re-applying", "did not reuse a rehearsal for this commit"):
+        assert quoted in gate and quoted in prod, quoted
+    assert "reusing {source}'s passing" in gate and "reusing dev's passing rehearsal of" in prod
 
     # A coverage-gap fix commits a new promotion too: rehearse dev again before release-plan.
     after_promote = gap[gap.index("`make promote-to ENV=prod`"):]

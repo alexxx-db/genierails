@@ -1218,7 +1218,10 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 
 # Two-phase release (design section 17), deterministic envs only.
 #
-# make release-plan ENV=prod checks provenance (release_gate.py provenance:
+# make release-plan ENV=prod first reuses the source env's rehearsal for HEAD
+# when its inputs are unchanged (release_gate.py rehearse-reuse: the receipt
+# make rehearse ENV=dev would write without re-applying, under the dev lock;
+# it never applies), then checks provenance (release_gate.py provenance:
 # a passing clean rehearsal of HEAD, a clean checkout, HEAD on freshly fetched
 # origin/main, matching fingerprints and envs/prod/generated digest, not older
 # than the last release unless prod:rollback:<commit> is acknowledged), then,
@@ -1238,6 +1241,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	$(_DEPLOYER_CHECK) "make release-plan" || exit 1; \
 	$(_ACCESS_CHECK) "make release-plan" || exit 1; \
 	$(_GROUP_CHECK) "make release-plan" || exit 1; \
+	$(_RELEASE_GATE) rehearse-reuse --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || exit 1; \
 	prov="$$(mktemp)"; \
 	$(_RELEASE_GATE) provenance --env-dir "$(ENV_DIR)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
 	$(_EXTERNAL_MASK_INVENTORY) || exit 1; \
