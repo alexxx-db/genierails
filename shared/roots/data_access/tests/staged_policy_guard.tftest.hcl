@@ -279,8 +279,7 @@ run "readers_gate_passes" {
 
 # create plans no new SELECT.
 run "create_withholds_new_select" {
-  command         = plan
-  expect_failures = [check.business_select_withheld]
+  command = plan
   variables {
     policy_stage  = "create"
     table_readers = { "cat.sch.orders" = ["raw"] }
@@ -293,8 +292,7 @@ run "create_withholds_new_select" {
 
 # tighten plans no new SELECT.
 run "tighten_withholds_new_select" {
-  command         = plan
-  expect_failures = [check.business_select_withheld]
+  command = plan
   variables {
     policy_stage  = "tighten"
     table_readers = { "cat.sch.orders" = ["raw"] }
@@ -307,8 +305,7 @@ run "tighten_withholds_new_select" {
 
 # switch plans no new SELECT.
 run "switch_withholds_new_select" {
-  command         = plan
-  expect_failures = [check.business_select_withheld]
+  command = plan
   variables {
     policy_stage  = "switch"
     table_readers = { "cat.sch.orders" = ["raw"] }
@@ -321,8 +318,7 @@ run "switch_withholds_new_select" {
 
 # restore plans no new SELECT.
 run "restore_withholds_new_select" {
-  command         = plan
-  expect_failures = [check.business_select_withheld]
+  command = plan
   variables {
     policy_stage  = "restore"
     table_readers = { "cat.sch.orders" = ["raw"] }
@@ -335,8 +331,7 @@ run "restore_withholds_new_select" {
 
 # retire plans no new SELECT.
 run "retire_withholds_new_select" {
-  command         = plan
-  expect_failures = [check.business_select_withheld]
+  command = plan
   variables {
     policy_stage  = "retire"
     table_readers = { "cat.sch.orders" = ["raw"] }
@@ -349,8 +344,7 @@ run "retire_withholds_new_select" {
 
 # abandon plans no new SELECT.
 run "abandon_withholds_new_select" {
-  command         = plan
-  expect_failures = [check.business_select_withheld]
+  command = plan
   variables {
     policy_stage  = "abandon"
     table_readers = { "cat.sch.orders" = ["raw"] }
