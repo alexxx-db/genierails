@@ -306,33 +306,35 @@ def _direct_promote_args():
     return ("promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=paycat=ppay")
 
 
-@pytest.mark.parametrize("ci", ["", "true"])
-def test_direct_promote_refuses_deterministic_destination_without_writing(repo, tmp_path, ci):
+@pytest.mark.parametrize("jobs", [(), ("-j4",)], ids=["serial", "make-j4"])
+@pytest.mark.parametrize("selected_env", [False, True], ids=["default-env", "env-prod"])
+def test_direct_promote_refuses_deterministic_destination_without_writing(repo, tmp_path, jobs, selected_env):
     _write_prod(repo, PROD_ENV)
-    before = _state(repo)
+    before = _snapshot(repo), _state(repo)
+    args = [*jobs, *_direct_promote_args()]
+    if selected_env:
+        args.append("ENV=prod")
 
-    result = _make(repo, tmp_path, *_direct_promote_args(), **({"CI": ci} if ci else {}))
+    result = _make(repo, tmp_path, *args)
 
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
     assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused for deterministic destinations" in out
     assert "make promote-to ENV=prod" in out
     assert "Cross-env promote" not in out
-    assert _state(repo) == before
+    assert (_snapshot(repo), _state(repo)) == before
 
 
 @pytest.mark.parametrize("how", ["env", "makeflags", "cmdline"])
 def test_direct_promote_marker_cannot_be_forged_from_user_inputs(repo, tmp_path, how):
+    sys.path.insert(0, str(SHARED / "scripts"))
+    from promote_token import mint
+
     _write_prod(repo, PROD_ENV)
     before = _state(repo)
-    token = tmp_path / "fake-token"
-    # Match the real token's shape. Merely naming a file through any Make input
-    # is insufficient without a live issuing wrapper in the process ancestry.
-    token.write_text(json.dumps({
-        "env_dir": str((_envs(repo) / "prod").resolve()),
-        "issuer": 2 ** 31 - 1,
-    }) + "\n")
-    token.chmod(0o600)
+    wrong = tmp_path / "other"
+    wrong.mkdir()
+    token = mint(wrong)
     args = list(_direct_promote_args())
     env = {}
     if how == "env":
@@ -377,6 +379,40 @@ def test_direct_promote_to_legacy_destination_keeps_the_existing_path(repo, tmp_
     out = result.stdout + result.stderr
     assert "=== Cross-env promote: dev -> prod ===" in out
     assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused" not in out
+
+
+def _path_without_ps(tmp_path):
+    """Mirror PATH directories containing ps, omitting only ps itself."""
+    result = []
+    for index, raw in enumerate(os.environ["PATH"].split(os.pathsep)):
+        source = Path(raw)
+        if not (source / "ps").exists():
+            result.append(raw)
+            continue
+        mirror = tmp_path / f"path-{index}"
+        mirror.mkdir()
+        for item in source.iterdir():
+            if item.name != "ps":
+                (mirror / item.name).symlink_to(item)
+        result.append(str(mirror))
+    return os.pathsep.join(result)
+
+
+def test_promote_to_works_end_to_end_without_ps_on_path(repo, tmp_path):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+
+    environ = _env(tmp_path)
+    environ["PATH"] = f"{tmp_path / 'bin'}:{_path_without_ps(tmp_path)}"
+    result = subprocess.run(
+        ["make", "--no-print-directory", "-C", str(repo / "aws"), "promote-to", "ENV=prod"],
+        text=True, capture_output=True, env=environ, timeout=600,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "=== Promote complete: dev -> prod ===" in result.stdout
 
 
 def test_live_derivation_refuses_override_for_column_absent_from_prod():
@@ -873,26 +909,59 @@ def test_the_exposure_token_works_once_and_only_for_its_env(tmp_path, monkeypatc
 
 def test_the_promote_to_token_works_once_and_only_for_its_env(tmp_path):
     sys.path.insert(0, str(SHARED / "scripts"))
-    from promote_token import consume, mint
+    from promote_token import TOKEN_PREFIX, consume, mint
 
     env, other = tmp_path / "prod", tmp_path / "dev"
     env.mkdir()
     other.mkdir()
-    token = mint(env)
-    assert oct(token.stat().st_mode & 0o777) == "0o600"
-    assert not consume(other, str(token)) and token.exists()
-    assert consume(env, str(token)) and not token.exists()
-    assert not consume(env, str(token))
-    forged = tmp_path / "forged"
-    forged.write_text(f"{env.resolve()}\n")
-    forged.chmod(0o644)
-    assert not consume(env, str(forged))
+    wrong_env = mint(other)
+    assert oct(wrong_env.stat().st_mode & 0o777) == "0o600"
+    assert not consume(env, str(wrong_env)) and wrong_env.exists()
+    wrong_env.unlink()
+
+    non_private = mint(env)
+    non_private.chmod(0o644)
+    assert not consume(env, str(non_private)) and non_private.exists()
+    non_private.unlink()
+
     link = tmp_path / "link"
     good = mint(env)
     link.symlink_to(good)
     assert not consume(env, str(link)) and good.exists()
+    assert consume(env, str(good)) and not good.exists()
+    assert not consume(env, str(good))  # one use only
+
+    exposure_shape = tmp_path / "exposure-token"
+    exposure_shape.write_text(f"{env.resolve()}\n")
+    exposure_shape.chmod(0o600)
+    assert not consume(env, str(exposure_shape)) and exposure_shape.exists()
+    assert TOKEN_PREFIX not in exposure_shape.read_text()
     assert not consume(env, None) and not consume(env, "")
-    good.unlink()
+
+
+def test_promote_to_token_is_removed_on_sigterm(tmp_path):
+    env = tmp_path / "prod"
+    env.mkdir()
+    token_tmp = tmp_path / "tokens"
+    token_tmp.mkdir()
+    command = [
+        sys.executable, str(SHARED / "scripts" / "promote_token.py"),
+        "run", "--env-dir", str(env), "--", sys.executable, "-c",
+        "import time; time.sleep(60)",
+    ]
+    process = subprocess.Popen(command, env={**os.environ, "TMPDIR": str(token_tmp)})
+    for _ in range(200):
+        if list(token_tmp.glob(".genierails-promote-to-*")):
+            break
+        import time
+        time.sleep(0.01)
+    assert list(token_tmp.glob(".genierails-promote-to-*")), "token was not minted"
+
+    process.terminate()
+    process.wait(timeout=10)
+
+    assert process.returncode != 0
+    assert not list(token_tmp.glob(".genierails-promote-to-*"))
 
 
 def test_apply_check_passes_when_auth_matches_and_ignores_legacy(tmp_path):

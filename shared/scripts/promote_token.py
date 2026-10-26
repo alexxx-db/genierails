@@ -1,57 +1,36 @@
 #!/usr/bin/env python3
-"""One-time proof that cross-env promote was called by promote-to.
+"""One-time accident guard for promote-to's nested cross-env promote.
 
 The public make promote SOURCE_ENV=... DEST_ENV=... form is legacy-compatible,
 but deterministic destinations must go through make promote-to so the wrapper
 also promotes agents, custom masks, expected classification, saved settings and
 sticky governance records. The wrapper mints a private one-use file token bound
-to the destination env dir; the promote recipe consumes it before writing.
+to the destination env dir; the promote guard consumes it before writing.
+
+This prevents an ambient Make/environment variable from accidentally skipping
+the guard. Like exposure_token.py, it is not a security boundary against a
+caller who can create owner-only files and deliberately reproduce the format.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import subprocess
+import signal
 import stat
 import sys
 import tempfile
 from pathlib import Path
 
 ENV_VAR = "GENIERAILS_PROMOTE_TO_TOKEN"
+TOKEN_PREFIX = "GENIERAILS_PROMOTE_TO_V1\n"
 
 
 def mint(env_dir: Path) -> Path:
     fd, name = tempfile.mkstemp(prefix=".genierails-promote-to-")
     with os.fdopen(fd, "w") as handle:
-        json.dump({"env_dir": str(env_dir.resolve()), "issuer": os.getpid()}, handle)
-        handle.write("\n")
+        handle.write(TOKEN_PREFIX + str(env_dir.resolve()) + "\n")
     return Path(name)
-
-
-def _parent_pid(pid: int) -> int | None:
-    try:
-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], text=True,
-                             capture_output=True, check=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    try:
-        return int(out)
-    except ValueError:
-        return None
-
-
-def _in_ancestry(issuer: int) -> bool:
-    pid = os.getpid()
-    for _ in range(64):
-        if pid == issuer:
-            return True
-        parent = _parent_pid(pid)
-        if parent is None or parent <= 0 or parent == pid:
-            return False
-        pid = parent
-    return False
 
 
 def consume(env_dir: Path, token: str | None) -> bool:
@@ -65,11 +44,8 @@ def consume(env_dir: Path, token: str | None) -> bool:
     valid = (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
              and stat.S_IMODE(info.st_mode) == 0o600)
     try:
-        data = json.loads(path.read_text())
-        valid = (valid and data.get("env_dir") == str(env_dir.resolve())
-                 and isinstance(data.get("issuer"), int)
-                 and _in_ancestry(data["issuer"]))
-    except (OSError, json.JSONDecodeError):
+        valid = valid and path.read_text() == TOKEN_PREFIX + str(env_dir.resolve()) + "\n"
+    except OSError:
         valid = False
     if valid:
         path.unlink()
@@ -79,10 +55,22 @@ def consume(env_dir: Path, token: str | None) -> bool:
 def run(env_dir: Path, command: list[str]) -> int:
     token = mint(env_dir)
     env = os.environ | {ENV_VAR: str(token)}
+    child = None
+
+    def terminate(signum, _frame):
+        if child is not None and child.poll() is None:
+            child.terminate()
+        raise SystemExit(128 + signum)
+
+    previous = {sig: signal.signal(sig, terminate) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
-        return subprocess.run(command, env=env).returncode
+        import subprocess
+        child = subprocess.Popen(command, env=env)
+        return child.wait()
     finally:
         token.unlink(missing_ok=True)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def main(argv: list[str] | None = None) -> int:
