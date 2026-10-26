@@ -4,7 +4,8 @@ With an azurerm state backend, scripts/terraform_env.sh keeps ARM_* for the
 backend, and the Databricks provider reads them too: ARM_CLIENT_SECRET next to
 the env's SP secret failed "more than one authorization method configured:
 azure and oauth". The roots pin auth_type (oauth-m2m for a client secret, the
-kept pipeline OIDC type in a CI job).
+kept pipeline OIDC type in a CI job, which terraform_layer.sh passes as
+-var=databricks_pipeline_auth_type).
 
 Each test builds a root from one real root's provider blocks and the
 variables/locals they read, runs the real provider (plan, so it authenticates)
@@ -119,8 +120,10 @@ def _plan(roots, layer: str, *, secret: str = "env-sp-secret", backend: str = "a
     (root / "auth.auto.tfvars").write_text(
         "".join(f'{k} = "{v}"\n' for k, v in values.items() if k in variables))
     # The runner's scrub (terraform_layer.sh passes "azurerm" when the env's
-    # remote_state.hcl selects that backend), then the real provider.
-    script = f'. "{TERRAFORM_ENV}"; genierails_terraform_env {backend}; exec terraform plan -input=false -no-color'
+    # remote_state.hcl selects that backend) and the -var it then adds for a
+    # kept pipeline OIDC, then the real provider.
+    script = (f'. "{TERRAFORM_ENV}"; genierails_terraform_env {backend}; exec terraform plan -input=false -no-color'
+              ' ${DATABRICKS_AUTH_TYPE:+"-var=databricks_pipeline_auth_type=$DATABRICKS_AUTH_TYPE"}')
     env = {k: v for k, v in env.items() if not k.startswith(("DATABRICKS_", "ARM_", "TF_VAR_"))}
     proc = subprocess.run(["bash", "-c", script], cwd=root, text=True, capture_output=True,
                           env={**env, "HOME": str(root), **ARM, **shell}, timeout=600)
@@ -157,6 +160,8 @@ def test_azure_devops_oidc_wins_in_an_azure_pipelines_job(roots, secret):
     assert methods == ["azure-devops-oidc", "azure-devops-oidc"]
 
 
+# (terraform_layer.sh refuses a caller's TF_VAR_ before the scrub; test.sh
+# relies on the scrub dropping it.)
 @pytest.mark.parametrize("shell", [
     {"DATABRICKS_AUTH_TYPE": "azure-devops-oidc"},          # no Azure Pipelines job
     {"TF_VAR_databricks_pipeline_auth_type": "github-oidc"},

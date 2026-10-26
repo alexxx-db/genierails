@@ -447,8 +447,9 @@ variable "databricks_client_secret" {
   sensitive = true
 }
 
-# Set only by scripts/terraform_env.sh, from DATABRICKS_AUTH_TYPE it kept in a
-# pipeline job (github-oidc or azure-devops-oidc).
+# Set only by scripts/terraform_layer.sh, from the DATABRICKS_AUTH_TYPE that
+# scripts/terraform_env.sh kept in a pipeline job (github-oidc or
+# azure-devops-oidc); it refuses any caller's value.
 variable "databricks_pipeline_auth_type" {
   type    = string
   default = ""

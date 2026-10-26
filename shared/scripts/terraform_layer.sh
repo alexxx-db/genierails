@@ -130,7 +130,8 @@ cd "$ROOT_DIR"
 # env_dir and the state snapshots (workspace_state_file, data_access_state_file)
 # say where the roots read Terraform state; only this runner sets them, after
 # every caller option. A caller assignment to one (-var in either form, a
-# -var-file, the env's tfvars, TF_CLI_ARGS*) refuses here, before Terraform.
+# -var-file, the env's tfvars, a tfvars file Terraform loads from the root
+# itself, TF_CLI_ARGS*, TF_VAR_*) refuses here, before Terraform.
 case "$COMMAND" in
   plan|apply|destroy|import|console|print-cmd)
     RUNNER_VAR_FILES=()
@@ -138,8 +139,11 @@ case "$COMMAND" in
       tfvars_path="$(_layer_tfvars "$tfvars")"
       if [ -f "$tfvars_path" ]; then RUNNER_VAR_FILES+=(--var-file "$tfvars_path"); fi
     done
+    for tfvars_path in "$ROOT_DIR"/terraform.tfvars "$ROOT_DIR"/terraform.tfvars.json "$ROOT_DIR"/*.auto.tfvars "$ROOT_DIR"/*.auto.tfvars.json; do
+      if [ -f "$tfvars_path" ]; then RUNNER_VAR_FILES+=(--var-file "$tfvars_path"); fi
+    done
     if ! python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" --env-dir "$STATE_ENV_DIR" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@"; then
-      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state), import_walk only by it for terraform import, and policy_stage, held_access_grants and rebind_table_grants only by the staged policy controller (scripts/staged_policy_apply.py)." >&2
+      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state), import_walk only by it for terraform import, databricks_pipeline_auth_type only by it from a pipeline job's OIDC (scripts/terraform_env.sh), and policy_stage, held_access_grants and rebind_table_grants only by the staged policy controller (scripts/staged_policy_apply.py)." >&2
       exit 2
     fi
     ;;
@@ -344,6 +348,12 @@ esac
 RUNNER_VARS=()
 if [ "$LAYER" != "account" ]; then
   RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
+fi
+# genierails_terraform_env keeps DATABRICKS_AUTH_TYPE only as a pipeline job's
+# own OIDC; the providers' auth_type takes it from here (it outranks the env
+# variable, so without it a secret in the auth file would pin oauth-m2m).
+if [ -n "${DATABRICKS_AUTH_TYPE:-}" ]; then
+  RUNNER_VARS+=(-var="databricks_pipeline_auth_type=$DATABRICKS_AUTH_TYPE")
 fi
 if [ "$LAYER:$COMMAND" = "workspace:plan" ] && \
    python3 -c 'import os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from state_layout import STRUCTURAL_CHECK_TOKEN_ENV, consume_structural_check_token; raise SystemExit(0 if consume_structural_check_token(Path(sys.argv[2]), os.environ.get(STRUCTURAL_CHECK_TOKEN_ENV)) else 1)' "$SCRIPT_DIR" "$ENV_DIR"; then

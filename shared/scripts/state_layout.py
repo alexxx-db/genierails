@@ -452,9 +452,10 @@ def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
 
 
 # Variables only terraform_layer.sh sets: where the roots read their state and Genie ID files,
-# and import_walk (terraform import only).
+# import_walk (terraform import only) and databricks_pipeline_auth_type (the pipeline OIDC
+# that scripts/terraform_env.sh kept, which the providers' auth_type then trusts).
 RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
-               "expected_pre_release_withholding", "import_walk")
+               "expected_pre_release_withholding", "import_walk", "databricks_pipeline_auth_type")
 STRUCTURAL_CHECK_TOKEN_ENV = "GENIERAILS_STRUCTURAL_CHECK_TOKEN"
 # Variables only the staged policy controller sets (policy_generations._runner), as -var with the
 # env-lock token (environment_lock.stage_token). policy_stage selects which grants a plan withholds

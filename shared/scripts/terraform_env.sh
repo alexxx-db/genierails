@@ -19,9 +19,10 @@
 #   - ARM_*, with "azurerm" as the argument: that backend reads state with them.
 #     The provider would read them too (Azure client-secret auth next to the
 #     env's SP: "more than one authorization method"), so the roots pin
-#     auth_type: the kept pipeline OIDC type, passed as
-#     TF_VAR_databricks_pipeline_auth_type (a provider auth_type outranks
-#     DATABRICKS_AUTH_TYPE), else oauth-m2m when the auth file has a secret.
+#     auth_type: the kept pipeline OIDC type, which terraform_layer.sh passes
+#     as -var=databricks_pipeline_auth_type (a provider auth_type outranks
+#     DATABRICKS_AUTH_TYPE; no caller may set it), else oauth-m2m when the
+#     auth file has a secret.
 genierails_terraform_env() {
   local keep_arm="${1:-}" name github=0 azure_devops=0
   if [ "${GITHUB_ACTIONS:-}" = true ]; then github=1; fi
@@ -46,10 +47,6 @@ genierails_terraform_env() {
     unset SYSTEM_ACCESSTOKEN SYSTEM_OIDCREQUESTURI SYSTEM_TEAMFOUNDATIONCOLLECTIONURI \
       SYSTEM_TEAMPROJECTID SYSTEM_PLANID SYSTEM_JOBID SYSTEM_HOSTTYPE
   fi
-  if [ -n "${DATABRICKS_AUTH_TYPE:-}" ]; then
-    export TF_VAR_databricks_pipeline_auth_type="$DATABRICKS_AUTH_TYPE"
-  else
-    unset TF_VAR_databricks_pipeline_auth_type
-  fi
+  unset TF_VAR_databricks_pipeline_auth_type
   export DATABRICKS_CONFIG_FILE=/dev/null
 }
