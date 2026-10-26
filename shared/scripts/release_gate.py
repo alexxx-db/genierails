@@ -1961,7 +1961,7 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
     status = checkout_status(env_dir)
     repo = Path(status["repo"])
     epoch = release_epoch(cloud_dir, env)
-    phases, unlinked, ignored = release_phases(env_dir, env, epoch)
+    phases, unlinked, earlier, ignored = release_phases(env_dir, env, epoch)
     receipt = {
         "kind": "release", "version": VERSION, "env": env, "cloud": cloud_dir.name,
         "commit": manifest["commit"], "clean_tree": status["clean_tree"],
@@ -1973,7 +1973,7 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
         "kept_names": manifest.get("kept_names", {}),
         "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
         "release_epoch": epoch, "phase_manifests": phases, "phase_manifests_unlinked": unlinked,
-        "release_receipts_ignored": ignored,
+        "phase_manifests_earlier": earlier, "release_receipts_ignored": ignored,
         # Prod agent IDs live here and in state, never in git (design section 5).
         "agents": receipt_agents(env_dir, manifest),
         "state_serials": state_serials(env_dir), "host": socket.gethostname(), "created_at": _now(),
@@ -2093,26 +2093,64 @@ def _receipt_problem(cloud_dir: Path, env: str, receipt: Mapping) -> str:
     path = manifests_dir(cloud_dir, env) / str(manifest.get("id") or "") / "manifest.json"
     if not manifest.get("id") or not path.is_file() or sha256_file(path) != manifest.get("sha256"):
         return f"its manifest {path} is missing or doesn't match the hash it records"
+    if "release_epoch" in receipt and not (isinstance(receipt["release_epoch"], str)
+                                           and re.fullmatch(r"[0-9a-f]{32}", receipt["release_epoch"])):
+        return "its release epoch isn't one release_epoch writes"
     return ""
 
 
-def release_phases(env_dir: Path, env: str, epoch: str | None) -> tuple[list[str], list[dict], list[dict]]:
-    """A release receipt's phase manifests, the phase records it can't link (with why), and receipts it ignored.
+def _accounted_by(receipts: list[dict], path: Path, record: Mapping | None, verified: bool) -> str:
+    """The earlier release receipt that accounts for the phase record at ``path`` ('' when none does).
+
+    Its listing a record's id is never enough: the record's own identity
+    must tie it to that receipt's release. A record that verifies belongs to
+    the receipt of its release epoch, and to no other. One that has no
+    identity to check (unreadable, tampered, or written before records held
+    an epoch) is accounted for only by the receipt that already listed it as
+    unlinked with this exact file's sha256, so it is reported once, not on
+    every release; a receipt written before release epochs accounts for
+    the pre-epoch records it linked at its own commit, as it chose them.
+    """
+    stem = path.stem
+    epoch = record.get("release_epoch") if isinstance(record, Mapping) else None
+    try:
+        digest = sha256_file(path)
+    except OSError:
+        digest = ""
+    for receipt in receipts:
+        linked = {str(i) for i in receipt.get("phase_manifests") or []}
+        unlinked = {str(u.get("id")): u for u in receipt.get("phase_manifests_unlinked") or [] if isinstance(u, dict)}
+        if verified and isinstance(epoch, str):
+            if receipt.get("release_epoch") == epoch and (stem in linked or stem in unlinked):
+                return receipt["_path"]
+            continue
+        if stem in unlinked and digest and unlinked[stem].get("record_sha256") == digest:
+            return receipt["_path"]
+        if (isinstance(record, Mapping) and "release_epoch" not in record and "release_epoch" not in receipt
+                and stem in linked and record.get("commit") == receipt.get("commit")):
+            return receipt["_path"]
+    return ""
+
+
+def release_phases(env_dir: Path, env: str, epoch: str | None
+                   ) -> tuple[list[str], list[dict], list[dict], list[dict]]:
+    """Every phase record, each in exactly one of: this release's phase manifests, the records the
+    receipt can't link (with why), and those an earlier receipt accounts for; plus the receipts ignored.
 
     The release is its epoch (release_epoch): a phase record is linked when
     it carries this epoch, verifies (_phase_problem), and was applied with
     no staged policy run open or in one the journal records as finished (an
     abandoned run's phases were undone). Commits and clocks decide nothing.
-    Only an earlier release receipt of this env that verifies
-    (_receipt_problem) and lists a record, linked or unlinked, accounts for
-    it; every other record is listed unlinked with the reason, so none is
-    dropped silently. The receipts that don't verify are returned, and
-    account for nothing.
+    An earlier release receipt of this env that verifies (_receipt_problem)
+    accounts for a record only by the record's own identity (_accounted_by);
+    every other record is listed unlinked with the reason and its sha256,
+    so none is dropped silently. Receipts that don't verify are returned,
+    and account for nothing.
     """
     from scripts.staged_policy_apply import load_journal
 
     cloud_dir = cloud_dir_of(env_dir)
-    accounted, ignored = set(), []
+    receipts, ignored = [], []
     directory = release_dir(cloud_dir, env)
     for path in sorted(directory.rglob("*.json")) if directory.is_dir() else []:
         if path.name.startswith("."):
@@ -2121,9 +2159,8 @@ def release_phases(env_dir: Path, env: str, epoch: str | None) -> tuple[list[str
         problem = "the receipt is unreadable" if receipt is None else _receipt_problem(cloud_dir, env, receipt)
         if problem:
             ignored.append({"receipt": str(path), "reason": problem})
-            continue
-        accounted |= {str(i) for i in receipt.get("phase_manifests") or []}
-        accounted |= {str(u.get("id")) for u in receipt.get("phase_manifests_unlinked") or [] if isinstance(u, dict)}
+        else:
+            receipts.append(receipt | {"_path": str(path)})
     try:
         runs: dict[str, str] | None = {
             str(entry["run_id"]): "abandoned" if "abandoned" in entry else "finished"
@@ -2131,22 +2168,20 @@ def release_phases(env_dir: Path, env: str, epoch: str | None) -> tuple[list[str
             if isinstance(entry, dict) and entry.get("run_id")}
     except Exception:
         runs = None
-    directory = env_state(cloud_dir, env) / "receipts" / "phases"
-    linked, unlinked = [], []
-    for path in sorted(directory.rglob("*.json")) if directory.is_dir() else []:
-        if path.name.startswith(".") or path.stem in accounted:
-            continue
+
+    def classify(path: Path) -> tuple[str, dict]:
         record = _read_json(path)
-        if record is None:
-            unlinked.append({"id": path.stem, "record": str(path), "reason": "the phase record is unreadable"})
-            continue
-        run = record.get("policy_run")
-        reason = _phase_problem(cloud_dir, env, path, record)
+        problem = "the phase record is unreadable" if record is None else _phase_problem(cloud_dir, env, path, record)
+        by = _accounted_by(receipts, path, record, verified=not problem)
+        if by:
+            return "earlier", {"id": path.stem, "record": str(path), "receipt": by}
+        reason = problem
+        run = (record or {}).get("policy_run")
         if not reason and epoch is None:
             reason = f"the release epoch {_epoch_path(cloud_dir, env)} is missing or unreadable"
         elif not reason and record["release_epoch"] != epoch:
             reason = (f"it was applied in release epoch {record['release_epoch']}, not this release's {epoch} "
-                      "(another release's phase, whose receipt doesn't list it)")
+                      "(another release's phase, and no release receipt of that epoch lists it)")
         elif not reason and run:
             if runs is None:
                 reason = f"the policy journal can't be read, so whether staged policy run {run} finished is unknown"
@@ -2155,11 +2190,23 @@ def release_phases(env_dir: Path, env: str, epoch: str | None) -> tuple[list[str
             elif runs.get(run) != "finished":
                 reason = (f"it was applied in staged policy run {run}, which the policy journal doesn't record "
                           "as finished")
-        if reason:
-            unlinked.append({"id": path.stem, "record": str(path), "reason": reason})  # its name, not its claim
-        else:
-            linked.append((str(record.get("created_at") or ""), path.stem))
-    return [record_id for _, record_id in sorted(linked)], unlinked, ignored
+        if not reason:
+            return "linked", {"id": path.stem, "created_at": str(record.get("created_at") or "")}
+        try:
+            digest = sha256_file(path)
+        except OSError:
+            digest = ""
+        # Its name, not its claim; the hash lets the next receipt tell it is this very record.
+        return "unlinked", {"id": path.stem, "record": str(path), "record_sha256": digest, "reason": reason}
+
+    out: dict[str, list[dict]] = {"linked": [], "unlinked": [], "earlier": []}
+    directory = env_state(cloud_dir, env) / "receipts" / "phases"
+    for path in sorted(directory.rglob("*.json")) if directory.is_dir() else []:
+        if not path.name.startswith("."):
+            bucket, entry = classify(path)
+            out[bucket].append(entry)
+    linked = [e["id"] for e in sorted(out["linked"], key=lambda e: (e["created_at"], e["id"]))]
+    return linked, out["unlinked"], out["earlier"], ignored
 
 
 def maintain_check(env_dir: Path, env: str) -> dict:
