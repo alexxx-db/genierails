@@ -9,7 +9,8 @@ sets it unless OFFLINE=1.
 The report is a runtime file, never committed: it is written (0600, in a 0700
 directory) to the env's state dir, ``$GENIERAILS_STATE_DIR/<cloud>/<env>/evidence/``
 or ``<cloud>/.genierails-state/<env>/evidence/`` (git-ignored), where the
-release-gate receipts live. Nothing goes under envs/<env>/, so the clean
+release-gate receipts live. A folder that resolves (symlinks followed) inside the
+env's git checkout without being git-ignored is refused (exit 2, nothing written). Nothing goes under envs/<env>/, so the clean
 checkout and the env/generated digests that maintain and release-plan check
 never see it.
 
@@ -31,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -497,6 +499,36 @@ def evidence_dir(env_dir: Path) -> Path:
     return root / Path(env_dir).resolve().name / "evidence"
 
 
+def report_names(schema_version: str = SCHEMA_VERSION) -> tuple[str, str]:
+    stem = "compliance-evidence-v" + schema_version
+    return f"{stem}.json", f"{stem}.md"
+
+
+def refuse_committable(output_dir: Path, env_dir: Path) -> None:
+    """Refuse an evidence folder git could commit: inside the env's checkout and not ignored.
+
+    The default <cloud>/.genierails-state is ignored; a GENIERAILS_STATE_DIR (or a
+    symlink) can still point into the work tree. Symlinks are resolved first, and
+    only read-only git runs (rev-parse, check-ignore). A tracked report counts as
+    not ignored. Outside any checkout there is nothing to protect.
+    """
+    target = Path(output_dir).resolve()
+    top = subprocess.run(["git", "-C", str(Path(env_dir).resolve()), "rev-parse", "--show-toplevel"],
+                         text=True, capture_output=True)
+    if top.returncode:
+        return
+    repo = Path(top.stdout.strip()).resolve()
+    if target != repo and repo not in target.parents:
+        return
+    probes = [(target / name).relative_to(repo).as_posix() for name in report_names()]
+    ignored = subprocess.run(["git", "-C", str(repo), "check-ignore", "--", *probes], text=True, capture_output=True)
+    if ignored.returncode not in (0, 1) or set(ignored.stdout.split()) != set(probes):
+        raise EvidenceUnavailable(
+            f"the evidence folder {target} is inside the git checkout {repo} and not git-ignored, so the "
+            "record could be committed. Point GENIERAILS_STATE_DIR outside the checkout (or git-ignore that "
+            "folder) and run make evidence again")
+
+
 def _write_private(path: Path, text: str) -> None:
     """Write ``path`` 0600, replacing it whole (a failed write leaves the previous file)."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # mkstemp creates 0600
@@ -513,8 +545,8 @@ def _write_private(path: Path, text: str) -> None:
 def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     output_dir.chmod(0o700)
-    stem = "compliance-evidence-v" + report["schema_version"]
-    json_path, md_path = output_dir / f"{stem}.json", output_dir / f"{stem}.md"
+    json_name, md_name = report_names(report["schema_version"])
+    json_path, md_path = output_dir / json_name, output_dir / md_name
     _write_private(json_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
     _write_private(md_path, render_markdown(report))
     return json_path, md_path
@@ -532,7 +564,8 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
     tables = configured_tables(args.env_dir)
     try:
         output_dir = args.output_dir or evidence_dir(args.env_dir)
-    except RuntimeError as exc:  # state_layout.StateError: GENIERAILS_STATE_DIR is set but missing
+        refuse_committable(output_dir, args.env_dir)
+    except RuntimeError as exc:  # StateError (GENIERAILS_STATE_DIR set but missing) or EvidenceUnavailable
         print(f"ERROR: {exc}. No evidence was written.", file=sys.stderr)
         return 2
     live = os.getenv(INTEGRATION_ENV, "").lower() in {"1", "true", "yes"}

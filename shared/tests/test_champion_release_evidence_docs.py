@@ -56,6 +56,12 @@ def test_no_doc_asks_to_delete_the_evidence_folder_or_set_the_old_variable():
     doc = EVIDENCE_DOC.read_text()
     assert "`.genierails-state/<env>/evidence/`" in doc and "`$GENIERAILS_STATE_DIR/<cloud>/<env>/evidence/`" in doc
     assert "`OFFLINE=1` writes a config-only report" in doc
+    # Only the default folder is git-ignored; a custom state dir must be outside the repo or ignored.
+    assert "The default folder is git-ignored" in doc and "The folder is git-ignored" not in doc
+    custom = "custom `GENIERAILS_STATE_DIR` must be outside the repo or git-ignored"
+    assert custom in doc and custom in reference
+    assert "`GENIERAILS_STATE_DIR`, which must be outside the repo or git-ignored" in (SHARED.parent / "REFERENCE.md").read_text()
+    assert "`$GENIERAILS_STATE_DIR` when that is set, which must be outside the repo or git-ignored" in README.read_text()
     assert "`GENIERAILS_EVIDENCE_INTEGRATION=1`, which older versions needed for live collection, is still accepted" in doc
     # ...because make evidence writes there, live unless OFFLINE=1.
     makefile = MAKEFILE.read_text()

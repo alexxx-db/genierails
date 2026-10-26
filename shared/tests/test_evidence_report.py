@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -166,6 +167,90 @@ def test_an_earlier_envs_evidence_folder_is_left_alone_with_a_note(tmp_path, mon
     assert main(["--env-dir", str(env_dir)]) == 0
     assert (old / "compliance-evidence-v1.0.json").read_text() == "{}"
     assert f"NOTE: {old} is from an earlier GenieRails" in capsys.readouterr().out
+
+
+def _git_repo(tmp_path, monkeypatch, gitignore=""):
+    """A checkout at tmp_path/repo holding aws/envs/prod; returns (repo, env_dir)."""
+    import subprocess
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    repo = tmp_path / "repo"
+    env_dir = _offline_env(repo, monkeypatch)
+    if gitignore:
+        (repo / ".gitignore").write_text(gitignore)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    return repo, env_dir
+
+
+def _git_status(repo):
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+                          text=True, capture_output=True, check=True).stdout
+
+
+def _refused(capsys, tmp_path):
+    err = capsys.readouterr().err
+    assert "inside the git checkout" in err and "not git-ignored" in err and "No evidence was written" in err
+    assert not list(tmp_path.rglob("compliance-evidence-*"))
+
+
+def test_a_state_dir_inside_the_checkout_that_git_would_commit_is_refused(tmp_path, monkeypatch, capsys):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_a_state_dir_symlinked_into_the_checkout_is_refused(tmp_path, monkeypatch, capsys):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    (tmp_path / "state-link").symlink_to(repo / "custom-state")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state-link"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+    # ...and the default folder, when it is a symlink to an unignored place in the checkout.
+    monkeypatch.delenv("GENIERAILS_STATE_DIR")
+    (repo / "aws" / ".genierails-state").symlink_to(repo / "custom-state")
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_a_git_ignored_state_dir_inside_the_checkout_is_allowed(tmp_path, monkeypatch):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/custom-state/\n")
+    (repo / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (repo / "custom-state/aws/prod/evidence/compliance-evidence-v1.0.json").is_file()
+    assert "custom-state" not in _git_status(repo)
+
+
+def test_a_tracked_report_in_an_ignored_folder_is_refused(tmp_path, monkeypatch, capsys):
+    import subprocess
+
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/custom-state/\n")
+    tracked = repo / "custom-state/aws/prod/evidence/compliance-evidence-v1.0.json"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("{}")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", str(tracked)], check=True)
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    assert "not git-ignored" in capsys.readouterr().err and tracked.read_text() == "{}"
+
+
+def test_a_state_dir_outside_the_checkout_and_the_ignored_default_are_allowed(tmp_path, monkeypatch):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (tmp_path / "state/aws/prod/evidence/compliance-evidence-v1.0.md").is_file()
+    monkeypatch.delenv("GENIERAILS_STATE_DIR")
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (_out(env_dir) / "compliance-evidence-v1.0.md").is_file()
+    assert _git_status(repo) == "?? .gitignore\n?? aws/envs/prod/env.auto.tfvars\n"
 
 
 def test_configured_tables_includes_all_genie_tables_and_governance_fallback(tmp_path):

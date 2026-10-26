@@ -174,7 +174,7 @@ Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-ga
 ```bash
 make evidence ENV=prod
 ```
-It reads the live tags, masks and grants of prod's agent tables and writes a JSON record and Markdown summary to `.genierails-state/prod/evidence/` (git-ignored, next to the release receipts; under `$GENIERAILS_STATE_DIR` when that is set). It finds the SQL warehouse itself (prod's `sql_warehouse_id`, else the one the release applied); `WAREHOUSE_ID=<id>` only pins another, and `OFFLINE=1` writes a config-only report. The checkout stays clean, so `make maintain` and the next `release-plan` run as usual. Archive the record (e.g. with the change ticket): the next run replaces it. [Details](../../docs/evidence-report.md).
+It reads the live tags, masks and grants of prod's agent tables and writes a JSON record and Markdown summary to `.genierails-state/prod/evidence/` (git-ignored, next to the release receipts; under `$GENIERAILS_STATE_DIR` when that is set, which must be outside the repo or git-ignored). It finds the SQL warehouse itself (prod's `sql_warehouse_id`, else the one the release applied); `WAREHOUSE_ID=<id>` only pins another, and `OFFLINE=1` writes a config-only report. The checkout stays clean, so `make maintain` and the next `release-plan` run as usual. Archive the record (e.g. with the change ticket): the next run replaces it. [Details](../../docs/evidence-report.md).
 
 <a id="phase-5--prod-maintain-coverage"></a>
 ## Keep it safe

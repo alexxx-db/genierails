@@ -1074,6 +1074,18 @@ def test_offline_evidence_is_config_only_and_makes_no_live_call(make, repo, monk
     assert repo.git("status", "--porcelain", "--untracked-files=all") == ""
 
 
+def test_evidence_refuses_a_state_dir_inside_the_checkout_and_writes_nothing(make, repo, monkeypatch):
+    """Review repro: GENIERAILS_STATE_DIR=<repo>/custom-state make evidence once left untracked evidence."""
+    custom = repo.root / "custom-state"
+    custom.mkdir()
+    monkeypatch.delenv("GENIERAILS_EVIDENCE_INTEGRATION", raising=False)
+    result = make("evidence", "prod", "OFFLINE=1", environ_extra={rg.STATE_DIR_ENV: str(custom)})
+    assert result.returncode != 0
+    assert "not git-ignored" in result.stderr and "No evidence was written" in result.stderr
+    assert not list(repo.root.rglob("compliance-evidence-*"))
+    assert repo.git("status", "--porcelain", "--untracked-files=all") == ""
+
+
 def test_maintain_refuses_before_any_release(make, repo):
     result = make("maintain", "prod")
     assert result.returncode != 0 and "no release receipt yet" in result.stderr
