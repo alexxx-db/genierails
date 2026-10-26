@@ -137,8 +137,7 @@ def test_import_puts_every_option_before_addr_and_id(layer, tmp_path, layout, op
     assert all(a.startswith("-") for a in options_part), argv
     runner = [i for i, a in enumerate(options_part) if a.startswith("-var=") and a[5:].split("=")[0] in RUNNER_VARS]
     caller = [i for i, a in enumerate(options_part) if a in options]
-    # env_dir, the import_walk, withholding and pipeline auth switches, + genie_id_dir and the state files
-    assert len(runner) == (7 if state_dir else 4), argv
+    assert len(runner) == len(RUNNER_VARS), argv  # every one the root declares, empty when inactive
     assert runner == list(range(len(options_part) - len(runner), len(options_part))), argv  # last option
     assert not caller or max(caller) < min(runner), argv
 
@@ -228,6 +227,7 @@ def test_print_cmd_shows_the_import_argv_terraform_accepts(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     argv = shlex.split(result.stdout.split(")", 1)[1])
     assert argv == [f"-var-file={env_dir}/env.auto.tfvars", "-input=false", f"-var=env_dir={env_dir}",
+                    "-var=workspace_state_file=", "-var=data_access_state_file=", "-var=genie_id_dir=",
                     "-var=expected_pre_release_withholding=false", "-var=import_walk=true",
                     "-var=databricks_pipeline_auth_type=", ADDR, ID]
 
@@ -273,5 +273,94 @@ def test_import_argv_parses_as_terraform_parses_it(tmp_path, layout):
     argv = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)[:1] == ["import"]][-1]
     runner = [a for a in argv if a.startswith("-var=") and a[5:].split("=")[0] in RUNNER_VARS]
     assert argv[-2:] == [ADDR, ID] and argv[-2 - len(runner):-2] == runner, argv
-    # env_dir, the import_walk, withholding and pipeline auth switches, + genie_id_dir and the state files
-    assert len(runner) == (7 if layout == "state dir" else 4), argv
+    assert len(runner) == len(RUNNER_VARS), argv  # every one the root declares, empty when inactive
+
+
+# -- a root file can't decide a runner variable ------------------------------
+# The runner passes every one of its variables the root declares, empty or
+# false when inactive, so a default from an override file (override.tf,
+# *_override.tf, .tf.json forms) never reaches the configuration.
+
+def _runner_var_names() -> tuple[str, ...]:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from state_layout import RUNNER_VARS as names
+    return names
+
+
+BOOL_RUNNER_VARS = {"import_walk", "expected_pre_release_withholding"}
+
+
+def _echo_root() -> str:
+    """A workspace root that declares every runner variable and outputs it."""
+    blocks = ['terraform {\n  backend "local" {}\n}\n', 'resource "terraform_data" "adopted" {}\n']
+    for name in _runner_var_names():
+        if name == "env_dir":
+            blocks.append('variable "env_dir" {\n  type = string\n}\n')
+        elif name in BOOL_RUNNER_VARS:
+            blocks.append(f'variable "{name}" {{\n  type    = bool\n  default = false\n}}\n')
+        else:
+            blocks.append(f'variable "{name}" {{\n  type    = string\n  default = ""\n}}\n')
+        blocks.append(f'output "{name}" {{\n  value = var.{name}\n}}\n')
+    return "\n".join(blocks)
+
+
+def _forged(name: str, forged: Path):
+    if name in BOOL_RUNNER_VARS:
+        return True
+    if name == "databricks_pipeline_auth_type":
+        return "github-oidc"
+    return str(forged)
+
+
+@real_terraform
+@pytest.mark.parametrize("form", ["override.tf", "main_override.tf", "override.tf.json"])
+@pytest.mark.parametrize("layout", ["in-checkout", "state dir"])
+def test_an_override_file_cannot_set_a_runner_variable(tmp_path, form, layout):
+    shared = shared_copy(tmp_path)
+    root = shared / "roots" / "workspace"
+    for path in root.glob("*.tf"):
+        path.unlink()
+    shutil.rmtree(root / "tests", ignore_errors=True)  # init would install the tftests' modules
+    (root / "main.tf").write_text(_echo_root())
+    forged = tmp_path / "forged.tfstate.json"
+    forged.write_text("{}")
+    names = _runner_var_names()
+    if form.endswith(".json"):
+        (root / form).write_text(json.dumps({"variable": {
+            name: {"default": _forged(name, forged)} for name in names if name != "env_dir"}}))
+    else:
+        (root / form).write_text("".join(
+            f'variable "{name}" {{\n  default = {json.dumps(_forged(name, forged))}\n}}\n'
+            for name in names if name != "env_dir"))
+    env_dir = tmp_path / "envs" / "dev"
+    (env_dir / "data_access").mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text("# no settings\n")
+    environ = {k: v for k, v in os.environ.items()
+               if not k.startswith(("TF_CLI_ARGS", "TF_VAR_", "DATABRICKS_")) and k != "GENIERAILS_STATE_DIR"}
+    environ |= {"LAYER_ENV_DIR": str(env_dir), "ENVS_DIR": str(env_dir.parent), "TF_IN_AUTOMATION": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull}
+    if layout == "state dir":
+        (tmp_path / "state").mkdir()
+        environ["GENIERAILS_STATE_DIR"] = str(tmp_path / "state")
+    runner = shared / "scripts" / "terraform_layer.sh"
+
+    def run(*args):
+        result = subprocess.run([str(runner), "workspace", "dev", *args], text=True, capture_output=True,
+                                env=environ, timeout=TIMEOUT)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result
+
+    run("apply", "-auto-approve", "-no-color")
+    outputs = {name: out["value"] for name, out in json.loads(run("output", "-json").stdout).items()}
+    assert set(outputs) == set(names)
+    assert not [name for name, value in outputs.items() if value == _forged(name, forged)], outputs
+    assert outputs["env_dir"] == str(env_dir)
+    assert outputs["import_walk"] is False and outputs["expected_pre_release_withholding"] is False
+    assert outputs["databricks_pipeline_auth_type"] == ""
+    if layout == "in-checkout":
+        assert {outputs[n] for n in ("workspace_state_file", "data_access_state_file", "genie_id_dir")} == {""}
+    else:
+        assert outputs["workspace_state_file"].endswith("/inputs/workspace.tfstate.json"), outputs
+        assert outputs["data_access_state_file"].endswith("/inputs/data_access.tfstate.json"), outputs
+        assert outputs["genie_id_dir"].startswith(str(tmp_path / "state")), outputs

@@ -183,24 +183,31 @@ def _var_options(argv: str) -> list[str]:
     ("account", "apply", ("-auto-approve",)),
 ])
 def test_the_runner_always_sets_its_switches_last(tmp_path, layer, command, args):
-    # Not left to a variable default a root file could override
-    # (override.tf, *_override.tf[.json]): false or empty unless it sets them.
+    # Every runner variable the root declares, in RUNNER_VARS order, empty or
+    # false when inactive: not left to a default a root file could override
+    # (override.tf, *_override.tf[.json]), nor to RUNNER_VALUE_* in the caller's shell.
     env_dir = tmp_path / "envs" / {"account": "account", "data_access": "dev/data_access"}.get(layer, "dev")
-    calls = _run(tmp_path, layer, command, *args, env_dir=env_dir)
+    forged = {f"RUNNER_VALUE_{name}": "/forged" for name in
+              ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
+               "import_walk", "expected_pre_release_withholding", "databricks_pipeline_auth_type")}
+    calls = _run(tmp_path, layer, command, *args, env_dir=env_dir, **forged)
     runner_call = [argv for argv, _ in calls if argv.startswith(command + " ")]
     assert len(runner_call) == 1, calls
-    options = _var_options(runner_call[0])
-    assert options[-1] == f"-var={PIPELINE_VAR}=", options
-    switches = {o.split("=")[1]: o.split("=", 2)[2] for o in options
-                if o.split("=")[1] in ("import_walk", "expected_pre_release_withholding")}
-    expected = {}
-    if layer != "account":
-        expected["import_walk"] = "true" if command == "import" else "false"
-    if layer == "workspace":
-        expected["expected_pre_release_withholding"] = "false"
-    assert switches == expected, options
+    walk = "true" if command == "import" else "false"
+    expected = {
+        "workspace": [f"-var=env_dir={env_dir}", "-var=workspace_state_file=", "-var=data_access_state_file=",
+                      "-var=genie_id_dir=", "-var=expected_pre_release_withholding=false",
+                      f"-var=import_walk={walk}", f"-var={PIPELINE_VAR}="],
+        "data_access": [f"-var=env_dir={env_dir}", "-var=data_access_state_file=", f"-var=import_walk={walk}",
+                        f"-var={PIPELINE_VAR}="],
+        "account": [f"-var={PIPELINE_VAR}="],
+    }[layer]
+    argv = runner_call[0].split()
     if command == "import":
-        assert runner_call[0].split()[-2:] == list(args)
+        assert argv[-2:] == list(args)
+        argv = argv[:-2]
+    assert argv[-len(expected):] == expected, argv
+    assert "/forged" not in runner_call[0]
 
 
 def _project(tmp_path) -> Path:

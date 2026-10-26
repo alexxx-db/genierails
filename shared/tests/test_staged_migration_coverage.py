@@ -194,9 +194,10 @@ def test_the_runner_reads_a_staged_render_instead_of_the_split_config(tmp_path):
     assert f"-var-file={staged / 'abac.auto.tfvars'}" in args
     assert f"-var-file={layer / 'abac.auto.tfvars'}" not in args
     assert f"-var-file={layer / 'env.auto.tfvars'}" in args  # only the rendered file is replaced
-    # Among the runner's own variables, before only its pipeline auth switch (always last).
-    assert args[-2:] == [f"-var=masking_sql_file={staged / 'masking_functions.sql'}",
-                         "-var=databricks_pipeline_auth_type="]
+    # After the caller's, before the runner-only variables (the pipeline auth switch last).
+    masking = args.index(f"-var=masking_sql_file={staged / 'masking_functions.sql'}")
+    assert args.index("-var=sql_warehouse_id=wh") < masking < args.index(f"-var=env_dir={layer}")
+    assert args[-1] == "-var=databricks_pipeline_auth_type="
     # Without the variable nothing changes.
     environ.pop(pg.STAGE_CONFIG_ENV)
     log.unlink()

@@ -864,10 +864,7 @@ def test_the_runners_variables_come_after_every_caller_argument(tmp_path, fake_t
                    and a.split("=", 2)[1] in RUNNER_VARS]
     caller = [plan.index("-var=sql_warehouse_id=wh"), plan.index("-no-color")]
     assert runner_vars and min(runner_vars) > max(caller), plan
-    # env_dir and the withholding, import_walk and pipeline auth switches;
-    # + genie_id_dir (the state dir's records/) and the two state files.
-    expected = 7 if layout == "state dir" else 4
-    assert len(runner_vars) == expected, plan
+    assert len(runner_vars) == len(RUNNER_VARS), plan  # every one the root declares, empty when inactive
 
 
 # -- the staged policy controller's variables can't be set by a caller -------------------------

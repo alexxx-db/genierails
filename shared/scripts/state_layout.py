@@ -453,7 +453,9 @@ def write_state_file(env_dir: Path, env: str, layer: str, out: Path) -> bool:
 
 # Variables only terraform_layer.sh sets: where the roots read their state and Genie ID files,
 # import_walk (terraform import only) and databricks_pipeline_auth_type (the pipeline OIDC
-# that scripts/terraform_env.sh kept, which the providers' auth_type then trusts).
+# that scripts/terraform_env.sh kept, which the providers' auth_type then trusts). The
+# runner passes every one a root declares (declared_runner_vars), in this order, empty or
+# false when inactive, so no default decides one.
 RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
                "expected_pre_release_withholding", "import_walk", "databricks_pipeline_auth_type")
 STRUCTURAL_CHECK_TOKEN_ENV = "GENIERAILS_STRUCTURAL_CHECK_TOKEN"
@@ -463,6 +465,31 @@ STRUCTURAL_CHECK_TOKEN_ENV = "GENIERAILS_STRUCTURAL_CHECK_TOKEN"
 # preview plan and destroy are the two plain -var=policy_stage uses.
 STAGE_VARS = ("policy_stage", "held_access_grants", "rebind_table_grants")
 MAKE_STAGES = {("plan", "preview"), ("destroy", "destroy")}
+
+
+def _is_override_file(name: str) -> bool:
+    return name in ("override.tf", "override.tf.json") or name.endswith(("_override.tf", "_override.tf.json"))
+
+
+def declared_runner_vars(root: Path) -> list[str]:
+    """The RUNNER_VARS ``root`` declares in its own (non-override) files, in RUNNER_VARS order.
+
+    terraform_layer.sh passes each of them. An override file can only change a
+    variable a non-override file declares, so it can't add one this misses.
+    """
+    import re
+
+    declared: set[str] = set()
+    for path in sorted(Path(root).iterdir()):
+        if not path.is_file() or _is_override_file(path.name):
+            continue
+        if path.name.endswith(".tf"):
+            declared |= set(re.findall(r'^[ \t]*variable[ \t]+"([^"]+)"', path.read_text(), re.M))
+        elif path.name.endswith(".tf.json"):
+            blocks = json.loads(path.read_text()).get("variable", {})
+            for block in blocks if isinstance(blocks, list) else [blocks]:
+                declared |= set(block)
+    return [name for name in RUNNER_VARS if name in declared]
 
 
 def _assigned_names(args: list[str], source: str) -> list[tuple[str, str]]:
@@ -816,6 +843,7 @@ def main() -> int:
     check.add_argument("--var-file", type=Path, action="append", default=[])
     check.add_argument("--env-dir", type=Path)
     check.add_argument("args", nargs=argparse.REMAINDER)
+    commands.add_parser("runner-vars").add_argument("--root", type=Path, required=True)
     for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file",
                  "records-dir"):
         command = commands.add_parser(name)
@@ -838,6 +866,9 @@ def main() -> int:
             for line in overrides:
                 print(f"  {line}", file=sys.stderr)
             return 2 if overrides else 0
+        if args.command == "runner-vars":
+            print("\n".join(declared_runner_vars(args.root)))
+            return 0
         if args.command == "ci-allowed":
             return 0 if ci_allowed(args.env_dir, args.env, args.cloud_dir, args.cloud_root) else 1
         if args.command == "backend-args":
