@@ -24,6 +24,7 @@ provider "databricks" {
   account_id    = var.genie_only ? null : var.databricks_account_id
   client_id     = var.databricks_client_id
   client_secret = var.databricks_client_secret
+  auth_type     = local.databricks_auth_type
 }
 
 provider "databricks" {
@@ -31,6 +32,7 @@ provider "databricks" {
   host          = var.databricks_workspace_host
   client_id     = var.databricks_client_id
   client_secret = var.databricks_client_secret
+  auth_type     = local.databricks_auth_type
 }
 
 locals {
@@ -152,10 +154,10 @@ locals {
       # A captured agent (agents/<name>.space.json) gets no config from
       # Terraform: dev's stays as curated in the UI, and release pushes prod's
       # from the captured file (scripts/agent_ownership.py).
-      config = (local.deterministic
-        ? merge(s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
-        : s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
-      )
+      config = local.deterministic ? merge(
+        s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config),
+        { acl_groups = s.acl_groups == null ? [] : s.acl_groups }
+      ) : (s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config))
     }
   }
 
@@ -305,8 +307,9 @@ locals {
   }
   created_acl_handoffs = {
     for key, handoff in local.created_acl_handoff_candidates : key => handoff
-    if fileexists("${local.genie_id_dir}/.genie_space_id_${key}")
-    && (fileexists("${local.genie_id_dir}/.genie_space_id_${key}") ? try(trimspace(file("${local.genie_id_dir}/.genie_space_id_${key}")), "") == local.merged_spaces[key].genie_space_id : true)
+    if fileexists("${local.genie_id_dir}/.genie_space_id_${key}") && (
+      fileexists("${local.genie_id_dir}/.genie_space_id_${key}") ? try(trimspace(file("${local.genie_id_dir}/.genie_space_id_${key}")), "") == local.merged_spaces[key].genie_space_id : true
+    )
   }
   applied_can_run_groups = {
     for key, space in local.merged_spaces : key => [
@@ -330,9 +333,7 @@ locals {
   # Groups each space's desired CAN_RUN adds beyond what is applied.
   genie_space_can_run_widening = {
     for key, space in local.merged_spaces : key => (
-      local.acl_managed
-      ? sort(tolist(setsubtract(toset(space.config.acl_groups), toset(local.applied_can_run_groups[key]))))
-      : []
+      local.acl_managed ? sort(tolist(setsubtract(toset(space.config.acl_groups), toset(local.applied_can_run_groups[key])))) : []
     )
   }
 
@@ -355,9 +356,7 @@ locals {
         for pair in setproduct(local._space_tables[key], space.config.acl_groups) : "${pair[0]}|${pair[1]}"
         if length([
           for grant in local._applied_table_grants : grant
-          if endswith(pair[0], "*")
-          ? (startswith(grant, trimsuffix(pair[0], "*")) && endswith(grant, "|${pair[1]}"))
-          : grant == "${pair[0]}|${pair[1]}"
+          if endswith(pair[0], "*") ? (startswith(grant, trimsuffix(pair[0], "*")) && endswith(grant, "|${pair[1]}")) : grant == "${pair[0]}|${pair[1]}"
         ]) == 0
       ]
       : [
@@ -443,6 +442,27 @@ variable "databricks_client_id" {
 variable "databricks_client_secret" {
   type      = string
   sensitive = true
+}
+
+# Set only by scripts/terraform_layer.sh, from the DATABRICKS_AUTH_TYPE that
+# scripts/terraform_env.sh kept in a pipeline job (github-oidc or
+# azure-devops-oidc); it refuses any caller's value.
+variable "databricks_pipeline_auth_type" {
+  type    = string
+  default = ""
+  validation {
+    condition     = contains(["", "github-oidc", "azure-devops-oidc"], var.databricks_pipeline_auth_type)
+    error_message = "databricks_pipeline_auth_type is github-oidc, azure-devops-oidc or empty."
+  }
+}
+
+locals {
+  # The env's client secret pins OAuth M2M, so ARM_* kept for the azurerm
+  # backend (scripts/terraform_env.sh) can't add Azure auth ("more than one
+  # authorization method") or replace it. An IDs-only auth file in a pipeline
+  # job uses the job's OIDC; null leaves the provider's own choice.
+  databricks_auth_type = (var.databricks_pipeline_auth_type != "" ? var.databricks_pipeline_auth_type
+  : var.databricks_client_secret != "" ? "oauth-m2m" : null)
 }
 
 variable "databricks_workspace_id" {

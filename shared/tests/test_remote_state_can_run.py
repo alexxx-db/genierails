@@ -205,7 +205,9 @@ def test_in_checkout_state_passes_no_state_inputs(tmp_path):
     proc = _run_with_fake(tmp_path, env, fake)
     assert proc.returncode == 0, proc.stderr
     console = [c for c in Path(fake["FAKE_TF_LOG"]).read_text().splitlines() if c.startswith("console")][-1]
-    assert "state_file=" not in console
+    # The runner passes the state-file variables empty: the roots read the in-checkout state.
+    assert [a for a in console.split() if "state_file=" in a] == [
+        "-var=workspace_state_file=", "-var=data_access_state_file="], console
     assert sorted(p.name for p in env.rglob("*")) == [".coverage_gate.json", "abac.auto.tfvars", "data_access"]
 
 

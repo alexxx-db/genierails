@@ -9,8 +9,10 @@ Both the runner and test.sh get that env from scripts/terraform_env.sh, and a
 static check keeps every other script from running Terraform itself.
 """
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +25,7 @@ TEST_SH = ROOT / "shared" / "test.sh"
 AZURE = 'backend = "azurerm"\nresource_group_name = "r"\nstorage_account_name = "s"\ncontainer_name = "c"\n'
 S3 = 'backend = "s3"\nbucket = "b"\nregion = "r"\ndynamodb_table = "locks"\n'
 FAKE_TERRAFORM = """#!/usr/bin/env bash
-{ printf '== %s\\n' "$*"; env | grep -E '^(DATABRICKS|ARM|ACTIONS_ID_TOKEN|SYSTEM)_' | sort; } >> "$FAKE_TF_LOG"
+{ printf '== %s\\n' "$*"; env | grep -E '^(DATABRICKS|ARM|ACTIONS_ID_TOKEN|SYSTEM)_|^TF_VAR_databricks_pipeline_auth_type=' | sort; } >> "$FAKE_TF_LOG"
 exit 0
 """
 AMBIENT = {
@@ -61,10 +63,11 @@ def _calls(log: Path) -> list[tuple[str, dict]]:
     return calls
 
 
-def _run(tmp_path, layer, command, *args, env_dir=None, **extra):
+def _run(tmp_path, layer, command, *args, env_dir=None, runner=RUNNER, check=True, **extra):
     env_dir = env_dir or tmp_path / "envs" / "dev"
     env_dir.mkdir(parents=True, exist_ok=True)
-    (env_dir / "auth.auto.tfvars").write_text('databricks_workspace_host = "https://env-file.invalid"\n')
+    auth = env_dir / "auth.auto.tfvars"
+    auth.write_text('databricks_workspace_host = "https://env-file.invalid"\n' + (auth.read_text() if auth.exists() else ""))
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     # An operator profile the provider would otherwise read (DATABRICKS_CONFIG_FILE unset).
@@ -81,8 +84,10 @@ def _run(tmp_path, layer, command, *args, env_dir=None, **extra):
     env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HOME": str(home), "LANG": "C",
            "FAKE_TF_LOG": str(log), "LAYER_ENV_DIR": str(env_dir), "ENVS_DIR": str(env_dir.parent),
            "DATABRICKS_USER_AGENT_EXTRA": "genierails/0.1.0", **AMBIENT, **extra}
-    proc = subprocess.run([str(RUNNER), layer, "dev", command, *args], env=env, text=True,
+    proc = subprocess.run([str(runner), layer, "dev", command, *args], env=env, text=True,
                           capture_output=True, timeout=120)
+    if not check:
+        return proc, _calls(log)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     calls = _calls(log)
     assert calls and calls[0][0].startswith("init "), calls
@@ -123,6 +128,11 @@ def test_pipeline_oidc_auth_reaches_terraform_only_in_its_ci_job(tmp_path, auth_
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type, **ci_context)
     for argv, auth_env in calls:
         assert auth_env.get("DATABRICKS_AUTH_TYPE") == auth_type, argv
+        assert "TF_VAR_databricks_pipeline_auth_type" not in auth_env, argv
+        # The providers' auth_type (it outranks DATABRICKS_AUTH_TYPE) gets the
+        # kept OIDC from the runner, as its own -var.
+        if not argv.startswith("init "):
+            assert _var_options(argv)[-1] == "-var=databricks_pipeline_auth_type=" + auth_type, argv
         assert {k: auth_env.get(k) for k in token_vars} == {k: AMBIENT[k] for k in token_vars}, argv
         other = (GITHUB_TOKEN_VARS | ADO_TOKEN_VARS) - token_vars
         assert not other & set(auth_env), argv
@@ -143,6 +153,8 @@ def test_a_local_shell_cannot_present_pipeline_oidc(tmp_path, auth_type, ci_cont
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type, **ci_context)
     for argv, auth_env in calls:
         assert "DATABRICKS_AUTH_TYPE" not in auth_env, argv
+        if not argv.startswith("init "):
+            assert _var_options(argv)[-1] == "-var=databricks_pipeline_auth_type=", argv
         if "GITHUB_ACTIONS" not in ci_context or ci_context["GITHUB_ACTIONS"] != "true":
             assert not GITHUB_TOKEN_VARS & set(auth_env), argv
         if "TF_BUILD" not in ci_context:
@@ -153,6 +165,167 @@ def test_a_local_shell_cannot_present_pipeline_oidc(tmp_path, auth_type, ci_cont
 def test_other_ambient_auth_types_are_dropped(tmp_path, auth_type):
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type)
     assert all("DATABRICKS_AUTH_TYPE" not in auth_env for _, auth_env in calls)
+
+
+def _var_options(argv: str) -> list[str]:
+    return [arg for arg in argv.split() if arg.startswith("-var=")]
+
+
+@pytest.mark.parametrize("layer,command,args", [
+    ("workspace", "plan", ()),
+    ("workspace", "apply", ("-auto-approve",)),
+    ("workspace", "destroy", ("-auto-approve",)),
+    ("workspace", "import", ("databricks_group.g", "123")),
+    ("workspace", "console", ()),
+    ("data_access", "plan", ()),
+    ("data_access", "import", ("databricks_grant.g", "x")),
+    ("account", "plan", ()),
+    ("account", "apply", ("-auto-approve",)),
+])
+def test_the_runner_always_sets_its_switches_last(tmp_path, layer, command, args):
+    # Every runner variable the root declares, in RUNNER_VARS order, empty or
+    # false when inactive: not left to a default a root file could override
+    # (override.tf, *_override.tf[.json]), nor to RUNNER_VALUE_* in the caller's shell.
+    env_dir = tmp_path / "envs" / {"account": "account", "data_access": "dev/data_access"}.get(layer, "dev")
+    forged = {f"RUNNER_VALUE_{name}": "/forged" for name in
+              ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
+               "import_walk", "expected_pre_release_withholding", "databricks_pipeline_auth_type")}
+    calls = _run(tmp_path, layer, command, *args, env_dir=env_dir, **forged)
+    runner_call = [argv for argv, _ in calls if argv.startswith(command + " ")]
+    assert len(runner_call) == 1, calls
+    walk = "true" if command == "import" else "false"
+    expected = {
+        "workspace": [f"-var=env_dir={env_dir}", "-var=workspace_state_file=", "-var=data_access_state_file=",
+                      "-var=genie_id_dir=", "-var=expected_pre_release_withholding=false",
+                      f"-var=import_walk={walk}", f"-var={PIPELINE_VAR}="],
+        "data_access": [f"-var=env_dir={env_dir}", "-var=data_access_state_file=", f"-var=import_walk={walk}",
+                        f"-var={PIPELINE_VAR}="],
+        "account": [f"-var={PIPELINE_VAR}="],
+    }[layer]
+    argv = runner_call[0].split()
+    if command == "import":
+        assert argv[-2:] == list(args)
+        argv = argv[:-2]
+    assert argv[-len(expected):] == expected, argv
+    assert "/forged" not in runner_call[0]
+
+
+def _project(tmp_path) -> Path:
+    """A copy of the runner and its scripts, with roots of its own (the real
+    roots' .tf files: the runner passes the runner variables they declare)."""
+    project = tmp_path / "project"
+    shutil.copytree(RUNNER.parent, project / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    for layer in ("account", "data_access", "workspace"):
+        (project / "roots" / layer).mkdir(parents=True)
+        for tf in (RUNNER.parents[1] / "roots" / layer).glob("*.tf"):
+            shutil.copy(tf, project / "roots" / layer)
+    return project
+
+
+PIPELINE_VAR = "databricks_pipeline_auth_type"
+
+
+def _injection(tmp_path, project, route):
+    """Set the pipeline auth type the way ``route`` does; returns (args, env)."""
+    env_dir = tmp_path / "envs" / "dev"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    root = project / "roots" / "workspace"
+    hcl = f'{PIPELINE_VAR} = "azure-devops-oidc"\n'
+    if route == "-var=":
+        return [f"-var={PIPELINE_VAR}=azure-devops-oidc"], {}
+    if route == "-var split":
+        return ["-var", f"{PIPELINE_VAR}=azure-devops-oidc"], {}
+    if route == "--var=":
+        return [f"--var={PIPELINE_VAR}=azure-devops-oidc"], {}
+    if route in ("-var-file", "-var-file split", "-var-file json"):
+        path = tmp_path / ("caller.tfvars.json" if route.endswith("json") else "caller.tfvars")
+        path.write_text(json.dumps({PIPELINE_VAR: "azure-devops-oidc"}) if route.endswith("json") else hcl)
+        return (["-var-file", str(path)] if route.endswith("split") else [f"-var-file={path}"]), {}
+    if route in ("env auth.auto.tfvars", "env env.auto.tfvars"):
+        name = route.split()[1]
+        (env_dir / name).write_text(hcl)
+        return [], {}
+    if route.startswith("root "):
+        name = route.split()[1]
+        (root / name).write_text(json.dumps({PIPELINE_VAR: "azure-devops-oidc"}) if name.endswith(".json") else hcl)
+        return [], {}
+    if route in ("TF_CLI_ARGS", "TF_CLI_ARGS_plan"):
+        return [], {route: f"-var={PIPELINE_VAR}=azure-devops-oidc"}
+    if route == "TF_VAR_":
+        return [], {f"TF_VAR_{PIPELINE_VAR}": "azure-devops-oidc"}
+    raise AssertionError(route)
+
+
+INJECTION_ROUTES = ["-var=", "-var split", "--var=", "-var-file", "-var-file split", "-var-file json",
+                    "env auth.auto.tfvars", "env env.auto.tfvars", "root terraform.tfvars",
+                    "root terraform.tfvars.json", "root caller.auto.tfvars", "root caller.auto.tfvars.json",
+                    "TF_CLI_ARGS", "TF_CLI_ARGS_plan", "TF_VAR_"]
+
+
+@pytest.mark.parametrize("ci_context", [{}, {"GITHUB_ACTIONS": "true", "DATABRICKS_AUTH_TYPE": "github-oidc"}],
+                         ids=["local", "github-actions"])
+@pytest.mark.parametrize("route", INJECTION_ROUTES)
+def test_a_caller_cannot_set_the_pipeline_auth_type(tmp_path, route, ci_context):
+    # The providers trust databricks_pipeline_auth_type over the env's secret;
+    # only the runner sets it, from the OIDC terraform_env.sh kept.
+    project = _project(tmp_path)
+    args, extra = _injection(tmp_path, project, route)
+    proc, calls = _run(tmp_path, "workspace", "plan", *args, runner=project / "scripts" / RUNNER.name,
+                       check=False, **ci_context, **extra)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert f"sets {PIPELINE_VAR}" in proc.stderr, proc.stderr
+    assert f"{PIPELINE_VAR} only by it" in proc.stderr, proc.stderr
+    assert calls == [], calls  # refused before Terraform ran (init included)
+
+
+@pytest.mark.parametrize("name,text", [
+    # Bare labels are valid HCL (terraform fmt accepts them, and would quote them).
+    ("extra.tf", 'variable workspace_state_file {\n  default = ""\n}\n\nvariable "genie_id_dir" {\n  default = ""\n}\n'),
+    ("extra.tf.json", json.dumps({"variable": {"workspace_state_file": {"default": ""}, "genie_id_dir": {"default": ""}}})),
+], ids=["bare-label-tf", "tf-json"])
+def test_the_runner_finds_every_runner_variable_a_root_declares(tmp_path, name, text):
+    # The account root declares only the pipeline auth type; one more file
+    # declaring two runner variables gets them both from the runner, empty.
+    project = _project(tmp_path)
+    (project / "roots" / "account" / name).write_text(text)
+    calls = _run(tmp_path, "account", "plan", env_dir=tmp_path / "envs" / "account",
+                 runner=project / "scripts" / RUNNER.name)
+    assert _var_options(calls[1][0])[-3:] == ["-var=workspace_state_file=", "-var=genie_id_dir=",
+                                              f"-var={PIPELINE_VAR}="], calls[1][0]
+
+
+@pytest.mark.parametrize("name,text", [
+    ("broken.tf", 'variable "workspace_state_file" {\n  default = ""\n'),
+    ("broken.tf.json", '{"variable": {"workspace_state_file": '),
+])
+def test_a_root_file_that_cannot_be_parsed_refuses(tmp_path, name, text):
+    # What it declares is unknown, so the runner can't set all its variables.
+    project = _project(tmp_path)
+    (project / "roots" / "workspace" / name).write_text(text)
+    proc, calls = _run(tmp_path, "workspace", "plan", runner=project / "scripts" / RUNNER.name, check=False)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert f"{name} can't be parsed" in proc.stderr and "can't all be set" in proc.stderr, proc.stderr
+    assert calls == [], calls  # refused before Terraform ran (init included)
+
+
+def test_every_shipped_root_parses_and_declares_its_runner_variables():
+    # The runner parses each root with python-hcl2 on every run; a root it
+    # can't parse refuses every command, so the shipped ones must parse.
+    import sys
+    sys.path.insert(0, str(RUNNER.parent))
+    from state_layout import RUNNER_VARS, declared_runner_vars
+    roots = RUNNER.parents[1] / "roots"
+    assert declared_runner_vars(roots / "workspace") == list(RUNNER_VARS)
+    assert declared_runner_vars(roots / "data_access") == [
+        "env_dir", "data_access_state_file", "import_walk", "databricks_pipeline_auth_type"]
+    assert declared_runner_vars(roots / "account") == ["databricks_pipeline_auth_type"]
+
+
+def test_a_root_dir_tfvars_without_runner_variables_still_runs(tmp_path):
+    project = _project(tmp_path)
+    (project / "roots" / "workspace" / "caller.auto.tfvars").write_text('coverage_gate_max_age = "1h"\n')
+    calls = _run(tmp_path, "workspace", "plan", runner=project / "scripts" / RUNNER.name)
+    assert _var_options(calls[1][0])[-1] == f"-var={PIPELINE_VAR}="
 
 
 def test_azurerm_backend_keeps_the_arm_identity_it_reads_state_with(tmp_path):
