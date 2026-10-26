@@ -1059,7 +1059,8 @@ def test_an_earlier_releases_phases_are_not_linked_to_the_next_release(repo, man
     rg.phase_record(repo.prod, "prod", manifest)
     first_final = _engine_fix(repo, 2)
     _journal(repo, history=[_finished("run1")])
-    assert _receipt(repo, first_final)["phase_manifests"] == [_id(manifest)]
+    first = _receipt(repo, first_final)
+    assert first["phase_manifests"] == [_id(manifest)]
     time.sleep(1.1)  # receipts and records are timestamped per second
     _journal(repo, open_run="run2", history=[_finished("run1")])
     phase = _engine_fix(repo, 3)
@@ -1069,6 +1070,7 @@ def test_an_earlier_releases_phases_are_not_linked_to_the_next_release(repo, man
     receipt = _receipt(repo, final)
     assert receipt["phase_manifests"] == [_id(phase)]
     assert receipt["phase_manifests_unlinked"] == []
+    assert first["release_epoch"] and receipt["release_epoch"] not in (None, first["release_epoch"])
 
 
 @pytest.mark.parametrize("ended, reason", [
@@ -1148,6 +1150,55 @@ def test_an_unreadable_journal_still_records_the_applied_phase_but_never_links_i
     assert receipt["phase_manifests"] == [_id(manifest)]
     [unlinked] = receipt["phase_manifests_unlinked"]
     assert unlinked["id"] == _id(second) and "policy run is unknown" in unlinked["reason"]
+
+
+def test_a_deleted_earlier_receipt_does_not_let_its_phases_into_the_next_release(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # phase A of release 1
+    first_final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    first = rg.release_receipt(repo.prod, "prod", first_final)
+    first.unlink()  # lost, or deleted by hand
+    _journal(repo, open_run="run2", history=[_finished("run1")])
+    phase = _engine_fix(repo, 3)
+    rg.phase_record(repo.prod, "prod", phase)  # phase B of release 2
+    final = _engine_fix(repo, 4)
+    _journal(repo, history=[_finished("run1"), _finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(phase)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(manifest) and "another release's phase" in unlinked["reason"]
+
+
+def test_a_foreign_receipt_neither_accounts_for_nor_hides_a_phase(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)
+    final = _engine_fix(repo, 2)
+    time.sleep(1.1)  # the foreign receipt is newer than the phase
+    foreign = rg._write_once(rg.release_dir(repo.cloud, "prod") / "zz-dev.json", {
+        "kind": "release", "version": rg.VERSION, "env": "dev", "cloud": repo.cloud.name, "commit": repo.head(),
+        "manifest": {"id": _id(manifest), "sha256": rg.sha256_file(manifest)},
+        "phase_manifests": [_id(manifest)], "created_at": rg._now()})
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest)]
+    assert receipt["phase_manifests_unlinked"] == []
+    assert receipt["release_receipts_ignored"] == [
+        {"receipt": str(foreign), "reason": "a receipt of aws/dev, not aws/prod"}]
+
+
+def test_a_clock_that_went_backwards_does_not_hide_a_phase(repo, manifest, monkeypatch):
+    rg.release_receipt(repo.prod, "prod", manifest)  # release 1
+    _journal(repo, open_run="run2")
+    phase = _engine_fix(repo, 2)
+    with monkeypatch.context() as m:
+        m.setattr(rg, "_now", lambda: "2000-01-01T00:00:00+00:00")  # before release 1's receipt
+        rg.phase_record(repo.prod, "prod", phase)
+    final = _engine_fix(repo, 3)
+    _journal(repo, history=[_finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(phase)]
+    assert receipt["phase_manifests_unlinked"] == []
 
 
 # -- runtime overlay and kept policy names ----------------------------------------------
