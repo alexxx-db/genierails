@@ -1916,6 +1916,7 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
     cloud_dir = cloud_dir_of(env_dir)
     status = checkout_status(env_dir)
     repo = Path(status["repo"])
+    phases, unlinked = release_phases(env_dir, env)
     receipt = {
         "kind": "release", "version": VERSION, "env": env, "cloud": cloud_dir.name,
         "commit": manifest["commit"], "clean_tree": status["clean_tree"],
@@ -1926,7 +1927,7 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
         },
         "kept_names": manifest.get("kept_names", {}),
         "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
-        "phase_manifests": [m["id"] for m in phase_records(cloud_dir, env, manifest["commit"])],
+        "phase_manifests": phases, "phase_manifests_unlinked": unlinked,
         # Prod agent IDs live here and in state, never in git (design section 5).
         "agents": receipt_agents(env_dir, manifest),
         "state_serials": state_serials(env_dir), "host": socket.gethostname(), "created_at": _now(),
@@ -1957,20 +1958,112 @@ def account_receipts(cloud_dir: Path, env: str = ACCOUNT_ENV) -> list[dict]:
             if r.get("kind") == "account"]
 
 
+def _policy_run(env_dir: Path) -> str | None:
+    """The staged policy run open in the journal ('' when none is, None when the journal can't be read)."""
+    from scripts.staged_policy_apply import load_journal
+
+    try:
+        transition = (load_journal(Path(env_dir)) or {}).get("transition")
+    except Exception:
+        return None
+    return str(transition.get("run_id") or "") if isinstance(transition, dict) else ""
+
+
 def phase_record(env_dir: Path, env: str, manifest_path: Path) -> Path:
-    """A non-final manifest (one staged policy phase) was applied."""
+    """A non-final manifest (one staged policy phase) was applied.
+
+    The record holds the manifest's hash and the staged policy run it was
+    applied in, so the final release receipt can link it whatever commit it
+    was planned at, and leave out the phases of a run that was abandoned
+    (release_phases). The apply already happened: an unreadable journal is
+    recorded as an unknown run (never linked), not a failure.
+    """
     manifest = load_manifest(Path(manifest_path), env)
     cloud_dir = cloud_dir_of(env_dir)
     record = {"kind": "release-phase", "version": VERSION, "env": env, "commit": manifest["commit"],
-              "id": manifest["id"], "manifest": str(manifest_path), "created_at": _now()}
+              "id": manifest["id"], "manifest": str(manifest_path), "manifest_sha256": sha256_file(manifest_path),
+              "policy_run": _policy_run(env_dir), "created_at": _now()}
     return _write_once(env_state(cloud_dir, env) / "receipts" / "phases" / f"{manifest['id']}.json", record)
 
 
-def phase_records(cloud_dir: Path, env: str, commit: str) -> list[dict]:
-    last = last_release(cloud_dir, env)
-    since = str((last or {}).get("created_at", ""))
-    return [r for r in _receipts(env_state(cloud_dir, env) / "receipts" / "phases")
-            if r.get("commit") == commit and str(r.get("created_at", "")) > since]
+def _phase_problem(cloud_dir: Path, env: str, path: Path, record: Mapping) -> str:
+    """Why a phase record can't be verified ('' when it can): its fields, and its manifest's hash."""
+    record_id = str(record.get("id") or "")
+    if record.get("kind") != "release-phase" or record.get("version") != VERSION or record.get("env") != env:
+        return f"not a version {VERSION} release phase record of {env}"
+    if record_id != path.stem:
+        return f"it names manifest {record_id or '(none)'} but is stored as {path.name}"
+    if "manifest_sha256" not in record or "policy_run" not in record:
+        return "it was written before phase records held their manifest's hash and policy run, so it can't be verified"
+    if not isinstance(record["policy_run"], str):
+        return "the policy journal couldn't be read when it was written, so its policy run is unknown"
+    manifest_path = manifests_dir(cloud_dir, env) / record_id / "manifest.json"
+    if not manifest_path.is_file():
+        return f"its manifest {manifest_path} is missing"
+    if sha256_file(manifest_path) != record["manifest_sha256"]:
+        return f"its manifest {manifest_path} doesn't match the hash the record holds (changed after it was applied)"
+    try:
+        manifest = load_manifest(manifest_path, env)
+    except Refused as exc:
+        return str(exc)
+    if manifest.get("id") != record_id or manifest.get("commit") != record.get("commit"):
+        return f"the record and its manifest {manifest_path} disagree on the manifest id or commit"
+    return ""
+
+
+def release_phases(env_dir: Path, env: str) -> tuple[list[str], list[dict]]:
+    """The phase manifests of the release a receipt completes, and the phase records it leaves out, with why.
+
+    The release is every phase applied since the env's last release receipt,
+    whatever commit each was planned at (an engine fix can merge between two
+    phases). An earlier release's records (before its receipt, or on it) are
+    not this release's and are skipped. These are listed as unlinked, never
+    silently linked or dropped: a record or manifest that doesn't verify
+    (_phase_problem), and a phase of a staged policy run the journal doesn't
+    record as finished (one that was abandoned undid it). A phase applied
+    with no policy run open (imports, adoption, the deferred workspace) can't
+    belong to an abandoned run.
+    """
+    from scripts.staged_policy_apply import load_journal
+
+    cloud_dir = cloud_dir_of(env_dir)
+    earlier = release_receipts(cloud_dir, env)
+    since = str(earlier[-1].get("created_at", "")) if earlier else ""
+    on_earlier = {str(i) for r in earlier for i in r.get("phase_manifests") or []}
+    try:
+        runs: dict[str, str] | None = {
+            str(entry["run_id"]): "abandoned" if "abandoned" in entry else "finished"
+            for entry in (load_journal(Path(env_dir)) or {}).get("history") or []
+            if isinstance(entry, dict) and entry.get("run_id")}
+    except Exception:
+        runs = None
+    directory = env_state(cloud_dir, env) / "receipts" / "phases"
+    linked, unlinked = [], []
+    for path in sorted(directory.rglob("*.json")) if directory.is_dir() else []:
+        if path.name.startswith("."):
+            continue
+        record = _read_json(path)
+        if record is None:
+            unlinked.append({"id": path.stem, "record": str(path), "reason": "the phase record is unreadable"})
+            continue
+        created, record_id = str(record.get("created_at") or ""), str(record.get("id") or path.stem)
+        if (created and created <= since) or record_id in on_earlier:
+            continue
+        run = record.get("policy_run")
+        reason = _phase_problem(cloud_dir, env, path, record) or ("" if created else "it has no created_at")
+        if not reason and run:
+            if runs is None:
+                reason = f"the policy journal can't be read, so whether staged policy run {run} finished is unknown"
+            elif runs.get(run) == "abandoned":
+                reason = f"it was applied in staged policy run {run}, which was abandoned"
+            elif runs.get(run) != "finished":
+                reason = (f"it was applied in staged policy run {run}, which the policy journal doesn't record "
+                          "as finished")
+        if reason:
+            unlinked.append({"id": path.stem, "record": str(path), "reason": reason})  # its name, not its claim
+        else:
+            linked.append((created, record_id))
+    return [record_id for _, record_id in sorted(linked)], unlinked
 
 
 def maintain_check(env_dir: Path, env: str) -> dict:

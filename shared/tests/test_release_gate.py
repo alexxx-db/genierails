@@ -1007,6 +1007,149 @@ def test_a_phase_manifest_is_recorded_on_the_final_release_receipt(repo, manifes
     assert receipt["phase_manifests"] == [json.loads(manifest.read_text())["id"]]
 
 
+# -- the final receipt's phase manifests: one release, whatever commit planned each phase -----------
+
+def _journal(repo: Repo, *, open_run: str = "", history=()) -> None:
+    journal = spa.empty_journal()
+    journal.update(transition={"run_id": open_run} if open_run else None, history=list(history))
+    spa.save_journal(repo.prod, journal)
+
+
+def _finished(run: str) -> dict:
+    return {"run_id": run, "commit": "c", "from": "a", "to": "b", "retired": "", "phases": [],
+            "finished_at": rg._now()}
+
+
+def _abandoned(run: str) -> dict:
+    return {"run_id": run, "abandoned": "b", "at": rg._now()}
+
+
+def _engine_fix(repo: Repo, n: int) -> Path:
+    """An engine fix merges mid-release; the next phase is planned at the new commit."""
+    repo.commit({"shared/scripts/code.py": f"x = {n}\n"})
+    rehearse(repo)
+    return _second_manifest(repo)
+
+
+def _id(path: Path) -> str:
+    return json.loads(Path(path).read_text())["id"]
+
+
+def _receipt(repo: Repo, final: Path) -> dict:
+    return json.loads(rg.release_receipt(repo.prod, "prod", final).read_text())
+
+
+def test_the_final_receipt_links_every_phase_of_the_release_whatever_commit_planned_it(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # planned at commit A
+    second = _engine_fix(repo, 2)
+    rg.phase_record(repo.prod, "prod", second)  # planned at commit B
+    final = _engine_fix(repo, 3)  # the final phase, at commit C
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest), _id(second)]
+    assert receipt["phase_manifests_unlinked"] == []
+    record = json.loads((rg.env_state(repo.cloud, "prod") / "receipts" / "phases" / f"{_id(second)}.json")
+                        .read_text())
+    assert record["policy_run"] == "run1" and record["manifest_sha256"] == rg.sha256_file(second)
+
+
+def test_an_earlier_releases_phases_are_not_linked_to_the_next_release(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)
+    first_final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    assert _receipt(repo, first_final)["phase_manifests"] == [_id(manifest)]
+    time.sleep(1.1)  # receipts and records are timestamped per second
+    _journal(repo, open_run="run2", history=[_finished("run1")])
+    phase = _engine_fix(repo, 3)
+    rg.phase_record(repo.prod, "prod", phase)
+    final = _engine_fix(repo, 4)
+    _journal(repo, history=[_finished("run1"), _finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(phase)]
+    assert receipt["phase_manifests_unlinked"] == []
+
+
+@pytest.mark.parametrize("ended, reason", [
+    (_abandoned, "run run1, which was abandoned"),
+    (None, "run run1, which the policy journal doesn't record as finished"),
+])
+def test_an_abandoned_or_unfinished_runs_phases_are_not_linked(repo, manifest, ended, reason):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # run1's first phase; then make policy-abandon
+    history = [ended("run1")] if ended else []
+    _journal(repo, open_run="run2", history=history)
+    retry = _second_manifest(repo)  # the same commit: a commit filter can't tell the runs apart
+    rg.phase_record(repo.prod, "prod", retry)
+    final = _second_manifest(repo)
+    _journal(repo, history=history + [_finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(retry)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(manifest) and reason in unlinked["reason"]
+
+
+def _tamper_manifest(repo: Repo, phase: Path, record: Path) -> None:
+    os.chmod(phase, 0o600)
+    phase.write_text(phase.read_text().replace('"live-1"', '"live-forged"'))
+
+
+def _tamper_record_id(repo: Repo, phase: Path, record: Path) -> None:
+    data = json.loads(record.read_text()) | {"id": _id(phase).replace("-", "_")}
+    os.chmod(record, 0o600)
+    record.write_text(json.dumps(data))
+
+
+def _tamper_unreadable(repo: Repo, phase: Path, record: Path) -> None:
+    os.chmod(record, 0o600)
+    record.write_text("{not json")
+
+
+def _tamper_legacy(repo: Repo, phase: Path, record: Path) -> None:
+    data = {k: v for k, v in json.loads(record.read_text()).items() if k not in ("manifest_sha256", "policy_run")}
+    os.chmod(record, 0o600)
+    record.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("tamper, reason", [
+    (_tamper_manifest, "doesn't match the hash the record holds"),
+    (_tamper_record_id, "but is stored as"),
+    (_tamper_unreadable, "the phase record is unreadable"),
+    (_tamper_legacy, "written before phase records held their manifest's hash"),
+])
+def test_a_phase_record_that_does_not_verify_is_listed_unlinked_never_linked(repo, manifest, tamper, reason):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)
+    second = _engine_fix(repo, 2)
+    record = rg.env_state(repo.cloud, "prod") / "receipts" / "phases" / f"{_id(second)}.json"
+    rg.phase_record(repo.prod, "prod", second)
+    tamper(repo, second, record)
+    final = _engine_fix(repo, 3)
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(second) and reason in unlinked["reason"]
+    assert unlinked["record"] == str(record)
+
+
+def test_an_unreadable_journal_still_records_the_applied_phase_but_never_links_it(repo, manifest):
+    rg.phase_record(repo.prod, "prod", manifest)  # no journal yet: no policy run was open
+    journal = spa.journal_path(repo.prod)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text("{not json")
+    second = _engine_fix(repo, 2)
+    record = json.loads(rg.phase_record(repo.prod, "prod", second).read_text())  # the apply already happened
+    assert record["policy_run"] is None
+    _journal(repo, history=[_finished("run1")])
+    final = _engine_fix(repo, 3)
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(second) and "policy run is unknown" in unlinked["reason"]
+
+
 # -- runtime overlay and kept policy names ----------------------------------------------
 
 def test_overlay_is_used_only_when_current_and_deterministic(repo, monkeypatch):
