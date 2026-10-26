@@ -450,7 +450,7 @@ def test_release_plan_never_reuses_a_receipt_of_a_divergent_commit(repo):
 DROP = object()
 
 
-def _rewrite(receipt: dict, **changes) -> dict:
+def _edit_receipt(receipt: dict, **changes) -> dict:
     """Edit a stored receipt in place, by hand (what the seal must catch); DROP removes a field."""
     path = Path(receipt["_path"])
     data = json.loads(path.read_text())
@@ -466,7 +466,7 @@ def _rewrite(receipt: dict, **changes) -> dict:
 
 def test_a_failed_receipt_edited_to_passed_is_never_reused(repo, capsys):
     failed = rehearse(repo, "failed")
-    _rewrite(failed, result="passed", reason=DROP)
+    _edit_receipt(failed, result="passed", reason=DROP)
     commit = repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
     before = len(_dev_receipts(repo))
     why = _reuse(repo)
@@ -479,7 +479,7 @@ def test_a_failed_receipt_edited_to_passed_is_never_reused(repo, capsys):
 
 def test_a_receipt_edited_to_passed_never_satisfies_provenance(repo):
     failed = rehearse(repo, "failed")
-    _rewrite(failed, result="passed", reason=DROP)
+    _edit_receipt(failed, result="passed", reason=DROP)
     assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
     with pytest.raises(rg.Refused, match="fail validation .edited by hand.. and never count: .*its digest doesn't match"):
         rg.provenance(repo.prod, "prod")
@@ -503,7 +503,7 @@ INCONSISTENT = [
 def test_a_sealed_but_inconsistent_receipt_is_never_reused(repo, changes, why):
     """Re-sealing after an edit passes the digest; the fields must still fit together."""
     first = rehearse(repo)
-    data = {k: v for k, v in _rewrite(first, **changes).items()}
+    data = {k: v for k, v in _edit_receipt(first, **changes).items()}
     Path(first["_path"]).write_text(json.dumps(rg.seal(data), indent=2, sort_keys=True) + "\n")
     repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
     reason = _reuse(repo)
@@ -511,7 +511,7 @@ def test_a_sealed_but_inconsistent_receipt_is_never_reused(repo, changes, why):
 
 
 def _reseal(receipt: dict, **changes) -> None:
-    data = _rewrite(receipt, **changes)
+    data = _edit_receipt(receipt, **changes)
     Path(receipt["_path"]).write_text(json.dumps(rg.seal(data), indent=2, sort_keys=True) + "\n")
 
 
