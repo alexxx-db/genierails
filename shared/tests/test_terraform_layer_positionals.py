@@ -291,16 +291,17 @@ def _runner_var_names() -> tuple[str, ...]:
 BOOL_RUNNER_VARS = {"import_walk", "expected_pre_release_withholding"}
 
 
-def _echo_root() -> str:
+def _echo_root(bare_labels: bool = False) -> str:
     """A workspace root that declares every runner variable and outputs it."""
     blocks = ['terraform {\n  backend "local" {}\n}\n', 'resource "terraform_data" "adopted" {}\n']
     for name in _runner_var_names():
+        label = name if bare_labels else f'"{name}"'  # both valid HCL
         if name == "env_dir":
-            blocks.append('variable "env_dir" {\n  type = string\n}\n')
+            blocks.append(f'variable {label} {{\n  type = string\n}}\n')
         elif name in BOOL_RUNNER_VARS:
-            blocks.append(f'variable "{name}" {{\n  type    = bool\n  default = false\n}}\n')
+            blocks.append(f'variable {label} {{\n  type    = bool\n  default = false\n}}\n')
         else:
-            blocks.append(f'variable "{name}" {{\n  type    = string\n  default = ""\n}}\n')
+            blocks.append(f'variable {label} {{\n  type    = string\n  default = ""\n}}\n')
         blocks.append(f'output "{name}" {{\n  value = var.{name}\n}}\n')
     return "\n".join(blocks)
 
@@ -314,15 +315,20 @@ def _forged(name: str, forged: Path):
 
 
 @real_terraform
-@pytest.mark.parametrize("form", ["override.tf", "main_override.tf", "override.tf.json"])
-@pytest.mark.parametrize("layout", ["in-checkout", "state dir"])
-def test_an_override_file_cannot_set_a_runner_variable(tmp_path, form, layout):
+@pytest.mark.parametrize("form,layout,labels", [
+    ("override.tf", "in-checkout", "quoted"), ("main_override.tf", "in-checkout", "quoted"),
+    ("override.tf.json", "in-checkout", "quoted"), ("override.tf", "state dir", "quoted"),
+    ("main_override.tf", "state dir", "quoted"), ("override.tf.json", "state dir", "quoted"),
+    # Declared with bare labels (variable workspace_state_file { ... }), as valid as quoted ones.
+    ("override.tf", "in-checkout", "bare"),
+])
+def test_an_override_file_cannot_set_a_runner_variable(tmp_path, form, layout, labels):
     shared = shared_copy(tmp_path)
     root = shared / "roots" / "workspace"
     for path in root.glob("*.tf"):
         path.unlink()
     shutil.rmtree(root / "tests", ignore_errors=True)  # init would install the tftests' modules
-    (root / "main.tf").write_text(_echo_root())
+    (root / "main.tf").write_text(_echo_root(bare_labels=labels == "bare"))
     forged = tmp_path / "forged.tfstate.json"
     forged.write_text("{}")
     names = _runner_var_names()

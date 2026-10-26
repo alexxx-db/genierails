@@ -471,24 +471,38 @@ def _is_override_file(name: str) -> bool:
     return name in ("override.tf", "override.tf.json") or name.endswith(("_override.tf", "_override.tf.json"))
 
 
+class RootParseError(Exception):
+    """A root file declared_runner_vars can't parse: what it declares is unknown."""
+
+
 def declared_runner_vars(root: Path) -> list[str]:
     """The RUNNER_VARS ``root`` declares in its own (non-override) files, in RUNNER_VARS order.
 
-    terraform_layer.sh passes each of them. An override file can only change a
-    variable a non-override file declares, so it can't add one this misses.
+    terraform_layer.sh passes each of them. Every *.tf is parsed as HCL (quoted
+    or bare labels alike) and every *.tf.json as JSON; one that can't be parsed
+    raises RootParseError, since a declaration in it would go unset. An
+    override file can only change a variable a non-override file declares, so
+    it can't add one this misses.
     """
-    import re
+    import hcl2
 
     declared: set[str] = set()
     for path in sorted(Path(root).iterdir()):
-        if not path.is_file() or _is_override_file(path.name):
+        if not path.is_file() or _is_override_file(path.name) or not path.name.endswith((".tf", ".tf.json")):
             continue
-        if path.name.endswith(".tf"):
-            declared |= set(re.findall(r'^[ \t]*variable[ \t]+"([^"]+)"', path.read_text(), re.M))
-        elif path.name.endswith(".tf.json"):
-            blocks = json.loads(path.read_text()).get("variable", {})
+        try:
+            text = path.read_text()
+            data = json.loads(text) if path.name.endswith(".tf.json") else hcl2.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            blocks = data.get("variable", [])
             for block in blocks if isinstance(blocks, list) else [blocks]:
-                declared |= set(block)
+                if not isinstance(block, dict):
+                    raise ValueError("a variable block that isn't an object")
+                declared |= {str(name).strip('"') for name in block}
+        except Exception as exc:  # unparseable: what it declares is unknown, so it can't pass
+            detail = (str(exc).strip().splitlines() or [""])[0]
+            raise RootParseError(f"{path} can't be parsed ({type(exc).__name__}: {detail})") from None
     return [name for name in RUNNER_VARS if name in declared]
 
 
@@ -868,7 +882,12 @@ def main() -> int:
             if overrides:
                 return 2
             if args.root is not None:
-                print("\n".join(declared_runner_vars(args.root)))
+                try:
+                    names = declared_runner_vars(args.root)
+                except RootParseError as exc:
+                    print(f"  {exc}", file=sys.stderr)
+                    return 3
+                print("\n".join(names))
             return 0
         if args.command == "ci-allowed":
             return 0 if ci_allowed(args.env_dir, args.env, args.cloud_dir, args.cloud_root) else 1

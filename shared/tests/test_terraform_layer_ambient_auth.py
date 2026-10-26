@@ -278,6 +278,49 @@ def test_a_caller_cannot_set_the_pipeline_auth_type(tmp_path, route, ci_context)
     assert calls == [], calls  # refused before Terraform ran (init included)
 
 
+@pytest.mark.parametrize("name,text", [
+    # Bare labels are valid HCL (terraform fmt accepts them, and would quote them).
+    ("extra.tf", 'variable workspace_state_file {\n  default = ""\n}\n\nvariable "genie_id_dir" {\n  default = ""\n}\n'),
+    ("extra.tf.json", json.dumps({"variable": {"workspace_state_file": {"default": ""}, "genie_id_dir": {"default": ""}}})),
+], ids=["bare-label-tf", "tf-json"])
+def test_the_runner_finds_every_runner_variable_a_root_declares(tmp_path, name, text):
+    # The account root declares only the pipeline auth type; one more file
+    # declaring two runner variables gets them both from the runner, empty.
+    project = _project(tmp_path)
+    (project / "roots" / "account" / name).write_text(text)
+    calls = _run(tmp_path, "account", "plan", env_dir=tmp_path / "envs" / "account",
+                 runner=project / "scripts" / RUNNER.name)
+    assert _var_options(calls[1][0])[-3:] == ["-var=workspace_state_file=", "-var=genie_id_dir=",
+                                              f"-var={PIPELINE_VAR}="], calls[1][0]
+
+
+@pytest.mark.parametrize("name,text", [
+    ("broken.tf", 'variable "workspace_state_file" {\n  default = ""\n'),
+    ("broken.tf.json", '{"variable": {"workspace_state_file": '),
+])
+def test_a_root_file_that_cannot_be_parsed_refuses(tmp_path, name, text):
+    # What it declares is unknown, so the runner can't set all its variables.
+    project = _project(tmp_path)
+    (project / "roots" / "workspace" / name).write_text(text)
+    proc, calls = _run(tmp_path, "workspace", "plan", runner=project / "scripts" / RUNNER.name, check=False)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert f"{name} can't be parsed" in proc.stderr and "can't all be set" in proc.stderr, proc.stderr
+    assert calls == [], calls  # refused before Terraform ran (init included)
+
+
+def test_every_shipped_root_parses_and_declares_its_runner_variables():
+    # The runner parses each root with python-hcl2 on every run; a root it
+    # can't parse refuses every command, so the shipped ones must parse.
+    import sys
+    sys.path.insert(0, str(RUNNER.parent))
+    from state_layout import RUNNER_VARS, declared_runner_vars
+    roots = RUNNER.parents[1] / "roots"
+    assert declared_runner_vars(roots / "workspace") == list(RUNNER_VARS)
+    assert declared_runner_vars(roots / "data_access") == [
+        "env_dir", "data_access_state_file", "import_walk", "databricks_pipeline_auth_type"]
+    assert declared_runner_vars(roots / "account") == ["databricks_pipeline_auth_type"]
+
+
 def test_a_root_dir_tfvars_without_runner_variables_still_runs(tmp_path):
     project = _project(tmp_path)
     (project / "roots" / "workspace" / "caller.auto.tfvars").write_text('coverage_gate_max_age = "1h"\n')

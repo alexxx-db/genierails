@@ -154,10 +154,10 @@ locals {
       # A captured agent (agents/<name>.space.json) gets no config from
       # Terraform: dev's stays as curated in the UI, and release pushes prod's
       # from the captured file (scripts/agent_ownership.py).
-      config = (local.deterministic
-        ? merge(s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config), { acl_groups = s.acl_groups == null ? [] : s.acl_groups })
-        : s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config)
-      )
+      config = local.deterministic ? merge(
+        s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config),
+        { acl_groups = s.acl_groups == null ? [] : s.acl_groups }
+      ) : (s.captured ? local.empty_genie_config : try(local.effective_genie_space_configs[local.canonical_space_names[idx]], local.empty_genie_config))
     }
   }
 
@@ -307,8 +307,9 @@ locals {
   }
   created_acl_handoffs = {
     for key, handoff in local.created_acl_handoff_candidates : key => handoff
-    if fileexists("${local.genie_id_dir}/.genie_space_id_${key}")
-    && (fileexists("${local.genie_id_dir}/.genie_space_id_${key}") ? try(trimspace(file("${local.genie_id_dir}/.genie_space_id_${key}")), "") == local.merged_spaces[key].genie_space_id : true)
+    if fileexists("${local.genie_id_dir}/.genie_space_id_${key}") && (
+      fileexists("${local.genie_id_dir}/.genie_space_id_${key}") ? try(trimspace(file("${local.genie_id_dir}/.genie_space_id_${key}")), "") == local.merged_spaces[key].genie_space_id : true
+    )
   }
   applied_can_run_groups = {
     for key, space in local.merged_spaces : key => [
@@ -332,9 +333,7 @@ locals {
   # Groups each space's desired CAN_RUN adds beyond what is applied.
   genie_space_can_run_widening = {
     for key, space in local.merged_spaces : key => (
-      local.acl_managed
-      ? sort(tolist(setsubtract(toset(space.config.acl_groups), toset(local.applied_can_run_groups[key]))))
-      : []
+      local.acl_managed ? sort(tolist(setsubtract(toset(space.config.acl_groups), toset(local.applied_can_run_groups[key])))) : []
     )
   }
 
@@ -357,9 +356,7 @@ locals {
         for pair in setproduct(local._space_tables[key], space.config.acl_groups) : "${pair[0]}|${pair[1]}"
         if length([
           for grant in local._applied_table_grants : grant
-          if endswith(pair[0], "*")
-          ? (startswith(grant, trimsuffix(pair[0], "*")) && endswith(grant, "|${pair[1]}"))
-          : grant == "${pair[0]}|${pair[1]}"
+          if endswith(pair[0], "*") ? (startswith(grant, trimsuffix(pair[0], "*")) && endswith(grant, "|${pair[1]}")) : grant == "${pair[0]}|${pair[1]}"
         ]) == 0
       ]
       : [
