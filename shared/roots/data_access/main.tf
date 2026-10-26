@@ -669,10 +669,26 @@ module "data_access" {
 # A raw terraform run that withholds new grants without a current coverage pass
 # still applies; say so. Staged deterministic phases with a passing gate defer
 # new SELECT to their grant phase, which is expected and needs no warning here.
+locals {
+  _withheld_env    = basename(dirname(var.env_dir))
+  _withheld_from   = var.promote_from == null ? "" : var.promote_from
+  _withheld_source = local._withheld_from == "" ? "dev" : local._withheld_from
+  # Where the warning sends the user, as release_gate.env_role sorts envs:
+  # legacy envs apply; deterministic ones rehearse, and a promoted one (promote_from
+  # set, or prod) refuses apply and rehearse, so the fix goes through its source
+  # and a release (coverage_fix.drift_hint and promoted_release_steps).
+  business_select_withheld_next_step = (
+    var.governance_mode != "deterministic" ? "Run this layer through make (make apply ENV=${local._withheld_env}), which refreshes live tags and DDL and runs the coverage check." :
+    local._withheld_from != "" || local._withheld_env == "prod" ? "Fix the cause in ${local._withheld_source}, make rehearse ENV=${local._withheld_source}, make promote-to ENV=${local._withheld_env}, then commit and push envs/${local._withheld_env}/ to origin/main (or merge its PR), make rehearse ENV=${local._withheld_source} on that commit, make release-plan ENV=${local._withheld_env} and make release ENV=${local._withheld_env}; release-plan refreshes live tags and DDL and runs the coverage check." :
+    "Run this layer through make (make rehearse ENV=${local._withheld_env}), which refreshes live tags and DDL and runs the coverage check."
+  )
+  business_select_withheld_message = "Coverage check ${module.data_access.withheld_table_grants.status}: ${module.data_access.withheld_table_grants.problem}. New business SELECT withheld: ${join(", ", module.data_access.withheld_table_grants.grants)}. Removals and existing grants still apply. ${local.business_select_withheld_next_step}"
+}
+
 check "business_select_withheld" {
   assert {
     condition     = length(module.data_access.withheld_table_grants.grants) == 0 || module.data_access.withheld_table_grants.status == "pass"
-    error_message = "Coverage check ${module.data_access.withheld_table_grants.status}: ${module.data_access.withheld_table_grants.problem}. New business SELECT withheld: ${join(", ", module.data_access.withheld_table_grants.grants)}. Removals and existing grants still apply. Run this layer through make (make apply ENV=${basename(dirname(var.env_dir))}), which refreshes live tags and DDL and runs the coverage check."
+    error_message = local.business_select_withheld_message
   }
 }
 
