@@ -2099,8 +2099,9 @@ def _receipt_problem(cloud_dir: Path, env: str, receipt: Mapping) -> str:
     return ""
 
 
-def _accounted_by(receipts: list[dict], path: Path, record: Mapping | None, verified: bool) -> str:
-    """The earlier release receipt that accounts for the phase record at ``path`` ('' when none does).
+def _accounted_by(receipts: list[dict], key: str, path: Path, record: Mapping | None, verified: bool,
+                  canonical: bool = True) -> str:
+    """The earlier release receipt that accounts for the phase record ``key`` at ``path`` ('' when none does).
 
     Its listing a record's id is never enough: the record's own identity
     must tie it to that receipt's release. A record that verifies belongs to
@@ -2110,8 +2111,10 @@ def _accounted_by(receipts: list[dict], path: Path, record: Mapping | None, veri
     unlinked with this exact file's sha256, so it is reported once, not on
     every release; a receipt written before release epochs accounts for
     the pre-epoch records it linked at its own commit, as it chose them.
+    A file outside the canonical location (``canonical`` False) is accounted
+    for only by that unlinked listing.
     """
-    stem = path.stem
+    stem = key
     epoch = record.get("release_epoch") if isinstance(record, Mapping) else None
     try:
         digest = sha256_file(path)
@@ -2120,13 +2123,13 @@ def _accounted_by(receipts: list[dict], path: Path, record: Mapping | None, veri
     for receipt in receipts:
         linked = {str(i) for i in receipt.get("phase_manifests") or []}
         unlinked = {str(u.get("id")): u for u in receipt.get("phase_manifests_unlinked") or [] if isinstance(u, dict)}
-        if verified and isinstance(epoch, str):
+        if canonical and verified and isinstance(epoch, str):
             if receipt.get("release_epoch") == epoch and (stem in linked or stem in unlinked):
                 return receipt["_path"]
             continue
         if stem in unlinked and digest and unlinked[stem].get("record_sha256") == digest:
             return receipt["_path"]
-        if (isinstance(record, Mapping) and "release_epoch" not in record and "release_epoch" not in receipt
+        if (canonical and isinstance(record, Mapping) and "release_epoch" not in record and "release_epoch" not in receipt
                 and stem in linked and record.get("commit") == receipt.get("commit")):
             return receipt["_path"]
     return ""
@@ -2144,7 +2147,10 @@ def release_phases(env_dir: Path, env: str, epoch: str | None
     An earlier release receipt of this env that verifies (_receipt_problem)
     accounts for a record only by the record's own identity (_accounted_by);
     every other record is listed unlinked with the reason and its sha256,
-    so none is dropped silently. Receipts that don't verify are returned,
+    so none is dropped silently. A record id is the name of its file where
+    phase_record writes it, so each id is listed once; a file anywhere else
+    in the phases dir (a copy in a subdirectory) is listed unlinked under its
+    relative path and never links. Receipts that don't verify are returned,
     and account for nothing.
     """
     from scripts.staged_policy_apply import load_journal
@@ -2169,12 +2175,27 @@ def release_phases(env_dir: Path, env: str, epoch: str | None
     except Exception:
         runs = None
 
+    directory = env_state(cloud_dir, env) / "receipts" / "phases"
+    paths = [p for p in (sorted(directory.rglob("*.json")) if directory.is_dir() else [])
+             if not p.name.startswith(".")]
+    canonical_ids = {p.stem for p in paths if p.parent == directory}
+
     def classify(path: Path) -> tuple[str, dict]:
+        # phase_record writes <phases>/<id>.json, so a record id is that file's name and is listed once.
+        # Any other file is an anomaly listed under its relative path: it never links nor stands for an id.
+        canonical = path.parent == directory
+        key = path.stem if canonical else path.relative_to(directory).as_posix()
         record = _read_json(path)
-        problem = "the phase record is unreadable" if record is None else _phase_problem(cloud_dir, env, path, record)
-        by = _accounted_by(receipts, path, record, verified=not problem)
+        if not canonical:
+            problem = (f"duplicate record id {path.stem} at {path}: phase records are read only from "
+                       f"{directory / (path.stem + '.json')}" if path.stem in canonical_ids else
+                       f"it isn't where phase records are written ({directory}/<manifest id>.json)")
+        else:
+            problem = ("the phase record is unreadable" if record is None
+                       else _phase_problem(cloud_dir, env, path, record))
+        by = _accounted_by(receipts, key, path, record, verified=not problem, canonical=canonical)
         if by:
-            return "earlier", {"id": path.stem, "record": str(path), "receipt": by}
+            return "earlier", {"id": key, "record": str(path), "receipt": by}
         reason = problem
         run = (record or {}).get("policy_run")
         if not reason and epoch is None:
@@ -2191,20 +2212,18 @@ def release_phases(env_dir: Path, env: str, epoch: str | None
                 reason = (f"it was applied in staged policy run {run}, which the policy journal doesn't record "
                           "as finished")
         if not reason:
-            return "linked", {"id": path.stem, "created_at": str(record.get("created_at") or "")}
+            return "linked", {"id": key, "created_at": str(record.get("created_at") or "")}
         try:
             digest = sha256_file(path)
         except OSError:
             digest = ""
         # Its name, not its claim; the hash lets the next receipt tell it is this very record.
-        return "unlinked", {"id": path.stem, "record": str(path), "record_sha256": digest, "reason": reason}
+        return "unlinked", {"id": key, "record": str(path), "record_sha256": digest, "reason": reason}
 
     out: dict[str, list[dict]] = {"linked": [], "unlinked": [], "earlier": []}
-    directory = env_state(cloud_dir, env) / "receipts" / "phases"
-    for path in sorted(directory.rglob("*.json")) if directory.is_dir() else []:
-        if not path.name.startswith("."):
-            bucket, entry = classify(path)
-            out[bucket].append(entry)
+    for path in paths:
+        bucket, entry = classify(path)
+        out[bucket].append(entry)
     linked = [e["id"] for e in sorted(out["linked"], key=lambda e: (e["created_at"], e["id"]))]
     return linked, out["unlinked"], out["earlier"], ignored
 

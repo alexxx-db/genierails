@@ -1214,8 +1214,41 @@ def _rewrite(path: Path, change) -> None:
 
 
 def _every_record_once(repo: Repo, linked, unlinked, earlier) -> None:
-    found = sorted(p.stem for p in (rg.env_state(repo.cloud, "prod") / "receipts" / "phases").glob("*.json"))
+    directory = rg.env_state(repo.cloud, "prod") / "receipts" / "phases"
+    found = sorted(p.stem if p.parent == directory else p.relative_to(directory).as_posix()
+                   for p in directory.rglob("*.json"))
     assert sorted(linked + [e["id"] for e in unlinked + earlier]) == found
+
+
+def test_a_copy_of_a_phase_record_elsewhere_is_listed_once_and_never_links(repo, manifest):
+    _journal(repo, open_run="run1")
+    record = rg.phase_record(repo.prod, "prod", manifest)
+    directory = record.parent
+    (directory / "duplicate").mkdir()
+    copy = directory / "duplicate" / record.name
+    copy.write_bytes(record.read_bytes())  # same id, same bytes
+    stray = directory / "nested" / "other.json"
+    stray.parent.mkdir()
+    stray.write_text(json.dumps(json.loads(record.read_text()) | {"id": "other"}))
+    final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    linked, unlinked, earlier = (receipt["phase_manifests"], receipt["phase_manifests_unlinked"],
+                                 receipt["phase_manifests_earlier"])
+    assert linked == [_id(manifest)] and earlier == []
+    assert [(u["id"], u["record"], u["record_sha256"]) for u in unlinked] == [
+        (f"duplicate/{record.name}", str(copy), rg.sha256_file(copy)),
+        ("nested/other.json", str(stray), rg.sha256_file(stray))]
+    assert unlinked[0]["reason"].startswith(f"duplicate record id {_id(manifest)} at {copy}")
+    assert "isn't where phase records are written" in unlinked[1]["reason"]
+    ids = linked + [e["id"] for e in unlinked + earlier]
+    assert len(ids) == len(set(ids)) and ids.count(_id(manifest)) == 1
+    _every_record_once(repo, linked, unlinked, earlier)
+    # The next release reports each anomaly once, as accounted for by this receipt, and links nothing.
+    linked, unlinked, earlier, _ = _phases_now(repo)
+    assert (linked, unlinked) == ([], [])
+    assert sorted(e["id"] for e in earlier) == sorted([_id(manifest), f"duplicate/{record.name}", "nested/other.json"])
+    _every_record_once(repo, linked, unlinked, earlier)
 
 
 @pytest.mark.parametrize("listed_as", ["phase_manifests", "phase_manifests_unlinked"])
