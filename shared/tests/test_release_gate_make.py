@@ -973,6 +973,107 @@ def test_a_failed_saved_plan_writes_no_release_receipt(make, repo):
 
 # -- maintain --------------------------------------------------------------------------
 
+FAKE_EVIDENCE_SDK = r'''
+"""A fake databricks.sdk for make evidence: logs every client and statement, answers no rows."""
+import json, os
+
+
+def _log(entry):
+    with open(os.environ["FAKE_SDK_LOG"], "a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
+class _Response:
+    statement_id = "s-1"
+
+    class status:
+        state = "SUCCEEDED"
+        error = None
+
+    class result:
+        data_array = []
+
+
+class _Statements:
+    def execute_statement(self, statement, warehouse_id, wait_timeout):
+        _log({"warehouse": warehouse_id})
+        return _Response()
+
+
+class _Policies:
+    def list_policies(self, *args, **kwargs):
+        return iter(())
+
+
+class WorkspaceClient:
+    def __init__(self, config):
+        _log({"client": config.host})
+        self.statement_execution, self.policies = _Statements(), _Policies()
+'''
+
+
+def _evidence_sdk(tmp_path: Path, repo: Repo) -> dict[str, str]:
+    """A fake SDK on PYTHONPATH (no real call is possible) and fake, git-ignored prod credentials."""
+    sdk = tmp_path / "evidence-sdk" / "databricks" / "sdk"
+    sdk.mkdir(parents=True)
+    (sdk.parent / "__init__.py").write_text("")
+    (sdk / "__init__.py").write_text(FAKE_EVIDENCE_SDK)
+    (sdk / "config.py").write_text("class Config:\n    def __init__(self, **kwargs): self.__dict__.update(kwargs)\n")
+    (sdk / "useragent.py").write_text("")
+    (repo.prod / "auth.auto.tfvars").write_text(
+        'databricks_workspace_host = "https://prod.example"\n'
+        'databricks_client_id = "fake-client"\ndatabricks_client_secret = "fake-secret"\n')
+    return {"PYTHONPATH": str(tmp_path / "evidence-sdk"), "FAKE_SDK_LOG": str(tmp_path / "sdk.jsonl"),
+            "PIP_NO_INDEX": "1"}
+
+
+def _sdk_calls(tmp_path: Path) -> list[dict]:
+    log = tmp_path / "sdk.jsonl"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def _evidence(repo: Repo) -> dict:
+    out = repo.state / "aws" / "prod" / "evidence"
+    assert (out.stat().st_mode & 0o777) == 0o700
+    assert sorted(p.name for p in out.iterdir()) == ["compliance-evidence-v1.0.json", "compliance-evidence-v1.0.md"]
+    assert all((p.stat().st_mode & 0o777) == 0o600 for p in out.iterdir())
+    text = (out / "compliance-evidence-v1.0.json").read_text() + (out / "compliance-evidence-v1.0.md").read_text()
+    assert "fake-secret" not in text
+    return json.loads((out / "compliance-evidence-v1.0.json").read_text())
+
+
+@pytest.mark.parametrize("old_flag", [None, "1"], ids=["default", "old-integration-var"])
+def test_evidence_is_live_by_default_and_maintain_still_runs_after_it(make, repo, monkeypatch, old_flag):
+    manifest = _planned(make)
+    assert make("_release-manifest", "prod", f"MANIFEST={manifest}").returncode == 0
+    monkeypatch.delenv("GENIERAILS_EVIDENCE_INTEGRATION", raising=False)
+    environ = _evidence_sdk(make.tmp, repo) | ({"GENIERAILS_EVIDENCE_INTEGRATION": old_flag} if old_flag else {})
+
+    result = make("evidence", "prod", "WAREHOUSE_ID=wh-1", environ_extra=environ)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _sdk_calls(make.tmp)[:1] == [{"client": "https://prod.example"}]
+    assert _evidence(repo)["header"]["source"] == "databricks-live"
+    assert not (repo.prod / "generated" / "evidence").exists()
+    assert repo.git("status", "--porcelain", "--untracked-files=all") == ""
+    # The record is invisible to maintain: clean checkout, unchanged digests.
+    make.reset()
+    result = make("maintain", "prod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "apply-governance" in make.names()
+
+
+def test_offline_evidence_is_config_only_and_makes_no_live_call(make, repo, monkeypatch):
+    environ = _evidence_sdk(make.tmp, repo) | {"GENIERAILS_EVIDENCE_INTEGRATION": "1"}  # OFFLINE=1 wins
+
+    result = make("evidence", "prod", "OFFLINE=1", environ_extra=environ)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _sdk_calls(make.tmp) == []
+    assert _evidence(repo)["header"]["source"] == "offline-config"
+    assert repo.git("status", "--porcelain", "--untracked-files=all") == ""
+
+
 def test_maintain_refuses_before_any_release(make, repo):
     result = make("maintain", "prod")
     assert result.returncode != 0 and "no release receipt yet" in result.stderr

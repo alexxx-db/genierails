@@ -1,7 +1,9 @@
 """The champion walkthrough after release: live evidence, then maintain.
 
-make evidence resolves the SQL warehouse itself (resolve_env_config.py
-warehouse), so the documented command carries no WAREHOUSE_ID. The README
+make evidence is live by default and resolves the SQL warehouse itself
+(resolve_env_config.py warehouse), so the documented command carries no
+GENIERAILS_EVIDENCE_INTEGRATION and no WAREHOUSE_ID. Its record goes to the
+git-ignored state dir, so no doc asks to delete an evidence folder first. The README
 also once said adopt-custom-mask was not on main; it is. make maintain runs
 on the deployment machine (cron) at the last released commit, never in CI.
 Dev step 4 says what a generate re-run keeps in each governance mode.
@@ -16,7 +18,7 @@ REFERENCE = SHARED / "examples/dev_to_prod/REFERENCE.md"
 EVIDENCE_DOC = SHARED / "docs/evidence-report.md"
 MAKEFILE = SHARED / "Makefile.shared"
 
-EVIDENCE = "GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod"
+EVIDENCE = "make evidence ENV=prod"
 
 
 def _section(text: str, start: str, end: str) -> str:
@@ -37,8 +39,30 @@ def test_prod_step_4_records_evidence_after_the_release_and_its_stop_advice():
     assert prod.index("make release ENV=prod") < prod.index("**If it stops on coverage or drift**") \
         < prod.index("**4. Record evidence.**")
     assert f"```bash\n{EVIDENCE}\n```" in step
-    # The checkout must be clean again before maintain / the next release-plan.
-    assert "`make maintain` and the next `release-plan` need a clean checkout" in step
+    assert "writes a JSON record and Markdown summary to `.genierails-state/prod/evidence/` (git-ignored" in step
+    assert "`OFFLINE=1` writes a config-only report" in step
+    assert "The checkout stays clean, so `make maintain` and the next `release-plan` run as usual." in step
+
+
+def test_no_doc_asks_to_delete_the_evidence_folder_or_set_the_old_variable():
+    reference = REFERENCE.read_text()
+    for path in (README, REFERENCE, EVIDENCE_DOC, SHARED.parent / "REFERENCE.md"):
+        text = path.read_text()
+        assert "generated/evidence/` before" not in text and "delete that folder" not in text, path
+        assert "remove the folder before" not in text and "then delete" not in text, path
+        assert not re.search(r"GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence", text), path
+        assert "envs/prod/generated/evidence" not in text, path
+    assert ".genierails-state/prod/evidence/" in reference
+    doc = EVIDENCE_DOC.read_text()
+    assert "`.genierails-state/<env>/evidence/`" in doc and "`$GENIERAILS_STATE_DIR/<cloud>/<env>/evidence/`" in doc
+    assert "`OFFLINE=1` writes a config-only report" in doc
+    assert "`GENIERAILS_EVIDENCE_INTEGRATION=1`, which older versions needed for live collection, is still accepted" in doc
+    # ...because make evidence writes there, live unless OFFLINE=1.
+    makefile = MAKEFILE.read_text()
+    recipe = makefile[makefile.index("\nevidence:"):makefile.index("\naudit-rulebook:")]
+    assert 'GENIERAILS_EVIDENCE_INTEGRATION=1 python3 "$(SHARED_ROOT)/evidence_report.py" --warehouse-id' in recipe
+    assert '"$(OFFLINE)"' in recipe
+    assert "root / Path(env_dir).resolve().name / \"evidence\"" in (SHARED / "evidence_report.py").read_text()
 
 
 def test_no_doc_requires_an_explicit_warehouse_for_evidence():

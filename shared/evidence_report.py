@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """Build versioned JSON and Markdown compliance evidence for a GenieRails footprint.
 
-Offline mode (the default) uses local configuration only and never imports the
-Databricks SDK. Set GENIERAILS_EVIDENCE_INTEGRATION=1 to collect live Unity
-Catalog state through a Databricks SQL warehouse.
+Run directly, offline mode is the default: it uses local configuration only and
+never imports the Databricks SDK. GENIERAILS_EVIDENCE_INTEGRATION=1 collects
+live Unity Catalog state through a Databricks SQL warehouse; ``make evidence``
+sets it unless OFFLINE=1.
+
+The report is a runtime file, never committed: it is written (0600, in a 0700
+directory) to the env's state dir, ``$GENIERAILS_STATE_DIR/<cloud>/<env>/evidence/``
+or ``<cloud>/.genierails-state/<env>/evidence/`` (git-ignored), where the
+release-gate receipts live. Nothing goes under envs/<env>/, so the clean
+checkout and the env/generated digests that maintain and release-plan check
+never see it.
 
 Live mode reads two kinds of mask: table-attached masks and row filters from
 information_schema (legacy envs), and the ABAC policies the policies API lists
@@ -24,6 +32,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -336,9 +345,13 @@ def abac_policy_rows(table: str, policies: Iterable[Any], columns: list[dict[str
 
 def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehouse_id: str,
                        auth_file: Path = Path("auth.auto.tfvars")) -> dict[str, Any]:
-    """Read live state through the SDK; called only in explicitly enabled integration mode."""
+    """Read live state through the SDK; called only in integration mode (make evidence's default)."""
     from scripts.auth_configured import workspace_client
-    client = workspace_client(auth_file, product="genierails-evidence", product_version=SCHEMA_VERSION)
+    try:
+        client = workspace_client(auth_file, product="genierails-evidence", product_version=SCHEMA_VERSION)
+    except RuntimeError as exc:  # missing or incomplete auth; the messages name the file, never a value
+        raise EvidenceUnavailable(f"can't read live state: {exc} (make evidence OFFLINE=1 writes the "
+                                  "config-only report)") from None
     if not tables:
         return {name: [] for name in ("columns", "classifications", "tags", "masks", "policies", "grants")}
     def query(sql: str) -> list[list[Any]]:
@@ -475,12 +488,35 @@ def collect_live_state(columns: list[dict[str, str]], tables: list[str], warehou
     return result
 
 
+def evidence_dir(env_dir: Path) -> Path:
+    """The env's evidence folder in its state dir (release_gate.env_state(...) / "evidence")."""
+    from scripts.state_layout import IN_CHECKOUT_STATE, checked_state_dir, cloud_dir
+
+    cloud, base = cloud_dir(env_dir), checked_state_dir()  # a missing GENIERAILS_STATE_DIR refuses
+    root = base / cloud.name if base else cloud / IN_CHECKOUT_STATE
+    return root / Path(env_dir).resolve().name / "evidence"
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write ``path`` 0600, replacing it whole (a failed write leaves the previous file)."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # mkstemp creates 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    path.chmod(0o600)
+
+
 def write_report(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output_dir.chmod(0o700)
     stem = "compliance-evidence-v" + report["schema_version"]
     json_path, md_path = output_dir / f"{stem}.json", output_dir / f"{stem}.md"
-    json_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    md_path.write_text(render_markdown(report), encoding="utf-8")
+    _write_private(json_path, json.dumps(report, indent=2, sort_keys=True) + "\n")
+    _write_private(md_path, render_markdown(report))
     return json_path, md_path
 
 
@@ -494,6 +530,11 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
     args = parser.parse_args(argv)
     columns, tags = configured_columns(args.env_dir), configured_tags(args.env_dir)
     tables = configured_tables(args.env_dir)
+    try:
+        output_dir = args.output_dir or evidence_dir(args.env_dir)
+    except RuntimeError as exc:  # state_layout.StateError: GENIERAILS_STATE_DIR is set but missing
+        print(f"ERROR: {exc}. No evidence was written.", file=sys.stderr)
+        return 2
     live = os.getenv(INTEGRATION_ENV, "").lower() in {"1", "true", "yes"}
     if live:
         if not args.warehouse_id:
@@ -510,8 +551,12 @@ def main(argv: list[str] | None = None, *, collector: Callable[..., dict[str, An
             report["abac_policies_not_evaluated"] = state.get("abac_policies_not_evaluated", [])
     else:
         report = assemble_report(columns, tags=tags, approved_by=args.approved_by, approved_at=args.approved_at)
-    paths = write_report(report, args.output_dir or args.env_dir / "generated" / "evidence")
+    paths = write_report(report, output_dir)
     print("Wrote " + " and ".join(str(path) for path in paths))
+    old = Path(args.env_dir) / "generated" / "evidence"
+    if old.is_dir():
+        print(f"NOTE: {old} is from an earlier GenieRails, which wrote evidence there. Archive it and remove "
+              "it if it isn't committed: an uncommitted file under envs/ stops make maintain and release-plan.")
     return 0
 
 
