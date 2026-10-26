@@ -22,6 +22,8 @@ The **Stage** column uses the stages of [design section 17](shared/docs/design/d
 
 Applying targets refuse in CI (`CI=true/1/yes`, or the Azure Pipelines, Jenkins, GitLab, Buildkite or CircleCI markers). The one exception is `make rehearse ENV=dev` when dev has remote state with locking (`envs/dev/remote_state.hcl`). `GENIERAILS_ALLOW_CI_APPLY=1` exists only for GenieRails' own throwaway integration-test jobs.
 
+On Databricks compute (a notebook, Job, serverless run or App: `DATABRICKS_RUNTIME_VERSION`, `DB_CLUSTER_ID`, `DB_IS_JOB_CLUSTER` or `DATABRICKS_APP_NAME` set) those targets, and `sync-tags`, `bootstrap-sp`, `bootstrap-pipelines` and `account-plan`, refuse before any lock, write or live call, even with `GENIERAILS_ALLOW_CI_APPLY=1`: receipts, manifests, the staged journal, env locks and Genie ID records live on local disk, which that compute doesn't keep. Run them from the [deployment machine](shared/docs/deployment-machine.md); `check`, `plan`, `validate`, `evidence` and `audit-schema` still run there. The opt-in for a future Job runner is not supported end to end yet ([pipelines](shared/docs/pipelines.md#databricks-compute)).
+
 ## Parameters every target reads
 
 | Parameter | Meaning |
@@ -29,6 +31,7 @@ Applying targets refuse in CI (`CI=true/1/yes`, or the Azure Pipelines, Jenkins,
 | `ENV=<env>` | The env under `envs/`. Default `dev`. `ENV=account` selects the shared account layer, where a target allows it. Must be lowercase letters, digits, `_` or `-`, starting with a letter; make refuses anything else before a recipe runs. |
 | `VERBOSE=1` | Print full PASS reports from validation (`validate`, `validate-generated`, `coverage-gate`, `promote`); also passed to classification and the coverage check. |
 | `GENIERAILS_STATE_DIR` (environment variable) | Where the deployment machine keeps Terraform state, receipts, manifests and locks, outside the checkout. Unset: `<cloud>/.genierails-state` and the in-checkout layout. See [deployment machine](shared/docs/deployment-machine.md). |
+| `GENIERAILS_ALLOW_DATABRICKS_COMPUTE=1` (make command line only), `GENIERAILS_DURABLE_STATE_DIR` (environment variable) | Not supported end to end yet: the opt-in that lets state-changing targets run on Databricks compute. Needs both: the flag on the make command line (a shell variable, an exported variable or `make -e` doesn't count; on Linux neither does an inherited `MAKEFLAGS`), and `GENIERAILS_DURABLE_STATE_DIR` naming an existing durable directory that holds `GENIERAILS_STATE_DIR`. See [pipelines](shared/docs/pipelines.md#databricks-compute). |
 | `ALLOW_TAG_VALUE_REMOVAL=<key>:<value>,...` | `make account-plan` only: the tag-policy values the account manifest may remove (with `WAREHOUSE_ID=<id>` for the usage check). Sorted and recorded in the manifest; approving the manifest approves exactly these removals, and `make apply-account` refuses a different list. Unset: nothing is removed. See [tag-policy values](shared/docs/deterministic-policies.md#tag-policy-values). |
 
 A deterministic env is one with `governance_mode = "deterministic"`; a legacy env is anything else.

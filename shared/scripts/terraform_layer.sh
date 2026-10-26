@@ -166,10 +166,26 @@ else
   is_ci=
   case "$ci_value" in true|1|yes) is_ci=1 ;; esac
   [ -n "${TF_BUILD:-}${JENKINS_URL:-}${GITLAB_CI:-}${BUILDKITE:-}${CIRCLECI:-}" ] && is_ci=1
+  # Databricks compute (scripts/databricks_compute.py lists the markers) loses
+  # its disk with the run: local state survives only inside
+  # GENIERAILS_DURABLE_STATE_DIR. GENIERAILS_ALLOW_CI_APPLY doesn't lift it.
+  dbx_marker=
+  for m in DATABRICKS_RUNTIME_VERSION DB_CLUSTER_ID DB_IS_JOB_CLUSTER DATABRICKS_APP_NAME; do
+    if [ -n "$(printenv "$m")" ]; then dbx_marker="$m"; break; fi
+  done
+  if [ -n "$dbx_marker" ] && [ -n "${GENIERAILS_DURABLE_STATE_DIR:-}" ] \
+    && durable_real="$(cd "$GENIERAILS_DURABLE_STATE_DIR" 2>/dev/null && pwd -P)" \
+    && case "$(cd "$STATE_BASE" && pwd -P)/" in "$durable_real"/*) true ;; *) false ;; esac; then
+    dbx_marker=
+  fi
   # Second line behind the make guard: in CI a write to a local backend would
   # land in the runner's throwaway state.
   case "$COMMAND" in
     apply|apply-plan|destroy|import|state-rm|state-mv)
+      if [ -n "$dbx_marker" ]; then
+        echo "ERROR: refusing terraform $COMMAND on Databricks compute ($dbx_marker is set): $STATE_ENV_DIR has no remote_state.hcl, and local state here doesn't outlive the run. Run it from a long-lived deployment machine." >&2
+        exit 2
+      fi
       if [ "$is_ci" = 1 ] && [ "${GENIERAILS_ALLOW_CI_APPLY:-}" != 1 ]; then
         echo "ERROR: refusing terraform $COMMAND in CI: $STATE_ENV_DIR has no remote_state.hcl, so the backend is local." >&2
         exit 2
