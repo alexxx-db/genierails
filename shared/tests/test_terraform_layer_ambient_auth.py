@@ -211,11 +211,14 @@ def test_the_runner_always_sets_its_switches_last(tmp_path, layer, command, args
 
 
 def _project(tmp_path) -> Path:
-    """A copy of the runner and its scripts, with empty roots of its own."""
+    """A copy of the runner and its scripts, with roots of its own (the real
+    roots' .tf files: the runner passes the runner variables they declare)."""
     project = tmp_path / "project"
     shutil.copytree(RUNNER.parent, project / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
     for layer in ("account", "data_access", "workspace"):
         (project / "roots" / layer).mkdir(parents=True)
+        for tf in (RUNNER.parents[1] / "roots" / layer).glob("*.tf"):
+            shutil.copy(tf, project / "roots" / layer)
     return project
 
 

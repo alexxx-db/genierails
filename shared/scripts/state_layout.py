@@ -842,8 +842,8 @@ def main() -> int:
     check.add_argument("--tf-command", required=True)
     check.add_argument("--var-file", type=Path, action="append", default=[])
     check.add_argument("--env-dir", type=Path)
+    check.add_argument("--root", type=Path, help="print the RUNNER_VARS this root declares when nothing overrides")
     check.add_argument("args", nargs=argparse.REMAINDER)
-    commands.add_parser("runner-vars").add_argument("--root", type=Path, required=True)
     for name in ("ci-allowed", "backend-args", "root", "layer-dir", "migrate", "state-json", "state-file",
                  "records-dir"):
         command = commands.add_parser(name)
@@ -865,9 +865,10 @@ def main() -> int:
             overrides = runner_var_overrides(caller, args.tf_command, args.var_file, env_dir=args.env_dir)
             for line in overrides:
                 print(f"  {line}", file=sys.stderr)
-            return 2 if overrides else 0
-        if args.command == "runner-vars":
-            print("\n".join(declared_runner_vars(args.root)))
+            if overrides:
+                return 2
+            if args.root is not None:
+                print("\n".join(declared_runner_vars(args.root)))
             return 0
         if args.command == "ci-allowed":
             return 0 if ci_allowed(args.env_dir, args.env, args.cloud_dir, args.cloud_root) else 1
