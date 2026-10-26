@@ -404,8 +404,8 @@ run "rebind_variables_in_rebind" {
 }
 
 # A staged phase whose coverage check genuinely doesn't pass warns as a plain
-# plan does, and points a deterministic env at rehearse (a promoted one at its
-# source and a release), never at make apply. Each file below has its own
+# plan does, and points a deterministic env at rehearse (a promoted one at
+# make check), never at make apply. Each file below has its own
 # state, so it rewrites only the gate result and keeps the applied state.
 run "readers_gate_fails" {
   state_key = "gate_fail"
@@ -440,7 +440,7 @@ run "create_with_failed_gate_warns_rehearse" {
   }
 }
 
-run "retire_with_failed_gate_in_promoted_env_warns_release" {
+run "retire_with_failed_gate_in_promoted_env_warns_check" {
   command         = plan
   expect_failures = [check.business_select_withheld]
   variables {
@@ -453,12 +453,12 @@ run "retire_with_failed_gate_in_promoted_env_warns_release" {
     error_message = "the gate file says fail"
   }
   assert {
-    condition     = local.business_select_withheld_next_step == "Fix the cause in dev, make rehearse ENV=dev, make promote-to ENV=staged, then commit and push envs/staged/ to origin/main (or merge its PR), make rehearse ENV=dev on that commit, make release-plan ENV=staged and make release ENV=staged; release-plan refreshes live tags and DDL and runs the coverage check."
-    error_message = "a promoted env is pointed at its source and a release: ${local.business_select_withheld_next_step}"
+    condition     = local.business_select_withheld_next_step == "ENV=staged is promoted, so make apply and make rehearse refuse it: run make check ENV=staged, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "a promoted env is pointed at make check: ${local.business_select_withheld_next_step}"
   }
   assert {
-    condition     = !strcontains(local.business_select_withheld_message, "make apply")
-    error_message = "the warning must not advise make apply: ${local.business_select_withheld_message}"
+    condition     = length(regexall("make (rehearse|apply|release-plan|release) ENV=", local.business_select_withheld_message)) == 0
+    error_message = "the warning must name no command make refuses here: ${local.business_select_withheld_message}"
   }
 }
 
@@ -491,7 +491,7 @@ run "switch_with_stale_gate_warns_rehearse" {
   }
 }
 
-run "abandon_with_stale_gate_in_promoted_env_warns_release" {
+run "abandon_with_stale_gate_in_promoted_env_warns_check" {
   command         = plan
   expect_failures = [check.business_select_withheld]
   variables {
@@ -504,8 +504,8 @@ run "abandon_with_stale_gate_in_promoted_env_warns_release" {
     error_message = "the gate fingerprint is stale"
   }
   assert {
-    condition     = local.business_select_withheld_next_step == "Fix the cause in test, make rehearse ENV=test, make promote-to ENV=staged, then commit and push envs/staged/ to origin/main (or merge its PR), make rehearse ENV=test on that commit, make release-plan ENV=staged and make release ENV=staged; release-plan refreshes live tags and DDL and runs the coverage check."
-    error_message = "a promoted env is pointed at its own source: ${local.business_select_withheld_next_step}"
+    condition     = local.business_select_withheld_next_step == "ENV=staged is promoted, so make apply and make rehearse refuse it: run make check ENV=staged, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "a promoted env is pointed at make check: ${local.business_select_withheld_next_step}"
   }
 }
 
@@ -562,7 +562,7 @@ run "prod_setup" {
   }
 }
 
-run "prod_missing_gate_warns_release" {
+run "prod_missing_gate_warns_check" {
   command         = plan
   expect_failures = [check.business_select_withheld]
   variables {
@@ -571,7 +571,30 @@ run "prod_missing_gate_warns_release" {
     table_readers = { "cat.sch.orders" = ["raw"] }
   }
   assert {
-    condition     = module.data_access.withheld_table_grants.status == "missing" && local.business_select_withheld_next_step == "Fix the cause in dev, make rehearse ENV=dev, make promote-to ENV=prod, then commit and push envs/prod/ to origin/main (or merge its PR), make rehearse ENV=dev on that commit, make release-plan ENV=prod and make release ENV=prod; release-plan refreshes live tags and DDL and runs the coverage check."
-    error_message = "prod is pointed at dev and a release: ${local.business_select_withheld_next_step}"
+    condition     = module.data_access.withheld_table_grants.status == "missing" && local.business_select_withheld_next_step == "ENV=prod is promoted, so make apply and make rehearse refuse it: run make check ENV=prod, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "prod is pointed at make check: ${local.business_select_withheld_next_step}"
+  }
+}
+
+# dev -> stg -> prod: prod's source stg is itself promoted, so make rehearse
+# refuses it (and release-plan ENV=prod would need it rehearsed). The advice
+# names no rehearse, apply or release-plan, only make check ENV=prod, which
+# prints the fix from the chain's root (coverage_fix.recovery_steps).
+run "prod_promoted_through_stg_names_no_refused_command" {
+  command         = plan
+  expect_failures = [check.business_select_withheld]
+  variables {
+    env_dir       = "tests/.tmp/prod/data_access"
+    policy_stage  = "create"
+    promote_from  = "stg"
+    table_readers = { "cat.sch.orders" = ["raw"] }
+  }
+  assert {
+    condition     = local.business_select_withheld_next_step == "ENV=prod is promoted, so make apply and make rehearse refuse it: run make check ENV=prod, which runs the coverage check and prints the fix along this env's promotion chain; the fix reaches this env only through make promote-to and a release."
+    error_message = "a prod promoted through stg is pointed at make check: ${local.business_select_withheld_next_step}"
+  }
+  assert {
+    condition     = length(regexall("make (rehearse|apply|release-plan|release) ENV=", local.business_select_withheld_message)) == 0 && strcontains(local.business_select_withheld_message, "run make check ENV=prod")
+    error_message = "the warning must name no command make refuses here: ${local.business_select_withheld_message}"
   }
 }
