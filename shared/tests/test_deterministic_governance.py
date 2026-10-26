@@ -167,7 +167,7 @@ def test_missing_acl_is_feature_gated_and_explicit_empty_is_allowed():
     spaces = [{"name": "X"}]
     assert errors(genie_spaces=spaces) == []
     result = errors(require_acl_groups=True, genie_spaces=spaces)
-    assert result == ["agent X has no acl_groups — list the groups that may run it"]
+    assert result == ["agent X has no acl_groups — set the groups allowed to run it"]
     assert errors(require_acl_groups=True, genie_spaces=[{"name": "X", "acl_groups": []}]) == []
     assert errors(genie_spaces=[{"name": "X", "acl_groups": [1]}])
     assert errors(genie_spaces=[{"name": "X", "acl_groups": [""]}])
