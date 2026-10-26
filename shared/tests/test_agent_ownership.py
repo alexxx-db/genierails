@@ -834,8 +834,8 @@ def test_detach_next_steps_release_the_removal_after_a_source_rehearsal(tmp_path
     runner, _ = _runner(tmp_path)
     ownership.detach(prod, "prod", "Sales", runner, commit=head, clean=True)
     out = " ".join(capsys.readouterr().out.split())
-    steps = ["make promote-to ENV=prod", "commit and push envs/prod/", "make rehearse ENV=stg on that commit",
-             "make release-plan ENV=prod", "make release ENV=prod", "its plan must show no destroy"]
+    steps = ["make promote-to ENV=prod", "commit and push envs/prod/", "make release-plan ENV=prod",
+             "it reuses the stg rehearsal", "make release ENV=prod", "its plan must show no destroy"]
     assert [out.index(step) for step in steps] == sorted(out.index(step) for step in steps), out
 
 

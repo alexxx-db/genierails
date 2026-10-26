@@ -425,7 +425,7 @@ def test_a_receipt_copied_from_another_store_is_ignored(tmp_path, monkeypatch):
     copied.parent.mkdir(parents=True)
     shutil.copyfile(written, copied)
     assert rg.passing_receipt(cloud, "dev", commit) is None
-    assert rg.reusable_receipt(cloud, "dev", "f") is None
+    assert rg.reusable_receipt(cloud, "dev", "f", tmp_path, commit) is None
     rg._write_rehearse(cloud, "dev", receipt | {"store": "", "created_at": rg._now() + "x"})  # a forged one
     assert rg.passing_receipt(cloud, "dev", commit) is None
     assert len(rg.rehearse_receipts(cloud, "dev", any_store=True)) == 2

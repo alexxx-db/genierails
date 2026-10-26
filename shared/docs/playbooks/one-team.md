@@ -58,7 +58,7 @@ the new `main`. Both ways reach prod through the same stages.
 | You want to | Do this |
 |---|---|
 | Add an agent | its `agents/` file, `make generate ENV=dev`, review the proposed `table_readers`; [details](agents.md#add-an-agent) |
-| Give another group an agent in prod | edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`, and `table_readers` if needed; PR, merge, rehearse dev on the merge commit, `release-plan`, `release` |
+| Give another group an agent in prod | edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`, and `table_readers` if needed; PR, merge, `release-plan` (a prod-only change: it reuses dev's rehearsal), `release` |
 | Remove an agent | `acl_groups = []` and `detached = true`; PR, merge, rehearse dev on the merge commit, `release-plan`, `release`, then `make detach-agent`; [details](agents.md#remove-an-agent) |
 | Remove a table from an agent | remove it in the dev UI, capture, generate, promote; PR, merge, rehearse dev on the merge commit, `release-plan`, `release`; masks stay |
 | Change who can read a table | edit `table_readers`, in dev and promote, or in prod directly; [details](governance.md#who-can-read-a-table) |

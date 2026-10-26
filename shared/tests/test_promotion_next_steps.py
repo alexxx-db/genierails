@@ -2,8 +2,10 @@
 
 release-plan plans only a commit on origin/main that has a passing rehearsal of
 the destination's source env (its promote_from, dev by default) at that same
-commit. So a deterministic promotion is always: promote-to, commit and push (or
-merge the PR), rehearse the source env on that commit, release-plan, release.
+commit, and writes that receipt itself from an earlier rehearsal of an ancestor
+when the source env's inputs are unchanged. So a deterministic promotion is:
+promote-to, commit and push (or merge the PR), release-plan (it names make
+rehearse when the source env changed too), release.
 Legacy envs have no release-plan and release directly.
 """
 
@@ -28,7 +30,7 @@ from generate_abac import generate_next_steps  # noqa: E402
 DETERMINISTIC_STG = 'governance_mode = "deterministic"\npromote_from = "stg"\n'
 DETERMINISTIC = 'governance_mode = "deterministic"\n'
 LEGACY = 'governance_mode = "legacy"\n'
-FULL_STG = ["commit and push envs/prod/", "make rehearse ENV=stg on that commit", "make release-plan ENV=prod",
+FULL_STG = ["commit and push envs/prod/", "make release-plan ENV=prod", "it reuses the stg rehearsal",
             "make release ENV=prod"]
 
 
@@ -74,72 +76,80 @@ SRC = "rehearse the source env (`promote_from`, dev by default)"
 PLAN = ["`release-plan`", "`release`"]
 MAKE_PLAN = ["make release-plan ENV=prod", "make release ENV=prod"]
 
-# file -> where the passage starts -> what must follow, in order.
-DOC_ORDER = [
-    # release-plan reuses the dev rehearsal on the promotion commit (dev's inputs unchanged).
+REUSE = "it reuses the"
+# release-plan reuses the source env's rehearsal for a commit that changed only the promoted env
+# (a promotion, ack.txt or a prod-only setting): no second rehearse. Each passage names release-plan
+# with its reuse, then release, and never asks for a rehearse on that commit.
+DOC_REUSE = [
     ("shared/examples/dev_to_prod/README.md", "make promote-to ENV=prod # copies the reviewed rules",
      ["git push", "make release-plan ENV=prod # reuses dev's rehearsal", "make release ENV=prod"]),
     ("shared/examples/dev_to_prod/README.md", "**3. Check, plan, release.**",
      ["make check ENV=prod", *MAKE_PLAN]),
-    ("shared/examples/dev_to_prod/README.md", "plans only a commit on your `origin/main`",
-     ["make rehearse ENV=dev", "dev is prod's `promote_from` in this walkthrough", "make rehearse ENV=stg",
-      "release-plan reuses that rehearsal itself"]),
     ("shared/examples/dev_to_prod/README.md", "**Reuse an existing mask** (the common case)",
-     ["`make promote-to ENV=prod`", "`make rehearse ENV=dev` (again", "`make release-plan ENV=prod`",
+     ["`make promote-to ENV=prod`", "`make check ENV=prod`", "`make release-plan ENV=prod`", REUSE,
       "`make release ENV=prod`"]),
-    ("shared/examples/dev_to_prod/REFERENCE.md", "| `make release-plan ENV=prod` | 4 |",
-     ["writes the receipt `make rehearse ENV=dev` would", "applying nothing", "`make rehearse ENV=dev` receipt", "dev is prod's `promote_from` here", "`make rehearse ENV=stg`"]),
     ("shared/examples/dev_to_prod/REFERENCE.md", "Stops at `coverage-gate` or `audit-rulebook`",
-     ["`promote-to`", "push to `origin/main`", "`make rehearse ENV=dev` on that commit",
-      "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
+     ["`promote-to`", "push to `origin/main`", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
     ("shared/examples/dev_to_prod/REFERENCE.md", "Deterministic envs (`governance_mode = \"deterministic\"`) never",
-     ["`make generate ENV=dev`", "`make check ENV=dev`", "`make promote-to ENV=prod`", "`make check ENV=prod`",
-      "commit and push", "`make rehearse ENV=dev` again", "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
-    ("shared/examples/dev_to_prod/REFERENCE.md", "A new kind of mask is a custom mask:",
-     ["`make adopt-custom-mask ENV=dev TREATMENT=custom_<name>`", "`tag_treatments`", "then the same steps"]),
-    ("shared/examples/dev_to_prod/REFERENCE.md", "Later legacy `make generate ENV=dev` runs keep the mask",
-     ["It refuses a deterministic env and writes nothing", "map the class or adopt a custom mask"]),
-    ("shared/examples/dev_to_prod/REFERENCE.md", "- Then `make rehearse ENV=dev`, `make promote-to ENV=prod`",
-     ["`make promote-to ENV=prod`", "`make release ENV=prod`", "legacy envs have no `release-plan`"]),
+     ["`make generate ENV=dev`", "`make check ENV=dev`", "`make rehearse ENV=dev`", "`make promote-to ENV=prod`",
+      "`make check ENV=prod`", "commit and push", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
+    ("shared/docs/access.md", "`make promote-to ENV=prod` (seeds prod's",
+     ["push that to `origin/main`", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
+    ("shared/docs/import-genie-agent-from-ui.md", "The remaining workflow is unchanged",
+     ["promote", "merge the promotion", "`release-plan`", REUSE, "`release`"]),
+    ("shared/docs/design/deterministic-governance.md", "6. Approve and merge the promotion PR",
+     ["`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
+    *[("shared/docs/design/deterministic-governance.md", row, ["merge", "`release-plan`", REUSE, "`release`"])
+      for row in ("| Promote A while B has unfinished dev edits |", "| Mask change while B is mid-curation |",
+                  "| Grant another group access to A in prod |", "| Change who can read a table |")],
+    ("shared/docs/design/deterministic-governance.md", "| Stop governing a table |",
+     ["a PR applies the removal: merge", "in the rehearse env rehearse on the merge commit",
+      "in a promoted env `release-plan`", REUSE, "`release`"]),
+    ("shared/docs/design/deterministic-governance.md", "Prod-only PRs (`acl_groups`, `table_readers`, `ack.txt`",
+     ["no rehearse is needed", "`release-plan` writes the source env's receipt itself"]),
+    ("shared/docs/playbooks/agents.md", "make promote-to ENV=prod # carries the capture",
+     ["merge it", "make release-plan ENV=prod # on the deployment machine (reuses dev's rehearsal)",
+      "make release ENV=prod"]),
+    ("shared/docs/playbooks/agents.md", "3. **Merge.** The operator runs `make release-plan ENV=prod`.",
+     ["When only `envs/prod/` changed it reuses", "when the PR also changed the source env",
+      "names `make rehearse` to run on the merge commit first", "`make release ENV=prod`"]),
+    ("shared/docs/playbooks/agents.md", "governance adds it to `table_readers` in the same PR",
+     ["merge", "`release-plan`", "it reuses the source env's rehearsal, so no rehearse is needed", "`release`"]),
+    ("shared/docs/playbooks/governance.md", "make promote-to ENV=prod # the promotion PR",
+     ["merge it", "make release-plan ENV=prod # on the deployment machine (reuses dev's rehearsal)",
+      "make release ENV=prod"]),
+    ("shared/docs/playbooks/governance.md", "make promote-to ENV=prod # commit envs/prod/, PR, merge",
+     ["make release-plan ENV=prod # on the deployment machine (reuses dev's rehearsal)", "make release ENV=prod"]),
+    ("shared/docs/playbooks/governance.md", "`catalog_map = { \"dev_finance\" = \"prod_finance\" }`, promote",
+     ["merge the promotion", "`release-plan`", REUSE, "`release`"]),
+    ("shared/docs/playbooks/governance.md", "promoted from. Then generate",
+     ["`promote-to`", "merge to `origin/main`", "`release-plan`", REUSE, "`release`"]),
+    ("shared/docs/playbooks/one-team.md", "| Give another group an agent in prod |",
+     ["merge", "`release-plan`", "it reuses dev's rehearsal", "`release`"]),
     ("REFERENCE.md", "| `make release-plan` |",
      ["a passing clean rehearsal of HEAD in the env's source env, its `promote_from` (default `dev`)",
       "it first writes the receipt `make rehearse` would", "applying nothing"]),
+    ("shared/examples/dev_to_prod/REFERENCE.md", "| `make release-plan ENV=prod` | 4 |",
+     ["writes the receipt `make rehearse ENV=dev` would", "applying nothing", "`make rehearse ENV=dev` receipt",
+      "dev is prod's `promote_from` here", "`make rehearse ENV=stg`"]),
+    ("shared/examples/dev_to_prod/README.md", "plans only a commit on your `origin/main`",
+     ["make rehearse ENV=dev", "dev is prod's `promote_from` in this walkthrough", "make rehearse ENV=stg",
+      "release-plan reuses that rehearsal itself"]),
+]
+# A second rehearse is required (and asked for) only when the source env's inputs changed too:
+# a PR that also edits envs/dev, or a GenieRails upgrade (shared/ changed).
+DOC_ORDER = [
+    ("shared/examples/dev_to_prod/REFERENCE.md", "- Then `make rehearse ENV=dev`, `make promote-to ENV=prod`",
+     ["`make promote-to ENV=prod`", "`make release ENV=prod`", "legacy envs have no `release-plan`"]),
     ("README.md", "promote the *rules* to prod", ["release a rehearsed commit", *PLAN]),
     ("shared/docs/pipelines.md", "**`make release-plan ENV=prod`** refuses",
      ["of prod's source env (`promote_from`, dev by default)"]),
-    ("shared/docs/access.md", "`make promote-to ENV=prod` (seeds prod's",
-     ["push that to `origin/main`", "`make rehearse` again on that commit", "`make release-plan ENV=prod`",
-      "`make release ENV=prod`"]),
-    ("shared/docs/import-genie-agent-from-ui.md", "The remaining workflow is unchanged",
-     ["promote", "merge the promotion", SRC, *PLAN]),
     ("shared/docs/legacy-migration.md", "make promote-to ENV=prod # 2d.",
      ["make rehearse ENV=dev", *MAKE_PLAN]),
-    ("shared/docs/design/deterministic-governance.md", "6. Approve and merge the promotion PR",
-     ["once rehearse passes on that commit", "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
-    *[("shared/docs/design/deterministic-governance.md", row,
-       ["merge", "rehearse the source env on", *PLAN])
-      for row in ("| Promote A while B has unfinished dev edits |", "| Mask change while B is mid-curation |",
-                  "| Grant another group access to A in prod |", "| Change who can read a table |",
-                  "| Upgrade GenieRails |")],
-    ("shared/docs/design/deterministic-governance.md", "| Stop governing a table |",
-     ["a PR applies the removal: merge", "rehearse on the merge commit", *PLAN]),
-    ("shared/docs/playbooks/agents.md", "make promote-to ENV=prod # carries the capture",
-     ["rehearse dev on the merge commit", *MAKE_PLAN]),
-    ("shared/docs/playbooks/agents.md", "3. **Merge.** After the rehearsal of",
-     ["the source env (`promote_from`, dev by default) passes on the merge commit",
-      "`make release-plan ENV=prod`", "`make release ENV=prod`"]),
-    ("shared/docs/playbooks/agents.md", "governance adds it to `table_readers` in the same PR",
-     ["merge", "rehearse the source env (`promote_from`, dev by default) on the merged commit", *PLAN]),
+    ("shared/docs/design/deterministic-governance.md", "| Upgrade GenieRails |",
+     ["merge", "rehearse the source env on", *PLAN]),
     ("shared/docs/playbooks/agents.md", "# merge, rehearse dev on the merge commit",
      ["release-plan", "release"]),
-    ("shared/docs/playbooks/governance.md", "make promote-to ENV=prod # the promotion PR",
-     ["rehearse dev on the merge commit", *MAKE_PLAN]),
-    ("shared/docs/playbooks/governance.md", "make promote-to ENV=prod # commit envs/prod/, PR, merge",
-     ["make rehearse ENV=dev # again, on the promotion's merge commit", *MAKE_PLAN]),
-    ("shared/docs/playbooks/governance.md", "`catalog_map = { \"dev_finance\" = \"prod_finance\" }`, promote",
-     ["merge the promotion", SRC, *PLAN]),
-    ("shared/docs/playbooks/governance.md", "promoted from. Then generate",
-     ["`promote-to`", "merge to `origin/main`", SRC, *PLAN]),
     ("shared/docs/playbooks/governance.md", "`make promote-to ENV=prod` in the same PR. Then merge",
      [f"{SRC} on the merged commit", *PLAN]),
     ("shared/docs/playbooks/one-team.md", "make promote-to ENV=prod # same PR",
@@ -148,17 +158,47 @@ DOC_ORDER = [
      ["`make rehearse ENV=dev` on the merge commit", "6. **Release.**", "`make release-plan ENV=prod`",
       "`make release ENV=prod`"]),
     *[("shared/docs/playbooks/one-team.md", row, ["merge, rehearse dev on the merge commit", *PLAN])
-      for row in ("| Give another group an agent in prod |", "| Remove an agent |",
-                  "| Remove a table from an agent |")],
+      for row in ("| Remove an agent |", "| Remove a table from an agent |")],
 ]
+# A rehearse a reuse passage may still name: the rehearse env's own one, or the one release-plan asks for.
+CONDITIONAL_REHEARSE = ("in the rehearse env rehearse on the merge commit",
+                        "names `make rehearse` to run on the merge commit first")
+# What a reuse passage must never say: a rehearse required on the promotion / merge commit.
+STALE_REHEARSE = re.compile(r"rehearse[^.;|]{0,80}?(?:again|on (?:the|its|that|this) (?:merge|merged|promotion|new)?"
+                            r"\s*commit|on the promotion's)", re.IGNORECASE)
 
 
-@pytest.mark.parametrize("path, start, steps", DOC_ORDER, ids=[f"{p}::{s[:40]}" for p, s, _ in DOC_ORDER])
-def test_docs_rehearse_the_promotion_commit_before_release_plan(path, start, steps):
+@pytest.mark.parametrize("path, start, steps", DOC_REUSE, ids=[f"{p}::{s[:40]}" for p, s, _ in DOC_REUSE])
+def test_docs_let_release_plan_reuse_the_source_rehearsal(path, start, steps):
     text = _text(path)
     assert start in text, f"{path}: passage {start!r} is gone"
     passage = text[text.index(start):][:700]
     assert _in_order(passage, steps), f"{path}: {passage[:300]}"
+    upto = passage[:passage.index(steps[-1]) + len(steps[-1])]
+    for allowed in CONDITIONAL_REHEARSE:
+        upto = upto.replace(allowed, "")
+    stale = STALE_REHEARSE.findall(upto)
+    assert not stale, f"{path}: still asks for a second rehearse: {stale}"
+
+
+@pytest.mark.parametrize("path, start, steps", DOC_ORDER, ids=[f"{p}::{s[:40]}" for p, s, _ in DOC_ORDER])
+def test_docs_rehearse_the_source_env_when_its_inputs_changed(path, start, steps):
+    text = _text(path)
+    assert start in text, f"{path}: passage {start!r} is gone"
+    passage = text[text.index(start):][:700]
+    assert _in_order(passage, steps), f"{path}: {passage[:300]}"
+
+
+def test_no_doc_still_requires_rehearsing_the_promotion_commit():
+    """The phrases the reuse removed stay gone from every tracked doc."""
+    tracked = subprocess.run(["git", "ls-files", "*.md"], cwd=ROOT, text=True, capture_output=True, check=True)
+    gone = ("rehearse dev on the promotion commit", "again, on the promotion", "on this new commit: release-plan needs",
+            "a no-op rehearse that writes a receipt", "rehearse on the merge commit is a no-op",
+            "(a no-op that writes a receipt)", "`make rehearse` again on that commit",
+            "`make rehearse ENV=dev` again on that commit")
+    found = [f"{path}: {phrase}" for path in tracked.stdout.split() if "CHANGELOG" not in path
+             for phrase in gone if phrase in _text(path)]
+    assert not found, "\n".join(found)
 
 
 # A list-style "promote, release" / "PR, release" with no release-plan between.
@@ -233,10 +273,10 @@ def test_every_drift_branch_prints_the_hint_for_its_own_target():
 
 
 @pytest.mark.parametrize("text, expected", [
-    (DETERMINISTIC_STG, "commit and push envs/prod/ to origin/main (or merge its PR), make rehearse ENV=stg on that "
-                        "commit, make release-plan ENV=prod and make release ENV=prod"),
-    (DETERMINISTIC, "commit and push envs/prod/ to origin/main (or merge its PR), make rehearse ENV=dev on that "
-                    "commit, make release-plan ENV=prod and make release ENV=prod"),
+    (DETERMINISTIC_STG, "commit and push envs/prod/ to origin/main (or merge its PR), make release-plan ENV=prod "
+                        "(it reuses the stg rehearsal, or names the command to run) and make release ENV=prod"),
+    (DETERMINISTIC, "commit and push envs/prod/ to origin/main (or merge its PR), make release-plan ENV=prod "
+                    "(it reuses the dev rehearsal, or names the command to run) and make release ENV=prod"),
     (LEGACY, "make release ENV=prod"),
 ])
 def test_release_steps_follow_the_env_mode_and_its_promote_from(tmp_path, text, expected):
@@ -460,8 +500,9 @@ def test_every_coverage_gap_fix_prints_the_readme_recovery_sequence(tmp_path, ca
     monkeypatch.delenv("GENIERAILS_RERUN_TARGET", raising=False)
     dev, prod = _gap_envs(tmp_path)
     readme = _readme_recovery()
+    # No second make rehearse ENV=dev: release-plan reuses the rehearsal of the commit before the promotion.
     assert readme == ["make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
-                      "make promote-to ENV=prod", "make check ENV=prod", "make rehearse ENV=dev",
+                      "make promote-to ENV=prod", "make check ENV=prod",
                       "make release-plan ENV=prod", "make release ENV=prod"]
     builder = coverage_fix.recovery_steps(["dev", "prod"], "envs/dev/env.auto.tfvars")
     assert builder.startswith("commit envs/dev/env.auto.tfvars, make generate ENV=dev")
@@ -516,7 +557,7 @@ def test_a_prod_promoted_from_a_rehearsed_stg_maps_and_rehearses_in_stg(tmp_path
     _dev, stg, prod = _chain_envs(tmp_path, "")
     assert coverage_fix.promotion_chain(prod) == ["stg", "prod"]
     expected = ["make generate ENV=stg", "make check ENV=stg", "make rehearse ENV=stg", "make promote-to ENV=prod",
-                "make check ENV=prod", "make rehearse ENV=stg", "make release-plan ENV=prod", "make release ENV=prod"]
+                "make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod"]
     builder = coverage_fix.recovery_steps(["stg", "prod"], "envs/stg/env.auto.tfvars")
     assert re.findall(MAKE_STEP, builder) == expected
     for text in _all_fixes(prod):

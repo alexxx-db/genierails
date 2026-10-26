@@ -630,6 +630,7 @@ def test_champion_walkthrough_lets_release_plan_reuse_the_dev_rehearsal_on_the_p
         assert quoted in gate and quoted in prod, quoted
     assert "reusing {source}'s passing" in gate and "reusing dev's passing rehearsal of" in prod
 
-    # A coverage-gap fix commits a new promotion too: rehearse dev again before release-plan.
+    # A coverage-gap fix commits a new promotion too: release-plan reuses dev's rehearsal of the fix commit.
     after_promote = gap[gap.index("`make promote-to ENV=prod`"):]
-    assert after_promote.index("`make rehearse ENV=dev`") < after_promote.index("`make release-plan ENV=prod`")
+    assert "`make rehearse ENV=dev`" not in after_promote[:after_promote.index("`make release ENV=prod`")]
+    assert "`make release-plan ENV=prod` (it reuses the dev rehearsal, or names the command to run)" in after_promote

@@ -384,7 +384,7 @@ def test_release_plan_reuse_never_counts_a_receipt_from_another_store(repo):
     foreign = {k: v for k, v in json.loads(path.read_text()).items()} | {"store": "ci-runner-store"}
     path.chmod(0o600)
     path.unlink()
-    rg._write_once(path, foreign)
+    rg._write_once(path, rg.seal(foreign))  # a genuine receipt of another store
     repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
     why = _reuse(repo)
     assert why and "written by another store" in why and "make rehearse ENV=dev on this commit" in why
@@ -413,6 +413,109 @@ def test_release_plan_reuse_leaves_a_legacy_or_missing_source_to_provenance(repo
     repo.commit({"aws/envs/prod/env.auto.tfvars": PROD_ENV,
                  "aws/envs/dev/env.auto.tfvars": 'uc_tables = ["dev_catalog.s.t"]\n'})
     assert _reuse(repo) is None and not _dev_receipts(repo)
+
+
+# -- reuse refuses divergent commits and edited or inconsistent receipts (Codex r1) ---------
+
+def _diverge(repo: Repo) -> tuple[str, str]:
+    """A passing dev rehearsal of a commit, then HEAD on a side branch that doesn't contain it."""
+    base = repo.head()
+    rehearsed = repo.commit({"aws/envs/prod/ack.txt": "# main\n"})
+    rehearse(repo)
+    repo.git("checkout", "-q", "-b", "side", base)
+    side = repo.commit({"aws/envs/prod/ack.txt": "# side\n"}, push=False)
+    assert not rg.is_ancestor(repo.root, rehearsed, side)
+    assert rg.inputs_fingerprint(repo.root, repo.cloud, "dev")["fingerprint"] == \
+        rg.passing_receipt(repo.cloud, "dev", rehearsed)["fingerprint"]
+    return rehearsed, side
+
+
+def test_rehearse_never_reuses_a_receipt_of_a_divergent_commit(repo, capsys):
+    rehearsed, side = _diverge(repo)
+    capsys.readouterr()
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "run"
+    out = capsys.readouterr().out
+    assert f"{rehearsed[:12]} is not an ancestor of {side[:12]} (a divergent branch)" in out, out
+    assert rg.passing_receipt(repo.cloud, "dev", side) is None
+
+
+def test_release_plan_never_reuses_a_receipt_of_a_divergent_commit(repo):
+    rehearsed, side = _diverge(repo)
+    before = len(_dev_receipts(repo))
+    why = _reuse(repo)
+    assert why and f"{rehearsed[:12]} is not an ancestor of {side[:12]}" in why and "make rehearse ENV=dev" in why
+    assert len(_dev_receipts(repo)) == before and rg.passing_receipt(repo.cloud, "dev", side) is None
+
+
+DROP = object()
+
+
+def _rewrite(receipt: dict, **changes) -> dict:
+    """Edit a stored receipt in place, by hand (what the seal must catch); DROP removes a field."""
+    path = Path(receipt["_path"])
+    data = json.loads(path.read_text())
+    for key, value in changes.items():
+        if value is DROP:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    path.chmod(0o600)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    return data
+
+
+def test_a_failed_receipt_edited_to_passed_is_never_reused(repo, capsys):
+    failed = rehearse(repo, "failed")
+    _rewrite(failed, result="passed", reason=DROP)
+    commit = repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    before = len(_dev_receipts(repo))
+    why = _reuse(repo)
+    assert why and "its digest doesn't match its content" in why and "make rehearse ENV=dev" in why
+    assert len(_dev_receipts(repo)) == before and rg.passing_receipt(repo.cloud, "dev", commit) is None
+    capsys.readouterr()
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "run"
+    assert "its digest doesn't match its content" in capsys.readouterr().out
+
+
+def test_a_receipt_edited_to_passed_never_satisfies_provenance(repo):
+    failed = rehearse(repo, "failed")
+    _rewrite(failed, result="passed", reason=DROP)
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+    with pytest.raises(rg.Refused, match="don't match their digest .edited by hand.. and never count"):
+        rg.provenance(repo.prod, "prod")
+
+
+@pytest.mark.parametrize(("changes", "why"), [
+    ({"applied": True, "reused_from": "a" * 40}, "applied and reused_from disagree"),
+    ({"applied": False, "reused_from": None}, "applied and reused_from disagree"),
+    ({"fingerprint_parts": {"code": "x", "env": "y", "account": "z", "fingerprint": "w"}},
+     "its fingerprint doesn't match its parts"),
+    ({"commit": "b" * 40}, "its commit doesn't match where it is stored"),
+    ({"reason": "a step failed"}, "a passing receipt carries a failure reason"),
+    ({"env": "prod"}, "not a rehearse receipt of this env and version"),
+    ({"dirty": ["uncommitted: x"]}, "not a passing rehearsal of a clean checkout"),
+    ({"surprise": 1}, "unexpected fields: unknown surprise"),
+    ({"targets": DROP}, "unexpected fields: missing targets"),
+])
+def test_a_sealed_but_inconsistent_receipt_is_never_reused(repo, changes, why):
+    """Re-sealing after an edit passes the digest; the fields must still fit together."""
+    first = rehearse(repo)
+    data = {k: v for k, v in _rewrite(first, **changes).items()}
+    Path(first["_path"]).write_text(json.dumps(rg.seal(data), indent=2, sort_keys=True) + "\n")
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    reason = _reuse(repo)
+    assert reason and why in reason, reason
+
+
+def test_every_receipt_rehearse_writes_is_sealed_and_reusable(repo):
+    applied = rehearse(repo)
+    assert rg.sealed(applied) and rg.reuse_problem(applied, "dev") is None
+    commit = repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "reused"
+    reused = rg.passing_receipt(repo.cloud, "dev", commit)
+    assert rg.sealed(reused) and rg.reuse_problem(reused, "dev") is None
+    failed = rg.rehearse_finish(repo.dev, "dev", "failed", Path("Makefile"), "make", "boom")
+    assert rg.sealed(failed) and rg.reuse_problem(failed, "dev") == "not a passing rehearsal of a clean checkout"
 
 
 def test_the_rehearse_reuse_cli_prints_why_and_exits_zero_for_provenance_to_refuse(repo, capsys):
@@ -500,7 +603,7 @@ def test_provenance_refuses_a_fingerprint_mismatch(repo):
     receipt = rehearse(repo)
     forged = {k: v for k, v in receipt.items() if k != "_path"} | {"fingerprint": "0" * 64,
                                                                     "created_at": rg._now()}
-    rg._write_once(Path(receipt["_path"]).with_name("zz-forged.json"), forged)
+    rg._write_once(Path(receipt["_path"]).with_name("zz-forged.json"), rg.seal(forged))
     with pytest.raises(rg.Refused, match="fingerprint differs from the rehearsal receipt"):
         rg.provenance(repo.prod, "prod")
 

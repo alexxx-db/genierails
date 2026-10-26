@@ -290,7 +290,7 @@ def _foreign_store(repo) -> None:
     data = json.loads(path.read_text()) | {"store": "ci-runner-store"}
     path.chmod(0o600)
     path.unlink()
-    rg._write_once(path, data)
+    rg._write_once(path, rg.seal(data))  # a genuine receipt of another store
     repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
 
 
@@ -319,6 +319,33 @@ def test_release_plan_refuses_when_the_dev_rehearsal_cannot_be_reused(make, repo
     assert named in result.stderr.split("did not reuse")[1].splitlines()[0], result.stderr
     assert make.calls() == [] and len(rg.rehearse_receipts(repo.cloud, "dev", any_store=True)) == before
     assert _no_lock(repo, "dev") and _no_lock(repo, "prod")
+
+
+def test_release_plan_never_reuses_a_divergent_or_edited_dev_receipt(tmp_path, make, repo):
+    """Codex r1: a non-ancestor commit's receipt, and a failed receipt edited to passed."""
+    base = repo.head()
+    rehearsed = repo.commit({"aws/envs/prod/ack.txt": "# main\n"})
+    assert make("rehearse", "dev").returncode == 0
+    repo.git("checkout", "-q", "-b", "side", base)
+    repo.commit({"aws/envs/prod/ack.txt": "# side\n"}, push=False)
+    make.reset()
+    result = make("release-plan", "prod")
+    assert result.returncode != 0 and f"{rehearsed[:12]} is not an ancestor of" in result.stderr, result.stderr
+    assert make.calls() == [] and rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+
+    repo.git("checkout", "-q", "main")
+    failed = repo.commit({"aws/envs/dev/env.auto.tfvars": DEV_ENV + "# new\n"})
+    assert Make(tmp_path, repo, fail="coverage-gate")("rehearse", "dev").returncode != 0  # a failed receipt
+    path = Path(next(r["_path"] for r in rg.rehearse_receipts(repo.cloud, "dev") if r["commit"] == failed))
+    data = json.loads(path.read_text()) | {"result": "passed"}
+    data.pop("reason", None)
+    path.chmod(0o600)
+    path.write_text(json.dumps(data))
+    repo.commit({"aws/envs/prod/ack.txt": "# after\n"})
+    make.reset()
+    result = make("release-plan", "prod")
+    assert result.returncode != 0 and "its digest doesn't match its content" in result.stderr, result.stderr
+    assert make.calls() == [] and rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
 
 
 def test_release_plan_refuses_without_any_dev_rehearsal_and_names_the_command(make, repo):

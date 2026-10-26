@@ -17,8 +17,8 @@ git add envs/dev/ && git commit        # open a PR; after merge the dev pipeline
 # prod
 make promote-to ENV=prod               # carries the capture to envs/prod/agents/
 make check ENV=prod
-git add envs/prod/ && git commit       # the promotion PR; after merge, rehearse dev on the merge commit
-make release-plan ENV=prod             # on the deployment machine; approve the manifest
+git add envs/prod/ && git commit       # the promotion PR; merge it
+make release-plan ENV=prod             # on the deployment machine (reuses dev's rehearsal); approve the manifest
 make release ENV=prod                  # releases the approved manifest
 ```
 
@@ -80,9 +80,11 @@ keeps its last captured version.
    ack line in a governance-reviewed PR.
 2. **Check and open the promotion PR.** `make check ENV=prod`; commit
    `envs/prod/`. It can carry the dev change too, in one PR.
-3. **Merge.** After the rehearsal of the source env (`promote_from`, dev by
-   default) passes on the merge commit, the operator
-   runs `make release-plan ENV=prod`, gets the manifest approved, and runs
+3. **Merge.** The operator runs `make release-plan ENV=prod`. When only
+   `envs/prod/` changed it reuses the source env's (`promote_from`, dev by
+   default) earlier rehearsal; when the PR also changed the source env, it
+   names `make rehearse` to run on the merge commit first. Then get the
+   manifest approved and run
    `make release ENV=prod` ([deployment machine](../deployment-machine.md#release-prod)).
    **Pass looks like:** `ALL EFFECTIVE` and `=== Release complete (prod) ===`.
 
@@ -94,9 +96,9 @@ or changes its ID, so conversations stay. Never edit a prod agent in the UI.
 
 Edit `acl_groups` in `envs/prod/agents/<agent>.auto.tfvars`: prod owns it and
 `promote-to` never overwrites it. If a new group can't read the agent's tables,
-governance adds it to `table_readers` in the same PR. Then PR, merge, rehearse
-the source env (`promote_from`, dev by default) on the merged commit (a no-op
-that writes a receipt), `release-plan` and `release`.
+governance adds it to `table_readers` in the same PR. Then PR, merge,
+`release-plan` (a prod-only change: it reuses the source env's rehearsal, so
+no rehearse is needed) and `release`.
 
 ## Remove an agent
 
