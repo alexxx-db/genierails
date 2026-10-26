@@ -9,6 +9,12 @@ receipt store with no .store-id yet counts no receipt instead of creating one
 is reported only as configured or not (auth_configured.auth_status), and the
 lock's nonce is never read out.
 
+In CI it never suggests a target make's CI guard would refuse: CI detection
+and the opt-out are scripts/ci_guard.py's (what _guard-not-ci-apply runs),
+and which targets carry the guard is read from Makefile.shared's
+prerequisites. Such a step prints as "run <command> from the deployment
+machine, not CI".
+
 ``next`` walks the gates the commands themselves apply (release_gate
 provenance, current-manifest and maintain-check, the staged policy journal,
 the env lock, the placeholder and deployer checks, coverage_fix's
@@ -25,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 from pathlib import Path
@@ -34,12 +41,69 @@ for _path in (SHARED, SHARED / "scripts"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from scripts import ci_guard  # noqa: E402
 from scripts import release_gate as rg  # noqa: E402
 from scripts.auth_configured import AuthStatus, auth_status  # noqa: E402
 from scripts.coverage_fix import promotion_chain  # noqa: E402
 from scripts.state_layout import data_access_subdir, remote_configured  # noqa: E402
 
 EVIDENCE = Path("generated") / "evidence"
+MAKEFILE = SHARED / "Makefile.shared"
+_TARGET_LINE = re.compile(r"^([a-z][a-z0-9_-]*):(?!=)([^#]*)")
+_MAKE_COMMAND = re.compile(r"^make ([a-z][a-z0-9_-]*)(?: ENV=(\S+))?")
+
+
+def ci_guarded_targets(makefile: Path = MAKEFILE) -> dict[str, str]:
+    """target -> the CI guard it runs first ("apply" or "rebind"), read from Makefile.shared's prerequisites."""
+    guarded = {}
+    for line in makefile.read_text().splitlines():
+        match = _TARGET_LINE.match(line)
+        if match:
+            prereqs = match.group(2).split()
+            if "_guard-not-ci-rebind" in prereqs:
+                guarded[match.group(1)] = "rebind"
+            elif "_guard-not-ci-apply" in prereqs:
+                guarded[match.group(1)] = "apply"
+    return guarded
+
+
+def _ci(cloud_dir: Path, makefile_cloud_dir: Path) -> dict:
+    """What _guard-not-ci-apply would see (scripts/ci_guard.py), and its dev rehearse exemption."""
+    markers = ci_guard.ci_markers()
+    out = {"detected": bool(markers), "markers": markers, "allow_ci_apply": ci_guard.opted_out()}
+    if markers:
+        saved = os.environ.get("GENIERAILS_MAKE_GOALS")
+        os.environ["GENIERAILS_MAKE_GOALS"] = "rehearse"  # the goal make next would suggest
+        try:
+            out["dev_rehearse_allowed"] = ci_guard.dev_rehearse_allowed(
+                cloud_dir / "envs" / "dev", "dev", makefile_cloud_dir, cloud_dir)
+        finally:
+            if saved is None:
+                os.environ.pop("GENIERAILS_MAKE_GOALS", None)
+            else:
+                os.environ["GENIERAILS_MAKE_GOALS"] = saved
+    return out
+
+
+def ci_refusal(command: str, ci: dict, cloud_dir: Path) -> str:
+    """Why make would refuse ``command`` in this CI ("" when it wouldn't, or it isn't a guarded target)."""
+    match = _MAKE_COMMAND.match(command)
+    if not match or not ci["detected"]:
+        return ""
+    target, env = match.group(1), match.group(2) or "dev"
+    guard = ci_guarded_targets().get(target)
+    where = ", ".join(ci["markers"])
+    if guard == "rebind":
+        return f"make {target} refuses in CI ({where}), even with {ci_guard.ALLOW_CI_APPLY}=1"
+    if guard != "apply" or ci["allow_ci_apply"]:
+        return ""
+    if target == "rehearse" and env == "dev" and ci.get("dev_rehearse_allowed") \
+            and rg.deterministic(cloud_dir / "envs" / "dev"):
+        return ""
+    return (f"make {target} refuses applying targets in CI ({where}) unless {ci_guard.ALLOW_CI_APPLY}=1 "
+            "(isolated integration-test workflows only)"
+            + ("; make rehearse ENV=dev runs in CI only for a deterministic dev with configured, locked "
+               "remote state" if target == "rehearse" else ""))
 
 
 # -- facts ----------------------------------------------------------------------
@@ -239,7 +303,7 @@ def _evidence(env_dir: Path, git: dict) -> dict:
 
 
 def collect(cloud_dir: Path, env: str, *, remote: str = "origin", branch: str = "main",
-            with_next: bool = True) -> dict:
+            with_next: bool = True, makefile_cloud_dir: Path | None = None) -> dict:
     cloud_dir = Path(cloud_dir).resolve()
     env_dir = cloud_dir / "envs" / env
     report: dict = {"env": env, "cloud": cloud_dir.name, "env_dir": _rel_env(env_dir), "errors": []}
@@ -250,6 +314,7 @@ def collect(cloud_dir: Path, env: str, *, remote: str = "origin", branch: str = 
     report["auth"] = auth_status(env_dir / "auth.auto.tfvars").value if env_dir.is_dir() else "missing"
     report["lock"] = _lock(env_dir)
     report["evidence"] = _evidence(env_dir, git)
+    report["ci"] = _ci(cloud_dir, Path(makefile_cloud_dir or cloud_dir))
     report["generated"] = (env_dir / "generated" / "abac.auto.tfvars").is_file()
     if config.get("parses"):
         report["placeholders"] = _placeholders(env_dir, config["cfg"], config["role"])
@@ -274,8 +339,11 @@ def collect(cloud_dir: Path, env: str, *, remote: str = "origin", branch: str = 
     except Exception as exc:  # a state dir that can't be read: report it, never guess
         report["errors"].append(str(exc))
     if with_next:
-        report["next"] = dict(zip(("command", "why"), next_step(cloud_dir, env, report, remote=remote,
-                                                                branch=branch)))
+        command, why = next_step(cloud_dir, env, report, remote=remote, branch=branch)
+        refusal = ci_refusal(command, report["ci"], cloud_dir)
+        if refusal:
+            command, why = f"run {command} from the deployment machine, not CI", f"{why}; but {refusal}"
+        report["next"] = {"command": command, "why": why}
     return report
 
 
@@ -594,6 +662,11 @@ def _text(report: dict) -> list[str]:
                 lines.append(f"  Open change: run {t['run_id']} {t['from'] or 'nothing'} -> {t['to']}, {t['status']}"
                              f", done: {', '.join(t['completed']) or 'none'}; "
                              + ("config moved on; " if staged.get("config_moved_on") else "resumable; ") + abandon)
+    ci = report["ci"]
+    lines.append("  CI:          " + ("not detected" if not ci["detected"] else
+                                     f"detected ({', '.join(ci['markers'])}); "
+                                     + (f"{ci_guard.ALLOW_CI_APPLY}=1: applying targets may run"
+                                        if ci["allow_ci_apply"] else "applying targets refuse")))
     lock = report["lock"]
     if lock.get("error"):
         lines.append(f"  Lock:        {lock['error']}")
@@ -626,13 +699,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--branch", default="main")
+    parser.add_argument("--makefile-cloud-dir", type=Path, default=None,
+                        help="the cloud dir the Makefile records (GENIERAILS_CLOUD_DIR), as the CI guard gets it")
     args = parser.parse_args(argv)
     os.environ["GIT_OPTIONAL_LOCKS"] = "0"  # git status must not refresh the index (a write)
     if args.env in (rg.ACCOUNT_ENV, data_access_subdir()):
         print(f"make {args.command} is workspace-driven. Use ENV=<workspace> instead of ENV={args.env}.",
               file=sys.stderr)
         return 2
-    report = collect(args.cloud_dir, args.env, remote=args.remote, branch=args.branch)
+    report = collect(args.cloud_dir, args.env, remote=args.remote, branch=args.branch,
+                     makefile_cloud_dir=args.makefile_cloud_dir)
     if args.command == "next":
         print(report["next"]["command"])
         print(f"  Why: {report['next']['why']}")

@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -19,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts import environment_lock
+from scripts import env_status, environment_lock
 from scripts import policy_generations as pg
 from scripts import release_gate as rg
 from tests import script_stubs
@@ -55,10 +57,11 @@ class World:
             tool.write_text(f"#!/bin/sh\ntouch {self.markers / name}-ran\nexit 1\n")
             tool.chmod(0o755)
 
-    def environ(self) -> dict:
+    def environ(self, extra: dict | None = None) -> dict:
+        """The host environment minus every CI marker (so a CI runner doesn't change the table), plus ``extra``."""
         environ = {k: v for k, v in script_stubs.without_ci(os.environ).items()
                    if k not in ("MAKEFLAGS", "MAKELEVEL", "PYTHONPATH")}
-        environ |= self.repo.env
+        environ |= self.repo.env | (extra or {})
         environ["PYTHONPATH"] = str(self.tmp / "fake-py")
         environ["PATH"] = f"{self.bin}:{Path(sys.executable).parent}:{environ['PATH']}"
         return environ
@@ -77,29 +80,30 @@ class World:
                     files[key] = ("dir", oct(st.st_mode))
         return files
 
-    def run(self, command: str, env: str, *extra: str, via_make: bool = False) -> subprocess.CompletedProcess:
+    def run(self, command: str, env: str, *extra: str, via_make: bool = False, ci: dict | None = None,
+            makefile: Path | None = None) -> subprocess.CompletedProcess:
         before = self.snapshot()
         if via_make:
-            args = ["make", "--no-print-directory", "-f", str(ROOT / "aws" / "Makefile"), command, f"ENV={env}",
+            args = ["make", "--no-print-directory", "-f", str(makefile or ROOT / "aws" / "Makefile"), command, f"ENV={env}",
                     f"CLOUD_ROOT={self.repo.cloud}", f"SHARED_ROOT={ROOT / 'shared'}", *extra]
         else:
             args = [sys.executable, str(SCRIPT), command, "--cloud-dir", str(self.repo.cloud), "--env", env, *extra]
-        result = subprocess.run(args, cwd=self.repo.cloud, text=True, capture_output=True, env=self.environ())
+        result = subprocess.run(args, cwd=self.repo.cloud, text=True, capture_output=True, env=self.environ(ci))
         assert self.snapshot() == before, "make status/next changed the repo, its origin or the receipt store"
         assert not list(self.markers.iterdir()), "a Databricks client or Terraform was reached"
         for secret in (SECRET, NONCE):
             assert secret not in result.stdout + result.stderr
         return result
 
-    def next(self, env: str) -> tuple[str, str]:
-        result = self.run("next", env)
+    def next(self, env: str, ci: dict | None = None) -> tuple[str, str]:
+        result = self.run("next", env, ci=ci)
         assert result.returncode == 0, result.stderr
         command, why = result.stdout.rstrip("\n").split("\n", 1)
         assert why.startswith("  Why: ")
         return command, why[len("  Why: "):]
 
-    def status(self, env: str) -> dict:
-        result = self.run("status", env, "--json")
+    def status(self, env: str, ci: dict | None = None) -> dict:
+        result = self.run("status", env, "--json", ci=ci)
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout)
 
@@ -478,3 +482,165 @@ def test_makefile_documents_both_targets():
     text = (ROOT / "shared" / "Makefile.shared").read_text()
     assert "\nstatus: ## Read-only:" in text and "\nnext: ## Read-only:" in text
     assert " status next\n" in text.split("\n\n", 1)[0] + "\n"
+
+
+# -- CI: never a target make's CI guard refuses --------------------------------------------------------------------
+
+CI_RUNS = [{"CI": "true"}, {"CI": "YES"}, {"CI": "1"}, {"TF_BUILD": "True"}, {"GITLAB_CI": "true"},
+           {"JENKINS_URL": "http://jenkins"}, {"BUILDKITE": "true"}, {"CIRCLECI": "true"}]
+OPTED_OUT = {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "1"}
+MAKEFILE_TEXT = (ROOT / "shared" / "Makefile.shared").read_text()
+
+
+def guard_accepts(world: World, command: str, ci: dict) -> bool:
+    """Whether make's real _guard-not-ci-apply (Makefile.shared) lets ``command``'s target run under ``ci``.
+
+    A target without the guard always passes it. The guard target is run on its own, so its dev rehearse
+    exemption (goal exactly rehearse) never applies here; that one has its own test below.
+    """
+    match = re.match(r"^make ([a-z][a-z0-9_-]*)(?: ENV=(\S+))?", command)
+    prereqs = re.search(rf"^{re.escape(match.group(1))}:(?!=)([^#\n]*)", MAKEFILE_TEXT, re.MULTILINE) if match else None
+    guards = [g for g in ("_guard-not-ci-rebind", "_guard-not-ci-apply") if prereqs and g in prereqs.group(1).split()]
+    if not guards:
+        return True
+    guard = guards[0]
+    result = subprocess.run(["make", "--no-print-directory", "-f", str(ROOT / "aws" / "Makefile"), guard,
+                             f"ENV={match.group(2) or 'dev'}", f"CLOUD_ROOT={world.repo.cloud}",
+                             f"SHARED_ROOT={ROOT / 'shared'}"], cwd=world.repo.cloud, text=True,
+                            capture_output=True, env=world.environ(ci))
+    return result.returncode == 0
+
+
+def deployment_machine(command: str) -> str:
+    return f"run {command} from the deployment machine, not CI"
+
+
+@pytest.mark.parametrize("ci", CI_RUNS, ids=lambda ci: ",".join(ci))
+def test_ci_never_suggests_release_plan(world, repo, ci):
+    account_applied(repo)
+    rehearse(repo)
+    plain = world.next("prod")[0]
+    assert plain == "make release-plan ENV=prod" and not guard_accepts(world, plain, ci)
+    command, why = world.next("prod", ci)
+    assert command == deployment_machine("make release-plan ENV=prod")
+    assert why.endswith("but make release-plan refuses applying targets in CI "
+                        f"({env_status.ci_guard.ci_markers(ci)[0]}) unless GENIERAILS_ALLOW_CI_APPLY=1 "
+                        "(isolated integration-test workflows only)")
+    assert world.next("dev", ci)[0] == deployment_machine("make release-plan ENV=prod")
+
+
+def test_ci_never_suggests_release_maintain_apply_account_rehearse_or_abandon(world, repo):
+    ci = {"CI": "true"}
+    account_manifest(repo, changes=True)
+    assert world.next("dev", ci)[0] == deployment_machine("make apply-account")
+    assert not guard_accepts(world, "make apply-account", ci)
+    account_applied(repo)
+    assert world.next("dev", ci)[0] == deployment_machine("make rehearse ENV=dev")
+    rehearse(repo)
+    journal(repo, "prod", "0" * 16)
+    staged = world.status("prod")["staged"]
+    moved = world.next("prod", ci)[0]
+    if staged["abandonable"]:
+        assert moved == deployment_machine("make policy-abandon ENV=prod")
+        assert not guard_accepts(world, "make policy-abandon ENV=prod", ci)
+    else:
+        assert moved == f"git checkout --detach {repo.head()}"
+    pg.ledger_dir(repo.prod).joinpath("journal.json").unlink()
+    manifest(repo, "m1")
+    assert world.next("prod", ci)[0] == deployment_machine("make release ENV=prod")
+    receipt(repo, "release", "m1")
+    assert world.next("prod", ci)[0] == deployment_machine("make maintain ENV=prod")
+    for target in ("release ENV=prod", "maintain ENV=prod", "rehearse ENV=dev"):
+        assert not guard_accepts(world, f"make {target}", ci)
+
+
+def test_ci_keeps_steps_make_runs_in_ci(world, repo):
+    """account-plan, promote-to, setup and commits carry no CI guard, so CI gets them unchanged."""
+    ci = {"CI": "true"}
+    assert world.next("dev", ci)[0] == "make account-plan"
+    assert guard_accepts(world, "make account-plan", ci)
+    account_applied(repo)
+    (repo.prod / "generated" / "masking_functions.sql").write_text("-- promoted\n")
+    assert world.next("prod", ci)[0] == "git add envs/ && git commit"
+
+
+def test_ci_opt_out_suggests_what_make_then_accepts(world, repo):
+    account_applied(repo)
+    rehearse(repo)
+    assert world.next("prod", OPTED_OUT) == world.next("prod")
+    assert world.next("prod", OPTED_OUT)[0] == "make release-plan ENV=prod"
+    assert guard_accepts(world, "make release-plan ENV=prod", OPTED_OUT)
+    status = world.status("prod", OPTED_OUT)["ci"]
+    assert status == {"detected": True, "markers": ["CI=true"], "allow_ci_apply": True,
+                      "dev_rehearse_allowed": False}
+
+
+@pytest.mark.parametrize("ci", [{"CI": "false"}, {"CI": ""}, {"TF_BUILD": ""}, {"GENIERAILS_ALLOW_CI_APPLY": "1"}],
+                         ids=["CI=false", "CI=empty", "TF_BUILD=empty", "opt-out-only"])
+def test_not_ci_is_not_ci(world, repo, ci):
+    account_applied(repo)
+    rehearse(repo)
+    assert world.next("prod", ci)[0] == "make release-plan ENV=prod"
+    assert guard_accepts(world, "make release-plan ENV=prod", ci)
+    assert world.status("prod", ci)["ci"]["detected"] is False
+
+
+def test_ci_status_field(world, repo):
+    status = world.status("prod", {"TF_BUILD": "True", "CI": "true"})["ci"]
+    assert status["detected"] is True and status["markers"] == ["CI=true", "TF_BUILD"]
+    assert status["allow_ci_apply"] is False
+    assert world.status("prod")["ci"] == {"detected": False, "markers": [], "allow_ci_apply": False}
+    text = world.run("status", "prod", ci={"CI": "true"}).stdout
+    assert "  CI:          detected (CI=true); applying targets refuse" in text
+    assert "  CI:          not detected" in world.run("status", "prod").stdout
+    assert "GENIERAILS_ALLOW_CI_APPLY=1: applying targets may run" in world.run("status", "prod", ci=OPTED_OUT).stdout
+
+
+def test_ci_dev_rehearse_exemption_follows_the_guard(world, repo):
+    """make rehearse ENV=dev with locked remote state runs in CI (state_layout.ci_allowed): next keeps it."""
+    shutil.copyfile(ROOT / "aws" / "Makefile", repo.cloud / "Makefile")
+    repo.commit({"aws/envs/dev/remote_state.hcl": 'backend = "s3"\nbucket = "b"\nregion = "r"\n'
+                                                  'dynamodb_table = "locks"\n'})
+    account_applied(repo)
+    ci = {"CI": "true"}
+    by_make = world.run("next", "dev", ci=ci, via_make=True, makefile=repo.cloud / "Makefile")
+    assert by_make.returncode == 0, by_make.stderr
+    assert by_make.stdout.splitlines()[0] == "make rehearse ENV=dev"
+    guard = subprocess.run([sys.executable, str(ROOT / "shared" / "scripts" / "ci_guard.py"), "apply",
+                            "--cloud-dir", str(repo.cloud), "--cloud-root", str(repo.cloud),
+                            "--env-dir", str(repo.dev), "--env", "dev"], text=True, capture_output=True,
+                           env=world.environ(ci | {"GENIERAILS_MAKE_GOALS": "rehearse"}))
+    assert guard.returncode == 0, guard.stderr
+    # A Makefile from another checkout with CLOUD_ROOT pointed here fails ci_allowed: guard and next both refuse.
+    other = world.run("next", "dev", ci=ci, via_make=True)
+    assert other.stdout.splitlines()[0] == deployment_machine("make rehearse ENV=dev")
+    other_guard = subprocess.run(["make", "--no-print-directory", "-f", str(ROOT / "aws" / "Makefile"), "rehearse",
+                                  "ENV=dev", f"CLOUD_ROOT={repo.cloud}", f"SHARED_ROOT={ROOT / 'shared'}"],
+                                 cwd=repo.cloud, text=True, capture_output=True, env=world.environ(ci))
+    assert other_guard.returncode and "applying targets cannot run in CI" in other_guard.stderr
+    # A legacy dev never rehearses in CI, remote state or not.
+    repo.commit({"aws/envs/dev/env.auto.tfvars": LEGACY})
+    legacy = world.run("next", "dev", ci=ci, via_make=True, makefile=repo.cloud / "Makefile")
+    assert legacy.stdout.splitlines()[0] == deployment_machine("make rehearse ENV=dev")
+
+
+def test_make_and_next_share_one_ci_detection():
+    """No inline CI check is left in Makefile.shared: every one runs scripts/ci_guard.py, which make next imports."""
+    text = (ROOT / "shared" / "Makefile.shared").read_text()
+    assert "TF_BUILD" not in text and "ci_value" not in text
+    assert "\n_guard-not-ci-apply:\n\t@GENIERAILS_MAKE_GOALS=\"$(MAKECMDGOALS)\" $(_CI_GUARD) apply " in text
+    assert "\n_guard-not-ci-rebind:\n\t@$(_CI_GUARD) rebind\n" in text
+    from scripts import staged_policy_apply
+
+    assert staged_policy_apply.CI_MARKERS is env_status.ci_guard.CI_MARKERS
+    guarded = env_status.ci_guarded_targets()
+    assert {"rehearse", "release", "release-plan", "maintain", "apply-account", "policy-abandon"} <= set(guarded)
+    assert guarded["policy-rebind"] == "rebind"
+    assert not {"account-plan", "promote-to", "setup", "generate", "check", "status", "next"} & set(guarded)
+
+
+@pytest.mark.parametrize("ci", [*CI_RUNS, OPTED_OUT, {"CI": "false"}, {"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "0"}],
+                         ids=lambda ci: ",".join(f"{k}={v}" for k, v in ci.items()))
+def test_the_real_guard_and_ci_guard_agree(world, ci):
+    expected = env_status.ci_guard.apply_allowed(ci)
+    assert guard_accepts(world, "make release ENV=prod", ci) is expected
