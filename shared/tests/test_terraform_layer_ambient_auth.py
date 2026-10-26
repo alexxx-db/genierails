@@ -23,7 +23,7 @@ TEST_SH = ROOT / "shared" / "test.sh"
 AZURE = 'backend = "azurerm"\nresource_group_name = "r"\nstorage_account_name = "s"\ncontainer_name = "c"\n'
 S3 = 'backend = "s3"\nbucket = "b"\nregion = "r"\ndynamodb_table = "locks"\n'
 FAKE_TERRAFORM = """#!/usr/bin/env bash
-{ printf '== %s\\n' "$*"; env | grep -E '^(DATABRICKS|ARM|ACTIONS_ID_TOKEN|SYSTEM)_' | sort; } >> "$FAKE_TF_LOG"
+{ printf '== %s\\n' "$*"; env | grep -E '^(DATABRICKS|ARM|ACTIONS_ID_TOKEN|SYSTEM)_|^TF_VAR_databricks_pipeline_auth_type=' | sort; } >> "$FAKE_TF_LOG"
 exit 0
 """
 AMBIENT = {
@@ -45,6 +45,8 @@ AMBIENT = {
     "SYSTEM_ACCESSTOKEN": "spoofed-ado-token",
     "SYSTEM_OIDCREQUESTURI": "https://spoofed.invalid/oidc",
     "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI": "https://dev.azure.com/spoofed/",
+    # The roots' provider auth_type pin (scripts/terraform_env.sh).
+    "TF_VAR_databricks_pipeline_auth_type": "github-oidc",
 }
 GITHUB_TOKEN_VARS = {"ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"}
 ADO_TOKEN_VARS = {"SYSTEM_ACCESSTOKEN", "SYSTEM_OIDCREQUESTURI", "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI"}
@@ -123,6 +125,7 @@ def test_pipeline_oidc_auth_reaches_terraform_only_in_its_ci_job(tmp_path, auth_
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type, **ci_context)
     for argv, auth_env in calls:
         assert auth_env.get("DATABRICKS_AUTH_TYPE") == auth_type, argv
+        assert auth_env.get("TF_VAR_databricks_pipeline_auth_type") == auth_type, argv
         assert {k: auth_env.get(k) for k in token_vars} == {k: AMBIENT[k] for k in token_vars}, argv
         other = (GITHUB_TOKEN_VARS | ADO_TOKEN_VARS) - token_vars
         assert not other & set(auth_env), argv
@@ -143,6 +146,7 @@ def test_a_local_shell_cannot_present_pipeline_oidc(tmp_path, auth_type, ci_cont
     calls = _run(tmp_path, "workspace", "plan", DATABRICKS_AUTH_TYPE=auth_type, **ci_context)
     for argv, auth_env in calls:
         assert "DATABRICKS_AUTH_TYPE" not in auth_env, argv
+        assert "TF_VAR_databricks_pipeline_auth_type" not in auth_env, argv
         if "GITHUB_ACTIONS" not in ci_context or ci_context["GITHUB_ACTIONS"] != "true":
             assert not GITHUB_TOKEN_VARS & set(auth_env), argv
         if "TF_BUILD" not in ci_context:
