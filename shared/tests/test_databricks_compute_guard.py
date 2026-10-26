@@ -9,6 +9,7 @@ neither terraform, the databricks CLI nor the Databricks SDK is reached.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -23,18 +24,139 @@ MARKERS = {"DATABRICKS_RUNTIME_VERSION": "15.4", "DB_CLUSTER_ID": "0101-123456-a
            "DB_IS_JOB_CLUSTER": "TRUE", "DATABRICKS_APP_NAME": "genierails"}
 REFUSED = "refused: this is Databricks compute"
 OPT_IN = "GENIERAILS_ALLOW_DATABRICKS_COMPUTE"
-# Everything _guard-not-ci-apply guards, plus the live writers CI doesn't run
-# (sync-tags, bootstrap-sp, bootstrap-pipelines) and account-plan's locked manifest.
-STATE_CHANGING = (
-    "enable-classification", "rehearse", "release", "release-plan", "_release-manifest", "maintain", "apply",
-    "apply-governance", "apply-genie", "_apply-layer", "integration-test",
-    "test-champion", "test-all", "test-ci", "test-ci-parallel",
-    "destroy", "destroy-governance", "destroy-genie", "_destroy-layer",
-    "import", "migrate-state", "migrate-state-dir", "ungovern", "apply-account", "policy-abandon", "policy-rebind",
-    "detach-agent", "split-agent-files",
-    "sync-tags", "_sync-tags-add-only-locked", "bootstrap-sp", "bootstrap-pipelines", "account-plan",
-    "_account-plan-locked",
-)
+GUARDS = ("_guard-not-ci-apply", "_guard-not-databricks-compute")
+
+
+# --- which targets change state: found in the Makefile, not listed by hand ----
+#
+# A target changes state when its recipe (with the Makefile's _-macros expanded)
+# runs a terraform write through the layer runner, imports, takes an env lock,
+# or writes a receipt, manifest, phase record, staged journal or governance
+# record, or when it reaches such a target through a prerequisite or a
+# $(MAKE) call. A target whose guard is conditional (promote, promote-to,
+# _prepare-classification) guards its own writing mode, so reaching it doesn't
+# make the caller state-changing (plan re-splits and preps classification read-only).
+SINKS = {
+    "terraform write": r'ROOT_RUNNER\)"?(?:\s+"?[^\s";|&]+"?){2}\s+(?:apply|apply-plan|destroy|import|state-rm|state-mv)\b',
+    "import": r"IMPORT_EXISTING_SCRIPT|import_existing\.(?:sh|py)",
+    "staged journal": r'staged_policy_apply\.py"\)?\s+(?:run|rebind|apply-saved|abandon|confirm)\b',
+    "env lock": r'environment_lock\.py"\)?\s+lock\b|state_layout\.py"\s+migrate\b',
+    "receipt or manifest": r'release_gate\.py"\)?\s+(?:phase-record|rehearse-start|rehearse-finish|release-receipt|'
+                           r'manifest-write|account-receipt|account-manifest-write|plan-dir|account-plan-dir)\b',
+    "Genie ID record or receipt": r'agent_ownership\.py"\)?\s+(?:detach|receipt|restore-ids|sync)\b',
+    "live tag or identity write": r"sync_tag_policies\.py|bootstrap_sp\.py|bootstrap_pipelines\.py",
+    "promotion transaction": r"_PROMOTION_TXN_BEGIN\b",
+}
+MAKE_CALL = r'\$\(MAKE\)(?:\s+(?:--?[\w-]+|[A-Za-z_]+="[^"]*"|[A-Za-z_]+=\S*))*\s+([a-z_][\w.-]*)'
+
+
+def _logical_lines(text):
+    out, buf = [], ""
+    for line in text.splitlines():
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        out.append(buf + line)
+        buf = ""
+    return out
+
+
+def _parse_makefile(path=ROOT / "shared" / "Makefile.shared"):
+    macros, rules, current = {}, {}, None
+    for line in _logical_lines(path.read_text()):
+        if line.startswith("\t"):
+            if current:
+                for name in current:
+                    rules[name]["recipe"].append(line[1:])
+            continue
+        current = None
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^(?:override\s+)?(_[A-Z][A-Z0-9_]*)\s*(?::=|\?=|=)(.*)$", line)
+        if m:
+            macros[m.group(1)] = m.group(2).strip()
+            continue
+        if re.match(r"^(?:override\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?::=|\?=|\+=|=)", line):
+            continue
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*(?:\s+[A-Za-z_][A-Za-z0-9_.-]*)*)\s*:(?!=)(.*)$", line)
+        if not m or re.match(r"\s*(?:override\s|[A-Za-z_]+\s*:?=)", m.group(2)):
+            continue  # not a rule, or a target-specific variable
+        current = m.group(1).split()
+        for name in current:
+            rule = rules.setdefault(name, {"prereqs": "", "recipe": []})
+            rule["prereqs"] = (rule["prereqs"] + " " + m.group(2).split("##")[0]).strip()
+    return macros, rules
+
+
+def _expand(text, macros, depth=0):
+    """Expand $(_MACRO) and $(call _MACRO,...) references (only the Makefile's own _-macros)."""
+    if depth > 15:
+        return text
+    return re.sub(r"\$\((?:call\s+)?(_[A-Z][A-Z0-9_]*)(?=[),])",
+                  lambda m: f"({m.group(1)} " + _expand(macros[m.group(1)], macros, depth + 1) if m.group(1) in macros
+                  else m.group(0), text)
+
+
+def _balanced(text):
+    """The leading $(...) expression of ``text``."""
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += ch == "("
+        depth -= ch == ")"
+        if depth == 0 and i:
+            return text[:i + 1]
+    return text
+
+
+def _guard_kind(rule, macros):
+    """'always', 'conditional' or None: how the target takes the guard at its very start."""
+    prereqs = re.sub(r"^\(_[A-Z0-9_]+ ", "", _expand(rule["prereqs"], macros).lstrip())
+    if prereqs.split() and prereqs.split()[0] in GUARDS:
+        return "always"
+    if prereqs.startswith("$(if") and any(g in _balanced(prereqs) for g in GUARDS):
+        return "conditional"
+    if rule["recipe"] and "$(_DATABRICKS_COMPUTE_GUARD)" in rule["recipe"][0]:
+        return "always"
+    return None
+
+
+def state_changing_targets(path=ROOT / "shared" / "Makefile.shared"):
+    """{target: reason} for every target that (transitively) changes state."""
+    macros, rules = _parse_makefile(path)
+    direct, edges, kinds = {}, {}, {}
+    for name, rule in rules.items():
+        body = _expand("\n".join(rule["recipe"]), macros)
+        direct[name] = next((label for label, pattern in SINKS.items() if re.search(pattern, body)), None)
+        prereqs = re.sub(r"\$\(if [^)]*\)", " ", _expand(rule["prereqs"], macros)).split()
+        edges[name] = {t for t in (*prereqs, *re.findall(MAKE_CALL, body)) if t in rules and t != name}
+        kinds[name] = _guard_kind(rule, macros)
+    found = {name: reason for name, reason in direct.items() if reason}
+    changed = True
+    while changed:
+        changed = False
+        for name, callees in edges.items():
+            if name in found:
+                continue
+            via = sorted(c for c in callees if c in found and kinds[c] != "conditional")
+            if via:
+                found[name] = f"reaches {via[0]}"
+                changed = True
+    return {name: (reason, kinds[name]) for name, reason in found.items() if name not in GUARDS}
+
+
+ENUMERATED = state_changing_targets()
+
+
+def guarded_targets(path=ROOT / "shared" / "Makefile.shared"):
+    macros, rules = _parse_makefile(path)
+    return {name for name, rule in rules.items() if name not in GUARDS and _guard_kind(rule, macros)}
+
+
+# Every enumerated target, plus every other target that takes the guard (the
+# scenario test targets), must refuse at run time.
+STATE_CHANGING = tuple(sorted({*ENUMERATED, *guarded_targets()}))
+# Arguments that select a conditionally guarded target's writing mode.
+WRITING_MODE = {"_prepare-classification": ("IMPORT_CLASSIFICATION=1",)}
 CI_VARS = ("CI", "TF_BUILD", "JENKINS_URL", "GITLAB_CI", "BUILDKITE", "CIRCLECI", "GITHUB_ACTIONS",
            "GENIERAILS_ALLOW_CI_APPLY")
 # Logs any call; a refusal must leave the log empty.
@@ -106,19 +228,48 @@ def _assert_refused_unchanged(site, *args, **env):
     return output
 
 
+# --- the Makefile: every state-changing target takes the guard first ---------
+
+def test_every_state_changing_target_takes_the_guard_at_its_start():
+    unguarded = {name: reason for name, (reason, kind) in ENUMERATED.items() if kind is None}
+    assert not unguarded, f"state-changing targets without the Databricks-compute guard first: {unguarded}"
+
+
+def test_the_enumeration_sees_writers_and_spares_read_only_targets():
+    assert {"apply", "rehearse", "release", "release-plan", "maintain", "_apply-layer", "_destroy-layer", "import",
+            "sync-tags", "account-plan", "promote", "promote-to", "_apply-account-locked",
+            "_apply-account-for-workspace", "_release-plan-roots", "migrate-state-dir"} <= set(ENUMERATED)
+    assert not {"plan", "_plan-layer", "check", "validate", "validate-generated", "coverage-gate", "evidence",
+                "audit-schema", "policy-status", "verify-access-spec", "help"} & set(ENUMERATED)
+
+
+def test_the_enumeration_flags_what_review_found_on_1c9b2e6(tmp_path):
+    """Codex's REQUEST_CHANGES on 1c9b2e6: two internal targets and both promotions were unguarded."""
+    old = subprocess.run(["git", "-C", str(ROOT), "show", "1c9b2e6:shared/Makefile.shared"],
+                         text=True, capture_output=True)
+    if old.returncode != 0:
+        pytest.skip("commit 1c9b2e6 is not in this clone")
+    (tmp_path / "Makefile.shared").write_text(old.stdout)
+    unguarded = {name for name, (_, kind) in state_changing_targets(tmp_path / "Makefile.shared").items()
+                 if kind is None}
+    assert {"_apply-account-locked", "_apply-account-for-workspace", "promote", "promote-to"} <= unguarded
+
+
 # --- every marker refuses every state-changing target, writing nothing --------
 
 @pytest.mark.parametrize("marker", MARKERS)
 @pytest.mark.parametrize("target", STATE_CHANGING)
 def test_every_state_changing_target_refuses_on_databricks_compute(site, target, marker):
-    output = _assert_refused_unchanged(site, target, "ENV=dev", **{marker: MARKERS[marker]})
+    output = _assert_refused_unchanged(site, target, "ENV=dev", *WRITING_MODE.get(target, ()),
+                                       **{marker: MARKERS[marker]})
     assert f"({marker} is set)" in output
 
 
 @pytest.mark.parametrize("target", STATE_CHANGING)
 def test_azure_targets_refuse_too(target):
     status = _shared_status()
-    proc = subprocess.run(["make", "--no-print-directory", "-f", str(ROOT / "azure" / "Makefile"), target, "ENV=dev"],
+    proc = subprocess.run(["make", "--no-print-directory", "-f", str(ROOT / "azure" / "Makefile"), target, "ENV=dev",
+                           *WRITING_MODE.get(target, ())],
                           cwd=ROOT, text=True, capture_output=True, timeout=60,
                           env=_env(os.environ.get("HOME", ""), DATABRICKS_RUNTIME_VERSION="client.1.13"))
     assert proc.returncode != 0
@@ -136,6 +287,11 @@ def test_the_databricks_refusal_wins_over_ci_and_its_opt_out(site):
 def test_dev_rehearse_ci_exception_does_not_apply(site):
     # CI may run make rehearse ENV=dev with remote state; Databricks compute may not.
     _assert_refused_unchanged(site, "rehearse", "ENV=dev", CI="true", DATABRICKS_RUNTIME_VERSION="15.4")
+
+
+def test_cross_env_promote_refuses(site):
+    _assert_refused_unchanged(site, "promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=paycat=prodcat",
+                              DATABRICKS_RUNTIME_VERSION="15.4")
 
 
 def test_command_line_marker_counts(site):
@@ -163,6 +319,15 @@ def test_offline_read_only_targets_still_run(site, target):
     proc = _make(site, target, "ENV=dev", guarded=False, DATABRICKS_RUNTIME_VERSION="15.4")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert REFUSED not in proc.stdout + proc.stderr
+
+
+def test_plan_runs_its_same_env_promote_on_databricks_compute(site):
+    # plan re-splits generated/ through promote at MAKELEVEL 1: that mode isn't guarded.
+    # (It then stops at the live mask inventory: the fixture has no credentials.)
+    proc = _make(site, "plan", "ENV=dev", guarded=False, DATABRICKS_RUNTIME_VERSION="15.4")
+    output = proc.stdout + proc.stderr
+    assert REFUSED not in output
+    assert "env config validation: PASS" in output and "external-mask inventory failed" in output, output
 
 
 @pytest.mark.parametrize("cloud", ["aws", "azure"])
@@ -271,28 +436,76 @@ def test_opt_in_hint_only_when_attempted():
     assert dc.marker({"DB_CLUSTER_ID": ""}) is None
 
 
-# --- the runner's second line: local-backend writes ----------------------------
+# --- the runner's second line: before any state or env dir, both opt-in parts --
 
 @pytest.mark.parametrize("marker", MARKERS)
 @pytest.mark.parametrize("command", ["apply", "destroy", "import", "state-rm"])
-def test_runner_refuses_local_backend_writes_on_databricks_compute(tmp_path, marker, command):
+def test_runner_refuses_writes_on_databricks_compute(tmp_path, marker, command):
     proc, log = _run_layer(tmp_path, command, **{marker: MARKERS[marker], "GENIERAILS_ALLOW_CI_APPLY": "1"})
     assert proc.returncode == 2
-    assert "refusing terraform" in proc.stderr and "on Databricks compute" in proc.stderr
-    assert not log.exists() or f"terraform {command.replace('state-', 'state ')}" not in log.read_text()
+    assert f"terraform {command} (data_access:dev) refused: this is Databricks compute" in proc.stderr
+    assert not log.exists(), log.read_text()
     assert not (tmp_path / "data_access" / "terraform.tfstate").exists()
 
 
-def test_runner_allows_local_state_inside_the_durable_dir(tmp_path):
+@pytest.mark.parametrize("parts", ["durable dir only", "flag only", "state dir outside"])
+def test_runner_needs_both_opt_in_parts_and_creates_nothing_first(tmp_path, parts):
+    durable = tmp_path / "durable"
+    state = durable / "state"
+    state.mkdir(parents=True)
+    env = {"DATABRICKS_RUNTIME_VERSION": "15.4", "GENIERAILS_DURABLE_STATE_DIR": str(durable),
+           "GENIERAILS_STATE_DIR": str(state), OPT_IN: "1"}
+    if parts == "durable dir only":
+        del env[OPT_IN]
+    elif parts == "flag only":
+        del env["GENIERAILS_DURABLE_STATE_DIR"]
+    else:
+        (tmp_path / "elsewhere").mkdir()
+        env["GENIERAILS_STATE_DIR"] = str(tmp_path / "elsewhere")
+    proc, log = _run_layer(tmp_path, "apply", **env)
+    assert proc.returncode == 2 and "refused: this is Databricks compute" in proc.stderr
+    assert not log.exists()
+    # Refused before the layer dir, its .terraform or permissions were touched.
+    assert list(state.iterdir()) == [] and not (tmp_path / "elsewhere" / "aws").exists()
+    assert list((tmp_path / "data_access").iterdir()) == []
+
+
+def test_runner_applies_with_both_opt_in_parts(tmp_path):
+    durable = tmp_path / "durable"
+    (durable / "state").mkdir(parents=True)
     proc, log = _run_layer(tmp_path, "apply", DATABRICKS_RUNTIME_VERSION="15.4",
-                           GENIERAILS_DURABLE_STATE_DIR=str(tmp_path))
-    assert proc.returncode == 0, proc.stderr
+                           GENIERAILS_DURABLE_STATE_DIR=str(durable), GENIERAILS_STATE_DIR=str(durable / "state"),
+                           **{OPT_IN: "1"})
+    assert "refused" not in proc.stderr, proc.stderr
     assert "terraform apply" in log.read_text()
 
 
 def test_runner_plan_is_not_refused(tmp_path):
     proc, _ = _run_layer(tmp_path, "plan", DATABRICKS_RUNTIME_VERSION="15.4")
-    assert "on Databricks compute" not in proc.stderr
+    assert "Databricks compute" not in proc.stderr
+
+
+# --- the /Workspace mount marker (serverless without a variable) --------------
+
+def test_workspace_mount_marker(tmp_path, monkeypatch):
+    from shared.scripts import databricks_compute as dc
+
+    (tmp_path / "Workspace").mkdir()
+    assert dc.marker({}, tmp_path) is None  # a plain directory isn't the FUSE mount
+    monkeypatch.setattr(dc.os.path, "ismount", lambda path: str(path) == str(tmp_path / "Workspace"))
+    assert dc.marker({}, tmp_path) == f"the {tmp_path / 'Workspace'} mount"
+    message = dc.guard({}, "apply", root=tmp_path)
+    assert f"this is Databricks compute (the {tmp_path / 'Workspace'} mount)" in message
+    other = tmp_path / "laptop"
+    (other / "workspace").mkdir(parents=True)  # devcontainer-style lowercase mount: never a marker
+    monkeypatch.setattr(dc.os.path, "ismount", lambda path: True)
+    assert dc.marker({}, other) is None
+
+
+def test_this_machine_has_no_marker():
+    from shared.scripts import databricks_compute as dc
+
+    assert dc.marker({k: v for k, v in os.environ.items() if k not in MARKERS}) is None
 
 
 def _run_layer(tmp_path, command, **env):

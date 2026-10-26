@@ -42,6 +42,7 @@ if str(SHARED_ROOT) not in sys.path:
 
 from scripts.sticky_governance import GovernedTablesError, _load_hcl, deterministic  # noqa: E402
 from scripts.release_gate import PROMOTED, env_role  # noqa: E402
+from scripts.databricks_compute import MARKERS as DATABRICKS_COMPUTE_MARKERS  # noqa: E402
 
 RESERVED_ENVS = ("account", "data_access")
 # Runtime files never enter the scratch copy: credentials, state, Terraform
@@ -68,6 +69,9 @@ LEAKED_VARS = (
     "DEST_ENV", "DEST_ENV_DIR", "DEST_CATALOG_MAP", "ACCOUNT_ENV_DIR", "FROM", "CATALOG_MAP",
     "CHECK", "APPLY_FLAGS", "GENIERAILS_APPLY_FLAGS", "TARGET_ENV", "SPACE", "MODE",
     "GENIERAILS_STATE_DIR",
+    # The scratch copy is throwaway by design, so its promote and plan may run
+    # on Databricks compute (scripts/databricks_compute.py).
+    *DATABRICKS_COMPUTE_MARKERS,
 )
 
 

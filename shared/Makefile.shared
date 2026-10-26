@@ -323,7 +323,7 @@ _guard-genie-placeholder:
 # disk past the run, so every state-changing target refuses there first, before
 # any lock, write or live call: its receipts, manifests, staged journal, env
 # locks and Genie ID records would be lost (scripts/databricks_compute.py lists
-# the markers). GENIERAILS_ALLOW_CI_APPLY doesn't lift it. With no marker set
+# the markers: four variables and the /Workspace mount; only the helper decides). GENIERAILS_ALLOW_CI_APPLY doesn't lift it. With no marker set
 # nothing else runs, so laptops, servers and CI see no change. The opt-in for a
 # future Job runner (not supported end to end yet) takes
 # GENIERAILS_ALLOW_DATABRICKS_COMPUTE=1 with origin "command line" (as
@@ -333,16 +333,23 @@ _guard-genie-placeholder:
 override _DATABRICKS_COMPUTE_MARKERS = DATABRICKS_RUNTIME_VERSION DB_CLUSTER_ID DB_IS_JOB_CLUSTER DATABRICKS_APP_NAME
 override _DATABRICKS_COMPUTE_OPT_IN = $(if $(filter command line,$(origin GENIERAILS_ALLOW_DATABRICKS_COMPUTE)),$(GENIERAILS_ALLOW_DATABRICKS_COMPUTE))
 override _DATABRICKS_OPT_IN_FROM_MAKEFLAGS := $(if $(and $(filter 0,$(MAKELEVEL)),$(_DATABRICKS_COMPUTE_OPT_IN)),$(shell 2>/dev/null tr '\0' '\n' < /proc/$$PPID/environ | grep -q '^MAKEFLAGS=.*GENIERAILS_ALLOW_DATABRICKS_COMPUTE=' && echo 1))
-override _DATABRICKS_COMPUTE_GUARD = for m in $(_DATABRICKS_COMPUTE_MARKERS); do \
-		if [ -n "$$(printenv "$$m")" ]; then \
-			python3 "$(SHARED_ROOT)/scripts/databricks_compute.py" guard --goals "$(MAKECMDGOALS)" \
-				--opt-in "$(_DATABRICKS_COMPUTE_OPT_IN)" --opt-in-from-makeflags "$(_DATABRICKS_OPT_IN_FROM_MAKEFLAGS)" || exit 1; \
-			break; \
-		fi; \
-	done
+override _DATABRICKS_COMPUTE_GUARD = dbx=; if [ -d /Workspace ]; then dbx=1; fi; \
+	for m in $(_DATABRICKS_COMPUTE_MARKERS); do if [ -n "$$(printenv "$$m")" ]; then dbx=1; fi; done; \
+	if [ -n "$$dbx" ]; then \
+		python3 "$(SHARED_ROOT)/scripts/databricks_compute.py" guard --goals "$(MAKECMDGOALS)" \
+			--opt-in "$(_DATABRICKS_COMPUTE_OPT_IN)" --opt-in-from-makeflags "$(_DATABRICKS_OPT_IN_FROM_MAKEFLAGS)" || exit 1; \
+	fi
 
 _guard-not-databricks-compute:
 	@$(_DATABRICKS_COMPUTE_GUARD)
+
+# Targets that write only in some modes take the guard only then, so plan's
+# same-env re-split and read-only classification prep still run: promote when
+# it is the command-line goal or a cross-env promotion (DEST_ENV), promote-to
+# unless CHECK=1, _prepare-classification when it imports (IMPORT_CLASSIFICATION=1).
+# tests/test_databricks_compute_guard.py finds every target that applies,
+# imports, destroys, locks or writes a receipt or journal and requires the guard.
+override _PROMOTE_DATABRICKS_GUARD = $(if $(or $(and $(filter 0,$(MAKELEVEL)),$(filter promote,$(MAKECMDGOALS))),$(strip $(DEST_ENV))),_guard-not-databricks-compute)
 
 _guard-not-ci-apply:
 	@$(_DATABRICKS_COMPUTE_GUARD)
@@ -999,7 +1006,7 @@ _guard-account-plan-empty:
 	fi; \
 	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
 
-_apply-account-for-workspace:
+_apply-account-for-workspace: _guard-not-databricks-compute
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || { echo "ERROR: cannot determine governance mode from $(ENV_DIR)/env.auto.tfvars" >&2; exit 1; }; \
 	any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; \
 	if [ "$$mode" = deterministic ] || [ "$$any_det" = 1 ]; then \
@@ -1049,7 +1056,7 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 	fi; \
 	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest"
 
-_apply-account-locked:
+_apply-account-locked: _guard-not-databricks-compute
 	@$(_DRY_RUN_GUARD); \
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
@@ -1351,7 +1358,7 @@ override _SAVED_GRANT_CHANGES = python3 -c 'import json,sys; print(int(any(s.get
 # its next changing phase, and the workspace is planned with the last one;
 # when that phase's grant opens SELECT the agent coverage check still lacks,
 # the workspace waits for the next release-plan (CAN_RUN only after SELECT).
-_release-plan-roots:
+_release-plan-roots: _guard-not-databricks-compute
 	@set -e; $(_DRY_RUN_GUARD); $(_IDENTITY_MAP_CHECK); $(_SCHEDULED_GOVERNANCE_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
 	echo "=== Saved plan (account) ==="; \
 	set +e; (umask 077; LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null); status=$$?; set -e; \
@@ -1572,7 +1579,7 @@ validate: _guarded-bootstrap ## Validate split config in the selected environmen
 		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,validate-workspace) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
 	fi
 
-promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into layers (same-env), or cross-env: make promote SOURCE_ENV=dev DEST_ENV=prod DEST_CATALOG_MAP="dev_cat=prod_cat"
+promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target ## Split generated/ into layers (same-env), or cross-env: make promote SOURCE_ENV=dev DEST_ENV=prod DEST_CATALOG_MAP="dev_cat=prod_cat"
 	@set -e; $(_DRY_RUN_GUARD); if [ -n "$(DEST_ENV)" ]; then \
 		if [ "$(DEST_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(DEST_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: DEST_ENV cannot be '$(ACCOUNT_ENV)' or '$(DATA_ACCESS_SUBDIR)'."; exit 1; \
@@ -1709,7 +1716,7 @@ _PROMOTE_TO_MAP = $(if $(filter command line,$(origin CATALOG_MAP)),$(CATALOG_MA
 
 # CHECK=1 writes nothing: it reruns promote-to in a scratch copy of envs/ (no
 # credentials or state) and fails if the committed output differs.
-promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
+promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
 	@$(_PROMOTE_TO_PLACEHOLDER_GUARD)
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
 	@$(_GUARD_WORKSPACE_ENV); \
@@ -1751,7 +1758,7 @@ check: ## Read-only PR check: validate, generated files current, validate-genera
 	$(_DRY_RUN_GUARD); \
 	$(_CHECK_ENV) check
 
-_prepare-classification:
+_prepare-classification: $(if $(filter 1,$(IMPORT_CLASSIFICATION)),_guard-not-databricks-compute)
 	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)" $(if $(filter 1,$(CLASSIFICATION_READ_ONLY)),--read-only,))" || exit 1; \
 	if [ "$(IMPORT_CLASSIFICATION)" = "1" ] || [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
 		for catalog in $$existing_catalogs; do \

@@ -267,21 +267,36 @@ throwaway integration tests; never set it on a deployment job.
 
 A notebook, Job, serverless run or App on Databricks keeps no local disk past
 the run, but receipts, manifests, the staged policy journal, env locks and
-Genie ID records live on local disk. So the applying targets above, plus
-`sync-tags`, `bootstrap-sp`, `bootstrap-pipelines` and `account-plan`, refuse
-there first, before any lock, write or live call, and point to the
-[deployment machine](deployment-machine.md). `GENIERAILS_ALLOW_CI_APPLY=1` and
-the dev-rehearse CI exception don't lift it. `check`, `plan`, `validate`,
-`evidence` and `audit-schema` still run.
+Genie ID records live on local disk. So every target that applies, imports,
+destroys, takes a lock or writes a receipt, manifest or journal (the applying
+targets above, `sync-tags`, `bootstrap-sp`, `bootstrap-pipelines`,
+`account-plan`, `promote-to` without `CHECK=1`, and `promote` run directly or
+cross-env), internal ones included, refuses there first, before any lock,
+write or live call, and points to the [deployment machine](deployment-machine.md).
+`GENIERAILS_ALLOW_CI_APPLY=1` and the dev-rehearse CI exception don't lift it.
+`check`, `plan`, `validate`, `evidence` and `audit-schema` still run (`check`'s
+throwaway scratch copy runs its promote and plan without the markers).
+`generate`, `capture` and the treatment and draft helpers write only
+committed config for review and aren't guarded.
 
-Markers (any one set, non-empty): `DATABRICKS_RUNTIME_VERSION` (every
-Databricks Runtime cluster, job cluster and serverless notebook or job),
-`DB_CLUSTER_ID` and `DB_IS_JOB_CLUSTER` (the cluster environment variables
-classic and job clusters set), `DATABRICKS_APP_NAME` (Databricks Apps).
-Credential variables such as `DATABRICKS_HOST` are not markers, so laptops,
-servers and CI runners behave as before. As a second line,
-`terraform_layer.sh` refuses a local-backend apply, destroy, import or state
-move there unless the state dir is inside `GENIERAILS_DURABLE_STATE_DIR`.
+Markers (any one):
+
+| Marker | Where | Source |
+|---|---|---|
+| `DATABRICKS_RUNTIME_VERSION` | Databricks Runtime notebooks and jobs | The Databricks SDK for Python turns on notebook-native auth only when it is set (`databricks/sdk/credentials_provider.py`; [notebook auth](https://docs.databricks.com/aws/en/dev-tools/sdk-python)) |
+| `DB_CLUSTER_ID`, `DB_IS_JOB_CLUSTER` | classic all-purpose and Jobs clusters | [Default cluster environment variables](https://docs.databricks.com/aws/en/init-scripts/environment-variables) |
+| `DATABRICKS_APP_NAME` | Databricks Apps | [App environment variables](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/system-env) |
+| the `/Workspace` mount (exact case, a mount point) | Databricks Runtime and serverless notebooks and jobs | [Workspace files](https://docs.databricks.com/aws/en/files/workspace-interact) |
+
+Serverless compute supports no compute-scoped environment variables, so the
+`/Workspace` mount is what catches a serverless run that doesn't set a
+variable. Credential variables (`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`) and
+Databricks Connect's client settings (`DATABRICKS_CLUSTER_ID`,
+`DATABRICKS_SERVERLESS_COMPUTE_ID`) are not markers, so laptops, servers and
+CI runners behave as before; a devcontainer's `/workspace` or `/workspaces`
+never counts. As a second line, `terraform_layer.sh` refuses an apply,
+destroy, import or state move there, whatever the backend, before it creates
+any state or env dir.
 
 **Opt-in (not supported end to end yet).** For a future Job runner with
 durable storage, both are required: `GENIERAILS_ALLOW_DATABRICKS_COMPUTE=1` on
@@ -289,8 +304,9 @@ the make command line itself (like `REUSE_SOURCE_AUTH`: a shell variable, an
 exported variable or `make -e` doesn't count, and on Linux the top-level make
 also refuses one inherited through an exported `MAKEFLAGS`), and
 `GENIERAILS_DURABLE_STATE_DIR` set to an absolute path of an existing
-directory that holds `GENIERAILS_STATE_DIR`. No GenieRails flow has been run
-end to end that way; the deployment machine remains the supported place.
+directory that holds `GENIERAILS_STATE_DIR`. `terraform_layer.sh` run on its
+own needs the same two (the flag from its environment). No GenieRails flow has
+been run end to end that way; the deployment machine remains the supported place.
 
 ## State location and dev remote state
 
