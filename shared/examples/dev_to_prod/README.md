@@ -29,7 +29,7 @@ make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't
 make rehearse ENV=dev       # on this new commit: release-plan needs a dev rehearsal of it (dev isn't re-applied)
 make release-plan ENV=prod  # plans prod and writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks; a first release repeats release-plan + release until "Release complete"
-GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod   # live compliance record; finds the warehouse itself
+make evidence ENV=prod      # live compliance record; finds the warehouse itself
 make maintain ENV=prod      # deployment machine, cron, at the last released commit
 ```
 
@@ -172,9 +172,9 @@ Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-ga
 
 **4. Record evidence.**
 ```bash
-GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod
+make evidence ENV=prod
 ```
-It reads the live tags, masks and grants of prod's agent tables and writes a JSON record and Markdown summary to `envs/prod/generated/evidence/`. It finds the SQL warehouse itself (prod's `sql_warehouse_id`, else the one the release applied); `WAREHOUSE_ID=<id>` only pins another. Archive the record (e.g. with the change ticket), then delete that folder: `make maintain` and the next `release-plan` need a clean checkout. [Details](../../docs/evidence-report.md).
+It reads the live tags, masks and grants of prod's agent tables and writes a JSON record and Markdown summary to `.genierails-state/prod/evidence/` (git-ignored, next to the release receipts; under `$GENIERAILS_STATE_DIR` when that is set, which must be outside every git checkout or git-ignored in each one). It finds the SQL warehouse itself (prod's `sql_warehouse_id`, else the one the release applied); `WAREHOUSE_ID=<id>` only pins another, and `OFFLINE=1` writes a config-only report. The checkout stays clean, so `make maintain` and the next `release-plan` run as usual. Archive the record (e.g. with the change ticket): the next run replaces it. [Details](../../docs/evidence-report.md).
 
 <a id="phase-5--prod-maintain-coverage"></a>
 ## Keep it safe

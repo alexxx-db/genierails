@@ -482,3 +482,40 @@ def test_an_agent_capture_named_like_conf_is_committed_even_with_ignorecase(clou
     assert not ignored(f"{cloud}/envs/dev/agents/Confidential Deals.space.json")
     assert not ignored(f"{cloud}/envs/dev/agents/Confidential Deals.auto.tfvars")
     assert ignored(f"{cloud}/envs/dev/app_config.json")
+
+
+@pytest.mark.parametrize("cloud", CLOUDS)
+@pytest.mark.parametrize("root_gitignore", ["none", "upstream"])
+def test_evidence_report_is_ignored_and_leaves_the_checkout_clean(cloud, root_gitignore, tmp_path, monkeypatch):
+    """make evidence writes outside envs/, under the ignored .genierails-state: the checkout stays clean
+    and prod's env fingerprint is unchanged, so maintain's clean-checkout and digest checks still pass."""
+    import evidence_report
+    from scripts import release_gate as rg
+
+    _isolate_git(monkeypatch, tmp_path)
+    monkeypatch.delenv(rg.STATE_DIR_ENV, raising=False)
+    monkeypatch.delenv(evidence_report.INTEGRATION_ENV, raising=False)
+    repo = tmp_path / "repo"
+    cloud_root = repo / cloud
+    prod = cloud_root / "envs" / "prod"
+    if root_gitignore == "upstream":
+        (repo / ".gitignore").parent.mkdir(parents=True, exist_ok=True)
+        (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text())
+    _touch(prod / "generated" / "abac.auto.tfvars")
+    (prod / "env.auto.tfvars").write_text('governance_mode = "deterministic"\nuc_tables = ["main.sales.customers"]\n')
+    (cloud_root / ".gitignore").write_text(cg.merged((ROOT / cloud / ".gitignore").read_text(), cg.block(cloud_root)))
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "envs")
+    before = rg.env_fingerprint(prod)
+
+    assert evidence_report.main(["--env-dir", str(prod)]) == 0
+
+    written = sorted(p.relative_to(repo).as_posix() for p in repo.rglob("compliance-evidence-*"))
+    assert written == [f"{cloud}/.genierails-state/prod/evidence/compliance-evidence-v1.0.{ext}"
+                       for ext in ("json", "md")]
+    untracked, ignored = _status(repo)
+    assert untracked == set() and all(_covered(rel, ignored) for rel in written)
+    status = rg.checkout_status(prod)
+    assert status["clean_tree"], status["dirty"]
+    assert rg.env_fingerprint(prod) == before
