@@ -484,15 +484,18 @@ def declared_runner_vars(root: Path) -> list[str]:
     override file can only change a variable a non-override file declares, so
     it can't add one this misses.
     """
-    import hcl2
-
     declared: set[str] = set()
     for path in sorted(Path(root).iterdir()):
         if not path.is_file() or _is_override_file(path.name) or not path.name.endswith((".tf", ".tf.json")):
             continue
         try:
             text = path.read_text()
-            data = json.loads(text) if path.name.endswith(".tf.json") else hcl2.loads(text)
+            if path.name.endswith(".tf.json"):
+                data = json.loads(text)
+            else:
+                import hcl2  # only here: a root with no .tf (a test stub) skips the import
+
+                data = hcl2.loads(text)
             if not isinstance(data, dict):
                 raise ValueError("not an object")
             blocks = data.get("variable", [])
