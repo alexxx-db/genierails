@@ -793,7 +793,7 @@ def test_state_readers_import_the_helper_without_help_from_other_modules(tmp_pat
 # -- the runner's own variables can't be overridden --------------------------
 
 RUNNER_VARS = ("env_dir", "workspace_state_file", "data_access_state_file", "genie_id_dir",
-               "expected_pre_release_withholding", "import_walk")
+               "expected_pre_release_withholding", "import_walk", "databricks_pipeline_auth_type")
 OVERRIDE_FORMS = ("-var=NAME=", "-var NAME=", "--var=NAME=", "-var-file=FILE", "-var-file FILE",
                   "env tfvars", "TF_CLI_ARGS", "TF_CLI_ARGS_plan")
 
@@ -866,8 +866,7 @@ def test_the_runners_variables_come_after_every_caller_argument(tmp_path, fake_t
                    and a.split("=", 2)[1] in RUNNER_VARS]
     caller = [plan.index("-var=sql_warehouse_id=wh"), plan.index("-no-color")]
     assert runner_vars and min(runner_vars) > max(caller), plan
-    expected = 4 if layout == "state dir" else 1  # + genie_id_dir (the state dir's records/)
-    assert len(runner_vars) == expected, plan
+    assert len(runner_vars) == len(RUNNER_VARS), plan  # every one the root declares, empty when inactive
 
 
 # -- the staged policy controller's variables can't be set by a caller -------------------------

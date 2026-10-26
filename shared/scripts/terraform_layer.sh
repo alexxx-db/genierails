@@ -130,7 +130,9 @@ cd "$ROOT_DIR"
 # env_dir and the state snapshots (workspace_state_file, data_access_state_file)
 # say where the roots read Terraform state; only this runner sets them, after
 # every caller option. A caller assignment to one (-var in either form, a
-# -var-file, the env's tfvars, TF_CLI_ARGS*) refuses here, before Terraform.
+# -var-file, the env's tfvars, a tfvars file Terraform loads from the root
+# itself, TF_CLI_ARGS*, TF_VAR_*) refuses here, before Terraform.
+RUNNER_VAR_NAMES=""
 case "$COMMAND" in
   plan|apply|destroy|import|console|print-cmd)
     RUNNER_VAR_FILES=()
@@ -138,8 +140,18 @@ case "$COMMAND" in
       tfvars_path="$(_layer_tfvars "$tfvars")"
       if [ -f "$tfvars_path" ]; then RUNNER_VAR_FILES+=(--var-file "$tfvars_path"); fi
     done
-    if ! python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" --env-dir "$STATE_ENV_DIR" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@"; then
-      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state), import_walk only by it for terraform import, and policy_stage, held_access_grants and rebind_table_grants only by the staged policy controller (scripts/staged_policy_apply.py)." >&2
+    for tfvars_path in "$ROOT_DIR"/terraform.tfvars "$ROOT_DIR"/terraform.tfvars.json "$ROOT_DIR"/*.auto.tfvars "$ROOT_DIR"/*.auto.tfvars.json; do
+      if [ -f "$tfvars_path" ]; then RUNNER_VAR_FILES+=(--var-file "$tfvars_path"); fi
+    done
+    # It also prints the RUNNER_VARS the root declares (each is passed below),
+    # and exits 3 when a root file can't be parsed (its declarations unknown).
+    runner_vars_rc=0
+    RUNNER_VAR_NAMES="$(python3 "$SCRIPT_DIR/state_layout.py" check-runner-vars --tf-command "$COMMAND" --env-dir "$STATE_ENV_DIR" --root "$ROOT_DIR" ${RUNNER_VAR_FILES[@]+"${RUNNER_VAR_FILES[@]}"} -- "$@")" || runner_vars_rc=$?
+    if [ "$runner_vars_rc" = 3 ]; then
+      echo "ERROR: refusing terraform $COMMAND: a file in $ROOT_DIR can't be parsed, so the runner variables it may declare can't all be set by $(basename "$0")." >&2
+      exit 2
+    elif [ "$runner_vars_rc" != 0 ]; then
+      echo "ERROR: refusing terraform $COMMAND: env_dir, workspace_state_file and data_access_state_file are set only by $(basename "$0") (where the roots read Terraform state), import_walk only by it for terraform import, databricks_pipeline_auth_type only by it from a pipeline job's OIDC (scripts/terraform_env.sh), and policy_stage, held_access_grants and rebind_table_grants only by the staged policy controller (scripts/staged_policy_apply.py)." >&2
       exit 2
     fi
     ;;
@@ -342,12 +354,17 @@ case "$LAYER:$COMMAND" in
 esac
 
 RUNNER_VARS=()
-if [ "$LAYER" != "account" ]; then
-  RUNNER_VARS+=(-var="env_dir=$ENV_DIR")
-fi
+# The runner's own variables (state_layout.py RUNNER_VARS) get their values as
+# RUNNER_VALUE_<name>; every one the root declares is passed below, empty or
+# false when inactive, so no root file (an override.tf default, say) decides
+# one. None comes from the caller's environment.
+unset ${!RUNNER_VALUE_@}
+RUNNER_VALUE_env_dir="$ENV_DIR"
+RUNNER_VALUE_expected_pre_release_withholding=false
+RUNNER_VALUE_import_walk=false
 if [ "$LAYER:$COMMAND" = "workspace:plan" ] && \
    python3 -c 'import os, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from state_layout import STRUCTURAL_CHECK_TOKEN_ENV, consume_structural_check_token; raise SystemExit(0 if consume_structural_check_token(Path(sys.argv[2]), os.environ.get(STRUCTURAL_CHECK_TOKEN_ENV)) else 1)' "$SCRIPT_DIR" "$ENV_DIR"; then
-  RUNNER_VARS+=(-var="expected_pre_release_withholding=true")
+  RUNNER_VALUE_expected_pre_release_withholding=true
 fi
 # terraform import walks the whole configuration with no plan, so
 # plantimestamp() is unknown; on a passing coverage check that left every
@@ -355,7 +372,7 @@ fi
 # nothing. import_walk gives the checks a known status that never passes
 # (modules/coverage_gate_check). Only for import: plan and apply never get it.
 if [ "$LAYER" != "account" ] && { [ "$COMMAND" = "import" ] || { [ "$COMMAND" = "print-cmd" ] && [ "${1:-}" = "import" ]; }; }; then
-  RUNNER_VARS+=(-var="import_walk=true")
+  RUNNER_VALUE_import_walk=true
 fi
 # Genie ID files: with GENIERAILS_STATE_DIR, the env's records/ in the state
 # dir (state_layout.py records-dir refuses while any is still in the checkout).
@@ -367,7 +384,7 @@ if [ "$LAYER" = "workspace" ] && [ -n "${GENIERAILS_STATE_DIR:-}" ] && [ "$genie
   GENIERAILS_GENIE_ID_DIR="$(python3 "$SCRIPT_DIR/state_layout.py" records-dir --env-dir "$ENV_DIR" --env "$ENV_NAME")" || exit 2
   mkdir -p "$GENIERAILS_GENIE_ID_DIR"
   export GENIERAILS_GENIE_ID_DIR
-  RUNNER_VARS+=(-var="genie_id_dir=$GENIERAILS_GENIE_ID_DIR")
+  RUNNER_VALUE_genie_id_dir="$GENIERAILS_GENIE_ID_DIR"
 fi
 if [ "$LAYER_CONFIG_DIR" != "$ENV_DIR" ]; then
   RUNNER_VARS+=(-var="masking_sql_file=$LAYER_CONFIG_DIR/masking_functions.sql")
@@ -402,12 +419,24 @@ if [ "$LAYER" != "account" ] && [ "$USE_STATE_LAYOUT" = 1 ]; then
         fi
       done
       if [ "$LAYER" = "workspace" ]; then
-        RUNNER_VARS+=(-var="workspace_state_file=$STATE_INPUTS_DIR/workspace.tfstate.json")
+        RUNNER_VALUE_workspace_state_file="$STATE_INPUTS_DIR/workspace.tfstate.json"
       fi
-      RUNNER_VARS+=(-var="data_access_state_file=$STATE_INPUTS_DIR/data_access.tfstate.json")
+      RUNNER_VALUE_data_access_state_file="$STATE_INPUTS_DIR/data_access.tfstate.json"
       ;;
   esac
 fi
+
+# genierails_terraform_env keeps DATABRICKS_AUTH_TYPE only as a pipeline job's
+# own OIDC; the providers' auth_type takes it from here (it outranks the env
+# variable, so without it a secret in the auth file would pin oauth-m2m).
+# Empty outside a pipeline job.
+RUNNER_VALUE_databricks_pipeline_auth_type="${DATABRICKS_AUTH_TYPE:-}"
+# Last among the options, in RUNNER_VARS order (the pipeline auth type last):
+# every one the root declares (RUNNER_VAR_NAMES, from check-runner-vars above).
+for runner_var in ${RUNNER_VAR_NAMES:-}; do
+  runner_value="RUNNER_VALUE_$runner_var"
+  RUNNER_VARS+=(-var="$runner_var=${!runner_value-}")
+done
 
 # Terraform reads options only before a command's positional arguments
 # (import: ADDR ID), so the runner's variables go after the caller's options

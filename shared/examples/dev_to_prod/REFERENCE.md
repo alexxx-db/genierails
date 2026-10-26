@@ -77,7 +77,7 @@ uses live `class.*` tags; never hand-edit the record.
 | `make audit-rulebook ENV=<e>` | 4/5 | Drift check — tags with no covering rule |
 | `make audit-schema ENV=<e>` | 5 | Untagged-column audit (also the first step of `make maintain`) |
 | `make generate-delta ENV=<e>` | — | [Legacy] model-based incremental tag assignments; the champion flow uses `make maintain` instead |
-| `make evidence ENV=<e>` | 4 | Compliance evidence record; `GENIERAILS_EVIDENCE_INTEGRATION=1` reads live state through the env's warehouse, resolved automatically (`WAREHOUSE_ID=<id>` optional) |
+| `make evidence ENV=<e>` | 4 | Compliance evidence record of live state, read through the env's warehouse, resolved automatically (`WAREHOUSE_ID=<id>` optional; `OFFLINE=1` for config only); written to the git-ignored `.genierails-state/<e>/evidence/` (a custom `GENIERAILS_STATE_DIR` must be outside every git checkout or git-ignored in each one) |
 
 Successful validation reports are compact by default. Add `VERBOSE=1` to a
 `make` command to restore the full PASS reports and informational detail;
@@ -186,7 +186,7 @@ What each walkthrough step does, for when you need more than the [walkthrough](R
 - Drift or an audit error stops it before the apply: existing access stays, and no new or wider `SELECT` or Genie run access is granted.
 - If it fails after it started applying, only access that passed the coverage check can be applied; follow the printed steps.
 - To withdraw access, remove the groups (or set `acl_groups = []`), then run `make apply ENV=prod` (legacy) or commit it and run `make release-plan ENV=prod` and `make release ENV=prod` (deterministic, where `make apply ENV=prod` refuses). `business_access_enabled` is retired; setting it to `false` revokes nothing.
-- Evidence (walkthrough Prod step 4, after the release): `GENIERAILS_EVIDENCE_INTEGRATION=1 make evidence ENV=prod` writes a live snapshot to `envs/prod/generated/evidence/`; add `GENIERAILS_EVIDENCE_APPROVED_BY="<you>"` to sign it. The warehouse is resolved from prod's config or applied workspace (`WAREHOUSE_ID=<id>` only pins one). Without the variable it writes a config-only report. Archive it and remove the folder before `make maintain` or the next `release-plan`: both need a clean checkout ([evidence report](../../docs/evidence-report.md)).
+- Evidence (walkthrough Prod step 4, after the release): `make evidence ENV=prod` writes a live snapshot to `.genierails-state/prod/evidence/` (`$GENIERAILS_STATE_DIR/<cloud>/prod/evidence/` when that is set); add `GENIERAILS_EVIDENCE_APPROVED_BY="<you>"` to sign it. The warehouse is resolved from prod's config or applied workspace (`WAREHOUSE_ID=<id>` only pins one). `OFFLINE=1` writes a config-only report; `GENIERAILS_EVIDENCE_INTEGRATION=1` is still accepted and changes nothing. The default folder is git-ignored and outside `envs/`, so `make maintain` and the next `release-plan` see a clean checkout; a custom `GENIERAILS_STATE_DIR` must be outside every git checkout or git-ignored in each one, else `make evidence` refuses and writes nothing; archive the record if you need it, since the next run replaces it ([evidence report](../../docs/evidence-report.md)).
 
 **`make maintain ENV=prod`**
 - Runs audit-schema → derive-assignments → coverage-gate → validate-generated → audit-rulebook → apply-governance. It audits before applying, keeps `SELECT` for already-covered tables, never widens access past a passing check, and never changes the Genie agent.

@@ -194,7 +194,10 @@ def test_the_runner_reads_a_staged_render_instead_of_the_split_config(tmp_path):
     assert f"-var-file={staged / 'abac.auto.tfvars'}" in args
     assert f"-var-file={layer / 'abac.auto.tfvars'}" not in args
     assert f"-var-file={layer / 'env.auto.tfvars'}" in args  # only the rendered file is replaced
-    assert args[-1] == f"-var=masking_sql_file={staged / 'masking_functions.sql'}"
+    # After the caller's, before the runner-only variables (the pipeline auth switch last).
+    masking = args.index(f"-var=masking_sql_file={staged / 'masking_functions.sql'}")
+    assert args.index("-var=sql_warehouse_id=wh") < masking < args.index(f"-var=env_dir={layer}")
+    assert args[-1] == "-var=databricks_pipeline_auth_type="
     # Without the variable nothing changes.
     environ.pop(pg.STAGE_CONFIG_ENV)
     log.unlink()
@@ -221,7 +224,10 @@ def test_the_data_access_root_takes_the_staged_masking_sql():
 
 # -- (3) state mv/rm backups stay next to the state ---------------------------------
 MINIMAL_ROOT = ('resource "terraform_data" "a" {}\n\nvariable "env_dir" {\n  type = string\n}\n\n'
-                'variable "data_access_state_file" {\n  type    = string\n  default = ""\n}\n')
+                'variable "data_access_state_file" {\n  type    = string\n  default = ""\n}\n\n'
+                # The runner always sets these (false or empty unless it means them).
+                'variable "import_walk" {\n  type    = bool\n  default = false\n}\n\n'
+                'variable "databricks_pipeline_auth_type" {\n  type    = string\n  default = ""\n}\n')
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")

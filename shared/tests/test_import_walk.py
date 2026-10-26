@@ -108,7 +108,7 @@ def test_data_access_import_works_while_the_coverage_check_passes(data_access):
     # Plan never gets import_walk: the same passing result still plans the business SELECT.
     plan = data_access.run("plan", "-no-color", "-refresh=false")
     assert plan.returncode == 0, plan.stdout + plan.stderr
-    assert "import_walk" not in plan.stderr
+    assert "-var=import_walk=false" in plan.stderr and "import_walk=true" not in plan.stderr
     assert 'module.data_access.databricks_grant.table_access["cat.sch.customers|analysts"] will be created' in plan.stdout
 
 
