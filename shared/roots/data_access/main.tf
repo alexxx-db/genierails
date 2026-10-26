@@ -666,10 +666,12 @@ module "data_access" {
   masking_paths_base = dirname(var.env_dir)
 }
 
-# A raw terraform run that withholds new grants still applies; say so.
+# A raw terraform run that withholds new grants without a current coverage pass
+# still applies; say so. Staged deterministic phases with a passing gate defer
+# new SELECT to their grant phase, which is expected and needs no warning here.
 check "business_select_withheld" {
   assert {
-    condition     = length(module.data_access.withheld_table_grants.grants) == 0
+    condition     = length(module.data_access.withheld_table_grants.grants) == 0 || module.data_access.withheld_table_grants.status == "pass"
     error_message = "Coverage check ${module.data_access.withheld_table_grants.status}: ${module.data_access.withheld_table_grants.problem}. New business SELECT withheld: ${join(", ", module.data_access.withheld_table_grants.grants)}. Removals and existing grants still apply. Run this layer through make (make apply ENV=${basename(dirname(var.env_dir))}), which refreshes live tags and DDL and runs the coverage check."
   }
 }
