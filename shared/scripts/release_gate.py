@@ -14,10 +14,12 @@ rehearse-start / rehearse-finish
     dev. When the fingerprint matches an earlier passing clean receipt of an
     ancestor of HEAD, rehearse writes a receipt for the new commit without
     re-applying (the promote-to digests are still recomputed). Each receipt
-    carries a digest of its own content (``seal``): a receipt whose digest
-    doesn't match is never a pass, and reuse also refuses a receipt whose
-    fields don't fit together (``reuse_problem``). Like the store id, this
-    stops hand edits and accidents, not someone who can rewrite the store.
+    carries a digest of its own content (``seal``). One validator
+    (``receipt_problem``: seal, field set, passed and clean, the commit it is
+    stored under, fingerprint parts, applied/reused_from) decides whether a
+    receipt counts, for provenance and for reuse alike; reuse adds only the
+    input-fingerprint match and ancestry. Like the store id, this stops hand
+    edits and accidents, not someone who can rewrite the store.
 
 rehearse-reuse
     ``make release-plan`` first does that same reuse for its source env when
@@ -438,10 +440,9 @@ def rehearse_receipts(cloud_dir: Path, env: str, *, any_store: bool = False) -> 
 
 
 def passing_receipt(cloud_dir: Path, env: str, commit: str) -> dict | None:
-    """The latest sealed passing receipt of a clean checkout at ``commit``."""
+    """The latest valid (``receipt_problem``) passing receipt of a clean checkout at ``commit``."""
     found = [r for r in rehearse_receipts(cloud_dir, env)
-             if r.get("commit") == commit and r.get("result") == "passed" and r.get("clean_tree") is True
-             and sealed(r)]
+             if r.get("commit") == commit and receipt_problem(r, env) is None]
     return found[-1] if found else None
 
 
@@ -453,15 +454,16 @@ def reuse_candidates(cloud_dir: Path, env: str, fingerprint: str, repo: Path,
                      commit: str) -> tuple[dict | None, list[str]]:
     """The receipt a rehearsal of ``commit`` may reuse, and why the other fingerprint matches can't be.
 
-    Shared by rehearse and release-plan. Only a passing clean receipt of this
-    store with the same fingerprint, sealed and internally consistent, of a
-    commit that is an ancestor of ``commit`` (not a divergent branch).
+    Shared by rehearse and release-plan. A receipt provenance would accept
+    (``receipt_problem``) whose fingerprint is today's (the reuse-only checks:
+    the same inputs, of a commit that is an ancestor of ``commit``, not a
+    divergent branch).
     """
     found, rejected = None, []
     for receipt in rehearse_receipts(cloud_dir, env):
         if receipt.get("fingerprint") != fingerprint or receipt.get("result") != "passed":
             continue  # a failed run is never a candidate; one edited to "passed" is, and is refused below
-        why = reuse_problem(receipt, env) or (
+        why = receipt_problem(receipt, env) or (
             None if is_ancestor(repo, str(receipt.get("commit")), commit)
             else f"{str(receipt.get('commit'))[:12]} is not an ancestor of {commit[:12]} (a divergent branch)")
         if why:
@@ -488,8 +490,11 @@ def sealed(receipt: Mapping) -> bool:
     return bool(receipt.get("digest")) and seal(receipt)["digest"] == receipt["digest"]
 
 
-def reuse_problem(receipt: Mapping, env: str) -> str | None:
-    """Why a stored receipt can't be reused (None: it can). Fails closed on anything unexpected."""
+def receipt_problem(receipt: Mapping, env: str) -> str | None:
+    """Why a stored receipt is not a valid passing rehearsal (None: it is); fails closed on anything unexpected.
+
+    The one check provenance (passing_receipt) and reuse (reuse_candidates) share.
+    """
     if not sealed(receipt):
         return "its digest doesn't match its content (edited by hand, or written before receipts were sealed)"
     keys = set(receipt) - {"_path"}
@@ -632,7 +637,7 @@ def rehearse_reuse(env_dir: Path, env: str, makefile: Path, make: str) -> str | 
                 return (f"the earlier {source} receipt(s) with the same inputs can't be reused ("
                         + "; ".join(rejected[:3]) + f"); {rehearse_cmd}")
             passed = [r for r in rehearse_receipts(cloud_dir, source)
-                      if r.get("result") == "passed" and r.get("clean_tree") is True and sealed(r)]
+                      if receipt_problem(r, source) is None]
             if passed:
                 last = passed[-1]
                 changed = [k for k in ("code", "env", "account")
@@ -766,15 +771,17 @@ def provenance(env_dir: Path, env: str, *, remote: str = "origin", branch: str =
                    if r.get("commit") == commit and r.get("store") != store_id(cloud_dir, source)]
         unclean = [r for r in rehearse_receipts(cloud_dir, source)
                    if r.get("commit") == commit and r.get("result") == "passed" and r.get("clean_tree") is not True]
-        unsealed = [r for r in rehearse_receipts(cloud_dir, source)
-                    if r.get("commit") == commit and r.get("result") == "passed" and not sealed(r)]
+        invalid = [(r, receipt_problem(r, source)) for r in rehearse_receipts(cloud_dir, source)
+                   if r.get("commit") == commit and r.get("result") == "passed"
+                   and (r.get("clean_tree") is True or not sealed(r))]
         problems.append(f"no passing rehearsal of {commit[:12]} (a clean checkout): run make rehearse "
                         f"ENV={source} on this commit first (receipts: {rehearse_dir(cloud_dir, source)})"
                         + (f"; {len(foreign)} receipt(s) for it were written by another store (a downloaded "
                            "CI artifact or a copy) and are informational only" if foreign else ""))
-        if unsealed:
-            problems.append(f"{len(unsealed)} receipt(s) for it don't match their digest (edited by hand?) and "
-                            f"never count: {Path(unsealed[-1]['_path']).name}")
+        if invalid:
+            last, why = invalid[-1]
+            problems.append(f"{len(invalid)} receipt(s) for it fail validation (edited by hand?) and never count: "
+                            f"{Path(last['_path']).name}: {why}")
         if unclean:
             problems.append("a receipt exists but its checkout wasn't clean: "
                             + "; ".join(unclean[-1].get("dirty") or ["(no details recorded)"])

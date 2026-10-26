@@ -481,11 +481,11 @@ def test_a_receipt_edited_to_passed_never_satisfies_provenance(repo):
     failed = rehearse(repo, "failed")
     _rewrite(failed, result="passed", reason=DROP)
     assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
-    with pytest.raises(rg.Refused, match="don't match their digest .edited by hand.. and never count"):
+    with pytest.raises(rg.Refused, match="fail validation .edited by hand.. and never count: .*its digest doesn't match"):
         rg.provenance(repo.prod, "prod")
 
 
-@pytest.mark.parametrize(("changes", "why"), [
+INCONSISTENT = [
     ({"applied": True, "reused_from": "a" * 40}, "applied and reused_from disagree"),
     ({"applied": False, "reused_from": None}, "applied and reused_from disagree"),
     ({"fingerprint_parts": {"code": "x", "env": "y", "account": "z", "fingerprint": "w"}},
@@ -496,7 +496,10 @@ def test_a_receipt_edited_to_passed_never_satisfies_provenance(repo):
     ({"dirty": ["uncommitted: x"]}, "not a passing rehearsal of a clean checkout"),
     ({"surprise": 1}, "unexpected fields: unknown surprise"),
     ({"targets": DROP}, "unexpected fields: missing targets"),
-])
+]
+
+
+@pytest.mark.parametrize(("changes", "why"), INCONSISTENT)
 def test_a_sealed_but_inconsistent_receipt_is_never_reused(repo, changes, why):
     """Re-sealing after an edit passes the digest; the fields must still fit together."""
     first = rehearse(repo)
@@ -507,15 +510,56 @@ def test_a_sealed_but_inconsistent_receipt_is_never_reused(repo, changes, why):
     assert reason and why in reason, reason
 
 
+def _reseal(receipt: dict, **changes) -> None:
+    data = _rewrite(receipt, **changes)
+    Path(receipt["_path"]).write_text(json.dumps(rg.seal(data), indent=2, sort_keys=True) + "\n")
+
+
+@pytest.mark.parametrize(("changes", "why"), [c for c in INCONSISTENT if "commit" not in c[0]])
+def test_a_sealed_but_inconsistent_receipt_never_satisfies_provenance(repo, changes, why):
+    """Codex r2: provenance runs the same validator as reuse (receipt_problem), not just the seal."""
+    first = rehearse(repo)
+    _reseal(first, **changes)
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+    with pytest.raises(rg.Refused) as refused:
+        rg.provenance(repo.prod, "prod")
+    assert "no passing rehearsal of" in str(refused.value)
+    assert f"fail validation (edited by hand?) and never count: {Path(first['_path']).name}: {why}" \
+        in str(refused.value), str(refused.value)
+
+
+def test_a_resealed_receipt_with_an_unknown_field_never_satisfies_provenance(repo):
+    first = rehearse(repo)
+    assert rg.provenance(repo.prod, "prod")["commit"] == repo.head()
+    _reseal(first, unknown=True)
+    assert rg.sealed(json.loads(Path(first["_path"]).read_text()))
+    with pytest.raises(rg.Refused, match="never count: .*unexpected fields: unknown unknown"):
+        rg.provenance(repo.prod, "prod")
+
+
+def test_a_receipt_stored_under_another_commit_never_satisfies_provenance(repo):
+    """A receipt moved (swapped) to another commit's directory, re-sealed: its path and commit disagree."""
+    first = rehearse(repo)
+    path = Path(first["_path"])
+    moved = path.parent.parent / ("b" * 40) / path.name
+    moved.parent.mkdir()
+    path.chmod(0o600)
+    path.rename(moved)
+    _reseal(first | {"_path": str(moved)})
+    with pytest.raises(rg.Refused, match="never count: .*its commit doesn't match where it is stored"):
+        rg.provenance(repo.prod, "prod")
+    assert rg.passing_receipt(repo.cloud, "dev", repo.head()) is None
+
+
 def test_every_receipt_rehearse_writes_is_sealed_and_reusable(repo):
     applied = rehearse(repo)
-    assert rg.sealed(applied) and rg.reuse_problem(applied, "dev") is None
+    assert rg.sealed(applied) and rg.receipt_problem(applied, "dev") is None
     commit = repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
     assert rg.rehearse_start(repo.dev, "dev", Path("Makefile"), "make") == "reused"
     reused = rg.passing_receipt(repo.cloud, "dev", commit)
-    assert rg.sealed(reused) and rg.reuse_problem(reused, "dev") is None
+    assert rg.sealed(reused) and rg.receipt_problem(reused, "dev") is None
     failed = rg.rehearse_finish(repo.dev, "dev", "failed", Path("Makefile"), "make", "boom")
-    assert rg.sealed(failed) and rg.reuse_problem(failed, "dev") == "not a passing rehearsal of a clean checkout"
+    assert rg.sealed(failed) and rg.receipt_problem(failed, "dev") == "not a passing rehearsal of a clean checkout"
 
 
 def test_the_rehearse_reuse_cli_prints_why_and_exits_zero_for_provenance_to_refuse(repo, capsys):
@@ -601,8 +645,9 @@ def test_provenance_fetches_origin_main_fresh(repo, tmp_path):
 
 def test_provenance_refuses_a_fingerprint_mismatch(repo):
     receipt = rehearse(repo)
-    forged = {k: v for k, v in receipt.items() if k != "_path"} | {"fingerprint": "0" * 64,
-                                                                    "created_at": rg._now()}
+    forged = {k: v for k, v in receipt.items() if k != "_path"} | {
+        "fingerprint": "0" * 64, "fingerprint_parts": receipt["fingerprint_parts"] | {"fingerprint": "0" * 64},
+        "created_at": rg._now()}
     rg._write_once(Path(receipt["_path"]).with_name("zz-forged.json"), rg.seal(forged))
     with pytest.raises(rg.Refused, match="fingerprint differs from the rehearsal receipt"):
         rg.provenance(repo.prod, "prod")

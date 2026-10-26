@@ -414,8 +414,10 @@ def test_a_receipt_copied_from_another_store_is_ignored(tmp_path, monkeypatch):
     commit = "a" * 40
     (tmp_path / "ci-runner").mkdir(parents=True, exist_ok=True)  # GenieRails never creates a missing state dir
     monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "ci-runner"))
-    receipt = {"kind": "rehearse", "version": rg.VERSION, "env": "dev", "commit": commit, "result": "passed",
-               "clean_tree": True, "fingerprint": "f", "created_at": rg._now(), "store": rg.store_id(cloud, "dev")}
+    receipt = {"kind": "rehearse", "version": rg.VERSION, "env": "dev", "cloud": "aws", "commit": commit,
+               "result": "passed", "clean_tree": True, "dirty": [], "fingerprint": "f",
+               "fingerprint_parts": {"fingerprint": "f"}, "reused_from": None, "applied": True, "targets": {},
+               "host": "h", "created_at": rg._now(), "store": rg.store_id(cloud, "dev")}
     written = rg._write_rehearse(cloud, "dev", receipt)
     assert rg.passing_receipt(cloud, "dev", commit)
 
