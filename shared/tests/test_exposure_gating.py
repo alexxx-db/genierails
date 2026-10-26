@@ -2,11 +2,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 import pytest
 
-from tests.terraform_helpers import tf, tf_init
+from tests.terraform_helpers import shared_copy, tf, tf_env, tf_init
 
 
 SHARED = Path(__file__).parents[1]
@@ -362,3 +363,50 @@ def test_apply_fingerprint_includes_terraform_and_genie_code():
 def test_roots_no_longer_forward_the_retired_flag():
     for path in ROOTS:
         assert not re.search(r"business_access_enabled\s*=\s*var\.", path.read_text()), path
+
+
+def _module_suite(tmp_path, *, layer_env: bool):
+    """terraform test of every modules/workspace tftest in a copy, the real genie_space.sh included.
+
+    create_to_id_handoff's teardown destroys a created space, whose destroy-time
+    provisioner runs ../../scripts/genie_space.sh trash: it loads the env auth
+    file from LAYER_ENV_DIR (here a fake env) and finds the ID file the stub
+    create wrote, with its adopted marker, through GENIERAILS_GENIE_ID_DIR, as
+    terraform_layer.sh exports them. curl must never run.
+    """
+    module = shared_copy(tmp_path, stub_genie=False) / "modules" / "workspace"
+    layer = tmp_path / "env"
+    _write_layer_auth(layer, "https://example.invalid")
+    called = tmp_path / "curl-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "curl").write_text(f'#!/bin/sh\necho "$*" >> {called}\nexit 99\n')
+    (bin_dir / "curl").chmod(0o755)
+    env = tf_env(tmp_path, PATH=f"{bin_dir}:{os.environ['PATH']}")
+    env.pop("LAYER_ENV_DIR", None)
+    env.pop("GENIERAILS_GENIE_ID_DIR", None)
+    if layer_env:
+        env |= {"LAYER_ENV_DIR": str(layer), "GENIERAILS_GENIE_ID_DIR": str(module / "tests/.tmp/handoff")}
+    tf_init(module, env=env)
+    return module, called, tf(module, "test", "-no-color", env=env)
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_workspace_module_suite_passes_including_teardown(tmp_path):
+    module, called, result = _module_suite(tmp_path, layer_env=True)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert re.search(r"Success! \d+ passed, 0 failed\.", result.stdout), result.stdout
+    assert "left the following resources in state" not in output
+    # The adopted space was unmanaged, not trashed: its ID file and marker are gone, no API call.
+    assert not list((module / "tests/.tmp/handoff").glob(".genie_*"))
+    assert not called.exists()
+
+
+@pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
+def test_workspace_module_suite_teardown_still_refuses_without_layer_env(tmp_path):
+    _module, called, result = _module_suite(tmp_path, layer_env=False)
+    output = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0
+    assert "LAYER_ENV_DIR is required to load the env auth file before trashing a Genie agent" in output
+    assert not called.exists()

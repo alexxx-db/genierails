@@ -811,6 +811,66 @@ def test_release_refuses_a_drifted_manifest_and_applies_nothing(make, repo, drif
     assert not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
 
 
+# A derive that prints progress to stdout and stderr, as derive_assignments.py does, and re-reads
+# live UC as unchanged (the env's effective config and DDL), or with FAKE_LIVE_DDL when live changed.
+_CHATTY_DERIVE = '''
+import os, shutil, sys
+from pathlib import Path
+sys.path.insert(0, {shared!r})
+from scripts import runtime_overlay as ro
+args = sys.argv[1:]
+out, ddl = Path(args[args.index("--out-dir") + 1]), Path(args[args.index("--write-ddl") + 1])
+print("Loaded environment from env.auto.tfvars")
+print("[SENSITIVITY] prodcat.s.t.ssn -> pii", file=sys.stderr)
+print("Derived 9 gr_treatment assignment(s)", flush=True)
+for name in ("abac.auto.tfvars", "masking_functions.sql"):
+    shutil.copyfile(ro.effective(Path.cwd(), name), out / name)
+ddl.write_text(os.environ.get("FAKE_LIVE_DDL") or Path("ddl/_fetched.sql").read_text())
+'''
+
+# The real release_gate.py live-snapshot, with only the derive script and the live policy lister swapped.
+_LIVE_SNAPSHOT_CLI = '''
+import functools, sys
+sys.path[:0] = [{shared!r}, {shared!r} + "/scripts"]
+from scripts import release_gate as rg
+rg.live_policies = lambda env_dir, catalogs: {{}}
+rg.live_snapshot = functools.partial(rg.live_snapshot, derive_script={derive!r})
+sys.exit(rg.main(["live-snapshot", *sys.argv[1:]]))
+'''
+
+
+def test_release_captures_the_real_rederived_live_snapshot_despite_derive_progress(make, repo):
+    """#258: _release-manifest's live="$(live-snapshot --rederive)" must capture only the digest."""
+    shared = str(ROOT / "shared")
+    derive = make._write("chatty_derive.py", _CHATTY_DERIVE.format(shared=shared))
+    cli = make._write("live_snapshot_cli.py", _LIVE_SNAPSHOT_CLI.format(shared=shared, derive=str(derive)))
+    real = {"release_gate.py live-snapshot": script_stubs.python_file(cli)}
+    ddl = repo.prod / "ddl" / "_fetched.sql"
+    ddl.parent.mkdir(exist_ok=True)
+    ddl.write_text("CREATE TABLE prodcat.s.t (ssn STRING);\n")
+    assert make("rehearse", "dev").returncode == 0
+    planned = make("release-plan", "prod", stubs=real)
+    assert planned.returncode == 0, planned.stdout + planned.stderr
+    manifest = Path(planned.stdout.split("make release ENV=prod MANIFEST=")[-1].strip())
+    # release-plan pinned the real digest of what the last derive wrote.
+    assert json.loads(manifest.read_text())["live_snapshot"] == rg.snapshot_digest(
+        repo.prod / "generated" / "abac.auto.tfvars", repo.prod / "generated" / "masking_functions.sql", ddl, {})
+    make.reset()
+
+    changed = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs=real,
+                   environ_extra={"FAKE_LIVE_DDL": "CREATE TABLE prodcat.s.t (ssn INT);\n"})
+    assert changed.returncode != 0
+    assert "live Unity Catalog changed" in changed.stderr and "Run make release-plan ENV=prod again" in changed.stderr
+    assert _applied(make) == [] and not rg.release_receipts(repo.cloud, "prod") and _no_lock(repo, "prod")
+
+    unchanged = make("_release-manifest", "prod", f"MANIFEST={manifest}", stubs=real)
+    assert unchanged.returncode == 0, unchanged.stdout + unchanged.stderr
+    assert "Derived 9 gr_treatment" in unchanged.stderr  # the derive's progress is kept, on stderr
+    assert [c for c in make.calls() if c[0] == "runner"] == [
+        ["runner", "workspace", "prod", "apply-plan", str(manifest.parent / "workspace.tfplan")]]
+    assert rg.last_release(repo.cloud, "prod")["manifest"]["path"] == str(manifest)
+
+
 def test_a_phase_manifest_records_the_phase_and_writes_no_release_receipt(make, repo):
     manifest = _planned(make)
     make.exit_code("staged", 10)
