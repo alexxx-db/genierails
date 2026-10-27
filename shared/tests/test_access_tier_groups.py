@@ -565,9 +565,9 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     dev = readme[readme.index("## Dev"):readme.index("## Prod")]
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
 
-    # The whole flow: own repo and first commit first; rehearse and release-plan run make check
-    # themselves, so the flow has no separate check line.
-    order = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
+    # The whole flow: own repo (setup REPO=) and first commit first; rehearse and release-plan run
+    # make check themselves, so the flow has no separate check line.
+    order = ["make setup ENV=dev REPO=<your-repo-url>", "git add .gitignore envs/",
              "make generate ENV=dev", "make rehearse ENV=dev       # checks the committed files",
              "make promote-to ENV=prod", "make release-plan ENV=prod", "after checking the committed files",
              "make release ENV=prod"]
@@ -580,19 +580,19 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
         "leave access_tier_groups placeholders"
     ) in flow
 
-    # Detailed walkthrough: rename before setup, then commit before generate/check/rehearse.
-    assert "git remote rename origin genierails" in before
+    # Detailed walkthrough: setup's REPO= (explained before you start), then commit before generate/check/rehearse.
+    assert "git remote" not in flow
+    assert "make setup ENV=dev REPO=<your-repo-url>" in before and "leave `REPO=` off" in before
     step_1 = dev[dev.index("**1. Set up.**"):dev.index("**2. Commit it (own repo).**")]
     committed = dev[dev.index("**2. Commit it (own repo).**"):]
-    assert "make setup ENV=dev" in step_1
+    assert "make setup ENV=dev REPO=<your-repo-url>" in step_1
     assert "git add .gitignore envs/" in committed
     steps = ["git add .gitignore envs/", "**4. Generate.**", "**5. Rehearse.**", "make rehearse ENV=dev",
              "It first runs `make check ENV=dev`", "before it takes the lock, writes anything or reads live dev"]
     positions = [committed.index(step) for step in steps]
     assert positions == sorted(positions)
     assert "**5. Check.**" not in dev and "**6. Rehearse.**" not in dev
-    detailed_positions = [readme.index("git remote rename origin genierails", readme.index("## Before you start")),
-                          readme.index("make setup ENV=dev", readme.index("## Dev")),
+    detailed_positions = [readme.index("make setup ENV=dev REPO=", readme.index("## Dev")),
                           readme.index("git add .gitignore envs/", readme.index("**2. Commit it (own repo).**"))]
     assert detailed_positions == sorted(detailed_positions)
     assert "The same `make check` runs alone as the PR check." in dev

@@ -293,7 +293,9 @@ def test_no_origin_remote(world, repo):
     account_applied(repo)
     rehearse(repo)
     repo.git("remote", "remove", "origin")
-    assert world.next("prod")[0] == "git remote add origin <your repo URL> && git push origin HEAD:main"
+    command, why = world.next("prod")
+    assert command == "make setup ENV=prod REPO=<your repo URL> && git push -u origin HEAD:main"
+    assert "local-only repo" in why
 
 
 def test_mid_first_release(world, repo):

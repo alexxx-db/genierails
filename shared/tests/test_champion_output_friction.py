@@ -144,9 +144,8 @@ def test_legacy_full_and_governance_keep_validate_then_apply(tmp_path, mode, tar
         ("full", "dev", ["    3. make rehearse ENV=dev   (applies, then proves the masks: ALL EFFECTIVE)"]),
         ("governance", "dev", ["    3. make rehearse ENV=dev   (applies, then proves the masks: ALL EFFECTIVE)"]),
         ("full", "prod", [
-            "    3. git push (or merge the PR) so the commit is on origin/main; on that commit:",
-            "       make rehearse ENV=dev   (release-plan needs a rehearsal of this exact commit)",
-            "    4. make release-plan ENV=prod",
+            "    3. git push (or merge the PR) so the commit is on origin/main",
+            "    4. make release-plan ENV=prod   (it reuses the dev rehearsal, or names the command to run)",
             "    5. make release ENV=prod",
         ]),
     ],
@@ -165,20 +164,31 @@ def test_deterministic_next_steps_match_walkthrough(tmp_path, mode, env_name, ta
     assert not any("TUNING.md" in line for line in lines)
 
 
-def test_deterministic_prod_banner_pushes_and_rehearses_the_source_before_release_plan(tmp_path):
-    """release-plan needs HEAD on origin/main and a source rehearsal of that commit (the README's Prod step 3)."""
+def test_deterministic_prod_banner_pushes_then_release_plan_reuses_the_source_rehearsal(tmp_path):
+    """release-plan needs HEAD on origin/main and a source rehearsal of that commit, which it writes itself
+    from the source's earlier rehearsal (or names make rehearse to run); the README's Prod step 3 says the same."""
     lines = generate_next_steps(tmp_path, "full", "prod", has_sql=True, champion_flow=False, tuning=False,
                                 source_env="stg")
     text = "\n".join(lines)
 
-    order = ["git commit", "origin/main", "make rehearse ENV=stg", "make release-plan ENV=prod",
+    order = ["git commit", "origin/main", "make release-plan ENV=prod", "it reuses the stg rehearsal",
              "make release ENV=prod"]
     positions = [text.index(step) for step in order]
     assert positions == sorted(positions)
-    assert "make rehearse ENV=prod" not in text
+    assert "make rehearse" not in text
     readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
-    assert prod.index("make rehearse ENV=dev") < prod.index("make release-plan ENV=prod")
+    step = prod[prod.index("**3. Check, plan, release.**"):prod.index("**4. Record evidence.**")]
+    block = step[step.index("```bash"):step.index("```", step.index("```bash") + 3)]
+    assert block.split("\n")[1:] == ["make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod",
+                                     ""]
+    flat = " ".join(step.split())
+    order = ["plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit",
+             "release-plan reuses that rehearsal itself and applies nothing in dev",
+             "run make rehearse ENV=dev on this commit",
+             "run the full `make rehearse ENV=dev`, then `make release-plan ENV=prod` again"]
+    positions = [flat.index(step) for step in order]
+    assert positions == sorted(positions)
 
 
 def test_main_passes_promote_from_as_the_banner_source_env():

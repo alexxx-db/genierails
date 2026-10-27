@@ -86,15 +86,21 @@ state and plans, `.terraform/`, locks, receipts, Genie ID and adoption markers
 and, for each deterministic env, its layer files (applying commands re-derive
 those).
 
-`make setup` decides from the `origin` remote. If `origin` is
+`make setup` decides from the `origin` remote. First, `REPO=<url>` makes the
+checkout your repo: an `origin` at GenieRails becomes the `genierails` remote
+and `origin` = `<url>` (refused, before anything is written, if `origin`
+already points elsewhere; never pushed). Without `REPO=`, a fresh clone's
+GenieRails `origin` is renamed to `genierails` (a local-only repo), except with
+`GITIGNORE=off` or in CI. If `origin` is still
 `github.com/databricks-solutions/genierails` (https or ssh), it is GenieRails'
 own repo, which must never commit `envs/`: it writes nothing and only prints how
 to opt in (as it does outside a git checkout). Any other checkout (your fork, an
 internal mirror, no origin yet) gets the block, even if it keeps GenieRails as
 an `upstream` remote for upgrades. An existing block is always refreshed. The
 overrides: `GITIGNORE=customer` forces the write anywhere, `GITIGNORE=off`
-leaves the file alone. If you contribute to GenieRails from a fork, always pass
-`GITIGNORE=off` so setup leaves the upstream cloud `.gitignore` files unchanged.
+leaves the file alone. If you contribute to GenieRails (from a fork or a clone), always pass
+`GITIGNORE=off` so setup leaves the upstream cloud `.gitignore` files and your
+remotes unchanged.
 Customer repositories may keep a GenieRails remote for upgrades; setup does not
 print contributor-only advice in customer-facing output.
 

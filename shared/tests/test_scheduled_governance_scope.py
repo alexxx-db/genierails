@@ -61,12 +61,13 @@ def _snapshot(root):
     return entries
 
 
-def _cloud(tmp_path, keyed_env):
-    """dev and prod env files only, both deterministic; keyed_env enables the job."""
+def _cloud(tmp_path, keyed_env, legacy=()):
+    """dev and prod env files only, deterministic unless named in legacy; keyed_env enables the job."""
     cloud_root = tmp_path / "aws"
     for env in ("dev", "prod"):
         (cloud_root / "envs" / env).mkdir(parents=True)
-        text = DETERMINISTIC + (ENABLED if env == keyed_env else "")
+        mode = 'governance_mode = "legacy"\n' if env in legacy else DETERMINISTIC
+        text = mode + (ENABLED if env == keyed_env else "")
         (cloud_root / "envs" / env / "env.auto.tfvars").write_text(text)
     return cloud_root
 
@@ -80,7 +81,6 @@ ENTRY_POINTS = [
     ("prod", ("apply-governance", "ENV=prod")),
     ("prod", ("promote-to", "ENV=prod")),
     ("prod", ("promote-to", "ENV=prod", "CHECK=1")),
-    ("prod", ("promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=dev=prod")),
     ("dev", ("rehearse", "ENV=dev")),
     ("prod", ("release-plan", "ENV=prod")),
     ("prod", ("release", "ENV=prod")),
@@ -97,6 +97,36 @@ def test_deterministic_env_with_the_job_is_refused_before_anything_is_written(tm
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert _refusal(env) in result.stderr, output
+    assert "===" not in result.stdout, output
+    assert _snapshot(cloud_root) == before
+
+
+PROMOTE = ("promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=dev=prod")
+
+
+def test_old_promote_from_a_deterministic_source_with_the_job_is_refused_before_anything_is_written(tmp_path):
+    # A legacy destination passes make promote's destination guard, so the scheduled-governance
+    # guard is the one that has to refuse the deterministic source.
+    cloud_root = _cloud(tmp_path, "dev", legacy=("prod",))
+    before = _snapshot(cloud_root)
+    result = _run_make(cloud_root, *PROMOTE)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert _refusal("dev") in result.stderr, output
+    assert "===" not in result.stdout, output
+    assert _snapshot(cloud_root) == before
+
+
+def test_old_promote_to_a_deterministic_destination_with_the_job_is_refused_before_anything_is_written(tmp_path):
+    # make promote refuses every deterministic destination (it must use promote-to) before the
+    # scheduled-governance guard runs; promote-to ENV=prod above reaches that guard.
+    cloud_root = _cloud(tmp_path, "prod")
+    before = _snapshot(cloud_root)
+    result = _run_make(cloud_root, *PROMOTE)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert ("ERROR: make promote SOURCE_ENV=... DEST_ENV=prod is refused for deterministic destinations.\n"
+            "       Use: make promote-to ENV=prod") in result.stderr, output
     assert "===" not in result.stdout, output
     assert _snapshot(cloud_root) == before
 
