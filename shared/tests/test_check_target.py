@@ -820,7 +820,30 @@ def _make_gated(repo, tmp_path, target, env):
     return result, (log.read_text() if log.exists() else "")
 
 
-def _write_auth(repo, env):
+def _copy_tracked_shared(dest):
+    """The engine as git tracks it (no local __pycache__, .terraform or other untracked files)."""
+    listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "shared"],
+                            capture_output=True, check=True).stdout
+    for rel in filter(None, listed.decode().split("\0")):
+        source = ROOT / rel
+        if source.is_file() and not source.is_symlink():
+            target = dest / Path(rel).relative_to("shared")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+
+def _vendor_shared(repo):
+    """Replace the fixture's shared/ symlink with a committed copy, as a customer checkout has."""
+    shared = repo / "shared"
+    if shared.is_symlink():
+        shared.unlink()
+        _copy_tracked_shared(shared)
+        _commit(repo, "vendor shared/")
+
+
+def _ready_to_apply(repo, env):
+    """What rehearse/release-plan need of the checkout: its own committed shared/ and the deployer's auth."""
+    _vendor_shared(repo)
     deployer = hcl2.load(open(_envs(repo) / env / "env.auto.tfvars")).get("deployer_principal_id", "")
     (_envs(repo) / env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
 
@@ -837,7 +860,7 @@ def test_a_broken_committed_config_is_refused_before_any_lock_write_or_live_call
     edited.write_text(edited.read_text().replace('"c"' if env == "dev" else "account_last4",
                                                  '"hand edited"' if env == "dev" else "redact", 1))
     _commit(promoted, "hand edit")
-    _write_auth(promoted, env)
+    _ready_to_apply(promoted, env)
     before = _baseline(promoted)
 
     result, live = _make_gated(promoted, tmp_path, target, env)
@@ -858,7 +881,7 @@ def test_a_broken_committed_config_is_refused_before_any_lock_write_or_live_call
 
 
 def test_rehearse_on_a_valid_committed_config_passes_the_check_and_goes_on(repo, tmp_path):
-    _write_auth(repo, "dev")
+    _ready_to_apply(repo, "dev")
     before = _baseline(repo)
 
     result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
@@ -900,8 +923,9 @@ def _broken_head_clean_worktree(repo, env):
 
 @pytest.mark.parametrize("target, env", [("rehearse", "dev"), ("release-plan", "prod")])
 def test_a_broken_commit_under_a_restored_working_tree_is_refused_before_anything(promoted, tmp_path, target, env):
+    _vendor_shared(promoted)  # first: vendoring commits everything, the restored file included
     rel = _broken_head_clean_worktree(promoted, env)
-    _write_auth(promoted, env)
+    _ready_to_apply(promoted, env)
     before = _baseline(promoted)
 
     result, live = _make_gated(promoted, tmp_path, target, env)
@@ -943,7 +967,7 @@ def test_the_embedded_check_reads_head_not_the_working_tree(promoted, env):
 
 
 def test_ignored_runtime_files_never_make_the_checkout_dirty(repo, tmp_path):
-    _write_auth(repo, "dev")
+    _ready_to_apply(repo, "dev")
     (_envs(repo) / "dev" / "data_access").mkdir(exist_ok=True)
     (_envs(repo) / "dev" / "data_access" / "terraform.tfstate").write_text("{}")
     assert _git(repo, "status", "--porcelain") == ""
@@ -953,3 +977,74 @@ def test_ignored_runtime_files_never_make_the_checkout_dirty(repo, tmp_path):
     assert "not clean" not in result.stderr
     assert "=== make check ENV=dev: passed ===" in result.stdout + result.stderr
     assert "--env dev" in live
+
+
+def _external_shared(repo, tmp_path, *, git_tree=True):
+    """repo/shared as a committed symlink to an engine copy outside the checkout."""
+    outside = tmp_path / "engine" / "shared"
+    _copy_tracked_shared(outside)
+    if git_tree:
+        _git(outside.parent, "init", "-q")
+        _git(outside.parent, "add", "-A")
+        _git(outside.parent, "commit", "-q", "-m", "engine")
+    (repo / "shared").unlink()
+    (repo / "shared").symlink_to(outside)
+    _commit(repo, "point shared/ at the engine")
+    return outside
+
+
+@pytest.mark.parametrize("state", ["untracked", "modified", "not-a-git-tree"])
+def test_an_external_shared_that_cannot_be_proven_clean_refuses_rehearse_before_anything(repo, tmp_path, state):
+    # Codex's repro: shared/ resolves outside the checkout and has an untracked file.
+    outside = _external_shared(repo, tmp_path, git_tree=state != "not-a-git-tree")
+    if state == "untracked":
+        (outside / "scripts" / "planted.py").write_text("x = 1\n")
+    elif state == "modified":
+        (outside / "scripts" / "check_env.py").write_text((outside / "scripts" / "check_env.py").read_text()
+                                                          + "\n# edited\n")
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert result.returncode != 0
+    assert "make rehearse refused: the checkout is not clean:" in result.stderr
+    assert "shared/ resolves outside this checkout" in result.stderr
+    assert "its state cannot be proven clean" in result.stderr
+    if state == "untracked":
+        assert "scripts/planted.py" in result.stderr
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
+
+
+def test_a_clean_external_shared_still_rehearses(repo, tmp_path):
+    _external_shared(repo, tmp_path)
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert "not clean" not in result.stderr, result.stderr
+    assert "=== make check ENV=dev: passed ===" in result.stdout + result.stderr
+    assert "--env dev" in live
+
+
+@pytest.mark.parametrize("state", ["clean", "untracked", "not-a-git-tree"])
+def test_receipts_and_provenance_use_the_same_engine_test_as_clean_check(repo, tmp_path, state):
+    from shared.scripts import release_gate as rg
+
+    outside = _external_shared(repo, tmp_path, git_tree=state != "not-a-git-tree")
+    if state == "untracked":
+        (outside / "planted.txt").write_text("x\n")
+    status = rg.checkout_status(_envs(repo) / "dev")
+    assert status["clean_tree"] is (state == "clean"), status
+    if state == "clean":
+        rg.clean_check(_envs(repo) / "dev", "dev", "make rehearse")
+    else:
+        assert any("cannot be proven clean" in line for line in status["dirty"]), status
+        with pytest.raises(rg.Refused, match="cannot be proven clean"):
+            rg.clean_check(_envs(repo) / "dev", "dev", "make rehearse")

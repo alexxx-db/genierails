@@ -564,12 +564,48 @@ def receipt_problem(receipt: Mapping, env: str) -> str | None:
     return next((why for ok, why in checks if not ok), None)
 
 
+def _engine_dirty(repo: Path) -> list[str]:
+    """Why the GenieRails engine (shared/) isn't provably clean ([] when it is).
+
+    An in-checkout shared/ counts like the cloud dir. A shared/ that resolves
+    outside the checkout (a symlink) counts only when its target is in a git
+    work tree whose status for it is empty (untracked included, ignored
+    excluded; GIT_* scrubbed so the caller's git environment can't redirect
+    it); anything else can't be proven clean, so it fails closed.
+    """
+    shared = repo / "shared"
+    if not shared.exists() and not shared.is_symlink():
+        return []
+    target = shared.resolve()
+    if target.is_relative_to(repo):
+        return [f"uncommitted: {line}" for line in dirty_paths(repo, [shared])]
+    unproven = f"shared/ resolves outside this checkout ({target}) and its state cannot be proven clean"
+    scrubbed = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(target), *args], text=True, capture_output=True, env=scrubbed)
+
+    if not target.is_dir():
+        return [f"{unproven}: it is not a directory"]
+    try:
+        top = run("rev-parse", "--show-toplevel")
+        if top.returncode:
+            return [f"{unproven}: it is not in a git work tree"]
+        status = run("status", "--porcelain", "--untracked-files=all", "--", ".")
+    except OSError as exc:
+        return [f"{unproven}: {exc}"]
+    if status.returncode:
+        return [f"{unproven}: git status failed: {(status.stderr or status.stdout).strip()}"]
+    lines = [line for line in status.stdout.splitlines() if line.strip()]
+    return [f"{unproven}: uncommitted in {top.stdout.strip()}: {line}" for line in lines]
+
+
 def checkout_status(env_dir: Path) -> dict:
     """Commit, clean flag (with why not) of the checkout an env lives in."""
     env_dir = Path(env_dir)
     repo = repo_root(env_dir)
     cloud_dir = cloud_dir_of(env_dir)
-    reasons = [f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir, repo / "shared"])[:20]]
+    reasons = ([f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir])] + _engine_dirty(repo))[:20]
     if not tracked(repo, env_dir / "env.auto.tfvars"):
         reasons.append(f"{_rel(repo, env_dir / 'env.auto.tfvars')} is not committed (commit envs/; "
                        "see shared/docs/version-control.md)")
@@ -579,19 +615,12 @@ def checkout_status(env_dir: Path) -> dict:
 def clean_check(env_dir: Path, env: str, command_name: str) -> None:
     """rehearse and release-plan, before their check, any lock or live call: the checkout is clean.
 
-    The same test as a receipt's clean_tree and provenance (checkout_status: tracked or untracked,
-    not ignored, changes under the cloud dir and shared/), so ignored runtime files (credentials,
-    state) never count. Their check reads the commit, so it must be the tree they apply. A shared/
-    outside this checkout (a symlinked copy) is no part of the commit and isn't listed.
+    Exactly a receipt's clean_tree and provenance's test (checkout_status: tracked or untracked,
+    not ignored, changes under the cloud dir, and a shared/ proven clean even when it resolves
+    outside the checkout), so ignored runtime files (credentials, state) never count and none of
+    them passes where this refuses. Their check reads the commit, so it must be the tree they apply.
     """
-    env_dir = Path(env_dir)
-    repo, cloud_dir = repo_root(env_dir), cloud_dir_of(env_dir)
-    shared = repo / "shared"
-    inside = shared.exists() and shared.resolve().is_relative_to(repo.resolve())
-    dirty = [f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir, *([shared] if inside else [])])]
-    if not tracked(repo, env_dir / "env.auto.tfvars"):
-        dirty.append(f"{_rel(repo, env_dir / 'env.auto.tfvars')} is not committed (commit envs/; "
-                     "see shared/docs/version-control.md)")
+    dirty = checkout_status(env_dir)["dirty"]
     if dirty:
         raise Refused(f"{command_name} refused: the checkout is not clean:\n      "
                       + "\n      ".join(dirty[:10])
