@@ -432,12 +432,18 @@ _guard-workspace-config:
 _SETUP_ENV_REL = $(patsubst $(CLOUD_ROOT)/%,%,$(ENV_DIR))
 _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
-# REPO=<url> (command line only) makes this checkout your repo: origin at
-# GenieRails becomes the genierails remote and origin = <url>; with no REPO a
-# fresh clone becomes a local-only repo (scripts/setup_repo.py). --check runs
-# before anything is written, so a refused REPO leaves files and remotes alone.
+# REPO=<url> makes this checkout your repo: origin at GenieRails becomes the
+# genierails remote and origin = <url>; with no REPO a fresh clone becomes a
+# local-only repo (scripts/setup_repo.py). --check runs before anything is
+# written, so a refused REPO leaves files and remotes alone. REPO never enters
+# shell text: make exports its raw $(value REPO) as GENIERAILS_SETUP_REPO, so
+# REPO='$$(cmd)' is just a refused URL. Only a command-line REPO counts; make
+# can't tell one inherited through MAKEFLAGS apart, so that counts too (an
+# accident guard, not a security boundary), while a plain exported REPO
+# (bootstrap-pipelines' <owner>/<name>) is ignored.
 override _SETUP_REPO = python3 "$(SHARED_ROOT)/scripts/setup_repo.py" --cloud-dir "$(CLOUD_ROOT)" \
-	--repo "$(if $(filter command line,$(origin REPO)),$(REPO))" --gitignore "$(GITIGNORE)" --env "$(ENV)"
+	--gitignore "$(GITIGNORE)" --env "$(ENV)"
+setup: export GENIERAILS_SETUP_REPO = $(if $(filter command line,$(origin REPO)),$(value REPO))
 
 setup: ## Prepare the selected environment(s) and show next steps
 	@$(_SCHEDULED_GOVERNANCE_GUARD)

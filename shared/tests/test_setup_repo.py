@@ -50,6 +50,7 @@ def _clone(tmp_path, cloud="aws", origin=UPSTREAM):
     """A checkout shaped like a fresh git clone of GenieRails (no network)."""
     repo = tmp_path / "genierails"
     (repo / cloud).mkdir(parents=True)
+    (repo / "shared").mkdir()  # setup manages git only at a GenieRails checkout root
     _git(repo, "init", "-q")
     if origin:
         _git(repo, "remote", "add", "origin", origin)
@@ -112,14 +113,14 @@ def test_rerun_with_the_same_repo_is_a_no_op(tmp_path):
     assert _no_refs(url)
 
 
-@pytest.mark.parametrize("env", ["dev", "prod"])
-def test_conflicting_repo_is_refused_before_anything_is_written(env, tmp_path):
+@pytest.mark.parametrize("env,jobs", [("dev", ()), ("prod", ()), ("prod", ("-j8",))])
+def test_conflicting_repo_is_refused_before_anything_is_written(env, jobs, tmp_path):
     repo = _clone(tmp_path)
     url = _customer_repo(tmp_path)
     assert _setup(repo / "aws", "ENV=dev", f"REPO={url}").returncode == 0
     before = _snapshot(repo)
     other = _customer_repo(tmp_path, "other.git")
-    result = _setup(repo / "aws", f"ENV={env}", f"REPO={other}")
+    result = _setup(repo / "aws", *jobs, f"ENV={env}", f"REPO={other}")
     assert result.returncode != 0
     assert f"origin already points at {url}, not {other}" in result.stderr
     assert "never repoints" in result.stderr and f"git remote set-url origin {other}" in result.stderr
@@ -187,17 +188,32 @@ def test_no_repo_leaves_remotes_alone_for_contributors_and_ci(opt_out, tmp_path)
     assert _remotes(repo) == {"origin": UPSTREAM} and "Git:" not in result.stdout
 
 
-def test_an_exported_repo_is_ignored(tmp_path):
+@pytest.mark.parametrize("exported", ["acme/gov", "git@example.com:acme/gov.git"])
+def test_an_exported_shell_repo_is_ignored(exported, tmp_path):
     """Only a command-line REPO counts (bootstrap-pipelines' REPO=<owner>/<name> may be exported)."""
     repo = _clone(tmp_path)
-    result = _setup(repo / "aws", "ENV=dev", "GITIGNORE=off", env=_env(REPO="acme/gov"))
+    result = _setup(repo / "aws", "ENV=dev", "GITIGNORE=off", env=_env(REPO=exported))
     assert result.returncode == 0, result.stdout + result.stderr
     assert _remotes(repo) == {"origin": UPSTREAM}
+    # Without GITIGNORE=off the fresh clone turns local-only, and still no origin comes from the export.
+    result = _setup(repo / "aws", "ENV=dev", env=_env(REPO=exported, GENIERAILS_SETUP_REPO=exported))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remotes(repo) == {"genierails": UPSTREAM}
+
+
+def test_a_repo_inherited_through_makeflags_counts(tmp_path):
+    """make can't tell MAKEFLAGS=REPO=... from the command line; the owner accepts it as an opt-in."""
+    repo = _clone(tmp_path)
+    url = _customer_repo(tmp_path)
+    result = _setup(repo / "aws", "ENV=dev", env=_env(MAKEFLAGS=f"REPO={url}"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remotes(repo) == {"genierails": UPSTREAM, "origin": url}
 
 
 def test_outside_git_repo_initialises_a_repo_on_main(tmp_path):
     root = tmp_path / "genierails"
     (root / "aws").mkdir(parents=True)
+    (root / "shared").mkdir()
     url = _customer_repo(tmp_path)
     result = _setup(root / "aws", "ENV=dev", f"REPO={url}")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -222,6 +238,15 @@ def test_plan_layouts():
     assert sr.plan({}, url) == [("add", "origin", url)]
     assert sr.plan(None, url) == [("init",), ("add", "origin", url)]
     assert sr.plan({"origin": url + "/", "genierails": UPSTREAM}, url) == []
+    for same in ("https://github.com/acme/gov", "https://github.com/acme/gov.git/", "ssh://git@github.com/acme/gov.git",
+                 "git@GitHub.com:acme/gov"):
+        assert sr.plan({"origin": "git@github.com:acme/gov.git"}, same) == [], same
+    assert sr.plan({"origin": "file:///srv/gov.git"}, "/srv/gov") == []
+    with pytest.raises(sr.Refused):
+        sr.plan({"origin": "git@github.com:acme/gov.git"}, "https://github.com/acme/other")
+    for ok in ("https://h.example/a/b.git", "ssh://git@h.example:2222/a/b", "git@h.example:a/b.git",
+               "h.example:a/b", "file:///srv/b.git", "/srv/b.git"):
+        sr.validate(ok)
     assert sr.plan({"origin": UPSTREAM}, "") == [("rename", "origin", "genierails")]
     assert sr.plan({"origin": UPSTREAM}, "", auto=False) == []
     assert sr.plan({"origin": UPSTREAM, "genierails": UPSTREAM}, "") == []
@@ -229,3 +254,90 @@ def test_plan_layouts():
     for remotes in ({"origin": "https://example.com/x.git"}, {"origin": UPSTREAM, "genierails": UPSTREAM}):
         with pytest.raises(sr.Refused):
             sr.plan(remotes, url)
+
+
+@pytest.mark.parametrize("repo_arg", [
+    "REPO=$$(printf pwned > {marker})",      # Codex's repro: a make-escaped $(...) reaching the shell
+    "REPO=a`printf pwned > {marker}`b",
+    "REPO=https://example.com/x;printf pwned > {marker}",
+    "REPO=https://example.com/x\nprintf pwned > {marker}",
+    'REPO=x" ; printf pwned > {marker} ; "',
+])
+def test_repo_never_reaches_the_shell(repo_arg, tmp_path):
+    repo = _clone(tmp_path)
+    marker = tmp_path / "marker"
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=dev", repo_arg.format(marker=marker))
+    assert not marker.exists(), result.stdout + result.stderr
+    assert result.returncode != 0 and "ERROR: make setup REPO=" in result.stderr
+    assert _snapshot(repo) == before and _remotes(repo) == {"origin": UPSTREAM}
+    assert not (repo / "aws/envs").exists()
+
+
+@pytest.mark.parametrize("bad", ["ext::sh -c touch% /tmp/x", "ext::sh", "fd::17", "fd::0,1/x", "foo::bar",
+                                 "http://example.com/x.git", "git://example.com/x.git", "ftp://example.com/x",
+                                 "https://example.com/x\x07", "relative/path", "-uhttps://x"])
+def test_dangerous_or_unknown_transports_are_refused(bad, tmp_path):
+    repo = _clone(tmp_path)
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=dev", f"REPO={bad}")
+    assert result.returncode != 0 and "ERROR: make setup REPO=" in result.stderr
+    assert _snapshot(repo) == before and not (repo / "aws/envs").exists()
+    with pytest.raises(sr.Refused):
+        sr.validate(bad)
+
+
+def _outer(tmp_path, origin="https://example.com/outer.git"):
+    """Codex's repro: GenieRails vendored into an unrelated repo at outer/vendor/genierails."""
+    outer = tmp_path / "outer"
+    gr = outer / "vendor" / "genierails"
+    (gr / "aws").mkdir(parents=True)
+    (gr / "shared").mkdir()
+    _git(outer, "init", "-q")
+    _git(outer, "remote", "add", "origin", origin)
+    return outer, gr
+
+
+def test_nested_inside_another_repo_with_repo_is_refused_and_touches_nothing(tmp_path):
+    outer, gr = _outer(tmp_path)
+    before = _snapshot(outer)
+    result = _setup(gr / "aws", "ENV=dev", f"REPO={_customer_repo(tmp_path)}")
+    assert result.returncode != 0
+    assert f"is inside the git repo at {outer.resolve()}" in result.stderr
+    assert _snapshot(outer) == before and _remotes(outer) == {"origin": "https://example.com/outer.git"}
+    assert not (gr / ".git").exists() and not (gr / "aws/envs").exists()
+
+
+def test_nested_inside_a_genierails_origin_repo_without_repo_renames_nothing(tmp_path):
+    outer, gr = _outer(tmp_path, origin=UPSTREAM)
+    result = _setup(gr / "aws", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remotes(outer) == {"origin": UPSTREAM} and "Git:" not in result.stdout
+
+
+def test_git_location_variables_never_redirect_the_change(tmp_path):
+    outer, _ = _outer(tmp_path / "o")
+    repo = _clone(tmp_path)
+    url = _customer_repo(tmp_path)
+    result = _setup(repo / "aws", "ENV=dev", f"REPO={url}",
+                    env=_env(GIT_DIR=str(outer / ".git"), GIT_WORK_TREE=str(outer)))
+    assert _remotes(outer) == {"origin": "https://example.com/outer.git"}
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remotes(repo) == {"genierails": UPSTREAM, "origin": url}
+
+
+def test_a_root_without_shared_is_refused(tmp_path):
+    root = tmp_path / "somewhere"
+    (root / "aws").mkdir(parents=True)
+    result = _setup(root / "aws", "ENV=dev", f"REPO={_customer_repo(tmp_path)}")
+    assert result.returncode != 0 and "doesn't hold GenieRails' shared/" in result.stderr
+    assert not (root / ".git").exists() and not (root / "aws/envs").exists()
+
+
+def test_ssh_and_https_forms_of_origin_are_the_same_repo(tmp_path):
+    repo = _clone(tmp_path)
+    assert _setup(repo / "aws", "ENV=dev", "REPO=git@example.com:acme/gov.git").returncode == 0
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=dev", "REPO=https://example.com/acme/gov/")
+    assert result.returncode == 0 and "nothing to change" in result.stdout, result.stdout + result.stderr
+    assert _snapshot(repo) == before

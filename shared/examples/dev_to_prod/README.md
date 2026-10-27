@@ -35,7 +35,7 @@ make maintain ENV=prod      # deployment machine, cron, at the last released com
 git clone https://github.com/databricks-solutions/genierails.git
 cd genierails/aws          # or: cd azure — every make command runs from the cloud folder
 ```
-Have an empty repo you own ready: [Dev step 1](#phase-0--dev-set-up)'s `make setup ENV=dev REPO=<your-repo-url>` makes this clone yours. It renames `origin` (GenieRails) to `genierails`, kept for upgrades, and adds `origin` = your repo. It never pushes, and re-running it with the same `REPO=` changes nothing; a different `REPO=` once `origin` exists is refused (setup never repoints a remote).
+Have an empty repo you own ready: [Dev step 1](#phase-0--dev-set-up)'s `make setup ENV=dev REPO=<your-repo-url>` makes this clone yours. It renames `origin` (GenieRails) to `genierails`, kept for upgrades, and adds `origin` = your repo. It never pushes, and re-running it with the same `REPO=` changes nothing; a different `REPO=` once `origin` exists is refused (setup never repoints a remote), and so is a checkout nested inside another repo. Only `REPO=` on the command line counts (or one inherited through `MAKEFLAGS`, which make can't tell apart); an exported shell `REPO` is ignored.
 Prefer to manage remotes yourself? Run `git remote rename origin genierails` and `git remote add origin <your-repo-url>` before setup and leave `REPO=` off.
 No repo of your own yet? Leave `REPO=` off: setup still renames `origin` and keeps a local-only repo (no remote, no GitHub account), where you commit, generate and rehearse. `make account-plan` and `make release-plan` still need your repo as `origin` for now, so add it with `make setup ENV=dev REPO=<your-repo-url>` before the first deploy.
 
