@@ -565,8 +565,8 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     dev = readme[readme.index("## Dev"):readme.index("## Prod")]
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
 
-    # The whole flow: own repo and first commit before check; check before rehearse and release-plan.
-    order = ["git remote rename origin genierails", "make setup ENV=dev", "git add .gitignore envs/",
+    # The whole flow: own repo (setup REPO=) and first commit before check; check before rehearse and release-plan.
+    order = ["make setup ENV=dev REPO=<your-repo-url>", "git add .gitignore envs/",
              "make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
              "make promote-to ENV=prod", "make check ENV=prod", "make release-plan ENV=prod",
              "make release ENV=prod"]
@@ -578,18 +578,18 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
         "leave access_tier_groups placeholders"
     ) in flow
 
-    # Detailed walkthrough: rename before setup, then commit before generate/check/rehearse.
-    assert "git remote rename origin genierails" in before
+    # Detailed walkthrough: setup's REPO= (explained before you start), then commit before generate/check/rehearse.
+    assert "git remote" not in flow
+    assert "make setup ENV=dev REPO=<your-repo-url>" in before and "leave `REPO=` off" in before
     step_1 = dev[dev.index("**1. Set up.**"):dev.index("**2. Commit it (own repo).**")]
     committed = dev[dev.index("**2. Commit it (own repo).**"):]
-    assert "make setup ENV=dev" in step_1
+    assert "make setup ENV=dev REPO=<your-repo-url>" in step_1
     assert "git add .gitignore envs/" in committed
     steps = ["git add .gitignore envs/", "**4. Generate.**", "**5. Check.**",
              "make check ENV=dev", "**6. Rehearse.**"]
     positions = [committed.index(step) for step in steps]
     assert positions == sorted(positions)
-    detailed_positions = [readme.index("git remote rename origin genierails", readme.index("## Before you start")),
-                          readme.index("make setup ENV=dev", readme.index("## Dev")),
+    detailed_positions = [readme.index("make setup ENV=dev REPO=", readme.index("## Dev")),
                           readme.index("git add .gitignore envs/", readme.index("**2. Commit it (own repo).**"))]
     assert detailed_positions == sorted(detailed_positions)
     assert "`make rehearse` and `make release-plan` don't run it" in dev

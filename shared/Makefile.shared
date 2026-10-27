@@ -432,9 +432,18 @@ _guard-workspace-config:
 _SETUP_ENV_REL = $(patsubst $(CLOUD_ROOT)/%,%,$(ENV_DIR))
 _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
+# REPO=<url> (command line only) makes this checkout your repo: origin at
+# GenieRails becomes the genierails remote and origin = <url>; with no REPO a
+# fresh clone becomes a local-only repo (scripts/setup_repo.py). --check runs
+# before anything is written, so a refused REPO leaves files and remotes alone.
+override _SETUP_REPO = python3 "$(SHARED_ROOT)/scripts/setup_repo.py" --cloud-dir "$(CLOUD_ROOT)" \
+	--repo "$(if $(filter command line,$(origin REPO)),$(REPO))" --gitignore "$(GITIGNORE)" --env "$(ENV)"
+
 setup: ## Prepare the selected environment(s) and show next steps
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
+	@$(_SETUP_REPO) --check
 	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
+	@$(_SETUP_REPO)
 	@echo "=== Setup ($(ENV)) ==="
 	@allow=0; [ "$$($(_RELEASE_GATE) env-role --env-dir "$(ENV_DIR)" --env "$(ENV)" 2>/dev/null)" = promoted ] && allow=1; \
 	GENIERAILS_ALLOW_ACCESS_TIER_PLACEHOLDERS=$$allow python3 "$(SHARED_ROOT)/genie_space_placeholder.py" --advice "$(ENV_DIR)/env.auto.tfvars"
