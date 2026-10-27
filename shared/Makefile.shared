@@ -372,8 +372,7 @@ override _CI_GUARD_ANSWER = case "$$ci_rc:$$ci_out" in \
 		"1:genierails-ci-guard:v1:refused") exit 1 ;; \
 		*) echo "ERROR: the CI guard ($(SHARED_ROOT)/scripts/ci_guard.py) gave no valid answer (exit $$ci_rc); refusing, as in CI." >&2; exit 1 ;; \
 	esac
-_guard-not-ci-apply:
-	@$(_DATABRICKS_COMPUTE_GUARD)
+_guard-not-ci-apply: _guard-not-databricks-compute
 	@ci_out="$$(GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" $(_CI_GUARD) apply --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)")"; ci_rc=$$?; \
 	$(_CI_GUARD_ANSWER)
 
