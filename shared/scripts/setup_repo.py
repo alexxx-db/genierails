@@ -31,9 +31,10 @@ With a REPO:
     ``genierails`` remote exists: rename origin to ``genierails`` (kept for
     upgrades), then add origin = <url>;
   - no origin (a local-only repo): add origin = <url>;
-  - origin is already <url> (same_repo: the same host, path, user and port,
-    with or without .git or a trailing /; https and git@ ssh forms of one
-    repo match): nothing to do;
+  - origin is already <url> (same_repo: the same form, host, exact path,
+    user and port, with or without .git or a trailing /; on github.com,
+    gitlab.com and bitbucket.org the https, ssh:// and git@ forms of one repo
+    match too): nothing to do;
   - not a git checkout (a downloaded archive): git init the checkout root on
     branch main, then add origin = <url>;
   - anything else (origin elsewhere, or GenieRails with a genierails remote
@@ -84,12 +85,18 @@ _USER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 DEFAULT_PORT = {"https": 443, "ssh": 22}
 
 
+# Hosted providers whose paths are always repo-relative (owner/repo, groups/sub/repo),
+# so git@host:p, ssh://git@host/p and https://host/p name one repo. Azure DevOps
+# maps v3/ (ssh) and _git/ (https) paths differently, so it never cross-matches.
+HOSTED = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
+
+
 class Url(NamedTuple):
-    family: str  # https, ssh (ssh:// and scp-like) or local (file:// and absolute paths)
+    form: str  # https, ssh (ssh://), scp (user@host:path) or local (file:// and absolute paths)
     user: str | None
     host: str  # lower case; "" for local
     port: int | None  # the scheme's default when not given; None for local
-    path: str  # no trailing / or .git; no leading / for a host
+    path: str  # exactly as given (a leading / kept), less a trailing / and .git
 
 
 def parse(url: str) -> Url:
@@ -102,7 +109,7 @@ def parse(url: str) -> Url:
         if scheme == "file":
             if not rest.startswith("/"):
                 raise Refused(f"REPO={url!r}: use file:///absolute/path (no host).")
-            family, user, host, port, path = "local", None, "", None, rest
+            form, user, host, port, path = "local", None, "", None, rest
         else:
             parts = urlsplit(url)
             if parts.password is not None:
@@ -111,19 +118,19 @@ def parse(url: str) -> Url:
             host_text, _, port_text = netloc.partition(":")
             if port_text and not (port_text.isdigit() and 0 < int(port_text) < 65536):
                 raise Refused(f"REPO={url!r}: the port must be a number from 1 to 65535.")
-            family, user, host, path = scheme, parts.username, host_text, parts.path
+            form, user, host, path = scheme, parts.username, host_text, parts.path
             port = int(port_text) if port_text else DEFAULT_PORT[scheme]
             if "@" in parts.netloc and not user:
                 raise Refused(f"REPO={url!r}: empty user before @.")
     elif url.startswith("/"):
-        family, user, host, port, path = "local", None, "", None, url
+        form, user, host, port, path = "local", None, "", None, url
     else:
         match = _SCP.fullmatch(url)
         if not match:
             raise Refused(f"REPO={url!r} is not a git URL: use https://host/owner/repo, ssh://..., "
                           "git@host:owner/repo or an absolute path.")
-        family, user, host, port, path = "ssh", match["user"], match["host"], DEFAULT_PORT["ssh"], match["path"]
-    if family != "local":
+        form, user, host, port, path = "scp", match["user"], match["host"], DEFAULT_PORT["ssh"], match["path"]
+    if form != "local":
         if not _HOST.fullmatch(host or ""):
             raise Refused(f"REPO={url!r}: the host must be a plain host name (letters, digits, . and -, "
                           "not starting with -).")
@@ -135,7 +142,7 @@ def parse(url: str) -> Url:
     if any(part.startswith("-") for part in path.split("/")):
         raise Refused(f"REPO={url!r}: no path component may start with -.")
     path = path.rstrip("/").removesuffix(".git").rstrip("/")
-    return Url(family, user, host.lower(), port, path.lstrip("/") if host else path)
+    return Url(form, user, host.lower(), port, path)
 
 
 def validate(repo: str) -> None:
@@ -160,23 +167,34 @@ def validate(repo: str) -> None:
 def same_repo(a: str, b: str) -> bool:
     """True only when a and b surely name one repo; any doubt is False (setup then refuses).
 
-    Same family: host, path, user (both missing, or equal) and port (a missing
-    port is the scheme's default: 22 for ssh and scp-like, 443 for https) must
-    all match. https vs ssh: the same host and path, https with no user on 443,
-    ssh as user git on 22 (GitHub-style hosting).
+    Same form (scp, ssh://, https://, local): host, the exact path (a leading /
+    matters: git@host:/abs and git@host:abs differ), user (both missing, or
+    equal) and port (a missing port is the scheme's default: 22 for ssh and
+    scp-like, 443 for https) must all match; file:///p and /p are one local
+    form. Different forms match only on a HOSTED provider, for the same
+    repo-relative path: https with no user on 443, ssh:// and scp as git@ on 22
+    (scp without a leading /). Every other host keeps its forms apart.
     """
     try:
         x, y = parse(a.strip()), parse(b.strip())
     except Refused:
         return False
-    if (x.host, x.path) != (y.host, y.path):
+    if x.form == y.form:
+        return (x.host, x.path, x.user, x.port) == (y.host, y.path, y.user, y.port)
+    if x.host != y.host or x.host not in HOSTED or "local" in (x.form, y.form):
         return False
-    if x.family == y.family:
-        return (x.user, x.port) == (y.user, y.port)
-    if {x.family, y.family} == {"https", "ssh"}:
-        web, ssh = (x, y) if x.family == "https" else (y, x)
-        return web.user is None and web.port == 443 and ssh.user == "git" and ssh.port == 22
-    return False
+
+    def repo_path(u: Url) -> str | None:
+        if u.form == "https":
+            return u.path.lstrip("/") if u.user is None and u.port == 443 and u.path.startswith("/") else None
+        if u.user != "git" or u.port != 22:
+            return None
+        if u.form == "ssh":
+            return u.path[1:] if u.path.startswith("/") else None
+        return None if u.path.startswith("/") else u.path
+
+    px, py = repo_path(x), repo_path(y)
+    return px is not None and px == py
 
 
 def plan(remotes: dict[str, str] | None, repo: str, *, auto: bool = True) -> list[tuple[str, ...]]:

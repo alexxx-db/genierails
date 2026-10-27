@@ -334,13 +334,45 @@ def test_a_root_without_shared_is_refused(tmp_path):
     assert not (root / ".git").exists() and not (root / "aws/envs").exists()
 
 
-def test_ssh_and_https_forms_of_origin_are_the_same_repo(tmp_path):
+@pytest.mark.parametrize("other", ["https://github.com/acme/gov/", "ssh://git@github.com/acme/gov",
+                                   "git@GitHub.com:acme/gov"])
+def test_hosted_ssh_and_https_forms_of_origin_are_the_same_repo(other, tmp_path):
     repo = _clone(tmp_path)
-    assert _setup(repo / "aws", "ENV=dev", "REPO=git@example.com:acme/gov.git").returncode == 0
+    assert _setup(repo / "aws", "ENV=dev", "REPO=git@github.com:acme/gov.git").returncode == 0
     before = _snapshot(repo)
-    result = _setup(repo / "aws", "ENV=dev", "REPO=https://example.com/acme/gov/")
+    result = _setup(repo / "aws", "ENV=dev", f"REPO={other}")
     assert result.returncode == 0 and "nothing to change" in result.stdout, result.stdout + result.stderr
     assert _snapshot(repo) == before
+
+
+@pytest.mark.parametrize("origin,other", [
+    ("git@host.example:/srv/gov.git", "git@host.example:srv/gov.git"),   # Codex: absolute vs home-relative
+    ("git@host.example:srv/gov.git", "git@host.example:/srv/gov.git"),
+    ("git@host.example:/srv/gov.git", "ssh://git@host.example/srv/gov.git"),  # same absolute path, other form
+    ("ssh://git@host.example/srv/gov.git", "git@host.example:/srv/gov.git"),
+    ("git@host.example:acme/gov.git", "https://host.example/acme/gov"),   # unknown host: forms stay apart
+    ("git@github.com:/acme/gov.git", "https://github.com/acme/gov"),       # hosted, but scp with a leading /
+])
+def test_different_paths_or_forms_on_an_unknown_host_are_refused(origin, other, tmp_path):
+    repo = _clone(tmp_path)
+    assert _setup(repo / "aws", "ENV=dev", f"REPO={origin}").returncode == 0
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=prod", f"REPO={other}")
+    assert result.returncode != 0 and "nothing to change" not in result.stdout
+    assert f"origin already points at {origin}, not {other}" in result.stderr
+    assert _snapshot(repo) == before and not (repo / "aws/envs/prod").exists()
+
+
+@pytest.mark.parametrize("url", ["git@host.example:/srv/gov.git", "git@host.example:srv/gov",
+                                 "ssh://git@host.example:2222/srv/gov.git", "https://host.example/acme/gov"])
+def test_an_identical_unknown_host_url_is_a_no_op(url, tmp_path):
+    repo = _clone(tmp_path)
+    assert _setup(repo / "aws", "ENV=dev", f"REPO={url}").returncode == 0
+    before = _snapshot(repo)
+    for same in (url, url + "/", url.removesuffix(".git")):
+        result = _setup(repo / "aws", "ENV=dev", f"REPO={same}")
+        assert result.returncode == 0 and "nothing to change" in result.stdout, result.stdout + result.stderr
+        assert _snapshot(repo) == before
 
 
 @pytest.mark.parametrize("bad", ["ssh://-oProxyCommand=touch/tmp/pwn/x", "git@-oProxyCommand:x", "ssh://user@-host/x",
@@ -380,7 +412,14 @@ def test_same_repo_compares_user_port_and_host():
     assert same("git@github.com:acme/gov.git", "https://github.com/acme/gov")
     assert same("https://github.com/acme/gov", "https://GITHUB.com:443/acme/gov.git")
     assert same("ssh://git@h.example:2222/a/b", "ssh://git@h.example:2222/a/b.git")
-    assert same("h.example:a/b", "ssh://h.example/a/b")  # both without a user
+    assert not same("h.example:a/b", "ssh://h.example/a/b")  # unknown host: different forms
+    assert not same("git@h.example:/abs/r", "git@h.example:abs/r")
+    assert same("git@h.example:/abs/r", "git@H.example:/abs/r.git/")
+    for hosted in ("github.com", "gitlab.com", "bitbucket.org"):
+        assert same(f"git@{hosted}:g/sub/r.git", f"https://{hosted}/g/sub/r")
+        assert same(f"ssh://git@{hosted}/g/sub/r", f"git@{hosted}:g/sub/r")
+    assert not same("git@ssh.dev.azure.com:v3/org/proj/r", "https://dev.azure.com/org/proj/_git/r")
+    assert same("https://dev.azure.com/org/proj/_git/r", "https://dev.azure.com/org/proj/_git/r/")
     assert same("file:///srv/gov.git", "/srv/gov/")
     assert not same("ssh://git@example.com:2222/acme/gov", "ssh://git@example.com/acme/gov")
     assert not same("ssh://alice@example.com/acme/gov", "ssh://bob@example.com/acme/gov")
