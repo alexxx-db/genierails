@@ -564,40 +564,40 @@ def receipt_problem(receipt: Mapping, env: str) -> str | None:
     return next((why for ok, why in checks if not ok), None)
 
 
-def _engine_dirty(repo: Path) -> list[str]:
-    """Why the GenieRails engine (shared/) isn't provably clean ([] when it is).
+# Ignored files under shared/ that are caches or local runtime data, never engine
+# code: Python bytecode (only used for its own matching tracked source),
+# Terraform's provider cache and lock files. Any other ignored file with a code
+# suffix could be loaded but is not in the code fingerprint, so it refuses.
+_ENGINE_CACHE_DIRS = ("__pycache__", ".terraform", ".pytest_cache")
+_ENGINE_CODE_SUFFIXES = (".py", ".sh", ".tf", ".hcl", ".sql", ".json")
 
-    An in-checkout shared/ counts like the cloud dir. A shared/ that resolves
-    outside the checkout (a symlink) counts only when its target is in a git
-    work tree whose status for it is empty (untracked included, ignored
-    excluded; GIT_* scrubbed so the caller's git environment can't redirect
-    it); anything else can't be proven clean, so it fails closed.
+
+def _engine_dirty(repo: Path) -> list[str]:
+    """Why the GenieRails engine (shared/) isn't the committed one ([] when it is).
+
+    shared/ must be a real directory in this checkout: the code fingerprint
+    hashes only the files git tracks here, so a shared/ that resolves
+    elsewhere (a symlink, at any revision) can't be bound by a receipt and
+    always refuses. Inside the checkout it must have no uncommitted change, and
+    no ignored file that could be loaded as code.
     """
     shared = repo / "shared"
     if not shared.exists() and not shared.is_symlink():
         return []
     target = shared.resolve()
-    if target.is_relative_to(repo):
-        return [f"uncommitted: {line}" for line in dirty_paths(repo, [shared])]
-    unproven = f"shared/ resolves outside this checkout ({target}) and its state cannot be proven clean"
-    scrubbed = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-
-    def run(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(target), *args], text=True, capture_output=True, env=scrubbed)
-
-    if not target.is_dir():
-        return [f"{unproven}: it is not a directory"]
-    try:
-        top = run("rev-parse", "--show-toplevel")
-        if top.returncode:
-            return [f"{unproven}: it is not in a git work tree"]
-        status = run("status", "--porcelain", "--untracked-files=all", "--", ".")
-    except OSError as exc:
-        return [f"{unproven}: {exc}"]
-    if status.returncode:
-        return [f"{unproven}: git status failed: {(status.stderr or status.stdout).strip()}"]
-    lines = [line for line in status.stdout.splitlines() if line.strip()]
-    return [f"{unproven}: uncommitted in {top.stdout.strip()}: {line}" for line in lines]
+    if shared.is_symlink() or not target.is_relative_to(repo):
+        return [f"shared/ resolves outside this checkout ({target}); deterministic rehearse/release-plan need "
+                "the engine committed in this repo so receipts can fingerprint it"]
+    reasons = [f"uncommitted: {line}" for line in dirty_paths(repo, [shared])]
+    ignored = git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
+                  _rel(repo, shared)).stdout
+    for rel in sorted(filter(None, ignored.split("\0"))):
+        parts = Path(rel).parts
+        if any(part in _ENGINE_CACHE_DIRS for part in parts) or rel.endswith(".terraform.lock.hcl"):
+            continue
+        if rel.endswith(_ENGINE_CODE_SUFFIXES):
+            reasons.append(f"ignored engine file (not in the code fingerprint; commit or delete it): {rel}")
+    return reasons
 
 
 def checkout_status(env_dir: Path) -> dict:

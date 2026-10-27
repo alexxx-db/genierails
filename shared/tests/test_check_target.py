@@ -993,9 +993,15 @@ def _external_shared(repo, tmp_path, *, git_tree=True):
     return outside
 
 
-@pytest.mark.parametrize("state", ["untracked", "modified", "not-a-git-tree"])
-def test_an_external_shared_that_cannot_be_proven_clean_refuses_rehearse_before_anything(repo, tmp_path, state):
-    # Codex's repro: shared/ resolves outside the checkout and has an untracked file.
+EXTERNAL = "shared/ resolves outside this checkout"
+COMMITTED_HERE = "need the engine committed in this repo so receipts can fingerprint it"
+
+
+@pytest.mark.parametrize("state", ["clean", "untracked", "modified", "not-a-git-tree"])
+def test_an_external_shared_refuses_rehearse_before_anything(repo, tmp_path, state):
+    # The code fingerprint hashes only this checkout's tracked files, so a shared/ that resolves
+    # elsewhere can't be bound by a receipt, clean (at any revision) or not. "untracked" is the
+    # r2 repro.
     outside = _external_shared(repo, tmp_path, git_tree=state != "not-a-git-tree")
     if state == "untracked":
         (outside / "scripts" / "planted.py").write_text("x = 1\n")
@@ -1010,27 +1016,12 @@ def test_an_external_shared_that_cannot_be_proven_clean_refuses_rehearse_before_
 
     assert result.returncode != 0
     assert "make rehearse refused: the checkout is not clean:" in result.stderr
-    assert "shared/ resolves outside this checkout" in result.stderr
-    assert "its state cannot be proven clean" in result.stderr
-    if state == "untracked":
-        assert "scripts/planted.py" in result.stderr
+    assert f"{EXTERNAL} ({outside.resolve()}); deterministic rehearse/release-plan {COMMITTED_HERE}" in result.stderr
     assert "=== make check" not in result.stdout + result.stderr
     assert live == "" and "environment lock acquired" not in result.stdout
     assert not (tmp_path / "tf.log").exists()
     _no_lock_or_receipt(repo)
     _assert_read_only(repo, before)
-
-
-def test_a_clean_external_shared_still_rehearses(repo, tmp_path):
-    _external_shared(repo, tmp_path)
-    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
-    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
-
-    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
-
-    assert "not clean" not in result.stderr, result.stderr
-    assert "=== make check ENV=dev: passed ===" in result.stdout + result.stderr
-    assert "--env dev" in live
 
 
 @pytest.mark.parametrize("state", ["clean", "untracked", "not-a-git-tree"])
@@ -1041,10 +1032,30 @@ def test_receipts_and_provenance_use_the_same_engine_test_as_clean_check(repo, t
     if state == "untracked":
         (outside / "planted.txt").write_text("x\n")
     status = rg.checkout_status(_envs(repo) / "dev")
-    assert status["clean_tree"] is (state == "clean"), status
-    if state == "clean":
+    assert status["clean_tree"] is False, status
+    assert any(EXTERNAL in line and COMMITTED_HERE in line for line in status["dirty"]), status
+    with pytest.raises(rg.Refused, match=COMMITTED_HERE):
         rg.clean_check(_envs(repo) / "dev", "dev", "make rehearse")
-    else:
-        assert any("cannot be proven clean" in line for line in status["dirty"]), status
-        with pytest.raises(rg.Refused, match="cannot be proven clean"):
-            rg.clean_check(_envs(repo) / "dev", "dev", "make rehearse")
+
+
+@pytest.mark.parametrize("planted, refused", [
+    ("scripts/.planted.json", True),                         # ignored (.*.json) and loadable: not fingerprinted
+    ("roots/data_access/.terraform/providers/p", False),     # Terraform's provider cache
+    ("roots/data_access/.terraform.lock.hcl", False),
+])
+def test_ignored_engine_code_under_an_in_repo_shared_refuses(repo, planted, refused):
+    from shared.scripts import release_gate as rg
+
+    _vendor_shared(repo)
+    path = repo / "shared" / planted
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x\n")
+    if planted.endswith(".terraform.lock.hcl"):
+        (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + ".terraform.lock.hcl\n")
+        _commit(repo, "ignore lock files")
+    assert _git(repo, "status", "--porcelain") == "", "the planted file must be git-ignored"
+    status = rg.checkout_status(_envs(repo) / "dev")
+    assert status["clean_tree"] is (not refused), status
+    if refused:
+        assert any(f"ignored engine file (not in the code fingerprint; commit or delete it): shared/{planted}" == line
+                   for line in status["dirty"]), status
