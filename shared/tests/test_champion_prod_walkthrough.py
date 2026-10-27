@@ -86,6 +86,14 @@ class Customer:
         (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
         (bin_dir / "terraform").chmod(0o755)
         self.git("init", "-q", "-b", "main")
+        # Like a real clone, the engine files GenieRails tracks are tracked here too, the ones the
+        # root .gitignore matches (treatment_config.json, example masking_functions.sql) included:
+        # release_gate refuses an ignored engine file, which the code fingerprint can't see.
+        listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "shared"],
+                                capture_output=True, check=True).stdout.split(b"\0")
+        engine = b"\0".join(rel for rel in listed if rel and (self.root / os.fsdecode(rel)).is_file())
+        subprocess.run(["git", "-C", str(self.root), "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                       input=engine, check=True, capture_output=True, env=os.environ | self.env)
         subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True, env=os.environ | self.env)
         self.git("remote", "add", "origin", str(self.origin))
         self.stubbed = Make(tmp_path, self)

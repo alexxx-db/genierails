@@ -178,10 +178,10 @@ def test_deterministic_prod_banner_pushes_then_release_plan_reuses_the_source_re
     assert "make rehearse" not in text
     readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
-    step = prod[prod.index("**3. Check, plan, release.**"):prod.index("**4. Record evidence.**")]
+    step = prod[prod.index("**3. Plan, release.**"):prod.index("**4. Record evidence.**")]
     block = step[step.index("```bash"):step.index("```", step.index("```bash") + 3)]
-    assert block.split("\n")[1:] == ["make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod",
-                                     ""]
+    # release-plan runs make check itself, so the block has no separate check line.
+    assert block.split("\n")[1:] == ["make release-plan ENV=prod", "make release ENV=prod", ""]
     flat = " ".join(step.split())
     order = ["plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit",
              "release-plan reuses that rehearsal itself and applies nothing in dev",
