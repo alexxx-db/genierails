@@ -429,8 +429,11 @@ def next_step(cloud_dir: Path, env: str, report: dict, *, remote: str = "origin"
 
     def push_first(why: str) -> tuple[str, str] | None:
         if not git["remote_configured"]:
-            return (f"git remote add {remote} <your repo URL> && git push {remote} HEAD:{branch}",
-                    f"there is no {remote} remote; {why}")
+            if remote != "origin":
+                return (f"git remote add {remote} <your repo URL> && git push {remote} HEAD:{branch}",
+                        f"there is no {remote} remote; {why}")
+            return (f"make setup ENV={env} REPO=<your repo URL> && git push -u origin HEAD:{branch}",
+                    f"this is a local-only repo (no origin remote; setup's REPO= adds it and never pushes); {why}")
         if not git["remote_known"] or not git["head_on_remote"]:
             return (f"git push {remote} HEAD:{branch} (or merge its PR, then pull)",
                     f"HEAD {git['head'][:12]} isn't on {git['remote']} (as last fetched; status doesn't fetch); "
@@ -619,7 +622,7 @@ def _text(report: dict) -> list[str]:
     elif not git.get("head"):
         lines.append("  Git:         no commit yet")
     else:
-        where = ("no remote " + git["remote"].split("/")[0] if not git["remote_configured"]
+        where = ("no remote " + git["remote"].split("/")[0] + " (local-only repo)" if not git["remote_configured"]
                  else f"{git['remote']} unknown (never fetched)" if not git["remote_known"]
                  else f"on {git['remote']}" if git["head_on_remote"] else f"not on {git['remote']}")
         lines.append(f"  Git:         HEAD {git['head'][:12]}, {where} (as last fetched)")

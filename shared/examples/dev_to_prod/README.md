@@ -5,12 +5,8 @@ Take a Genie agent you've curated in **dev** and ship it to **prod** with its se
 ## The whole flow
 
 ```bash
-# your own repo first: make check, rehearse receipts and release-plan read committed envs/
-git remote rename origin genierails      # keep GenieRails for upgrades
-git remote add origin <your-repo-url>
-
 # dev
-make setup ENV=dev          # writes the .gitignore that commits envs/; copy the templates; set deployer_principal_id and groups; per agent, its ID and acl_groups
+make setup ENV=dev REPO=<your-repo-url>   # first run: origin -> genierails (kept for upgrades), origin = your repo; writes the .gitignore that commits envs/; copy the templates; set deployer_principal_id and groups; per agent, its ID and acl_groups
 git add .gitignore envs/ && git commit -m "Govern the first agent in dev" && git push -u origin main
 #   Catalog Explorer: turn on Data classification, review detections, enable auto-tagging
 make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
@@ -37,11 +33,11 @@ make maintain ENV=prod      # deployment machine, cron, at the last released com
 
 ```bash
 git clone https://github.com/databricks-solutions/genierails.git
-cd genierails
-git remote rename origin genierails      # keep GenieRails for upgrades
-git remote add origin <your-repo-url>    # an empty repo you own
-cd aws                     # or: cd azure — every make command runs from the cloud folder
+cd genierails/aws          # or: cd azure — every make command runs from the cloud folder
 ```
+Have an empty repo you own ready: [Dev step 1](#phase-0--dev-set-up)'s `make setup ENV=dev REPO=<your-repo-url>` makes this clone yours. It renames `origin` (GenieRails) to `genierails`, kept for upgrades, and adds `origin` = your repo. It never pushes, and re-running it with the same `REPO=` changes nothing; a different `REPO=` once `origin` exists is refused (setup never repoints a remote), and so is a checkout nested inside another repo. Only `REPO=` on the command line counts (or one inherited through `MAKEFLAGS`, which make can't tell apart); an exported shell `REPO` is ignored.
+Prefer to manage remotes yourself? Run `git remote rename origin genierails` and `git remote add origin <your-repo-url>` before setup and leave `REPO=` off.
+No repo of your own yet? Leave `REPO=` off: setup still renames `origin` and keeps a local-only repo (no remote, no GitHub account), where you commit, generate and rehearse. `make account-plan` and `make release-plan` still need your repo as `origin` for now, so add it with `make setup ENV=dev REPO=<your-repo-url>` before the first deploy.
 
 | You need | Notes |
 |---|---|
@@ -58,7 +54,7 @@ cd aws                     # or: cd azure — every make command runs from the c
 
 **1. Set up.**
 ```bash
-make setup ENV=dev
+make setup ENV=dev REPO=<your-repo-url>
 cp ../shared/examples/dev_to_prod/env.auto.tfvars.example envs/dev/env.auto.tfvars
 mkdir -p envs/dev/agents
 cp ../shared/examples/dev_to_prod/agent.auto.tfvars.example "envs/dev/agents/Finance Analytics.auto.tfvars"
@@ -76,7 +72,7 @@ acl_groups     = ["regional_analysts", "viewers"]      # who gets CAN_RUN on the
 **Also accepted:** the same fields inline in `env.auto.tfvars` as `genie_spaces = [{ name = "...", genie_space_id = "...", acl_groups = [...] }]` (leave `genie_spaces = []` when using agent files). Prefer `agents/` files so agent and governance PRs stay separate; `make split-agent-files` moves an inline list into files later.
 `acl_groups` is required: `make generate` stops while an agent has none. It grants only `CAN_RUN` on the agent. `SELECT` on the agent's tables comes only from `table_readers` in `env.auto.tfvars`, which `make generate` proposes for you (filled with `acl_groups`) for each table nothing covers yet. Every `acl_groups` group must be able to read every table of the agent, so pick them from `access_tier_groups` (only tier groups and `raw_exempt_principals` can be readers); otherwise `generate`, `rehearse` and `release` stop and name the table and group.
 
-**2. Commit it (own repo).** `make check` reads only committed env files, a rehearse receipt counts only for a clean checkout, and `make release-plan` needs that commit on your `origin/main`. The [before-you-start](#prerequisites--gather-required-values) remote rename made `origin` your repo before step 1, so `make setup` already wrote the customer `.gitignore` block that commits `envs/` while ignoring credentials and runtime files:
+**2. Commit it (own repo).** `make check` reads only committed env files, a rehearse receipt counts only for a clean checkout, and `make release-plan` needs that commit on your `origin/main`. Step 1's `REPO=` made `origin` your repo ([before you start](#prerequisites--gather-required-values)), so `make setup` already wrote the customer `.gitignore` block that commits `envs/` while ignoring credentials and runtime files:
 ```bash
 git add .gitignore envs/
 git status                               # pass looks like: no auth.auto.tfvars, *.tfstate or .genie_* files
@@ -185,8 +181,8 @@ Run it from the [deployment machine](../../docs/deployment-machine.md). It masks
 <a id="commit-it"></a>
 ## Commit it
 
-The [before-you-start](#prerequisites--gather-required-values) remote rename puts the checkout in your own repo before [Dev step 1](#phase-0--dev-set-up), so `make setup` writes `.gitignore`; Dev step 2 commits it with `envs/`. Do this before `make check`, `make rehearse` or `make release-plan`.
-If you already ran `make setup` before renaming the remote, rename the remote,
-re-run `make setup ENV=dev`, then commit `.gitignore` and `envs/`.
+[Dev step 1](#phase-0--dev-set-up)'s `make setup ENV=dev REPO=<your-repo-url>` puts the checkout in your own repo and writes `.gitignore`; Dev step 2 commits it with `envs/`. Do this before `make check`, `make rehearse` or `make release-plan`.
+If you already ran `make setup` without `REPO=`, re-run `make setup ENV=dev REPO=<your-repo-url>`
+(it adds `origin`), then commit `.gitignore` and `envs/`.
 
 From then on every change goes through a PR into `main`, with `make check` as its check (`make release-plan` plans only a commit on `origin/main`): see [Pipelines](../../docs/pipelines.md) to set up CI, and the [agents](../../docs/playbooks/agents.md), [governance](../../docs/playbooks/governance.md) or [one-team](../../docs/playbooks/one-team.md) playbook for day-2 changes.
