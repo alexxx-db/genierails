@@ -167,14 +167,20 @@ def test_a_prod_promoted_from_a_rehearsed_stg_follows_the_printed_steps_to_a_rel
     assert hcl2.loads((stg / "env.auto.tfvars").read_text())["tag_treatments"] == {LABEL: "redact"}
     assert re.findall(r"make [a-z-]+ ENV=[a-z]+", next_line) == [
         "make generate ENV=stg", "make check ENV=stg", "make rehearse ENV=stg", "make promote-to ENV=prod",
-        "make check ENV=prod", "make rehearse ENV=stg", "make release-plan ENV=prod", "make release ENV=prod"]
+        "make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod"]
+    assert "make release-plan ENV=prod (it reuses the stg rehearsal, or names the command to run)" in next_line
 
     out = _follow(repo, next_line)
 
     assert hcl2.loads((prod / "env.auto.tfvars").read_text())["tag_treatments"] == {LABEL: "redact"}
     assert repo.git("status", "--porcelain") == ""
-    assert "without re-applying" in out["make rehearse ENV=stg"] or "Rehearse (stg)" in out["make rehearse ENV=stg"]
-    assert rg.passing_receipt(repo.cloud, "stg", repo.head())
+    assert "Rehearse receipt (passed)" in out["make rehearse ENV=stg"], out["make rehearse ENV=stg"]
+    # No second make rehearse ENV=stg: the promotion commit changed only envs/prod/, so release-plan wrote
+    # stg's receipt for it from the earlier rehearsal, applying nothing in stg.
+    plan_out = out["make release-plan ENV=prod"]
+    assert "reusing stg's passing rehearsal of" in plan_out and "without re-applying" in plan_out, plan_out
+    receipt = rg.passing_receipt(repo.cloud, "stg", repo.head())
+    assert receipt and receipt["applied"] is False, receipt
     manifest = rg.current_manifest(prod, "prod")
     assert manifest and manifest.is_file(), out["make release-plan ENV=prod"]
 

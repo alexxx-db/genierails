@@ -9014,7 +9014,8 @@ def generate_next_steps(
         # validate-generated + apply; prod never rehearses (the Makefile
         # refuses). A deterministic prod releases the manifest release-plan wrote,
         # and release-plan plans only a commit on origin/main with a passing
-        # rehearsal of the source env at that same commit.
+        # rehearsal of the source env at that same commit, which it writes itself
+        # from an earlier rehearsal when the source env's inputs are unchanged.
         lines = ["  Next steps:", "    1. Review the draft:"]
         if has_sql:
             lines.append(f"       {out_dir}/masking_functions.sql")
@@ -9029,9 +9030,9 @@ def generate_next_steps(
             lines.append(f"    3. make release ENV={env_name}")
         else:
             lines += [
-                "    3. git push (or merge the PR) so the commit is on origin/main; on that commit:",
-                f"       make rehearse ENV={source_env}   (release-plan needs a rehearsal of this exact commit)",
-                f"    4. make release-plan ENV={env_name}",
+                "    3. git push (or merge the PR) so the commit is on origin/main",
+                f"    4. make release-plan ENV={env_name}   (it reuses the {source_env} rehearsal, "
+                "or names the command to run)",
                 f"    5. make release ENV={env_name}",
             ]
         return lines
