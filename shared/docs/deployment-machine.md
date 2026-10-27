@@ -25,6 +25,10 @@ make release ENV=prod                          # applies exactly that manifest
 make maintain ENV=prod
 ```
 
+Not on Databricks compute: a notebook, Job, serverless run or App loses its
+disk, and with it the receipts, manifests and locks, so state-changing targets
+refuse there ([pipelines](pipelines.md#databricks-compute)).
+
 ## Set it up once
 
 1. **One persistent checkout.** Clone your repo once and always work there.

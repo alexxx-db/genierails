@@ -69,6 +69,24 @@ case "$LAYER:$COMMAND" in
     fi
     ;;
 esac
+# Second line behind make's Databricks-compute guard, before any state or env
+# dir is created: a write there would outlive neither its state nor its
+# records. Same rule as make: GENIERAILS_ALLOW_DATABRICKS_COMPUTE=1 and a
+# GENIERAILS_DURABLE_STATE_DIR holding GENIERAILS_STATE_DIR, whatever the
+# backend; GENIERAILS_ALLOW_CI_APPLY doesn't lift it. Only a marker runs python.
+case "$COMMAND" in
+  apply|apply-plan|destroy|import|state-rm|state-mv)
+    dbx=
+    [ -d /Workspace ] && dbx=1
+    for m in DATABRICKS_RUNTIME_VERSION DB_CLUSTER_ID DB_IS_JOB_CLUSTER DATABRICKS_APP_NAME; do
+      if [ -n "$(printenv "$m" || true)" ]; then dbx=1; fi
+    done
+    if [ -n "$dbx" ]; then
+      python3 "$SCRIPT_DIR/databricks_compute.py" guard --what "terraform $COMMAND ($LAYER:$ENV_NAME)" \
+        --opt-in "${GENIERAILS_ALLOW_DATABRICKS_COMPUTE:-}" || exit 2
+    fi
+    ;;
+esac
 # state-pull prints only the state on stdout (state_layout.py state_json reads it).
 if [ "$COMMAND" = "state-pull" ]; then
   exec 3>&1 1>&2

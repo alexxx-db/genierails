@@ -42,6 +42,7 @@ if str(SHARED_ROOT) not in sys.path:
 
 from scripts.sticky_governance import GovernedTablesError, _load_hcl, deterministic  # noqa: E402
 from scripts.release_gate import PROMOTED, env_role  # noqa: E402
+from scripts.databricks_compute import MARKERS as DATABRICKS_COMPUTE_MARKERS, marker  # noqa: E402
 
 RESERVED_ENVS = ("account", "data_access")
 # Runtime files never enter the scratch copy: credentials, state, Terraform
@@ -68,6 +69,9 @@ LEAKED_VARS = (
     "DEST_ENV", "DEST_ENV_DIR", "DEST_CATALOG_MAP", "ACCOUNT_ENV_DIR", "FROM", "CATALOG_MAP",
     "CHECK", "APPLY_FLAGS", "GENIERAILS_APPLY_FLAGS", "TARGET_ENV", "SPACE", "MODE",
     "GENIERAILS_STATE_DIR",
+    # The scratch copy is throwaway by design, so its promote and plan may run
+    # on Databricks compute (scripts/databricks_compute.py).
+    *DATABRICKS_COMPUTE_MARKERS,
 )
 
 
@@ -219,6 +223,31 @@ def _snapshot(envs: Path) -> dict[str, tuple[str, bytes]]:
         if not _not_copied(rel) and not path.is_symlink() and path.is_file():
             found[str(rel)] = ("file", path.read_bytes())
     return found
+
+
+def _gnu_make(make: str, origin: str) -> str:
+    """The make binary for a scratch copy on Databricks compute, or CheckFailed.
+
+    The scratch copy runs without the Databricks compute markers, so it may
+    run only the GNU make that started make check: MAKE must have make's own
+    "default" origin (not set on the command line or in the environment) and
+    resolve to a binary (not a script) that reports GNU Make.
+    """
+    found = marker(os.environ)
+    if origin != "default":
+        raise CheckFailed(f"refused on Databricks compute ({found}): MAKE was overridden (origin {origin}); "
+                          "make check's scratch copy runs only the make that started it")
+    path = shutil.which(make)
+    real = os.path.realpath(path) if path else ""
+    try:
+        with open(real, "rb") as handle:
+            is_script = handle.read(2) == b"#!"
+        version = subprocess.run([real, "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        is_script, version = True, ""
+    if is_script or not version.startswith("GNU Make"):
+        raise CheckFailed(f"refused on Databricks compute ({found}): {make} is not a GNU make binary")
+    return real
 
 
 class Scratch:
@@ -460,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cloud-dir", type=Path, required=True, help="aws/ or azure/ (holds envs/)")
     parser.add_argument("--makefile", type=Path, required=True, help="the cloud Makefile to run in the copy")
     parser.add_argument("--make", default="make", help="make binary")
+    parser.add_argument("--make-origin", default="default", help="make's $(origin MAKE)")
     parser.add_argument("--from", dest="from_env", default="", help="promote-check: FROM override")
     parser.add_argument("--catalog-map", default="", help="promote-check: CATALOG_MAP override")
     parser.add_argument("--env-dir-override", type=Path, help="a command-line ENV_DIR, refused unless it is envs/<env>")
@@ -473,6 +503,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: ENV={args.env} is not a workspace env.", file=sys.stderr)
         return 1
     label = f"make check ENV={args.env}" if args.command == "check" else f"make promote-to ENV={args.env} CHECK=1"
+    if marker(os.environ):
+        try:
+            args.make = _gnu_make(args.make, args.make_origin)
+        except CheckFailed as exc:
+            print(f"ERROR: {label} {exc}", file=sys.stderr)
+            return 1
     print(f"=== {label} (read-only: runs in a scratch copy; writes nothing under envs/) ===")
     try:
         (_check if args.command == "check" else _promote_check)(args)

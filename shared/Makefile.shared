@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-promote-destination _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access _verify-access-gate verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan _account-plan-locked apply-account check policy-status policy-abandon policy-rebind status next
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind _guard-not-databricks-compute setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access _verify-access-gate verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan _account-plan-locked apply-account check policy-status policy-abandon policy-rebind status next
 
 .PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask adopt-custom-mask
 
@@ -319,6 +319,60 @@ _guard-genie-placeholder:
 	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
 
+# Databricks compute (a notebook, Job, serverless run or App) keeps no local
+# disk past the run, so every state-changing target refuses there first, before
+# any lock, write or live call: its receipts, manifests, staged journal, env
+# locks and Genie ID records would be lost (scripts/databricks_compute.py lists
+# the markers: four variables and the /Workspace mount; only the helper decides). GENIERAILS_ALLOW_CI_APPLY doesn't lift it. With no marker set
+# nothing else runs, so laptops, servers and CI see no change. The opt-in for a
+# future Job runner (not supported end to end yet) takes
+# GENIERAILS_ALLOW_DATABRICKS_COMPUTE=1 with origin "command line" (as
+# REUSE_SOURCE_AUTH) plus GENIERAILS_DURABLE_STATE_DIR; on Linux the top-level
+# make also reads its own starting environment, so an inherited MAKEFLAGS
+# carrying the setting is refused.
+override _DATABRICKS_COMPUTE_MARKERS = DATABRICKS_RUNTIME_VERSION DB_CLUSTER_ID DB_IS_JOB_CLUSTER DATABRICKS_APP_NAME
+override _DATABRICKS_COMPUTE_OPT_IN = $(if $(filter command line,$(origin GENIERAILS_ALLOW_DATABRICKS_COMPUTE)),$(GENIERAILS_ALLOW_DATABRICKS_COMPUTE))
+override _DATABRICKS_OPT_IN_FROM_MAKEFLAGS := $(if $(and $(filter 0,$(MAKELEVEL)),$(_DATABRICKS_COMPUTE_OPT_IN)),$(shell 2>/dev/null tr '\0' '\n' < /proc/$$PPID/environ | grep -q '^MAKEFLAGS=.*GENIERAILS_ALLOW_DATABRICKS_COMPUTE=' && echo 1))
+override _DATABRICKS_COMPUTE_GUARD = dbx=; if [ -d /Workspace ]; then dbx=1; fi; \
+	for m in $(_DATABRICKS_COMPUTE_MARKERS); do if [ -n "$$(printenv "$$m")" ]; then dbx=1; fi; done; \
+	if [ -n "$$dbx" ]; then \
+		python3 "$(SHARED_ROOT)/scripts/databricks_compute.py" guard --goals "$(MAKECMDGOALS)" \
+			--opt-in "$(_DATABRICKS_COMPUTE_OPT_IN)" --opt-in-from-makeflags "$(_DATABRICKS_OPT_IN_FROM_MAKEFLAGS)" || exit 1; \
+	fi
+
+_guard-not-databricks-compute:
+	@$(_DATABRICKS_COMPUTE_GUARD)
+
+# Targets that write only in some modes take the guard only then, so plan's
+# same-env re-split and read-only classification prep still run: promote when
+# it is the command-line goal or a cross-env promotion (DEST_ENV), promote-to
+# unless CHECK=1, _prepare-classification when it imports (IMPORT_CLASSIFICATION=1).
+# tests/test_databricks_compute_guard.py finds every target that applies,
+# imports, destroys, locks or writes a receipt or journal and requires the guard.
+override _PROMOTE_DATABRICKS_GUARD = $(if $(or $(and $(filter 0,$(MAKELEVEL)),$(filter promote,$(MAKECMDGOALS))),$(strip $(DEST_ENV))),_guard-not-databricks-compute)
+
+# The guard also runs while make parses this file, before any recipe or
+# prerequisite can start: a sibling prerequisite gives no order under make -j
+# (or -j in MAKEFLAGS), so _prepare-env could otherwise write beside a refusing
+# guard. Every target that takes the guard is listed here (the test requires the
+# list to match), and the three conditional ones are checked in their writing
+# mode. Nothing runs without a marker or a guarded goal, so other runs see no change.
+override _DATABRICKS_GUARDED_TARGETS = _account-plan-locked _apply-account-for-workspace _apply-account-locked \
+	_apply-layer _destroy-layer _release-manifest _release-plan-roots _sync-tags-add-only-locked account-plan \
+	apply apply-account apply-genie apply-governance bootstrap-pipelines bootstrap-sp clean clean-all destroy \
+	destroy-genie destroy-governance detach-agent enable-classification import integration-test maintain \
+	migrate-root-to-env migrate-state migrate-state-dir policy-abandon policy-rebind rehearse release \
+	release-plan split-agent-files sync-tags test-all test-champion test-ci test-ci-parallel ungovern
+override _DATABRICKS_GUARDED_GOALS := $(strip $(filter $(_DATABRICKS_GUARDED_TARGETS),$(MAKECMDGOALS)) \
+	$(if $(_PROMOTE_DATABRICKS_GUARD),$(filter promote,$(MAKECMDGOALS))) \
+	$(if $(filter 1,$(CHECK)),,$(filter promote-to,$(MAKECMDGOALS))) \
+	$(if $(filter 1,$(IMPORT_CLASSIFICATION)),$(filter _prepare-classification,$(MAKECMDGOALS))))
+ifneq ($(_DATABRICKS_GUARDED_GOALS),)
+ifeq ($(shell ( $(_DATABRICKS_COMPUTE_GUARD) ) >&2 || echo refused),refused)
+$(error make $(MAKECMDGOALS) refused before any recipe ran (Databricks compute, above))
+endif
+endif
+
 # CI detection lives in scripts/ci_guard.py alone (CI=true|1|yes or a CI runner
 # marker; GENIERAILS_ALLOW_CI_APPLY=1 opts out of the apply guard; dev rehearse
 # with locked remote state is state_layout.ci_allowed). make next reads the
@@ -340,7 +394,7 @@ override _CI_GUARD_ANSWER = case "$$ci_rc:$$ci_out" in \
 		"1:genierails-ci-guard:v1:refused") exit 1 ;; \
 		*) echo "ERROR: the CI guard ($(SHARED_ROOT)/scripts/ci_guard.py) gave no valid answer (exit $$ci_rc); refusing, as in CI." >&2; exit 1 ;; \
 	esac
-_guard-not-ci-apply:
+_guard-not-ci-apply: _guard-not-databricks-compute
 	@ci_out="$$(GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" $(_CI_GUARD) apply --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)")"; ci_rc=$$?; \
 	$(_CI_GUARD_ANSWER)
 
@@ -984,7 +1038,7 @@ _guard-account-plan-empty:
 	fi; \
 	if [ $$status -ne 0 ]; then echo "ERROR: account plan failed." >&2; exit $$status; fi
 
-_apply-account-for-workspace:
+_apply-account-for-workspace: _guard-not-databricks-compute
 	@mode="$$(python3 -c 'import hcl2,sys; print(hcl2.load(open(sys.argv[1])).get("governance_mode", "legacy"))' "$(ENV_DIR)/env.auto.tfvars")" || { echo "ERROR: cannot determine governance mode from $(ENV_DIR)/env.auto.tfvars" >&2; exit 1; }; \
 	any_det="$$($(_ANY_DETERMINISTIC_ENV))" || exit 1; \
 	if [ "$$mode" = deterministic ] || [ "$$any_det" = 1 ]; then \
@@ -993,10 +1047,10 @@ _apply-account-for-workspace:
 		$(MAKE) --no-print-directory _apply-layer LAYER=account TARGET_ENV=$(ACCOUNT_ENV) LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)"; \
 	fi
 
-account-plan: _guarded-bootstrap ## Plan shared account resources: clean origin/main HEAD -> immutable account manifest to approve
+account-plan: _guard-not-databricks-compute _guarded-bootstrap ## Plan shared account resources: clean origin/main HEAD -> immutable account manifest to approve
 	@$(MAKE) --no-print-directory _account-plan-locked ENV="$(ACCOUNT_ENV)" ENV_DIR="$(ACCOUNT_ENV_DIR)"
 
-_account-plan-locked:
+_account-plan-locked: _guard-not-databricks-compute
 	@$(_DRY_RUN_GUARD); \
 	export GENIERAILS_RERUN_TARGET=account-plan; \
 	$(MAKE) --no-print-directory _guard-account-config || exit 1; \
@@ -1034,7 +1088,7 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 	fi; \
 	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest"
 
-_apply-account-locked:
+_apply-account-locked: _guard-not-databricks-compute
 	@$(_DRY_RUN_GUARD); \
 	manifest="$(abspath $(strip $(MANIFEST)))"; plans="$$(dirname "$$manifest")"; \
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
@@ -1339,7 +1393,7 @@ override _SAVED_GRANT_CHANGES = python3 -c 'import json,sys; print(int(any(s.get
 # its next changing phase, and the workspace is planned with the last one;
 # when that phase's grant opens SELECT the agent coverage check still lacks,
 # the workspace waits for the next release-plan (CAN_RUN only after SELECT).
-_release-plan-roots:
+_release-plan-roots: _guard-not-databricks-compute
 	@set -e; $(_DRY_RUN_GUARD); $(_IDENTITY_MAP_CHECK); $(_SCHEDULED_GOVERNANCE_GUARD); plan_dir="$(PLAN_DIR)"; target_env="$(ENV)"; \
 	echo "=== Saved plan (account) ==="; \
 	set +e; (umask 077; LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode -out="$$plan_dir/account.tfplan" >/dev/null); status=$$?; set -e; \
@@ -1560,7 +1614,7 @@ validate: _guarded-bootstrap ## Validate split config in the selected environmen
 		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/validate_abac.py" abac.auto.tfvars $(call _VALIDATION_FLAGS,validate-workspace) $(if $(COUNTRY),--country $(COUNTRY),) $(if $(INDUSTRY),--industry $(INDUSTRY),); \
 	fi
 
-promote: _guarded-bootstrap _guard-workspace-target ## Split generated/ into layers (same-env), or cross-env: make promote SOURCE_ENV=dev DEST_ENV=prod DEST_CATALOG_MAP="dev_cat=prod_cat"
+promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target ## Split generated/ into layers (same-env), or cross-env: make promote SOURCE_ENV=dev DEST_ENV=prod DEST_CATALOG_MAP="dev_cat=prod_cat"
 	@set -e; $(_DRY_RUN_GUARD); if [ -n "$(DEST_ENV)" ]; then \
 		if [ "$(DEST_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(DEST_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: DEST_ENV cannot be '$(ACCOUNT_ENV)' or '$(DATA_ACCESS_SUBDIR)'."; exit 1; \
@@ -1697,7 +1751,7 @@ _PROMOTE_TO_MAP = $(if $(filter command line,$(origin CATALOG_MAP)),$(CATALOG_MA
 
 # CHECK=1 writes nothing: it reruns promote-to in a scratch copy of envs/ (no
 # credentials or state) and fails if the committed output differs.
-promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
+promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
 	@$(_PROMOTE_TO_PLACEHOLDER_GUARD)
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
 	@$(_GUARD_WORKSPACE_ENV); \
@@ -1730,7 +1784,7 @@ promote-to: ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars,
 # of the cloud dir, so nothing under envs/ is written and no applying target
 # runs; safe under CI=true. ENV_DIR overrides are refused: it checks envs/$(ENV).
 override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter command line,$(origin ENV_DIR)), --env-dir-override "$(ENV_DIR)",) \
-	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
+	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))" --make-origin "$(origin MAKE)"
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
 	@$(_GENIE_PLACEHOLDER_GUARD)
@@ -1739,7 +1793,7 @@ check: ## Read-only PR check: validate, generated files current, validate-genera
 	$(_DRY_RUN_GUARD); \
 	$(_CHECK_ENV) check
 
-_prepare-classification:
+_prepare-classification: $(if $(filter 1,$(IMPORT_CLASSIFICATION)),_guard-not-databricks-compute)
 	@existing_catalogs="$$(python3 "$(SHARED_ROOT)/scripts/prepare_classification_config.py" "$(CLASSIFICATION_ENV_DIR)" $(if $(filter 1,$(CLASSIFICATION_READ_ONLY)),--read-only,))" || exit 1; \
 	if [ "$(IMPORT_CLASSIFICATION)" = "1" ] || [ "$(IMPORT_CLASSIFICATION)" = "record" ]; then \
 		for catalog in $$existing_catalogs; do \
@@ -1812,7 +1866,7 @@ plan: _guarded-bootstrap ## Run terraform plan for the selected layer or workspa
 # apply-account passes it, from its approved manifest, under the account lock)
 # also removes those values once sync_tag_policies.py proves them unused
 # (WAREHOUSE_ID reads system.information_schema). TAG_SYNC_MODE=replace is refused.
-sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (add-only; removals: account-plan, apply-account)
+sync-tags: _guard-not-databricks-compute _bootstrap ## Sync tag policy values in the shared account layer (add-only; removals: account-plan, apply-account)
 	@$(MAKE) --no-print-directory _guard-account-config
 	@echo "=== Sync Tag Policies (account) ==="
 	@if [ -n "$(strip $(TAG_SYNC_MODE))" ] && [ "$(strip $(TAG_SYNC_MODE))" != add-only ]; then \
@@ -1823,7 +1877,7 @@ sync-tags: _bootstrap ## Sync tag policy values in the shared account layer (add
 	fi; \
 	cd "$(ACCOUNT_ENV_DIR)" && python3 "$(SHARED_ROOT)/scripts/sync_tag_policies.py" $(if $(strip $(TAG_SYNC_REMOVE)),--remove "$(strip $(TAG_SYNC_REMOVE))" --warehouse-id "$(strip $(WAREHOUSE_ID))",)
 
-_sync-tags-add-only-locked:
+_sync-tags-add-only-locked: _guard-not-databricks-compute
 	@$(call _ENV_LOCK,tag-sync-add-only); \
 	$(MAKE) --no-print-directory sync-tags
 
@@ -2192,7 +2246,7 @@ destroy: _guard-not-ci-apply _bootstrap ## Destroy the selected layer or workspa
 # clean deletes Terraform state and .terraform/ by glob, so it refuses unless
 # ENV_DIR is the checkout's own envs/$(ENV) (see _is_own_env_dir) with real
 # generated/ and data_access/ dirs, whatever ENV_DIR or CLOUD_ROOT say.
-clean: ## Remove generated files and Terraform state for the selected environment
+clean: _guard-not-databricks-compute ## Remove generated files and Terraform state for the selected environment
 	@if [ ! -d "$(ENV_DIR)" ]; then \
 		echo "Environment '$(ENV)' not initialized: $(ENV_DIR)"; \
 		exit 0; \
@@ -2209,7 +2263,7 @@ clean: ## Remove generated files and Terraform state for the selected environmen
 	@echo "Cleaned generated files and Terraform state in $(ENV_DIR)."
 	@echo "NOTE: auth.auto.tfvars, env.auto.tfvars, abac.auto.tfvars, $(DATA_ACCESS_SUBDIR)/abac.auto.tfvars, $(DATA_ACCESS_SUBDIR)/masking_functions.sql, and .genie_space_id were NOT removed."
 
-clean-all: ## Remove all env workspaces under envs/
+clean-all: _guard-not-databricks-compute ## Remove all env workspaces under envs/
 	@echo "=== Clean All Environments ==="
 	@rm -rf "$(CLOUD_ROOT)/envs"
 	@echo "Removed $(CLOUD_ROOT)/envs"
@@ -2240,7 +2294,7 @@ BOOTSTRAP_AUTH_ENV ?=
 $(if $(BOOTSTRAP_AUTH_ENV),$(call _check_env_name,BOOTSTRAP_AUTH_ENV))
 _BOOTSTRAP_SP_FLAGS = $(if $(filter 1,$(PLAN)),--dry-run,) $(if $(filter 1,$(YES)),--yes,) $(if $(filter 1,$(ROTATE_SECRET)),--rotate-secret,) $(if $(TARGET_CATALOG),--target-catalog "$(TARGET_CATALOG)",) $(if $(WORKSPACE_PROFILE),--workspace-profile "$(WORKSPACE_PROFILE)",) $(if $(BOOTSTRAP_AUTH_ENV),--write-auth-file "$(CLOUD_ROOT)/envs/$(BOOTSTRAP_AUTH_ENV)/auth.auto.tfvars",) $(if $(and $(filter command line,$(origin BOOTSTRAP_AUTH_OVERWRITE)),$(filter 1,$(BOOTSTRAP_AUTH_OVERWRITE))),--force-auth-file,)
 
-bootstrap-sp: ## Create/reuse and authorize the GenieRails deployment service principal
+bootstrap-sp: _guard-not-databricks-compute ## Create/reuse and authorize the GenieRails deployment service principal
 	@test -n "$(ACCOUNT_ID)" || { echo "ERROR: ACCOUNT_ID is required"; exit 2; }
 	@test -n "$(WORKSPACE_ID)" || { echo "ERROR: WORKSPACE_ID is required (comma-separated for multiple)"; exit 2; }
 	python3 "$(SHARED_ROOT)/scripts/bootstrap_sp.py" \
@@ -2260,7 +2314,7 @@ bootstrap-sp: ## Create/reuse and authorize the GenieRails deployment service pr
 _BOOTSTRAP_PIPELINES_FLAGS = $(if $(filter 1,$(PLAN)),--dry-run,) $(if $(filter 1,$(YES)),--yes,) \
 	$(foreach opt,WORKSPACE_PROFILE:workspace-profile READONLY_SP_NAME:sp-name REPO:repo ADO_ORG:ado-org ADO_ORG_ID:ado-org-id ADO_PROJECT:ado-project CATALOGS:catalogs GENIE_SPACE_IDS:genie-space-ids WAREHOUSE_ID:warehouse-id DEPLOYER_CLIENT_ID:deployer-client-id GOVERNANCE_OWNERS:governance-owners AGENT_OWNERS:agent-owners,$(if $($(word 1,$(subst :, ,$(opt)))),--$(word 2,$(subst :, ,$(opt))) "$($(word 1,$(subst :, ,$(opt))))",))
 
-bootstrap-pipelines: ## Create read-only pipeline SPs + OIDC federation for ENV (CI=github|azure-devops); prints repo settings, writes nothing to the repo
+bootstrap-pipelines: _guard-not-databricks-compute ## Create read-only pipeline SPs + OIDC federation for ENV (CI=github|azure-devops); prints repo settings, writes nothing to the repo
 	@test -n "$(ACCOUNT_ID)" || { echo "ERROR: ACCOUNT_ID is required"; exit 2; }
 	@test -n "$(WORKSPACE_ID)" || { echo "ERROR: WORKSPACE_ID is required (the $(ENV) workspace)"; exit 2; }
 	python3 "$(SHARED_ROOT)/scripts/bootstrap_pipelines.py" \
@@ -2645,7 +2699,7 @@ integration-test: _guard-not-ci-apply ## Run the full end-to-end integration tes
 	@echo "  Integration test PASSED."
 	@echo "========================================================"
 
-migrate-root-to-env: _prepare-env ## Move existing root working files into envs/<ENV>
+migrate-root-to-env: _guard-not-databricks-compute _prepare-env ## Move existing root working files into envs/<ENV>
 	@echo "=== Migrate Root Workspace to $(ENV) ==="
 	@if [ -f "$(ENV_DIR)/auth.auto.tfvars" ] || \
 		[ -f "$(ENV_DIR)/env.auto.tfvars" ] || \
