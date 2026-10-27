@@ -152,12 +152,13 @@ def test_legacy_full_and_governance_keep_validate_then_apply(tmp_path, mode, tar
     ],
 )
 def test_deterministic_next_steps_match_walkthrough(tmp_path, mode, env_name, tail):
-    """A deterministic draft follows the walkthrough: commit, make check, then rehearse or release-plan."""
+    """A deterministic draft follows the walkthrough: commit, then rehearse or release-plan (both run make check)."""
     lines = generate_next_steps(tmp_path, mode, env_name, has_sql=True, champion_flow=False, tuning=False)
 
     assert lines[: -len(tail)][-1] == (
-        f"    2. git add envs/ && git commit, then: make check ENV={env_name}   (reads committed files only)"
+        "    2. git add envs/ && git commit   (rehearse and release-plan run make check on the committed files)"
     )
+    assert not any("make check ENV=" in line for line in lines)
     assert lines[-len(tail):] == tail
     assert not any("validate-generated" in line for line in lines)
     assert not any(re.search(r"make apply\b", line) for line in lines)

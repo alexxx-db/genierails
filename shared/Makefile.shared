@@ -498,9 +498,8 @@ setup: ## Prepare the selected environment(s) and show next steps
 			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 			[ -n "$$src" ] || src=dev; \
 			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run:"; \
-			echo "     make check ENV=$(ENV)   (read-only; also runs promote-to CHECK=1, which release-plan doesn't)"; \
 			echo "     make rehearse ENV=$$src   (release-plan needs a passing rehearsal of this commit), then:"; \
-			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
+			echo "     make release-plan ENV=$(ENV)   (runs make check ENV=$(ENV) and promote-to CHECK=1, checks the commit was rehearsed; saves every plan in one manifest)"; \
 			echo "     Get that manifest approved, then: make release ENV=$(ENV)"; \
 		else \
 			echo "  5. Run: make release ENV=$(ENV)"; \
@@ -554,13 +553,15 @@ setup: ## Prepare the selected environment(s) and show next steps
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
 		fi; \
 		echo "     Review envs/$(ENV)/generated/, then commit and push envs/."; \
-		step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; rehearse doesn't run it)"; \
+		if [ "$$det" != 1 ]; then \
+			step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; a legacy rehearse doesn't run it)"; \
+		fi; \
 		if [ "$$det" = 1 ]; then \
 			step=$$((step+1)); echo "  $$step. First deploy only (rehearse refuses a non-empty account plan, e.g. the new gr_treatment tag policy):"; \
 			echo "       make account-plan    (plans the shared account layer and writes the manifest to approve; changes nothing live)"; \
 			echo "       make apply-account   (applies exactly that approved manifest)"; \
 		fi; \
-		step=$$((step+1)); echo "  $$step. Run: make rehearse ENV=$(ENV)"; \
+		step=$$((step+1)); echo "  $$step. Run: make rehearse ENV=$(ENV)$$([ "$$det" = 1 ] && echo '   (runs make check ENV=$(ENV) first: refuses before any lock or live call if the committed files fail it)')"; \
 		echo "$$access_note"; \
 		if [ "$$det" = 1 ]; then \
 			echo "     verify-access picks a row-pairing key per masked table and prints the keys it proved;"; \
@@ -1112,7 +1113,8 @@ _apply-account-locked: _guard-not-databricks-compute
 	echo ""; \
 	echo "=== Account apply complete ==="
 
-# A deterministic env's rehearse takes the env lock and writes an append-only
+# A deterministic env's rehearse first runs the read-only make check
+# (_RUN_CHECK), then takes the env lock and writes an append-only
 # receipt per commit (scripts/release_gate.py): commit, clean-tree flag, the
 # fingerprint of code and dev inputs, result, and each promotion target's
 # promote-to digest. Unchanged inputs since a passing rehearsal write a receipt
@@ -1148,6 +1150,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
+		$(call _RUN_CHECK,rehearse); \
 		$(_CUSTOM_MASK_CASES) || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
 		gate=0; $(_RELEASE_GATE) rehearse-start --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || gate=$$?; \
@@ -1308,7 +1311,8 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 
 # Two-phase release (design section 17), deterministic envs only.
 #
-# make release-plan ENV=prod first reuses the source env's rehearsal for HEAD
+# make release-plan ENV=prod first runs the read-only make check ENV=prod
+# (_RUN_CHECK, with promote-to CHECK=1), then reuses the source env's rehearsal for HEAD
 # when its inputs are unchanged (release_gate.py rehearse-reuse: the receipt
 # make rehearse ENV=dev would write without re-applying, under the dev lock;
 # it never applies), then checks provenance (release_gate.py provenance:
@@ -1331,6 +1335,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	$(_DEPLOYER_CHECK) "make release-plan" || exit 1; \
 	$(_ACCESS_CHECK) "make release-plan" || exit 1; \
 	$(_GROUP_CHECK) "make release-plan" || exit 1; \
+	$(call _RUN_CHECK,release-plan); \
 	$(_RELEASE_GATE) rehearse-reuse --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || exit 1; \
 	prov="$$(mktemp)"; \
 	$(_RELEASE_GATE) provenance --env-dir "$(ENV_DIR)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --out "$$prov" || { rm -f "$$prov"; exit 1; }; \
@@ -1785,6 +1790,13 @@ promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote
 # runs; safe under CI=true. ENV_DIR overrides are refused: it checks envs/$(ENV).
 override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter command line,$(origin ENV_DIR)), --env-dir-override "$(ENV_DIR)",) \
 	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))" --make-origin "$(origin MAKE)"
+
+# rehearse and release-plan (deterministic envs) run the same check through
+# _RUN_CHECK, after their local guards and before any live call, lock or
+# write; their _guard-genie-placeholder prerequisite already ran the two
+# guards above, so they call check_env.py directly. make check stays the
+# standalone read-only target (the PR check and the prod workflow run it).
+override _RUN_CHECK = $(_CHECK_ENV) check || { echo "$(1): refused: make check ENV=$(ENV) failed (above); nothing was locked, written or applied. Fix it, commit, then re-run make $(1) ENV=$(ENV)." >&2; exit 1; }
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
 	@$(_GENIE_PLACEHOLDER_GUARD)

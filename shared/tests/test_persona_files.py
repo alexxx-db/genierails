@@ -502,7 +502,7 @@ def test_scaffold_treatments_writes_the_envs_tag_treatments_never_shared(tmp_pat
     assert (tmp_path / "treatment_config.json").read_bytes() == (SHARED / "treatment_config.json").read_bytes()
     assert "MAPPED class.loyalty_id -> identifier" in result.stdout
     assert "envs/dev/env.auto.tfvars tag_treatments (a governance file; shared/ is unchanged)" in result.stdout
-    assert "Next: commit envs/dev/env.auto.tfvars, make generate ENV=dev, make check ENV=dev, " \
+    assert "Next: commit envs/dev/env.auto.tfvars, make generate ENV=dev, " \
         "make rehearse ENV=dev; commit and push after each step that changes envs/" in result.stdout
     model = build_model(LOYALTY, LOYALTY_TYPES, after)
     assert model.unmapped == [] and model.columns["paycat.s.t.loyalty"].value.startswith("identifier__")

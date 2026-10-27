@@ -105,17 +105,19 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
     assert "     Prefer a script? make enable-classification ENV=dev turns it on (you still review detections in the UI).\n" in out
     assert "  6. Run: make generate ENV=dev   (one run: imports the agent, finds its tables, drafts rules)\n" in out
     assert "     Review envs/dev/generated/, then commit and push envs/.\n" in out
-    assert "  7. Run: make check ENV=dev   (read-only check of the committed files; rehearse doesn't run it)\n" in out
+    # No separate make check step: a deterministic rehearse runs it first.
+    assert "Run: make check" not in out
     # A first deterministic rehearse refuses a non-empty account plan (finding #5).
     assert (
-        "  8. First deploy only (rehearse refuses a non-empty account plan, e.g. the new gr_treatment tag policy):\n"
+        "  7. First deploy only (rehearse refuses a non-empty account plan, e.g. the new gr_treatment tag policy):\n"
         "       make account-plan    (plans the shared account layer and writes the manifest to approve; changes nothing live)\n"
         "       make apply-account   (applies exactly that approved manifest)\n"
     ) in out
-    assert "  9. Run: make rehearse ENV=dev\n" in out
+    assert ("  8. Run: make rehearse ENV=dev   (runs make check ENV=dev first: refuses before any lock or live "
+            "call if the committed files fail it)\n") in out
     assert "business_access_enabled" not in out
     assert "     (grants SELECT only from table_readers after its coverage check passes, and Genie CAN_RUN only from acl_groups after the live agent coverage check)\n" in out
-    assert re.findall(r"^  (\d+)\. ", out, flags=re.MULTILINE) == [str(n) for n in range(1, 10)]
+    assert re.findall(r"^  (\d+)\. ", out, flags=re.MULTILINE) == [str(n) for n in range(1, 9)]
     assert "shared/examples/dev_to_prod/README.md" in out
     # The champion flow relies on native Data Classification, not the country overlay.
     assert "APJ" not in out
@@ -127,7 +129,7 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
     advice = out[:out.index("Next steps")]
     assert re.findall(r"Setup required: replace placeholder (<[^>]+>)", advice) == [
         "<your-deployer-principal-id>", "<most-privileged-group>"], advice
-    # The README's Dev order: commit, classify, generate (commit), check, account layer, rehearse.
+    # The README's Dev order: commit, classify, generate (commit), account layer, rehearse (which checks).
     steps = out[out.index("Next steps"):]
     assert (
         steps.index("envs/dev/auth.auto.tfvars")
@@ -138,7 +140,6 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
         < steps.index("enable-classification")
         < steps.rindex("make generate")
         < steps.index("then commit and push envs/")
-        < steps.index("make check ENV=dev")
         < steps.index("make account-plan")
         < steps.index("make apply-account")
         < steps.index("make rehearse")
@@ -196,7 +197,7 @@ def test_setup_omits_completed_walkthrough_copy_and_renumbers(cloud, tmp_path):
     result = _make(cloud, tmp_path, "setup", "ENV=dev")
     assert result.returncode == 0, result.stderr
     assert "cp ../shared/examples/dev_to_prod/env.auto.tfvars.example" not in result.stdout
-    assert re.findall(r"^  (\d+)\. ", result.stdout, flags=re.MULTILINE) == [str(n) for n in range(1, 9)]
+    assert re.findall(r"^  (\d+)\. ", result.stdout, flags=re.MULTILINE) == [str(n) for n in range(1, 8)]
 
 
 def test_setup_existing_legacy_env_does_not_request_a_deployer_principal(tmp_path):
@@ -327,9 +328,9 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
         "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run:\n",
-        "     make check ENV=prod   (read-only; also runs promote-to CHECK=1, which release-plan doesn't)\n",
         "     make rehearse ENV=dev   (release-plan needs a passing rehearsal of this commit), then:\n",
-        "     make release-plan ENV=prod   (checks the commit was rehearsed",
+        "     make release-plan ENV=prod   (runs make check ENV=prod and promote-to CHECK=1, checks the commit "
+        "was rehearsed",
         "Get that manifest approved, then: make release ENV=prod\n",
         "make maintain ENV=prod",
     ]

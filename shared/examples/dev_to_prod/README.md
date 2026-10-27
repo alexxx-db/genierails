@@ -15,18 +15,16 @@ git add .gitignore envs/ && git commit -m "Govern the first agent in dev" && git
 #   Catalog Explorer: turn on Data classification, review detections, enable auto-tagging
 make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
 git add envs/ && git commit -m "Draft the rules" && git push
-make check ENV=dev          # read-only check of the committed files (rehearse doesn't run it)
 make account-plan           # first deploy: plan the shared account layer (gr_treatment tag policy) for approval
 make apply-account          # applies exactly that approved account manifest (rehearse refuses a non-empty account plan)
-make rehearse ENV=dev       # applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
+make rehearse ENV=dev       # checks the committed files, applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
 
 # prod (same for stg or any env)
 make setup ENV=prod         # set deployer_principal_id, catalog_map and group_map; leave access_tier_groups placeholders
 make promote-to ENV=prod    # copies the reviewed rules
 #   Catalog Explorer: same classification review on the prod catalog
 git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git push
-make check ENV=prod         # also runs promote-to CHECK=1 (release-plan doesn't run it)
-make release-plan ENV=prod  # reuses dev's rehearsal for this commit (dev isn't re-applied), plans prod, writes the manifest to approve
+make release-plan ENV=prod  # reuses dev's rehearsal for this commit (dev isn't re-applied) after checking the committed files, plans prod, writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks; a first release repeats release-plan + release until "Release complete"
 make evidence ENV=prod      # live compliance record; finds the warehouse itself
 make maintain ENV=prod      # deployment machine, cron, at the last released commit
@@ -96,13 +94,7 @@ It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes 
 - **Deterministic** (the template's default): every run recomputes the column masks, the `gr_treatment` column tags, the `gr_treatment` tag policy and the mask-library functions in `masking_functions.sql` from the `class.*` tags and the mask library. It replaces hand edits to those in `envs/dev/generated/` without a warning; row filters, table tags and any custom SQL above the `-- === GenieRails deterministic mask library ===` marker in `masking_functions.sql` are kept. To change a treatment, set it in `envs/dev/env.auto.tfvars` and re-run `make generate ENV=dev`: `column_overrides` for one column, `treatment_versions` for a treatment's partial version, `tag_treatments` to map a class to another treatment ([settings](REFERENCE.md#deterministic-governance-settings)).
 - **Legacy**: re-runs keep whatever is already in `envs/dev/generated/`, including your edits, and only add rules for new columns.
 
-**5. Check.**
-```bash
-make check ENV=dev
-```
-A read-only check of what git tracks under `envs/`, in a scratch copy: validate, generated files current, validate-generated, the offline coverage check, mask tests and a structural plan. It is the PR check; `make rehearse` and `make release-plan` don't run it. It stops at the first failing step.
-
-**6. Rehearse.**
+**5. Rehearse.**
 On a fresh repo, apply the shared account layer first. `make rehearse` (like `make release`) only adds allowed treatment-tag values to it, and stops while the account plan has anything else to apply (`ERROR: account plan is non-empty`): on a first deploy, the `gr_treatment` tag policy (and the groups, with `manage_groups = true`). From a clean checkout at your pushed `origin/main`:
 ```bash
 make account-plan           # saves the account plan and writes the account manifest to approve; changes nothing live
@@ -112,6 +104,7 @@ Run the pair again whenever a later `rehearse` or `release-plan` stops on a non-
 ```bash
 make rehearse ENV=dev
 ```
+It first runs `make check ENV=dev`: a read-only check of what git tracks under `envs/`, in a scratch copy (validate, generated files current, validate-generated, the offline coverage check, mask tests and a structural plan). If a step fails, it refuses with that step's message before it takes the lock, writes anything or reads live dev. The same `make check` runs alone as the PR check.
 It applies in dev, then runs `verify-access` as its last gate (`_verify-access-gate`), querying as each test tier. A first deploy applies in phases: the masking functions and policies first, then the column tags, then (once the masks are verified live) the tier groups' `USE_CATALOG`, `USE_SCHEMA` and `SELECT`; Genie `CAN_RUN` follows the SELECT. If it stops at the first phase, nothing is live yet: fix what it reports and re-run `make rehearse ENV=dev` (it resumes), or drop the change with `make policy-abandon ENV=dev`.
 **Pass looks like:** `ALL EFFECTIVE`: each test tier sees masked values, the authorized tier sees raw ones. To re-run only that proof later: `make verify-access ENV=dev`.
 You don't set a row-pairing key: it picks one per masked table (a single-column primary key, else an untagged id-like column such as `customer_id`) and proves it unique, non-null and unmasked. A deterministic env then prints the proven `verify_key_columns` line; committing it is optional and pins those keys. Only a table with no provable key needs `verify_key_columns` set ([how keys are picked](../../docs/effective-access-verification.md#how-genierails-picks-the-row-pairing-key)).
@@ -149,21 +142,20 @@ Commit and push the promoted files to `main` (`git add .gitignore envs/`, commit
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 
-**3. Check, plan, release.** Check the committed files, plan and review the manifest, then apply exactly what was approved:
+**3. Plan, release.** Plan and review the manifest, then apply exactly what was approved:
 ```bash
-make check ENV=prod
 make release-plan ENV=prod
 make release ENV=prod
 ```
-`make release-plan ENV=prod` plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit (dev is prod's `promote_from` in this walkthrough; with `promote_from = "stg"` it is `make rehearse ENV=stg`); the dev step 6 rehearsal was of an earlier commit. Since the promotion changed only `envs/prod/`, release-plan reuses that rehearsal itself and applies nothing in dev: it prints `reusing dev's passing rehearsal of <earlier commit> (nothing is applied)`, then `code and dev inputs are unchanged since the passing rehearsal of <earlier commit>; wrote a receipt for <this commit> without re-applying` and the `promote-to ENV=prod digest` it recorded. If code or `envs/dev/` changed since (or the checkout isn't clean, or dev was rehearsed only in CI), it stops with `did not reuse a rehearsal for this commit: <why>; run make rehearse ENV=dev on this commit` and `no passing rehearsal of <commit>`: run the full `make rehearse ENV=dev`, then `make release-plan ENV=prod` again.
+`make release-plan ENV=prod` plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit (dev is prod's `promote_from` in this walkthrough; with `promote_from = "stg"` it is `make rehearse ENV=stg`); the dev step 5 rehearsal was of an earlier commit. Since the promotion changed only `envs/prod/`, release-plan reuses that rehearsal itself and applies nothing in dev: it prints `reusing dev's passing rehearsal of <earlier commit> (nothing is applied)`, then `code and dev inputs are unchanged since the passing rehearsal of <earlier commit>; wrote a receipt for <this commit> without re-applying` and the `promote-to ENV=prod digest` it recorded. If code or `envs/dev/` changed since (or the checkout isn't clean, or dev was rehearsed only in CI), it stops with `did not reuse a rehearsal for this commit: <why>; run make rehearse ENV=dev on this commit` and `no passing rehearsal of <commit>`: run the full `make rehearse ENV=dev`, then `make release-plan ENV=prod` again.
 Legacy envs skip `make release-plan`: run `make release ENV=prod` directly (`release-plan` refuses them with `Legacy envs keep: make release ENV=prod`).
-`make check ENV=prod` also runs `promote-to CHECK=1`. `make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
+`make release-plan` first runs `make check ENV=prod`, which for a promoted env also runs `promote-to CHECK=1`; if a step fails, it refuses before any lock, live call or write. `make release` releases the manifest the last `release-plan` wrote, printing its path, commit and changes first. It refuses if that manifest was already released, if a newer `release-plan` replaced it, or if anything changed since it was planned. A pipeline can name the manifest explicitly with `MANIFEST=<path>`.
 **A first release takes several rounds.** Each deterministic `make release ENV=prod` applies one manifest, and a first release needs one per step: the masking functions and policies, then the column tags, then the tier groups' `USE_CATALOG`, `USE_SCHEMA` and `SELECT`, then (for an env with agents) Genie `CAN_RUN`, which is planned only once that `SELECT` is live. A prod with existing resources that aren't in Terraform state yet starts with one more manifest that only imports them. Every round but the last prints `=== Release phase applied (prod) ===`, then a line saying what it applied (for the import round `This manifest imported existing resources into Terraform state; nothing else was applied.`, for a policy phase `This manifest held one phase of a staged policy change; it is applied and verified.`, for the `SELECT` round `This manifest opened the SELECT the Genie agents need; the workspace (CAN_RUN) is planned with it live.`), then `Next: make release-plan ENV=prod, approve the new manifest, make release ENV=prod.`. Do exactly that on the same commit (its dev rehearsal still counts) until `make release` prints `=== Release complete (prod) ===`. Later policy replacements and tier moves take one round per phase too ([staged policy changes](../../docs/deterministic-policies.md#staged-policy-changes-rollout-step-6)).
 **Expect owner and admin reader refusals on the first `release-plan`.** The reader check refuses every principal that can read a governed table outside the tiers, `raw_exempt_principals` and prod's own `deployer_principal_id`: typically the metastore admin and the owner of the prod catalog, schema and tables (`ERROR: unacknowledged reader prod:reader:<table>:<principal>: ...`). The tier groups prod's `table_readers` grants are its reviewed contract and aren't refused. Review each printed line; for each you accept, add its key (`prod:reader:<table>:<principal>`) to `envs/prod/ack.txt`, then commit, push, and `make release-plan ENV=prod` again (it reuses the dev rehearsal: `ack.txt` isn't a dev input). The lines stay valid for every round; after `Release complete`, the next `release-plan` reports them as stale (those tables are no longer newly governed): delete them then.
 **Pass looks like:** `ALL EFFECTIVE` (from its `verify-access` gate) and "Release complete". Business users can now open the agent and get masked answers. To re-run only that proof later: `make verify-access ENV=prod`.
 
 **If it stops on coverage or drift**, prod found a sensitive tag your rules don't cover. Nothing new was granted. The message prints both fixes with exact commands:
-- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make check ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make check ENV=prod`, `make release-plan ENV=prod` (it reuses the dev rehearsal, or names the command to run) and `make release ENV=prod`, committing and pushing after each step that changes `envs/`.
+- **Reuse an existing mask** (the common case): `make scaffold-treatments ENV=prod TREATMENT=<name>` adds the class to `tag_treatments` in `envs/dev/env.auto.tfvars` (`shared/` is unchanged). Commit it, then `make generate ENV=dev`, `make rehearse ENV=dev`, `make promote-to ENV=prod`, `make release-plan ENV=prod` (it reuses the dev rehearsal, or names the command to run) and `make release ENV=prod`, committing and pushing after each step that changes `envs/`.
 - **A new kind of mask**: draft and test it with the dev-only helpers (`make draft-custom-mask` / `make test-custom-mask`, see the [governance playbook](../../docs/playbooks/governance.md)). Once it passes, `make adopt-custom-mask ENV=dev TREATMENT=custom_<name>` copies it into `envs/dev/custom_masks/` and prints the `tag_treatments` line to add to `envs/dev/env.auto.tfvars`. Commit both, then continue from `make generate ENV=dev` as above. The bare `make scaffold-treatments` stub and `materialize-treatment` are legacy-mode only ([legacy mode](../../docs/legacy-mode.md)).
 
 Details: [Fixing a coverage gap found in prod](REFERENCE.md#fixing-a-coverage-gap-found-in-prod).

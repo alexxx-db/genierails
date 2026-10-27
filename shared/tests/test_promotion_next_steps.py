@@ -83,16 +83,15 @@ REUSE = "it reuses the"
 DOC_REUSE = [
     ("shared/examples/dev_to_prod/README.md", "make promote-to ENV=prod # copies the reviewed rules",
      ["git push", "make release-plan ENV=prod # reuses dev's rehearsal", "make release ENV=prod"]),
-    ("shared/examples/dev_to_prod/README.md", "**3. Check, plan, release.**",
-     ["make check ENV=prod", *MAKE_PLAN]),
+    ("shared/examples/dev_to_prod/README.md", "**3. Plan, release.**", MAKE_PLAN),
     ("shared/examples/dev_to_prod/README.md", "**Reuse an existing mask** (the common case)",
-     ["`make promote-to ENV=prod`", "`make check ENV=prod`", "`make release-plan ENV=prod`", REUSE,
+     ["`make promote-to ENV=prod`", "`make release-plan ENV=prod`", REUSE,
       "`make release ENV=prod`"]),
     ("shared/examples/dev_to_prod/REFERENCE.md", "Stops at `coverage-gate` or `audit-rulebook`",
      ["`promote-to`", "push to `origin/main`", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
     ("shared/examples/dev_to_prod/REFERENCE.md", "Deterministic envs (`governance_mode = \"deterministic\"`) never",
-     ["`make generate ENV=dev`", "`make check ENV=dev`", "`make rehearse ENV=dev`", "`make promote-to ENV=prod`",
-      "`make check ENV=prod`", "commit and push", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
+     ["`make generate ENV=dev`", "`make rehearse ENV=dev`", "`make promote-to ENV=prod`",
+      "commit and push", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
     ("shared/docs/access.md", "`make promote-to ENV=prod` (seeds prod's",
      ["push that to `origin/main`", "`make release-plan ENV=prod`", REUSE, "`make release ENV=prod`"]),
     ("shared/docs/import-genie-agent-from-ui.md", "The remaining workflow is unchanged",
@@ -501,8 +500,8 @@ def test_every_coverage_gap_fix_prints_the_readme_recovery_sequence(tmp_path, ca
     dev, prod = _gap_envs(tmp_path)
     readme = _readme_recovery()
     # No second make rehearse ENV=dev: release-plan reuses the rehearsal of the commit before the promotion.
-    assert readme == ["make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
-                      "make promote-to ENV=prod", "make check ENV=prod",
+    # No make check either: rehearse and release-plan run it first.
+    assert readme == ["make generate ENV=dev", "make rehearse ENV=dev", "make promote-to ENV=prod",
                       "make release-plan ENV=prod", "make release ENV=prod"]
     builder = coverage_fix.recovery_steps(["dev", "prod"], "envs/dev/env.auto.tfvars")
     assert builder.startswith("commit envs/dev/env.auto.tfvars, make generate ENV=dev")
@@ -522,10 +521,10 @@ def test_every_coverage_gap_fix_prints_the_readme_recovery_sequence(tmp_path, ca
     assert re.findall(MAKE_STEP, mask.split("then ", 1)[1]) == readme
 
 
-def test_an_unpromoted_envs_coverage_gap_fix_generates_checks_and_rehearses_itself(tmp_path, capsys, monkeypatch):
+def test_an_unpromoted_envs_coverage_gap_fix_generates_and_rehearses_itself(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("GENIERAILS_RERUN_TARGET", raising=False)
     dev, _prod = _gap_envs(tmp_path)
-    expected = ["make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev"]
+    expected = ["make generate ENV=dev", "make rehearse ENV=dev"]  # rehearse runs make check first
     builder = coverage_fix.recovery_steps(["dev"], "envs/dev/env.auto.tfvars", "make rehearse ENV=dev")
     assert re.findall(MAKE_STEP, builder) == expected
     assert f"Next: {builder}\n" in _scaffold_output(capsys, "dev", dev, dev)
@@ -556,8 +555,8 @@ def test_a_prod_promoted_from_a_rehearsed_stg_maps_and_rehearses_in_stg(tmp_path
     monkeypatch.delenv("GENIERAILS_RERUN_TARGET", raising=False)
     _dev, stg, prod = _chain_envs(tmp_path, "")
     assert coverage_fix.promotion_chain(prod) == ["stg", "prod"]
-    expected = ["make generate ENV=stg", "make check ENV=stg", "make rehearse ENV=stg", "make promote-to ENV=prod",
-                "make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod"]
+    expected = ["make generate ENV=stg", "make rehearse ENV=stg", "make promote-to ENV=prod",
+                "make release-plan ENV=prod", "make release ENV=prod"]
     builder = coverage_fix.recovery_steps(["stg", "prod"], "envs/stg/env.auto.tfvars")
     assert re.findall(MAKE_STEP, builder) == expected
     for text in _all_fixes(prod):
@@ -575,9 +574,10 @@ def test_a_prod_promoted_through_a_promoted_stg_maps_in_dev_and_never_hand_edits
     assert coverage_fix.promotion_chain(prod) == ["dev", "stg", "prod"]
     builder = coverage_fix.recovery_steps(["dev", "stg", "prod"], "envs/dev/env.auto.tfvars")
     assert re.findall(MAKE_STEP, builder) == [
-        "make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev", "make promote-to ENV=stg",
+        "make generate ENV=dev", "make rehearse ENV=dev", "make promote-to ENV=stg",
         "make check ENV=stg", "make promote-to ENV=prod", "make check ENV=prod"]
-    # make rehearse refuses a promoted stg, so no rehearse of stg and no release-plan of prod is offered.
+    # make rehearse refuses a promoted stg, so no rehearse of stg and no release-plan of prod is offered:
+    # nothing would run make check for stg or prod, so the steps keep it.
     assert "release-plan ENV=prod needs a passing rehearsal of stg, and make rehearse refuses envs/stg" in builder
     for text in _all_fixes(prod):
         assert f"then {builder}" in text

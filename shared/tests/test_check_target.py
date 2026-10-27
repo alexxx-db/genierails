@@ -789,3 +789,99 @@ def test_check_removes_the_scratch_copy_when_copying_credentials_fails(repo, tmp
         check_env._check(args)
 
     assert list(scratch_tmp.iterdir()) == []
+
+
+# ── rehearse and release-plan run the same check first ──────────────────────
+# The first step after the check is a live call (rehearse: the custom-mask live
+# check; release-plan: rehearse-reuse, which takes the source env's lock). Both
+# are stubbed to record and stop, so a test sees whether the check let the
+# command reach them, and nothing else live can run.
+
+FIRST_LIVE_STEP = {"rehearse": "custom_masks.py live-check", "release-plan": "release_gate.py rehearse-reuse"}
+
+
+def _make_gated(repo, tmp_path, target, env):
+    """make <target> ENV=<env>, first live step stubbed (the deployer SP's auth file is written first)."""
+    from shared.tests import script_stubs
+
+    log = tmp_path / "live-steps.log"
+    recorder = tmp_path / "live-step"
+    recorder.write_text(f'#!/bin/sh\necho "$0 $*" >> "{log}"\nexit 1\n')
+    recorder.chmod(0o755)
+    # The fixture's agent has no acl_groups: the local reader and group guards
+    # (tested on their own) pass here so the command reaches the check.
+    stub_bin = script_stubs.install(tmp_path / "stub-bin", {FIRST_LIVE_STEP[target]: str(recorder),
+                                                           "table_readers.py check": "true",
+                                                           "group_map.py check": "true"})
+    environ = _env(tmp_path)
+    environ["PATH"] = f"{stub_bin}:{environ['PATH']}"
+    result = subprocess.run(["make", "--no-print-directory", "-C", str(repo / "aws"), target, f"ENV={env}"],
+                            text=True, capture_output=True, env=environ, timeout=300)
+    return result, (log.read_text() if log.exists() else "")
+
+
+def _write_auth(repo, env):
+    deployer = hcl2.load(open(_envs(repo) / env / "env.auto.tfvars")).get("deployer_principal_id", "")
+    (_envs(repo) / env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+
+
+def _no_lock_or_receipt(repo):
+    assert not list(_envs(repo).rglob(".governance.lock")), "a lock was taken"
+    assert not list(repo.rglob("receipts")), "a receipt was written"
+
+
+@pytest.mark.parametrize("target, env", [("rehearse", "dev"), ("release-plan", "prod")])
+def test_a_broken_committed_config_is_refused_before_any_lock_write_or_live_call(promoted, tmp_path, target, env):
+    # Valid config whose committed generated file the commit doesn't regenerate.
+    edited = _envs(promoted) / env / "generated" / "abac.auto.tfvars"
+    edited.write_text(edited.read_text().replace('"c"' if env == "dev" else "account_last4",
+                                                 '"hand edited"' if env == "dev" else "redact", 1))
+    _commit(promoted, "hand edit")
+    _write_auth(promoted, env)
+    before = _baseline(promoted)
+
+    result, live = _make_gated(promoted, tmp_path, target, env)
+
+    assert result.returncode != 0
+    # check's own message, then the command's refusal.
+    assert ": differs from the regenerated file" in result.stderr
+    assert f"=== make check ENV={env}: FAILED (" in result.stderr
+    assert (f"{target}: refused: make check ENV={env} failed (above); nothing was locked, written or applied."
+            in result.stderr)
+    if env == "prod":
+        assert "FAILED (promote-to ENV=prod CHECK=1)" in result.stderr
+    assert live == "", "the command went past the check"
+    assert "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(promoted)
+    _assert_read_only(promoted, before)
+
+
+def test_rehearse_on_a_valid_committed_config_passes_the_check_and_goes_on(repo, tmp_path):
+    _write_auth(repo, "dev")
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    out = result.stdout + result.stderr
+    assert "=== make check ENV=dev: passed ===" in out, out
+    assert "refused: make check" not in out
+    # The check's structural plan ran; then rehearse went on to its first live step.
+    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access",
+                                                                  "plan workspace expected-withholding"]
+    assert "--env dev" in live, out
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
+
+
+def test_release_plan_check_runs_after_the_workspace_env_and_mode_guards(repo, tmp_path):
+    # A legacy env is refused with release-plan's own message, before any check.
+    (_envs(repo) / "dev" / "env.auto.tfvars").write_text(DEV_ENV.replace("deterministic", "legacy"))
+    _commit(repo, "legacy")
+
+    result, live = _make_gated(repo, tmp_path, "release-plan", "dev")
+
+    assert result.returncode != 0
+    assert "is not in deterministic governance mode" in result.stderr
+    assert "make check ENV=dev" not in result.stdout + result.stderr
+    assert live == ""

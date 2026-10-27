@@ -101,13 +101,6 @@ stages:
                     WORKSPACE_ID: $(DEV_DATABRICKS_WORKSPACE_ID)
                     HOST: $(DEV_DATABRICKS_WORKSPACE_HOST)
 
-                - script: make check ENV=dev
-                  displayName: Read-only check of the merged commit
-                  workingDirectory: azure
-                  env:
-                    DATABRICKS_AUTH_TYPE: azure-devops-oidc
-                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-
                 # The service connection must use workload identity federation.
                 - task: AzureCLI@2
                   displayName: Rehearse dev
