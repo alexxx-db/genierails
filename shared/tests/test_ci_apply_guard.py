@@ -284,20 +284,34 @@ MAKE_CALL_SITES = {
 # Python modules that import ci_guard (or its wrapper staged_policy_apply._in_ci), each proven fail-closed below.
 PY_CALL_SITES = {"scripts/env_status.py": "ci_guard", "scripts/staged_policy_apply.py": "ci_guard",
                  "scripts/policy_generations.py": "_in_ci"}
+# Each broken ci_guard.py, as a script body. LINE is the permissive answer for the subcommand it was asked
+# (ci-status: not CI; apply/rebind: allowed), so a stub can print the right words with the wrong exit code.
+# ci_guard.py's answer protocol (versioned; test_every_ci_guard_call_site_is_listed checks ci_guard.ANSWERS).
+STATUS_CI, STATUS_NOT_CI = "genierails-ci-status:v1:ci", "genierails-ci-status:v1:not-ci"
+ALLOWED, REFUSED = "genierails-ci-guard:v1:allowed", "genierails-ci-guard:v1:refused"
+PRELUDE = ("import sys\nLINE = {{'ci-status': {not_ci!r}, 'apply': {allowed!r}, 'rebind': {allowed!r}}}"
+           ".get(sys.argv[1] if len(sys.argv) > 1 else '', '')\n")
 BROKEN = {
     "missing": None,
     "crash": "raise RuntimeError('ci_guard is broken')\n",
-    "unexpected-exit": "import sys\nsys.exit(7)\n",
-    "garbled-ci-answer": "import sys\nsys.exit(1)\n",
+    "unexpected-exit": "sys.exit(7)\n",
+    "exit-1": "sys.exit(1)\n",
+    "exit-10": "sys.exit(10)\n",                        # 891e8b3's "CI" answer, from anything
+    "exit-0-silent": "sys.exit(0)\n",
+    "right-line-nonzero-exit": "print(LINE)\nsys.exit(3)\n",
+    "garbage": "print('yes')\nsys.exit(0)\n",
+    "extra-output": "print(LINE)\nprint(LINE)\nsys.exit(0)\n",
+    "wrong-version": "print(LINE.replace(':v1:', ':v2:'))\nsys.exit(0)\n",
 }
-# For call sites behind _guard-not-ci-apply: every subcommand but apply breaks (apply passes), so the
-# call site itself is what has to refuse. "missing" runs a script path that doesn't exist.
+# For call sites behind _guard-not-ci-apply: apply answers allowed, every other subcommand is broken as
+# ``mode`` says, so the call site itself is what has to refuse. "missing" runs a script path that doesn't exist.
 STUB = """import os, runpy, sys
 command = sys.argv[1] if len(sys.argv) > 1 else ""
 if command == "apply":
+    print({allowed!r})
     sys.exit(0)
 mode = {mode!r}
-if mode != "real":  # every subcommand but apply: ci-status (or 918e199's in-ci)
+if mode != "real":
     if mode == "missing":
         os.execv(sys.executable, [sys.executable, {missing!r}])
     exec(compile({broken!r}, "ci_guard.py", "exec"))
@@ -330,7 +344,16 @@ def test_every_ci_guard_call_site_is_listed():
     # Never a bare `if` on it: only _CI_STATUS reads ci-status, and it refuses on any code but 0 and 10.
     assert not re.search(r"\bif !? *\$\(_CI_GUARD\)", text)
     assert text.count("$(_CI_GUARD) ci-status") == 1
-    assert '[ "$$ci_rc" != 0 ] && [ "$$ci_rc" != 10 ]' in text
+    # Only the exact (exit code, line) answers of ci_guard.ANSWERS pass; each Makefile matcher lists exactly those.
+    from scripts import ci_guard
+
+    for name, command in (("_CI_STATUS", "ci-status"), ("_CI_GUARD_ANSWER", "apply")):
+        block = text.split(f"override {name} = ", 1)[1].split("\n# ", 1)[0].split("\n_guard", 1)[0]
+        pairs = set(re.findall(r'"(\d+):(genierails-[a-z-]+:v\d+:[a-z-]+)"\)', block))
+        assert {(int(rc), line) for rc, line in pairs} == ci_guard.ANSWERS[command]
+        assert ") echo \"ERROR: the CI" in block and "exit 1 ;;" in block
+    assert ci_guard.ANSWERS == {"ci-status": {(0, STATUS_CI), (0, STATUS_NOT_CI)},
+                                "apply": {(0, ALLOWED), (1, REFUSED)}, "rebind": {(0, ALLOWED), (1, REFUSED)}}
     found = {}
     for path in sorted((SHARED / "scripts").glob("*.py")) + sorted(SHARED.glob("*.py")):
         rel = str(path.relative_to(SHARED))
@@ -360,13 +383,14 @@ def _shared_copy(tmp_path: Path, mode: str, *, stub: bool) -> Path:
     if not real.exists():
         shutil.copyfile(SHARED / "scripts" / "ci_guard.py", real)
         (tmp_path / "state_layout.py").symlink_to(SHARED / "scripts" / "state_layout.py")
+    prelude = PRELUDE.format(not_ci=STATUS_NOT_CI, allowed=ALLOWED)
     if stub:
-        guard.write_text(STUB.format(mode=mode, missing=str(tmp_path / "no-such-ci_guard.py"),
-                                     broken=BROKEN.get(mode) or "", real=str(real)))
+        guard.write_text(STUB.format(mode=mode, missing=str(tmp_path / "no-such-ci_guard.py"), allowed=ALLOWED,
+                                     broken=prelude + (BROKEN.get(mode) or ""), real=str(real)))
     elif BROKEN.get(mode, "") is None:
         guard.unlink()
     else:
-        guard.write_text(BROKEN[mode])
+        guard.write_text(prelude + BROKEN[mode])
     return copy
 
 
@@ -399,8 +423,7 @@ def test_a_broken_ci_guard_refuses_at_every_call_site(tmp_path, target, mode, ci
     result = _site_run(tmp_path, target, mode, CI_ENVS[ci])
     output = result.stdout + result.stderr
     assert result.returncode != 0, f"make {target} ran with ci_guard.py {mode} ({ci}):\n{output}"
-    if MAKE_CALL_SITES[target] == "ci-status":
-        assert "the CI check (" in output and "failed (exit" in output and "refusing, as in CI" in output
+    assert "gave no valid answer (exit" in output and "refusing, as in CI" in output
 
 
 @pytest.mark.parametrize("target,ci,refused", [
@@ -412,25 +435,31 @@ def test_a_healthy_ci_guard_still_answers_at_the_status_call_sites(tmp_path, tar
     """The control for the test above: with a working ci_guard.py those same runs pass or refuse on their merits."""
     result = _site_run(tmp_path, target, "healthy", CI_ENVS[ci])
     output = result.stdout + result.stderr
-    assert "the CI check (" not in output
+    assert "gave no valid answer" not in output
     if refused:
         assert result.returncode != 0 and "uses legacy governance, which the CI dev pipeline doesn't run" in output
     else:
         assert result.returncode == 0, output
 
 
-def test_ci_status_exit_codes():
-    def status(env, *args):
-        return subprocess.run([sys.executable, str(SHARED / "scripts" / "ci_guard.py"), "ci-status", *args],
-                              env=_clean_env(**env), capture_output=True, text=True).returncode
+def test_ci_guard_answers_one_exact_line():
+    from scripts import ci_guard
 
-    assert status({}) == 0
-    assert status({"CI": "true"}) == 10 and status({"TF_BUILD": "True"}) == 10
-    assert status({"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "1"}, "--allow-opt-out") == 0
-    assert status({"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "1"}) == 10
+    def answer(env, *args):
+        result = subprocess.run([sys.executable, str(SHARED / "scripts" / "ci_guard.py"), *args],
+                                env=_clean_env(**env), capture_output=True, text=True)
+        return result.returncode, result.stdout
+
+    not_ci, ci = (0, ci_guard.STATUS_NOT_CI + "\n"), (0, ci_guard.STATUS_CI + "\n")
+    assert answer({}, "ci-status") == not_ci
+    assert answer({"CI": "true"}, "ci-status") == ci and answer({"TF_BUILD": "True"}, "ci-status") == ci
+    assert answer({"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "1"}, "ci-status", "--allow-opt-out") == not_ci
+    assert answer({"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "1"}, "ci-status") == ci
+    assert answer({}, "rebind") == (0, ci_guard.ALLOWED + "\n")
+    assert answer({"CI": "true", "GENIERAILS_ALLOW_CI_APPLY": "1"}, "rebind") == (1, ci_guard.REFUSED + "\n")
 
 
-@pytest.mark.parametrize("failure", ["import", "raise"])
+@pytest.mark.parametrize("failure", ["import", "raise", "garbled-answer", "empty-answer"])
 def test_python_call_sites_count_a_broken_ci_guard_as_ci(monkeypatch, failure):
     sys.path.insert(0, str(SHARED))
     from scripts import env_status, policy_generations, staged_policy_apply
@@ -446,8 +475,12 @@ def test_python_call_sites_count_a_broken_ci_guard_as_ci(monkeypatch, failure):
         def boom(*args, **kwargs):
             raise RuntimeError("ci_guard is broken")
 
-        monkeypatch.setattr(ci_guard, "ci_markers", boom)
-        monkeypatch.setattr(ci_guard, "in_ci", boom)
+        if failure == "raise":
+            monkeypatch.setattr(ci_guard, "status_line", boom)
+            monkeypatch.setattr(ci_guard, "ci_markers", boom)
+        else:  # a status_line that answers anything but its exact lines
+            answer = "genierails-ci-status:v2:not-ci" if failure == "garbled-answer" else ""
+            monkeypatch.setattr(ci_guard, "status_line", lambda *args, **kwargs: answer)
     assert staged_policy_apply._in_ci({}) is True
     assert staged_policy_apply._in_ci({"GENIERAILS_ALLOW_CI_APPLY": "1"}) is True
     with pytest.raises(policy_generations.StageError, match="can't run in CI"):

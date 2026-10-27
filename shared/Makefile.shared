@@ -324,19 +324,31 @@ _guard-genie-placeholder:
 # with locked remote state is state_layout.ci_allowed). make next reads the
 # same module and the guarded targets below, so it never suggests one CI refuses.
 override _CI_GUARD = python3 "$(SHARED_ROOT)/scripts/ci_guard.py"
-# Sets ci_rc to 0 (not CI, or GENIERAILS_ALLOW_CI_APPLY=1) or 10 (CI). Any other
-# code (ci_guard.py missing or failing) refuses here, in CI or not: fail closed.
-override _CI_STATUS = ci_rc=0; $(_CI_GUARD) ci-status --allow-opt-out || ci_rc=$$?; \
-	if [ "$$ci_rc" != 0 ] && [ "$$ci_rc" != 10 ]; then \
-		echo "ERROR: the CI check ($(SHARED_ROOT)/scripts/ci_guard.py ci-status) failed (exit $$ci_rc); refusing, as in CI." >&2; exit 1; \
-	fi
+# ci_guard.py answers with one exact versioned line and its exit code
+# (ci_guard.ANSWERS); only that pair counts. Anything else (a missing, failing
+# or unrelated script, any other code or output) refuses, in CI or not.
+# _CI_STATUS sets ci to 1 (CI) or 0 (not CI, or GENIERAILS_ALLOW_CI_APPLY=1).
+override _CI_STATUS = ci_out="$$($(_CI_GUARD) ci-status --allow-opt-out)"; ci_rc=$$?; \
+	case "$$ci_rc:$$ci_out" in \
+		"0:genierails-ci-status:v1:ci") ci=1 ;; \
+		"0:genierails-ci-status:v1:not-ci") ci=0 ;; \
+		*) echo "ERROR: the CI check ($(SHARED_ROOT)/scripts/ci_guard.py ci-status) gave no valid answer (exit $$ci_rc); refusing, as in CI." >&2; exit 1 ;; \
+	esac
+# After ci_out/ci_rc of ci_guard.py apply or rebind: on to the recipe only when allowed.
+override _CI_GUARD_ANSWER = case "$$ci_rc:$$ci_out" in \
+		"0:genierails-ci-guard:v1:allowed") ;; \
+		"1:genierails-ci-guard:v1:refused") exit 1 ;; \
+		*) echo "ERROR: the CI guard ($(SHARED_ROOT)/scripts/ci_guard.py) gave no valid answer (exit $$ci_rc); refusing, as in CI." >&2; exit 1 ;; \
+	esac
 _guard-not-ci-apply:
-	@GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" $(_CI_GUARD) apply --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)"
+	@ci_out="$$(GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" $(_CI_GUARD) apply --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)")"; ci_rc=$$?; \
+	$(_CI_GUARD_ANSWER)
 
 # policy-rebind repairs a live rolled-back change: CI never runs it, and
 # GENIERAILS_ALLOW_CI_APPLY=1 (for throwaway integration workflows) doesn't apply.
 _guard-not-ci-rebind:
-	@$(_CI_GUARD) rebind
+	@ci_out="$$($(_CI_GUARD) rebind)"; ci_rc=$$?; \
+	$(_CI_GUARD_ANSWER)
 
 migrate-state-dir: _guard-not-ci-apply ## Move local state and records to GENIERAILS_STATE_DIR (env lock held, never overwrites)
 	@$(_DRY_RUN_GUARD); python3 "$(SHARED_ROOT)/scripts/state_layout.py" migrate --env-dir "$(ENV_DIR)" --env "$(ENV)"
@@ -962,7 +974,7 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 # the approved account-plan/apply-account flow applies it).
 _guard-account-plan-empty:
 	@$(_CI_STATUS); \
-	if [ "$$ci_rc" = 10 ] && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
+	if [ "$$ci" = 1 ] && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
 		echo "ERROR: in CI the account plan needs $(ACCOUNT_ENV_DIR)/remote_state.hcl, so it plans against the real account state (not the runner's empty state)." >&2; exit 1; \
 	fi; \
 	set +e; LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
@@ -1094,7 +1106,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		exit 1; \
 	fi; \
 	$(_CI_STATUS); \
-	if [ "$$ci_rc" = 10 ]; then \
+	if [ "$$ci" = 1 ]; then \
 		echo "rehearse: ENV=$(ENV) uses legacy governance, which the CI dev pipeline doesn't run (its applies take no env lock); set governance_mode = \"deterministic\" in envs/$(ENV)/env.auto.tfvars, or rehearse on the deployment machine." >&2; exit 1; \
 	fi; \
 	$(_LEGACY_GUARD) rehearse || exit 1; \

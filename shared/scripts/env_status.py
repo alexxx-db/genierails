@@ -75,8 +75,13 @@ def _ci(cloud_dir: Path, makefile_cloud_dir: Path) -> dict:
     try:
         from scripts import ci_guard
 
-        markers = ci_guard.ci_markers()
-        out = {"detected": bool(markers), "markers": markers, "allow_ci_apply": ci_guard.opted_out()}
+        # Only ci_guard's exact answers count; anything else is CI with no opt-out.
+        detected = ci_guard.status_line() != ci_guard.STATUS_NOT_CI
+        allowed = detected and ci_guard.status_line(allow_opt_out=True) == ci_guard.STATUS_NOT_CI
+        markers = list(ci_guard.ci_markers()) if detected else []
+        if detected and not markers:
+            raise ValueError("ci-status gave no valid answer")
+        out = {"detected": detected, "markers": markers, "allow_ci_apply": allowed}
     except Exception as exc:
         return {"detected": True, "markers": ["ci_guard.py failed"], "allow_ci_apply": False,
                 "dev_rehearse_allowed": False, "error": f"{type(exc).__name__}: {exc}"}

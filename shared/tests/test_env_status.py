@@ -628,8 +628,8 @@ def test_make_and_next_share_one_ci_detection():
     """No inline CI check is left in Makefile.shared: every one runs scripts/ci_guard.py, which make next imports."""
     text = (ROOT / "shared" / "Makefile.shared").read_text()
     assert "TF_BUILD" not in text and "ci_value" not in text and "in-ci" not in text
-    assert "\n_guard-not-ci-apply:\n\t@GENIERAILS_MAKE_GOALS=\"$(MAKECMDGOALS)\" $(_CI_GUARD) apply " in text
-    assert "\n_guard-not-ci-rebind:\n\t@$(_CI_GUARD) rebind\n" in text
+    assert "\n_guard-not-ci-apply:\n\t@ci_out=\"$$(GENIERAILS_MAKE_GOALS=\"$(MAKECMDGOALS)\" $(_CI_GUARD) apply " in text
+    assert "\n_guard-not-ci-rebind:\n\t@ci_out=\"$$($(_CI_GUARD) rebind)\"; ci_rc=$$?; \\\n\t$(_CI_GUARD_ANSWER)\n" in text
     assert "CI_MARKERS" not in (ROOT / "shared" / "scripts" / "staged_policy_apply.py").read_text()
     guarded = env_status.ci_guarded_targets()
     assert {"rehearse", "release", "release-plan", "maintain", "apply-account", "policy-abandon"} <= set(guarded)

@@ -1395,7 +1395,7 @@ def _in_ci(environ: dict, *, opt_out: bool = True) -> bool:
     try:
         from scripts import ci_guard
 
-        return ci_guard.in_ci(environ) and not (opt_out and ci_guard.opted_out(environ))
+        return ci_guard.status_line(environ, allow_opt_out=opt_out) != ci_guard.STATUS_NOT_CI
     except Exception:  # fail closed: a missing or failing CI check counts as CI
         return True
 
