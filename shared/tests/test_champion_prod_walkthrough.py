@@ -152,7 +152,7 @@ def test_the_prod_section_reads_as_expected():
     assert prod_commands() == [
         "make setup ENV=prod", "make promote-to ENV=prod",
         "git add .gitignore envs/", "git commit", "git push",
-        "make check ENV=prod", "make rehearse ENV=dev", "make release-plan ENV=prod",
+        "make check ENV=prod", "make release-plan ENV=prod",
     ]
     # The whole flow's prod commit adds the same files.
     flow = _section("The whole flow")
@@ -206,7 +206,7 @@ def test_the_release_recipe_prints_heading_then_explanation_then_next_per_round(
 
 
 def test_prod_step_3_says_a_first_release_takes_several_rounds_in_the_real_messages():
-    step = _step(_section("Prod"), "3. Check, rehearse, plan, release.")
+    step = _step(_section("Prod"), "3. Check, plan, release.")
     rounds = step[step.index("**A first release takes several rounds.**"):]
     rounds = rounds[:rounds.index("\n")]
     # The README shows one round's output in the recipe's order: heading, what it applied, Next;
@@ -236,7 +236,7 @@ def test_prod_step_3_says_a_first_release_takes_several_rounds_in_the_real_messa
 
 
 def test_prod_step_3_tells_legacy_envs_to_skip_release_plan():
-    step = _step(_section("Prod"), "3. Check, rehearse, plan, release.")
+    step = _step(_section("Prod"), "3. Check, plan, release.")
     line = "Legacy envs skip `make release-plan`: run `make release ENV=prod` directly " \
         "(`release-plan` refuses them with `Legacy envs keep: make release ENV=prod`)."
     assert line in step.splitlines()
@@ -276,8 +276,9 @@ def test_following_the_prod_section_word_for_word_reaches_a_release_manifest(cus
 
     promoted = repo.head()
     assert repo.git("status", "--porcelain") == ""
-    rehearse_out = out["make rehearse ENV=dev"]
-    assert "without re-applying" in rehearse_out and "NOT a clean checkout" not in rehearse_out, rehearse_out
+    # No second make rehearse ENV=dev: release-plan reused dev's rehearsal for the promotion commit.
+    plan_out = out["make release-plan ENV=prod"]
+    assert "reusing dev's passing rehearsal of" in plan_out and "without re-applying" in plan_out, plan_out
     assert rg.passing_receipt(repo.cloud, "dev", promoted)["applied"] is False
     manifest = rg.current_manifest(repo.cloud / "envs" / "prod", "prod")
     assert manifest and manifest.is_file(), out["make release-plan ENV=prod"]

@@ -287,9 +287,11 @@ def fix_lines(
 
 def promoted_release_steps(env_name: str, source: str) -> str:
     """What follows promote-to in a deterministic env: release-plan plans only a commit on
-    origin/main that has a passing rehearsal of the source env at that same commit."""
-    return (f"commit and push envs/{env_name}/ to origin/main (or merge its PR), make rehearse ENV={source} "
-            f"on that commit, make release-plan ENV={env_name} and make release ENV={env_name}")
+    origin/main with a passing rehearsal of the source env there, and writes that receipt itself
+    from an earlier rehearsal when the source env's inputs are unchanged (rehearse-reuse)."""
+    return (f"commit and push envs/{env_name}/ to origin/main (or merge its PR), make release-plan "
+            f"ENV={env_name} (it reuses the {source} rehearsal, or names the command to run) and make release "
+            f"ENV={env_name}")
 
 
 def recovery_steps(chain: list[str], changed: str, rerun: str = "") -> str:

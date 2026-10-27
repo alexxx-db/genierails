@@ -523,9 +523,9 @@ def test_scaffold_in_a_promoted_env_writes_the_env_it_is_promoted_from(tmp_path)
     assert hcl2.loads((dev / "env.auto.tfvars").read_text())["tag_treatments"] == {"class.loyalty_id": "redact"}
     assert (prod / "env.auto.tfvars").read_bytes() == prod_before, "promote-to owns prod's copy"
     assert "promote-to carries tag_treatments from envs/dev to prod." in result.stdout
-    # release-plan needs the promotion on origin/main and a dev rehearsal of that same commit.
+    # release-plan needs the promotion on origin/main; it reuses the dev rehearsal itself.
     after = result.stdout[result.stdout.index("make promote-to ENV=prod"):]
-    steps = ["commit and push envs/prod/", "make rehearse ENV=dev on that commit", "make release-plan ENV=prod",
+    steps = ["commit and push envs/prod/", "make release-plan ENV=prod", "it reuses the dev rehearsal",
              "make release ENV=prod"]
     assert [after.index(step) for step in steps] == sorted(after.index(step) for step in steps)
 
@@ -569,9 +569,10 @@ def test_the_coverage_gap_fix_points_deterministic_envs_at_tag_treatments(tmp_pa
     assert "envs/dev/env.auto.tfvars; shared/ is product code" in text
     assert "make scaffold-treatments ENV=prod TREATMENT=<mask-library treatment>" in text
     assert "make promote-to ENV=prod" in text
-    # The promotion is a new commit: push it and rehearse dev on it before release-plan.
+    # The promotion is a new commit: push it; release-plan reuses dev's rehearsal (no second rehearse).
     after_promote = text[text.index("make promote-to ENV=prod"):]
-    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
+    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make release-plan ENV=prod")
+    assert "it reuses the dev rehearsal" in after_promote and "make rehearse ENV=dev" not in after_promote
     assert "shared/treatment_config.json" not in text
 
 
@@ -584,7 +585,8 @@ def test_the_missing_mask_fix_in_a_deterministic_env_maps_or_adopts_never_materi
     assert "make adopt-custom-mask ENV=dev TREATMENT=custom_<name>" in text
     assert "tag_treatments (or column_overrides) in envs/dev/env.auto.tfvars" in text
     after_promote = text[text.index("make promote-to ENV=prod"):]
-    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make rehearse ENV=dev")
+    assert after_promote.index("commit and push envs/prod/") < after_promote.index("make release-plan ENV=prod")
+    assert "it reuses the dev rehearsal" in after_promote and "make rehearse ENV=dev" not in after_promote
 
 
 @pytest.mark.parametrize("env", ["dev", "prod"])
