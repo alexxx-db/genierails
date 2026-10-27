@@ -17,10 +17,15 @@ Markers (any one means Databricks compute):
   DB_CLUSTER_ID               classic all-purpose and job clusters (the
   DB_IS_JOB_CLUSTER           documented default cluster environment variables)
   DATABRICKS_APP_NAME         Databricks Apps (a documented default variable)
-  /Workspace mount            the workspace files FUSE mount on Databricks
-                              Runtime and serverless compute: an exact-case
-                              /Workspace entry under / that is a mount point,
-                              so serverless is caught even without a variable
+  /Workspace + /databricks    the workspace files FUSE mount (an exact-case
+                              /Workspace entry under / that is a mount point)
+                              together with the /databricks tree Databricks
+                              Runtime images carry (/databricks/python3); a
+                              /Workspace mount alone never counts
+
+Detection is best-effort, an accident guard rather than a security boundary:
+a run with no marker (serverless environment 1 may set none of them) is not
+detected and so not refused.
 
 An environment marker counts only when set and non-empty. Credentials-only
 variables (DATABRICKS_HOST, DATABRICKS_CLIENT_ID, ...) and Databricks Connect's
@@ -60,17 +65,21 @@ READ_ONLY = "make check, plan, validate, evidence and audit-schema"
 
 
 WORKSPACE_MOUNT = "Workspace"
+RUNTIME_TREE = "databricks"
 
 
 def marker(environ, root: Path = Path("/")) -> str | None:
-    """The first Databricks compute marker: a variable set in ``environ``, or the /Workspace mount."""
+    """The first Databricks compute marker: a variable set in ``environ``, or /Workspace with /databricks."""
     found = next((name for name in MARKERS if environ.get(name)), None)
     if found:
         return found
     try:
-        # Exact case, so a case-insensitive disk's /workspace never counts.
-        if WORKSPACE_MOUNT in os.listdir(root) and os.path.ismount(root / WORKSPACE_MOUNT):
-            return f"the {root / WORKSPACE_MOUNT} mount"
+        # Exact case, so a case-insensitive disk's /workspace never counts; a
+        # /Workspace mount needs the Databricks Runtime tree beside it.
+        entries = os.listdir(root)
+        if (WORKSPACE_MOUNT in entries and os.path.ismount(root / WORKSPACE_MOUNT)
+                and RUNTIME_TREE in entries and (root / RUNTIME_TREE).is_dir()):
+            return f"the {root / WORKSPACE_MOUNT} mount with {root / RUNTIME_TREE}"
     except OSError:
         pass
     return None

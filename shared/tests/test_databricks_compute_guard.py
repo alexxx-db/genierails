@@ -46,6 +46,10 @@ SINKS = {
     "Genie ID record or receipt": r'agent_ownership\.py"\)?\s+(?:detach|receipt|restore-ids|sync)\b',
     "live tag or identity write": r"sync_tag_policies\.py|bootstrap_sp\.py|bootstrap_pipelines\.py",
     "promotion transaction": r"_PROMOTION_TXN_BEGIN\b",
+    # rm, mv or cp onto Terraform state, its data dir and lock file, Genie ID
+    # files, or the whole envs/ tree (not _prepare-env's old-layout leftovers).
+    "state file move or delete": r'\b(?:rm|mv|cp)\s(?:[^;\n|&]|&&)*?'
+                                 r'(?:tfstate|\.terraform\b|\.genie_space_id|/envs"(?=[\s;]|$))',
 }
 MAKE_CALL = r'\$\(MAKE\)(?:\s+(?:--?[\w-]+|[A-Za-z_]+="[^"]*"|[A-Za-z_]+=\S*))*\s+([a-z_][\w.-]*)'
 
@@ -238,21 +242,28 @@ def test_every_state_changing_target_takes_the_guard_at_its_start():
 def test_the_enumeration_sees_writers_and_spares_read_only_targets():
     assert {"apply", "rehearse", "release", "release-plan", "maintain", "_apply-layer", "_destroy-layer", "import",
             "sync-tags", "account-plan", "promote", "promote-to", "_apply-account-locked",
-            "_apply-account-for-workspace", "_release-plan-roots", "migrate-state-dir"} <= set(ENUMERATED)
+            "_apply-account-for-workspace", "_release-plan-roots", "migrate-state-dir", "clean", "clean-all",
+            "migrate-root-to-env"} <= set(ENUMERATED)
     assert not {"plan", "_plan-layer", "check", "validate", "validate-generated", "coverage-gate", "evidence",
                 "audit-schema", "policy-status", "verify-access-spec", "help"} & set(ENUMERATED)
 
 
-def test_the_enumeration_flags_what_review_found_on_1c9b2e6(tmp_path):
-    """Codex's REQUEST_CHANGES on 1c9b2e6: two internal targets and both promotions were unguarded."""
-    old = subprocess.run(["git", "-C", str(ROOT), "show", "1c9b2e6:shared/Makefile.shared"],
+@pytest.mark.parametrize(("commit", "expected"), [
+    # Codex round 1: two internal targets and both promotions were unguarded.
+    ("1c9b2e6", {"_apply-account-locked", "_apply-account-for-workspace", "promote", "promote-to"}),
+    # Codex round 2: targets that move or delete state and env files.
+    ("e2b0df5", {"migrate-root-to-env", "clean", "clean-all"}),
+])
+def test_the_enumeration_flags_what_review_found(tmp_path, commit, expected):
+    old = subprocess.run(["git", "-C", str(ROOT), "show", f"{commit}:shared/Makefile.shared"],
                          text=True, capture_output=True)
     if old.returncode != 0:
-        pytest.skip("commit 1c9b2e6 is not in this clone")
+        pytest.skip(f"commit {commit} is not in this clone")
     (tmp_path / "Makefile.shared").write_text(old.stdout)
     unguarded = {name for name, (_, kind) in state_changing_targets(tmp_path / "Makefile.shared").items()
                  if kind is None}
-    assert {"_apply-account-locked", "_apply-account-for-workspace", "promote", "promote-to"} <= unguarded
+    assert expected <= unguarded
+
 
 
 # --- every marker refuses every state-changing target, writing nothing --------
@@ -487,19 +498,78 @@ def test_runner_plan_is_not_refused(tmp_path):
 
 # --- the /Workspace mount marker (serverless without a variable) --------------
 
-def test_workspace_mount_marker(tmp_path, monkeypatch):
+def test_workspace_mount_needs_the_runtime_tree(tmp_path, monkeypatch):
     from shared.scripts import databricks_compute as dc
 
     (tmp_path / "Workspace").mkdir()
     assert dc.marker({}, tmp_path) is None  # a plain directory isn't the FUSE mount
     monkeypatch.setattr(dc.os.path, "ismount", lambda path: str(path) == str(tmp_path / "Workspace"))
-    assert dc.marker({}, tmp_path) == f"the {tmp_path / 'Workspace'} mount"
-    message = dc.guard({}, "apply", root=tmp_path)
-    assert f"this is Databricks compute (the {tmp_path / 'Workspace'} mount)" in message
+    assert dc.marker({}, tmp_path) is None  # an exact-case custom mount alone never trips
+    (tmp_path / "databricks").write_text("")
+    assert dc.marker({}, tmp_path) is None  # a /databricks file isn't the runtime tree
+    (tmp_path / "databricks").unlink()
+    (tmp_path / "databricks" / "python3").mkdir(parents=True)
+    expected = f"the {tmp_path / 'Workspace'} mount with {tmp_path / 'databricks'}"
+    assert dc.marker({}, tmp_path) == expected
+    assert f"this is Databricks compute ({expected})" in dc.guard({}, "apply", root=tmp_path)
     other = tmp_path / "laptop"
-    (other / "workspace").mkdir(parents=True)  # devcontainer-style lowercase mount: never a marker
+    for name in ("workspace", "databricks"):  # devcontainer-style lowercase mount: never a marker
+        (other / name).mkdir(parents=True)
     monkeypatch.setattr(dc.os.path, "ismount", lambda path: True)
     assert dc.marker({}, other) is None
+
+
+# --- make check's scratch copy: only the make that started it -----------------
+
+FAKE_MAKE = '#!/bin/sh\necho "GNU Make 4.4 (fake)"; echo "fake make ran: $*" >> "$CALL_LOG"\nexit 0\n'
+
+
+@pytest.mark.parametrize("how", ["command line", "environment", "make -e"])
+def test_check_refuses_an_overridden_make_on_databricks_compute(site, tmp_path, how):
+    fake = tmp_path / "fake.sh"
+    fake.write_text(FAKE_MAKE)
+    fake.chmod(0o755)
+    site["log"].unlink(missing_ok=True)
+    before = _snapshot(site["tmp"])
+    args = ["check", "ENV=dev"]
+    env = {"DATABRICKS_RUNTIME_VERSION": "15.4"}
+    if how == "command line":
+        args.append(f"MAKE={fake}")
+    else:
+        env["MAKE"] = str(fake)
+        if how == "make -e":
+            args.insert(0, "-e")
+    proc = _make(site, *args, guarded=False, **env)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "refused on Databricks compute" in output and "MAKE was overridden" in output, output
+    assert not site["log"].exists(), site["log"].read_text()
+    assert _snapshot(site["tmp"]) == before
+
+
+def test_check_scratch_make_must_be_a_gnu_make_binary(tmp_path, monkeypatch):
+    from shared.scripts import check_env
+
+    fake = tmp_path / "make"
+    fake.write_text(FAKE_MAKE)
+    fake.chmod(0o755)
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    with pytest.raises(check_env.CheckFailed, match="is not a GNU make binary"):
+        check_env._gnu_make(str(fake), "default")
+    with pytest.raises(check_env.CheckFailed, match="MAKE was overridden"):
+        check_env._gnu_make("make", "command line")
+    real = check_env._gnu_make("make", "default")
+    assert os.path.isabs(real) and not open(real, "rb").read(2) == b"#!"
+
+
+def test_check_without_markers_keeps_its_make(site, tmp_path):
+    # Off Databricks compute nothing changes: an overridden MAKE is used as before.
+    fake = tmp_path / "fake.sh"
+    fake.write_text(FAKE_MAKE)
+    fake.chmod(0o755)
+    site["log"].unlink(missing_ok=True)
+    _make(site, "check", "ENV=dev", f"MAKE={fake}", guarded=False)
+    assert "fake make ran" in site["log"].read_text()
 
 
 def test_this_machine_has_no_marker():

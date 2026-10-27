@@ -1753,7 +1753,7 @@ promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote
 # of the cloud dir, so nothing under envs/ is written and no applying target
 # runs; safe under CI=true. ENV_DIR overrides are refused: it checks envs/$(ENV).
 override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter command line,$(origin ENV_DIR)), --env-dir-override "$(ENV_DIR)",) \
-	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
+	--env "$(ENV)" --cloud-dir "$(CLOUD_ROOT)" --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))" --make-origin "$(origin MAKE)"
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
 	@$(_GENIE_PLACEHOLDER_GUARD)
@@ -2205,7 +2205,7 @@ destroy: _guard-not-ci-apply _bootstrap ## Destroy the selected layer or workspa
 # clean deletes Terraform state and .terraform/ by glob, so it refuses unless
 # ENV_DIR is the checkout's own envs/$(ENV) (see _is_own_env_dir) with real
 # generated/ and data_access/ dirs, whatever ENV_DIR or CLOUD_ROOT say.
-clean: ## Remove generated files and Terraform state for the selected environment
+clean: _guard-not-databricks-compute ## Remove generated files and Terraform state for the selected environment
 	@if [ ! -d "$(ENV_DIR)" ]; then \
 		echo "Environment '$(ENV)' not initialized: $(ENV_DIR)"; \
 		exit 0; \
@@ -2222,7 +2222,7 @@ clean: ## Remove generated files and Terraform state for the selected environmen
 	@echo "Cleaned generated files and Terraform state in $(ENV_DIR)."
 	@echo "NOTE: auth.auto.tfvars, env.auto.tfvars, abac.auto.tfvars, $(DATA_ACCESS_SUBDIR)/abac.auto.tfvars, $(DATA_ACCESS_SUBDIR)/masking_functions.sql, and .genie_space_id were NOT removed."
 
-clean-all: ## Remove all env workspaces under envs/
+clean-all: _guard-not-databricks-compute ## Remove all env workspaces under envs/
 	@echo "=== Clean All Environments ==="
 	@rm -rf "$(CLOUD_ROOT)/envs"
 	@echo "Removed $(CLOUD_ROOT)/envs"
@@ -2658,7 +2658,7 @@ integration-test: _guard-not-ci-apply ## Run the full end-to-end integration tes
 	@echo "  Integration test PASSED."
 	@echo "========================================================"
 
-migrate-root-to-env: _prepare-env ## Move existing root working files into envs/<ENV>
+migrate-root-to-env: _guard-not-databricks-compute _prepare-env ## Move existing root working files into envs/<ENV>
 	@echo "=== Migrate Root Workspace to $(ENV) ==="
 	@if [ -f "$(ENV_DIR)/auth.auto.tfvars" ] || \
 		[ -f "$(ENV_DIR)/env.auto.tfvars" ] || \
