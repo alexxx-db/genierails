@@ -239,6 +239,22 @@ def test_every_state_changing_target_takes_the_guard_at_its_start():
     assert not unguarded, f"state-changing targets without the Databricks-compute guard first: {unguarded}"
 
 
+def test_every_guarded_target_is_checked_before_make_runs_anything():
+    """A prerequisite isn't ordered under make -j: the guard must also run at parse time for each one."""
+    macros, rules = _parse_makefile()
+    listed = set(macros["_DATABRICKS_GUARDED_TARGETS"].replace("\\", " ").split())
+    kinds = {name: _guard_kind(rules[name], macros) for name in STATE_CHANGING}
+    always = {name for name, kind in kinds.items() if kind == "always"}
+    conditional = {name for name, kind in kinds.items() if kind == "conditional"}
+    assert listed == always, (f"missing from _DATABRICKS_GUARDED_TARGETS: {sorted(always - listed)}; "
+                              f"listed but not guarded: {sorted(listed - always)}")
+    goals = macros["_DATABRICKS_GUARDED_GOALS"]
+    assert conditional == {"promote", "promote-to", "_prepare-classification"}
+    assert all(f"$(filter {name},$(MAKECMDGOALS))" in goals for name in conditional)
+    text = (ROOT / "shared" / "Makefile.shared").read_text()
+    assert "ifeq ($(shell ( $(_DATABRICKS_COMPUTE_GUARD) ) >&2 || echo refused),refused)" in text
+
+
 def test_the_enumeration_sees_writers_and_spares_read_only_targets():
     assert {"apply", "rehearse", "release", "release-plan", "maintain", "_apply-layer", "_destroy-layer", "import",
             "sync-tags", "account-plan", "promote", "promote-to", "_apply-account-locked",
@@ -274,6 +290,21 @@ def test_every_state_changing_target_refuses_on_databricks_compute(site, target,
     output = _assert_refused_unchanged(site, target, "ENV=dev", *WRITING_MODE.get(target, ()),
                                        **{marker: MARKERS[marker]})
     assert f"({marker} is set)" in output
+
+
+@pytest.mark.parametrize("jobs", ["-j4 argument", "MAKEFLAGS=-j4"])
+@pytest.mark.parametrize("target", STATE_CHANGING)
+def test_parallel_make_writes_nothing_before_the_refusal(site, target, jobs):
+    """Codex round 3: under -j, _prepare-env ran beside the refusing guard and created envs/parallelprobe."""
+    args = [target, "ENV=parallelprobe", *WRITING_MODE.get(target, ())]
+    env = {"DB_CLUSTER_ID": "round3"}
+    if jobs == "MAKEFLAGS=-j4":
+        env["MAKEFLAGS"] = "-j4"
+    else:
+        args.insert(0, "-j4")
+    output = _assert_refused_unchanged(site, *args, **env)
+    assert "refused before any recipe ran" in output
+    assert not (site["repo"] / "aws" / "envs" / "parallelprobe").exists()
 
 
 @pytest.mark.parametrize("target", STATE_CHANGING)

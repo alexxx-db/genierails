@@ -272,7 +272,7 @@ destroys, takes a lock or writes a receipt, manifest or journal (the applying
 targets above, `sync-tags`, `bootstrap-sp`, `bootstrap-pipelines`,
 `account-plan`, `promote-to` without `CHECK=1`, `promote` run directly or
 cross-env, and `clean`, `clean-all` and `migrate-root-to-env`, which move or
-delete state and env files), internal ones included, refuses there first, before any lock,
+delete state and env files), internal ones included, refuses there first (checked while make reads the Makefile, so even `make -j` starts nothing), before any lock,
 write or live call, and points to the [deployment machine](deployment-machine.md).
 `GENIERAILS_ALLOW_CI_APPLY=1` and the dev-rehearse CI exception don't lift it.
 `check`, `plan`, `validate`, `evidence` and `audit-schema` still run. `check`'s

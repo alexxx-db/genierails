@@ -351,6 +351,28 @@ _guard-not-databricks-compute:
 # imports, destroys, locks or writes a receipt or journal and requires the guard.
 override _PROMOTE_DATABRICKS_GUARD = $(if $(or $(and $(filter 0,$(MAKELEVEL)),$(filter promote,$(MAKECMDGOALS))),$(strip $(DEST_ENV))),_guard-not-databricks-compute)
 
+# The guard also runs while make parses this file, before any recipe or
+# prerequisite can start: a sibling prerequisite gives no order under make -j
+# (or -j in MAKEFLAGS), so _prepare-env could otherwise write beside a refusing
+# guard. Every target that takes the guard is listed here (the test requires the
+# list to match), and the three conditional ones are checked in their writing
+# mode. Nothing runs without a marker or a guarded goal, so other runs see no change.
+override _DATABRICKS_GUARDED_TARGETS = _account-plan-locked _apply-account-for-workspace _apply-account-locked \
+	_apply-layer _destroy-layer _release-manifest _release-plan-roots _sync-tags-add-only-locked account-plan \
+	apply apply-account apply-genie apply-governance bootstrap-pipelines bootstrap-sp clean clean-all destroy \
+	destroy-genie destroy-governance detach-agent enable-classification import integration-test maintain \
+	migrate-root-to-env migrate-state migrate-state-dir policy-abandon policy-rebind rehearse release \
+	release-plan split-agent-files sync-tags test-all test-champion test-ci test-ci-parallel ungovern
+override _DATABRICKS_GUARDED_GOALS := $(strip $(filter $(_DATABRICKS_GUARDED_TARGETS),$(MAKECMDGOALS)) \
+	$(if $(_PROMOTE_DATABRICKS_GUARD),$(filter promote,$(MAKECMDGOALS))) \
+	$(if $(filter 1,$(CHECK)),,$(filter promote-to,$(MAKECMDGOALS))) \
+	$(if $(filter 1,$(IMPORT_CLASSIFICATION)),$(filter _prepare-classification,$(MAKECMDGOALS))))
+ifneq ($(_DATABRICKS_GUARDED_GOALS),)
+ifeq ($(shell ( $(_DATABRICKS_COMPUTE_GUARD) ) >&2 || echo refused),refused)
+$(error make $(MAKECMDGOALS) refused before any recipe ran (Databricks compute, above))
+endif
+endif
+
 # CI detection lives in scripts/ci_guard.py alone (CI=true|1|yes or a CI runner
 # marker; GENIERAILS_ALLOW_CI_APPLY=1 opts out of the apply guard; dev rehearse
 # with locked remote state is state_layout.ci_allowed). make next reads the
