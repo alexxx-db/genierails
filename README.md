@@ -15,6 +15,8 @@ Put Genie onboarding on rails — with built-in guardrails. Take a Genie agent f
 
 After the first deployment: [one team doing both](shared/docs/playbooks/one-team.md), [pipelines](shared/docs/pipelines.md) and the [deployment machine](shared/docs/deployment-machine.md).
 
+Lost? Run `make next ENV=<env>` (from `aws/` or `azure/`): it prints the one next command and why; `make status ENV=<env>` shows the whole picture. Both are read-only.
+
 ## How it works
 
 1. **Unity Catalog decides what's sensitive.** Its built-in [Data Classification](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-classification) scanner reads your data and tags each sensitive column.

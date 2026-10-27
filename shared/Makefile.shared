@@ -1,7 +1,7 @@
 .PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-promote-destination _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
-.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access _verify-access-gate verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan _account-plan-locked apply-account check policy-status policy-abandon policy-rebind
+.PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access _verify-access-gate verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan _account-plan-locked apply-account check policy-status policy-abandon policy-rebind status next
 
 .PHONY: capture detach-agent split-agent-files suggest-treatment draft-genie-content draft-custom-mask test-custom-mask adopt-custom-mask
 
@@ -319,28 +319,36 @@ _guard-genie-placeholder:
 	@$(_GENIE_PLACEHOLDER_GUARD)
 	@$(_SCHEDULED_GOVERNANCE_GUARD)
 
+# CI detection lives in scripts/ci_guard.py alone (CI=true|1|yes or a CI runner
+# marker; GENIERAILS_ALLOW_CI_APPLY=1 opts out of the apply guard; dev rehearse
+# with locked remote state is state_layout.ci_allowed). make next reads the
+# same module and the guarded targets below, so it never suggests one CI refuses.
+override _CI_GUARD = python3 "$(SHARED_ROOT)/scripts/ci_guard.py"
+# ci_guard.py answers with one exact versioned line and its exit code
+# (ci_guard.ANSWERS); only that pair counts. Anything else (a missing, failing
+# or unrelated script, any other code or output) refuses, in CI or not.
+# _CI_STATUS sets ci to 1 (CI) or 0 (not CI, or GENIERAILS_ALLOW_CI_APPLY=1).
+override _CI_STATUS = ci_out="$$($(_CI_GUARD) ci-status --allow-opt-out)"; ci_rc=$$?; \
+	case "$$ci_rc:$$ci_out" in \
+		"0:genierails-ci-status:v1:ci") ci=1 ;; \
+		"0:genierails-ci-status:v1:not-ci") ci=0 ;; \
+		*) echo "ERROR: the CI check ($(SHARED_ROOT)/scripts/ci_guard.py ci-status) gave no valid answer (exit $$ci_rc); refusing, as in CI." >&2; exit 1 ;; \
+	esac
+# After ci_out/ci_rc of ci_guard.py apply or rebind: on to the recipe only when allowed.
+override _CI_GUARD_ANSWER = case "$$ci_rc:$$ci_out" in \
+		"0:genierails-ci-guard:v1:allowed") ;; \
+		"1:genierails-ci-guard:v1:refused") exit 1 ;; \
+		*) echo "ERROR: the CI guard ($(SHARED_ROOT)/scripts/ci_guard.py) gave no valid answer (exit $$ci_rc); refusing, as in CI." >&2; exit 1 ;; \
+	esac
 _guard-not-ci-apply:
-	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); is_ci=; \
-	case "$$ci_value" in true|1|yes) is_ci=1 ;; esac; \
-	if [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; then is_ci=1; fi; \
-	allow_dev_rehearse=; \
-	if GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" python3 "$(SHARED_ROOT)/scripts/state_layout.py" ci-allowed --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)" >/dev/null 2>&1; then allow_dev_rehearse=1; fi; \
-	if [ "$$is_ci" = "1" ] && [ "$$GENIERAILS_ALLOW_CI_APPLY" != "1" ] && [ "$$allow_dev_rehearse" != "1" ]; then \
-		echo "ERROR: applying targets cannot run in CI (except make rehearse ENV=dev with configured remote state and locking). Prod and account applies stay on the deployment machine." >&2; \
-		echo "Only isolated integration-test workflows may opt out with GENIERAILS_ALLOW_CI_APPLY=1." >&2; \
-		exit 1; \
-	fi
+	@ci_out="$$(GENIERAILS_MAKE_GOALS="$(MAKECMDGOALS)" $(_CI_GUARD) apply --cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))" --cloud-root "$(CLOUD_ROOT)" --env-dir "$(ENV_DIR)" --env "$(ENV)")"; ci_rc=$$?; \
+	$(_CI_GUARD_ANSWER)
 
 # policy-rebind repairs a live rolled-back change: CI never runs it, and
 # GENIERAILS_ALLOW_CI_APPLY=1 (for throwaway integration workflows) doesn't apply.
 _guard-not-ci-rebind:
-	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
-	case "$$ci_value" in true|1|yes) is_ci=1 ;; *) is_ci= ;; esac; \
-	if [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; then is_ci=1; fi; \
-	if [ "$$is_ci" = 1 ]; then \
-		echo "ERROR: make policy-rebind cannot run in CI, even with GENIERAILS_ALLOW_CI_APPLY=1. Run it on the deployment machine." >&2; \
-		exit 1; \
-	fi
+	@ci_out="$$($(_CI_GUARD) rebind)"; ci_rc=$$?; \
+	$(_CI_GUARD_ANSWER)
 
 migrate-state-dir: _guard-not-ci-apply ## Move local state and records to GENIERAILS_STATE_DIR (env lock held, never overwrites)
 	@$(_DRY_RUN_GUARD); python3 "$(SHARED_ROOT)/scripts/state_layout.py" migrate --env-dir "$(ENV_DIR)" --env "$(ENV)"
@@ -965,9 +973,8 @@ _external-mask-inventory: _guarded-bootstrap _guard-workspace-target
 # real account state: envs/account/remote_state.hcl (read-only here; only
 # the approved account-plan/apply-account flow applies it).
 _guard-account-plan-empty:
-	@ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
-	if { [ "$$ci_value" = true ] || [ "$$ci_value" = 1 ] || [ "$$ci_value" = yes ] || [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; } \
-		&& [ "$$GENIERAILS_ALLOW_CI_APPLY" != 1 ] && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
+	@$(_CI_STATUS); \
+	if [ "$$ci" = 1 ] && [ ! -f "$(ACCOUNT_ENV_DIR)/remote_state.hcl" ]; then \
 		echo "ERROR: in CI the account plan needs $(ACCOUNT_ENV_DIR)/remote_state.hcl, so it plans against the real account state (not the runner's empty state)." >&2; exit 1; \
 	fi; \
 	set +e; LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account $(ACCOUNT_ENV) plan -input=false -detailed-exitcode >/dev/null; status=$$?; set -e; \
@@ -1098,9 +1105,8 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_RELEASE_GATE) rehearse-finish --env-dir "$(ENV_DIR)" --env "$(ENV)" --result failed --reason "a rehearse step failed (above)" $(_RELEASE_GATE_MAKE); \
 		exit 1; \
 	fi; \
-	ci_value=$$(printf '%s' "$$CI" | tr '[:upper:]' '[:lower:]'); \
-	if { [ "$$ci_value" = true ] || [ "$$ci_value" = 1 ] || [ "$$ci_value" = yes ] || [ -n "$$TF_BUILD$$JENKINS_URL$$GITLAB_CI$$BUILDKITE$$CIRCLECI" ]; } \
-		&& [ "$$GENIERAILS_ALLOW_CI_APPLY" != 1 ]; then \
+	$(_CI_STATUS); \
+	if [ "$$ci" = 1 ]; then \
 		echo "rehearse: ENV=$(ENV) uses legacy governance, which the CI dev pipeline doesn't run (its applies take no env lock); set governance_mode = \"deterministic\" in envs/$(ENV)/env.auto.tfvars, or rehearse on the deployment machine." >&2; exit 1; \
 	fi; \
 	$(_LEGACY_GUARD) rehearse || exit 1; \
@@ -1999,6 +2005,16 @@ apply-governance: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-target
 # one waiting to retire, and any unfinished staged change).
 policy-status: _guard-workspace-target ## Show the staged policy journal (deterministic envs)
 	@$(_GUARD_WORKSPACE_ENV); $(_STAGED_POLICY) status --env-dir "$(ENV_DIR)" --env-name "$(ENV)"
+
+# Read-only (scripts/env_status.py): local files and git only; no Databricks
+# client, Terraform, fetch, lock or write, so safe anywhere, CI included. In CI,
+# make next never suggests a target _guard-not-ci-apply would refuse.
+override _ENV_STATUS = python3 "$(SHARED_ROOT)/scripts/env_status.py"
+status: ## Read-only: where ENV is (mode, role, git, rehearsal, manifest, staged change, lock, account manifest); JSON=1 for JSON
+	@$(_ENV_STATUS) status --cloud-dir "$(CLOUD_ROOT)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --makefile-cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))"$(if $(filter 1,$(JSON)), --json,)
+
+next: ## Read-only: print the one next command for ENV and why (lost? run make next ENV=<env>)
+	@$(_ENV_STATUS) next --cloud-dir "$(CLOUD_ROOT)" --env "$(ENV)" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --makefile-cloud-dir "$(or $(GENIERAILS_CLOUD_DIR),$(CLOUD_ROOT))"
 
 # Drops an unfinished staged policy change that never retagged a column or
 # moved a principal (its new policies match no column), so a corrected config
