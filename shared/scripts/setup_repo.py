@@ -9,8 +9,10 @@ exactly as they were), then again after the env files exist, to change the
 remotes. It never fetches and never pushes.
 
 The URL comes from the GENIERAILS_SETUP_REPO environment variable, which make
-exports from a command-line REPO (``$(value REPO)``, so neither make nor the
-shell ever parses it). make can't tell a REPO typed on the command line from
+exports from a command-line REPO (``$(value REPO)``), so no shell ever parses
+it. make itself still expands any $(...) in a command-line value (such as
+$(shell ...)) while building the recipe environment: GNU make semantics, run
+by whoever typed the command, before this script or any recipe runs. make can't tell a REPO typed on the command line from
 one inherited through MAKEFLAGS, so both count; a plain exported REPO (such
 as bootstrap-pipelines' <owner>/<name>) doesn't. Like REUSE_SOURCE_AUTH, this
 is an accident guard, not a security boundary.
@@ -29,8 +31,9 @@ With a REPO:
     ``genierails`` remote exists: rename origin to ``genierails`` (kept for
     upgrades), then add origin = <url>;
   - no origin (a local-only repo): add origin = <url>;
-  - origin is already <url> (the same host and path: https and ssh forms,
-    with or without .git or a trailing /): nothing to do;
+  - origin is already <url> (same_repo: the same host, path, user and port,
+    with or without .git or a trailing /; https and git@ ssh forms of one
+    repo match): nothing to do;
   - not a git checkout (a downloaded archive): git init the checkout root on
     branch main, then add origin = <url>;
   - anything else (origin elsewhere, or GenieRails with a genierails remote
@@ -50,6 +53,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 SHARED = Path(__file__).resolve().parents[1]
@@ -70,15 +74,78 @@ _GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_F
                       "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
                       "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_PREFIX")
 _SAFE_CHARS = re.compile(r"[A-Za-z0-9._~:/@%+=,\[\]-]+")
-_SCP = re.compile(r"(?:(?P<user>[A-Za-z0-9._-]+)@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:].*)")
-
-
 class Refused(Exception):
     pass
 
 
+_SCP = re.compile(r"(?:(?P<user>[^@/:]+)@)?(?P<host>[^@/:]+):(?P<path>[^:].*)")
+_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
+_USER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+DEFAULT_PORT = {"https": 443, "ssh": 22}
+
+
+class Url(NamedTuple):
+    family: str  # https, ssh (ssh:// and scp-like) or local (file:// and absolute paths)
+    user: str | None
+    host: str  # lower case; "" for local
+    port: int | None  # the scheme's default when not given; None for local
+    path: str  # no trailing / or .git; no leading / for a host
+
+
+def parse(url: str) -> Url:
+    """The parts of an accepted URL; raises Refused for anything else (see validate)."""
+    if "://" in url:
+        scheme, rest = url.split("://", 1)
+        scheme = scheme.lower()
+        if scheme not in ("https", "ssh", "file"):
+            raise Refused(f"REPO={url!r}: {scheme}:// isn't accepted; use https://, ssh:// or file://.")
+        if scheme == "file":
+            if not rest.startswith("/"):
+                raise Refused(f"REPO={url!r}: use file:///absolute/path (no host).")
+            family, user, host, port, path = "local", None, "", None, rest
+        else:
+            parts = urlsplit(url)
+            if parts.password is not None:
+                raise Refused("REPO= must not carry a password; use an SSH key or a credential helper.")
+            netloc = parts.netloc.rpartition("@")[2]
+            host_text, _, port_text = netloc.partition(":")
+            if port_text and not (port_text.isdigit() and 0 < int(port_text) < 65536):
+                raise Refused(f"REPO={url!r}: the port must be a number from 1 to 65535.")
+            family, user, host, path = scheme, parts.username, host_text, parts.path
+            port = int(port_text) if port_text else DEFAULT_PORT[scheme]
+            if "@" in parts.netloc and not user:
+                raise Refused(f"REPO={url!r}: empty user before @.")
+    elif url.startswith("/"):
+        family, user, host, port, path = "local", None, "", None, url
+    else:
+        match = _SCP.fullmatch(url)
+        if not match:
+            raise Refused(f"REPO={url!r} is not a git URL: use https://host/owner/repo, ssh://..., "
+                          "git@host:owner/repo or an absolute path.")
+        family, user, host, port, path = "ssh", match["user"], match["host"], DEFAULT_PORT["ssh"], match["path"]
+    if family != "local":
+        if not _HOST.fullmatch(host or ""):
+            raise Refused(f"REPO={url!r}: the host must be a plain host name (letters, digits, . and -, "
+                          "not starting with -).")
+        if user is not None and not _USER.fullmatch(user):
+            raise Refused(f"REPO={url!r}: the user must be a plain name (letters, digits, . _ -, "
+                          "not starting with -).")
+    if not path.strip("/"):
+        raise Refused(f"REPO={url!r} has no repository path.")
+    if any(part.startswith("-") for part in path.split("/")):
+        raise Refused(f"REPO={url!r}: no path component may start with -.")
+    path = path.rstrip("/").removesuffix(".git").rstrip("/")
+    return Url(family, user, host.lower(), port, path.lstrip("/") if host else path)
+
+
 def validate(repo: str) -> None:
-    """Refuse anything but https://, ssh://, file://, scp-like and absolute local paths."""
+    """Refuse anything but https://, ssh://, file://, scp-like and absolute local paths.
+
+    Hosts, users and path components never start with - (an ssh option such as
+    -oProxyCommand), and only conservative host and user characters pass.
+    file:// and absolute paths aren't checked to be repos: setup never
+    contacts the remote.
+    """
     if any(ord(c) < 32 or ord(c) == 127 for c in repo):
         raise Refused("REPO= contains a control character (a newline?); pass one plain git URL.")
     if not _SAFE_CHARS.fullmatch(repo):
@@ -87,37 +154,29 @@ def validate(repo: str) -> None:
     if re.match(r"[^/]*::", repo):
         raise Refused(f"REPO={repo!r} names a git remote helper (<transport>::...); "
                       "only https://, ssh://, file://, git@host:path and absolute paths are accepted.")
-    if "://" in repo:
-        scheme = repo.split("://", 1)[0].lower()
-        if scheme not in ("https", "ssh", "file"):
-            raise Refused(f"REPO={repo!r}: {scheme}:// isn't accepted; use https://, ssh:// or file://.")
-        return
-    if repo.startswith("/") or _SCP.fullmatch(repo):
-        return
-    raise Refused(f"REPO={repo!r} is not a git URL: use https://host/owner/repo, ssh://..., "
-                  "git@host:owner/repo or an absolute path.")
-
-
-def _key(url: str) -> tuple[str, str]:
-    """(host, path) a URL names, so https and ssh forms of one repo compare equal."""
-    url = url.strip()
-    if "://" in url:
-        parts = urlsplit(url)
-        host = "" if parts.scheme.lower() == "file" else (parts.hostname or "").lower()
-        path = parts.path
-    elif url.startswith("/"):
-        host, path = "", url
-    else:
-        match = _SCP.fullmatch(url)
-        if not match:
-            return ("?", url)
-        host, path = match["host"].lower(), match["path"]
-    path = path.rstrip("/").removesuffix(".git").rstrip("/")
-    return (host, path if not host else path.lstrip("/"))
+    parse(repo)
 
 
 def same_repo(a: str, b: str) -> bool:
-    return _key(a) == _key(b)
+    """True only when a and b surely name one repo; any doubt is False (setup then refuses).
+
+    Same family: host, path, user (both missing, or equal) and port (a missing
+    port is the scheme's default: 22 for ssh and scp-like, 443 for https) must
+    all match. https vs ssh: the same host and path, https with no user on 443,
+    ssh as user git on 22 (GitHub-style hosting).
+    """
+    try:
+        x, y = parse(a.strip()), parse(b.strip())
+    except Refused:
+        return False
+    if (x.host, x.path) != (y.host, y.path):
+        return False
+    if x.family == y.family:
+        return (x.user, x.port) == (y.user, y.port)
+    if {x.family, y.family} == {"https", "ssh"}:
+        web, ssh = (x, y) if x.family == "https" else (y, x)
+        return web.user is None and web.port == 443 and ssh.user == "git" and ssh.port == 22
+    return False
 
 
 def plan(remotes: dict[str, str] | None, repo: str, *, auto: bool = True) -> list[tuple[str, ...]]:

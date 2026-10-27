@@ -437,7 +437,9 @@ _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 # local-only repo (scripts/setup_repo.py). --check runs before anything is
 # written, so a refused REPO leaves files and remotes alone. REPO never enters
 # shell text: make exports its raw $(value REPO) as GENIERAILS_SETUP_REPO, so
-# REPO='$$(cmd)' is just a refused URL. Only a command-line REPO counts; make
+# no shell parses REPO='$$(cmd)': it is just a refused URL. make itself still
+# expands $(...) in any command-line value (say $(shell ...)) while building
+# the recipe environment, before any recipe runs. Only a command-line REPO counts; make
 # can't tell one inherited through MAKEFLAGS apart, so that counts too (an
 # accident guard, not a security boundary), while a plain exported REPO
 # (bootstrap-pipelines' <owner>/<name>) is ignored.

@@ -341,3 +341,52 @@ def test_ssh_and_https_forms_of_origin_are_the_same_repo(tmp_path):
     result = _setup(repo / "aws", "ENV=dev", "REPO=https://example.com/acme/gov/")
     assert result.returncode == 0 and "nothing to change" in result.stdout, result.stdout + result.stderr
     assert _snapshot(repo) == before
+
+
+@pytest.mark.parametrize("bad", ["ssh://-oProxyCommand=touch/tmp/pwn/x", "git@-oProxyCommand:x", "ssh://user@-host/x",
+                                 "git@host:-x", "ssh://-user@host/x", "-oProxyCommand=x:y", "ssh://host/a/-b",
+                                 "https://-h.example/x", "ssh://@host/x", "ssh://h_x.example/x",
+                                 "ssh://host:0/x", "ssh://host:99999/x", "https://u:pw@h.example/x", "https://h.example/"])
+def test_option_like_or_malformed_hosts_users_and_paths_are_refused(bad, tmp_path):
+    repo = _clone(tmp_path)
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=dev", f"REPO={bad}")
+    assert result.returncode != 0 and "ERROR: make setup REPO=" in result.stderr, result.stdout + result.stderr
+    assert _snapshot(repo) == before and _remotes(repo) == {"origin": UPSTREAM}
+    assert not (repo / "aws/envs").exists()
+    with pytest.raises(sr.Refused):
+        sr.validate(bad)
+
+
+@pytest.mark.parametrize("origin,other", [
+    ("ssh://git@example.com:2222/acme/gov.git", "ssh://git@example.com:22/acme/gov.git"),
+    ("ssh://alice@example.com/acme/gov.git", "ssh://bob@example.com/acme/gov.git"),
+    ("ssh://git@example.com:2222/acme/gov.git", "git@example.com:acme/gov.git"),
+    ("https://example.com:8443/acme/gov", "https://example.com/acme/gov"),
+])
+def test_a_different_port_or_user_is_not_the_same_repo(origin, other, tmp_path):
+    repo = _clone(tmp_path)
+    assert _setup(repo / "aws", "ENV=dev", f"REPO={origin}").returncode == 0
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=prod", f"REPO={other}")
+    assert result.returncode != 0 and "nothing to change" not in result.stdout
+    assert f"origin already points at {origin}, not {other}" in result.stderr
+    assert _snapshot(repo) == before and not (repo / "aws/envs/prod").exists()
+
+
+def test_same_repo_compares_user_port_and_host():
+    same = sr.same_repo
+    assert same("git@github.com:acme/gov.git", "ssh://git@github.com:22/acme/gov/")
+    assert same("git@github.com:acme/gov.git", "https://github.com/acme/gov")
+    assert same("https://github.com/acme/gov", "https://GITHUB.com:443/acme/gov.git")
+    assert same("ssh://git@h.example:2222/a/b", "ssh://git@h.example:2222/a/b.git")
+    assert same("h.example:a/b", "ssh://h.example/a/b")  # both without a user
+    assert same("file:///srv/gov.git", "/srv/gov/")
+    assert not same("ssh://git@example.com:2222/acme/gov", "ssh://git@example.com/acme/gov")
+    assert not same("ssh://alice@example.com/acme/gov", "ssh://bob@example.com/acme/gov")
+    assert not same("ssh://alice@example.com/acme/gov", "ssh://example.com/acme/gov")
+    assert not same("https://alice@github.com/acme/gov", "git@github.com:acme/gov")
+    assert not same("h.example:a/b", "https://h.example/a/b")  # ssh without git@ vs https: unsure, refuse
+    assert not same("https://github.com/acme/gov", "https://github.com/acme/Gov")
+    assert not same("/srv/gov", "ssh://git@srv/gov")
+    assert not same("not a url", "not a url")
