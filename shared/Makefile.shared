@@ -802,14 +802,18 @@ audit-schema: _guarded-bootstrap _guard-workspace-target ## Report untagged sens
 	@echo "=== Schema Drift Audit ($(ENV)) ==="
 	@cd "$(ENV_DIR)" && python3 "$(AUDIT_SCHEMA_SCRIPT)"
 
-evidence: _guarded-bootstrap _guard-workspace-target ## Emit JSON and Markdown compliance evidence (set GENIERAILS_EVIDENCE_INTEGRATION=1 for live state)
+# Live by default; OFFLINE=1 writes the config-only report (no SDK, no warehouse).
+# GENIERAILS_EVIDENCE_INTEGRATION=1, once needed for live, is still accepted and
+# changes nothing. The report goes to the env's git-ignored state dir
+# (evidence_report.evidence_dir), never under envs/<env>/.
+evidence: _guarded-bootstrap _guard-workspace-target ## Write the live JSON and Markdown compliance evidence to the env's git-ignored state dir (OFFLINE=1: config only)
 	@echo "=== Compliance Evidence ($(ENV)) ==="
-	@live="$$(printf '%s' "$$GENIERAILS_EVIDENCE_INTEGRATION" | tr '[:upper:]' '[:lower:]')"; \
-	if [ "$$live" = "1" ] || [ "$$live" = "true" ] || [ "$$live" = "yes" ]; then \
-		warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --terraform-runner "$(ROOT_RUNNER)" --env-name "$(ENV)")" && \
-		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/evidence_report.py" --warehouse-id "$$warehouse_id"; \
+	@offline="$$(printf '%s' "$(OFFLINE)" | tr '[:upper:]' '[:lower:]')"; \
+	if [ "$$offline" = "1" ] || [ "$$offline" = "true" ] || [ "$$offline" = "yes" ]; then \
+		cd "$(ENV_DIR)" && env -u GENIERAILS_EVIDENCE_INTEGRATION python3 "$(SHARED_ROOT)/evidence_report.py"; \
 	else \
-		cd "$(ENV_DIR)" && python3 "$(SHARED_ROOT)/evidence_report.py"; \
+		warehouse_id="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" warehouse --env-dir "$(ENV_DIR)" --explicit "$(WAREHOUSE_ID)" --terraform-runner "$(ROOT_RUNNER)" --env-name "$(ENV)")" && \
+		cd "$(ENV_DIR)" && GENIERAILS_EVIDENCE_INTEGRATION=1 python3 "$(SHARED_ROOT)/evidence_report.py" --warehouse-id "$$warehouse_id"; \
 	fi
 audit-rulebook: _guarded-bootstrap _guard-workspace-target ## Report prod-applied tags (class.* + governed keys) with no covering policy or mask
 	@echo "=== Rulebook Drift Audit ($(ENV)) ==="

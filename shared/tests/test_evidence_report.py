@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -8,6 +9,16 @@ from evidence_report import assemble_report, collect_live_state, configured_tabl
 
 
 COL = {"catalog": "main", "schema": "sales", "table": "customers", "column": "email"}
+
+
+@pytest.fixture(autouse=True)
+def _in_checkout_state(monkeypatch):
+    """Evidence goes to <cloud>/.genierails-state/<env>/evidence unless a test sets the state dir."""
+    monkeypatch.delenv("GENIERAILS_STATE_DIR", raising=False)
+
+
+def _out(env_dir):
+    return env_dir.parents[1] / ".genierails-state" / env_dir.name / "evidence"
 
 
 class NoPolicies:
@@ -68,7 +79,7 @@ def test_json_and_markdown_outputs(tmp_path):
 
 
 def test_cli_stays_offline_unless_integration_flag_is_set(tmp_path, monkeypatch):
-    env_dir = tmp_path / "dev"
+    env_dir = tmp_path / "aws" / "envs" / "dev"
     (env_dir / "data_access").mkdir(parents=True)
     (env_dir / "data_access" / "abac.auto.tfvars").write_text('''
 tag_assignments = [{
@@ -84,9 +95,228 @@ tag_assignments = [{
         raise AssertionError("offline mode made a live call")
 
     assert main(["--env-dir", str(env_dir)], collector=forbidden_collector) == 0
-    artifact = json.loads((env_dir / "generated/evidence/compliance-evidence-v1.0.json").read_text())
+    artifact = json.loads((_out(env_dir) / "compliance-evidence-v1.0.json").read_text())
     assert artifact["header"]["source"] == "offline-config"
     assert artifact["evidence"][0]["detected_tags"] == [{"name": "pii_level", "value": "email"}]
+
+
+def _offline_env(tmp_path, monkeypatch, env="prod"):
+    monkeypatch.delenv("GENIERAILS_EVIDENCE_INTEGRATION", raising=False)
+    env_dir = tmp_path / "aws" / "envs" / env
+    env_dir.mkdir(parents=True)
+    (env_dir / "env.auto.tfvars").write_text('uc_tables = ["main.sales.customers"]\n')
+    return env_dir
+
+
+def _mode(path):
+    return path.stat().st_mode & 0o777
+
+
+def test_default_output_is_the_env_state_dir_owner_only_never_envs(tmp_path, monkeypatch, capsys):
+    from scripts import release_gate as rg
+
+    env_dir = _offline_env(tmp_path, monkeypatch)
+    out = rg.env_state(tmp_path / "aws", "prod") / "evidence"
+    out.mkdir(parents=True)
+    out.chmod(0o755)
+    (out / "compliance-evidence-v1.0.json").write_text("{}")
+    (out / "compliance-evidence-v1.0.json").chmod(0o644)
+
+    assert main(["--env-dir", str(env_dir)]) == 0
+
+    assert evidence_report.evidence_dir(env_dir) == out == _out(env_dir)
+    assert sorted(p.name for p in out.iterdir()) == ["compliance-evidence-v1.0.json", "compliance-evidence-v1.0.md"]
+    assert _mode(out) == 0o700 and all(_mode(p) == 0o600 for p in out.iterdir())
+    assert json.loads((out / "compliance-evidence-v1.0.json").read_text())["header"]["source"] == "offline-config"
+    assert sorted(p.name for p in env_dir.rglob("*")) == ["env.auto.tfvars"]
+    assert str(out / "compliance-evidence-v1.0.json") in capsys.readouterr().out
+
+
+def test_state_dir_setting_holds_the_evidence(tmp_path, monkeypatch):
+    env_dir = _offline_env(tmp_path, monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(state))
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (state / "aws" / "prod" / "evidence" / "compliance-evidence-v1.0.json").is_file()
+    assert not (tmp_path / "aws" / ".genierails-state").exists()
+
+
+def test_a_missing_state_dir_refuses_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    env_dir = _offline_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "unmounted"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    assert "No evidence was written" in capsys.readouterr().err
+    assert not list(tmp_path.rglob("compliance-evidence-*"))
+
+
+def test_live_without_auth_fails_clearly_and_points_at_offline(tmp_path, monkeypatch, capsys):
+    env_dir = _offline_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
+    assert main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"]) == 2
+    err = capsys.readouterr().err
+    assert "auth.auto.tfvars" in err and "OFFLINE=1" in err and "No evidence was written" in err
+    assert not list(tmp_path.rglob("compliance-evidence-*"))
+
+
+def test_an_earlier_envs_evidence_folder_is_left_alone_with_a_note(tmp_path, monkeypatch, capsys):
+    env_dir = _offline_env(tmp_path, monkeypatch)
+    old = env_dir / "generated" / "evidence"
+    old.mkdir(parents=True)
+    (old / "compliance-evidence-v1.0.json").write_text("{}")
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (old / "compliance-evidence-v1.0.json").read_text() == "{}"
+    assert f"NOTE: {old} is from an earlier GenieRails" in capsys.readouterr().out
+
+
+def _git_repo(tmp_path, monkeypatch, gitignore=""):
+    """A checkout at tmp_path/repo holding aws/envs/prod; returns (repo, env_dir)."""
+    import subprocess
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    repo = tmp_path / "repo"
+    env_dir = _offline_env(repo, monkeypatch)
+    if gitignore:
+        (repo / ".gitignore").write_text(gitignore)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    return repo, env_dir
+
+
+def _git_status(repo):
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+                          text=True, capture_output=True, check=True).stdout
+
+
+def _refused(capsys, tmp_path):
+    err = capsys.readouterr().err
+    assert "inside the git work tree" in err and "not git-ignored" in err and "No evidence was written" in err
+    assert not list(tmp_path.rglob("compliance-evidence-*"))
+
+
+def test_a_state_dir_inside_the_checkout_that_git_would_commit_is_refused(tmp_path, monkeypatch, capsys):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_a_state_dir_symlinked_into_the_checkout_is_refused(tmp_path, monkeypatch, capsys):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    (tmp_path / "state-link").symlink_to(repo / "custom-state")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state-link"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+    # ...and the default folder, when it is a symlink to an unignored place in the checkout.
+    monkeypatch.delenv("GENIERAILS_STATE_DIR")
+    (repo / "aws" / ".genierails-state").symlink_to(repo / "custom-state")
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_a_git_ignored_state_dir_inside_the_checkout_is_allowed(tmp_path, monkeypatch):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/custom-state/\n")
+    (repo / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (repo / "custom-state/aws/prod/evidence/compliance-evidence-v1.0.json").is_file()
+    assert "custom-state" not in _git_status(repo)
+
+
+def test_a_tracked_report_in_an_ignored_folder_is_refused(tmp_path, monkeypatch, capsys):
+    import subprocess
+
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/custom-state/\n")
+    tracked = repo / "custom-state/aws/prod/evidence/compliance-evidence-v1.0.json"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("{}")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", str(tracked)], check=True)
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    assert "not git-ignored" in capsys.readouterr().err and tracked.read_text() == "{}"
+
+
+def test_git_env_variables_cannot_point_the_check_at_another_repo(tmp_path, monkeypatch, capsys):
+    """Bypass 1: GIT_DIR/GIT_WORK_TREE once sent discovery to another repo, so the record was written."""
+    import subprocess
+
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    (other / ".gitignore").write_text("*\n")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(repo))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_a_nested_repo_around_the_env_does_not_hide_the_customer_repo(tmp_path, monkeypatch, capsys):
+    """Bypass 2: only the innermost repo (around env_dir) was checked."""
+    import subprocess
+
+    repo, _ = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    nested = repo / "nested"
+    env_dir = _offline_env(nested, monkeypatch)
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (repo / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(repo / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+    # Inside both: ignored by the outer repo is not enough when the nested one would commit it...
+    (repo / ".gitignore").write_text("/aws/.genierails-state/\n/nested/custom-state/\n")
+    (nested / "custom-state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(nested / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+    # ...and passes once every work tree around it ignores it.
+    (nested / ".gitignore").write_text("/custom-state/\n")
+    assert main(["--env-dir", str(env_dir)]) == 0
+
+
+def test_a_case_alias_of_the_checkout_path_is_still_inside_it(tmp_path, monkeypatch, capsys):
+    """Bypass 3: on a case-insensitive filesystem, <Repo> spelled in another case passed a string prefix test."""
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (repo / "custom-state").mkdir()
+    alias = tmp_path / "REPO"
+    if not alias.exists():
+        pytest.skip("case-sensitive filesystem: no case alias exists")
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(alias / "custom-state"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    _refused(capsys, tmp_path)
+
+
+def test_missing_git_refuses_cleanly_inside_a_work_tree(tmp_path, monkeypatch, capsys):
+    """Bypass 4: no git on PATH once raised a traceback (exit 1); it must refuse with exit 2."""
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-git"))
+    assert main(["--env-dir", str(env_dir)]) == 2
+    err = capsys.readouterr().err
+    assert "git can't be run" in err and "No evidence was written" in err and "Traceback" not in err
+    assert not list(tmp_path.rglob("compliance-evidence-*"))
+    # Outside every work tree git isn't needed.
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    assert main(["--env-dir", str(env_dir)]) == 0
+
+
+def test_a_state_dir_outside_the_checkout_and_the_ignored_default_are_allowed(tmp_path, monkeypatch):
+    repo, env_dir = _git_repo(tmp_path, monkeypatch, gitignore="/aws/.genierails-state/\n")
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv("GENIERAILS_STATE_DIR", str(tmp_path / "state"))
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (tmp_path / "state/aws/prod/evidence/compliance-evidence-v1.0.md").is_file()
+    monkeypatch.delenv("GENIERAILS_STATE_DIR")
+    assert main(["--env-dir", str(env_dir)]) == 0
+    assert (_out(env_dir) / "compliance-evidence-v1.0.md").is_file()
+    assert _git_status(repo) == "?? .gitignore\n?? aws/envs/prod/env.auto.tfvars\n"
 
 
 def test_configured_tables_includes_all_genie_tables_and_governance_fallback(tmp_path):
@@ -362,15 +592,15 @@ def test_abac_policies_protect_ssn_and_cvv_without_information_schema_masks(monk
 
 def test_abac_policies_reach_the_written_artifacts(monkeypatch, tmp_path, capsys):
     _prod_client(monkeypatch)
-    env_dir = tmp_path / "prod"
-    env_dir.mkdir()
+    env_dir = tmp_path / "aws" / "envs" / "prod"
+    env_dir.mkdir(parents=True)
     _auth_file(env_dir)
     (env_dir / "env.auto.tfvars").write_text(f"uc_tables = {json.dumps(PROD_TABLES)}\n")
     monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
 
     assert main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"]) == 0
 
-    out = env_dir / "generated/evidence"
+    out = _out(env_dir)
     artifact = json.loads((out / "compliance-evidence-v1.0.json").read_text())
     assert _evidence(artifact, "prod_retail.crm.customers.ssn")["applied_policies"] != []
     assert _evidence(artifact, "prod_retail.payments.cards.cvv")["applied_policies"] != []
@@ -384,13 +614,14 @@ def test_abac_policies_reach_the_written_artifacts(monkeypatch, tmp_path, capsys
 
 def test_policy_listing_error_writes_no_evidence(monkeypatch, tmp_path, capsys):
     _prod_client(monkeypatch, list_error=PermissionError("User does not have MANAGE on catalog prod_retail"))
-    env_dir = tmp_path / "prod"
-    env_dir.mkdir()
+    env_dir = tmp_path / "aws" / "envs" / "prod"
+    env_dir.mkdir(parents=True)
     _auth_file(env_dir)
     (env_dir / "env.auto.tfvars").write_text(f"uc_tables = {json.dumps(PROD_TABLES)}\n")
     monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
     rc = main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"])
-    assert not (env_dir / "generated/evidence").exists(), "a report with empty applied_policies was written"
+    assert not _out(env_dir).exists() and not (env_dir / "generated").exists(), \
+        "a report with empty applied_policies was written"
     assert rc == 2
     captured = capsys.readouterr()
     assert "could not list the ABAC policies effective on prod_retail.crm.customers" in captured.err
@@ -490,13 +721,13 @@ def test_unknown_policy_type_is_listed_not_evaluated_and_flagged_in_markdown(mon
     policy = PolicyInfo(name="deny_all", to_principals=["account users"], policy_type=PolicyType.POLICY_TYPE_DENY,
                         for_securable_type=SecurableType.TABLE, on_securable_fullname=PROD_CATALOG)
     _prod_client(monkeypatch, policies=_prod_policies() + [policy])
-    env_dir = tmp_path / "prod"
-    env_dir.mkdir()
+    env_dir = tmp_path / "aws" / "envs" / "prod"
+    env_dir.mkdir(parents=True)
     _auth_file(env_dir)
     (env_dir / "env.auto.tfvars").write_text(f"uc_tables = {json.dumps(PROD_TABLES)}\n")
     monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
     assert main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"]) == 0
-    out = env_dir / "generated/evidence"
+    out = _out(env_dir)
     artifact = json.loads((out / "compliance-evidence-v1.0.json").read_text())
     assert artifact["abac_policy_listing"] == {"status": "incomplete", "tables": 2, "policies": 16}
     assert {item["policy"] for item in artifact["abac_policies_not_evaluated"]} == {"deny_all"}
@@ -512,14 +743,14 @@ def test_table_tags_read_failure_writes_no_evidence(monkeypatch, tmp_path, capsy
     _prod_client(monkeypatch, table_tags_error=RuntimeError("TABLE_OR_VIEW_NOT_FOUND table_tags"))
     with pytest.raises(evidence_report.EvidenceUnavailable, match="table tags"):
         collect_live_state([], PROD_TABLES, "warehouse-1", _auth_file(tmp_path))
-    env_dir = tmp_path / "prod"
-    env_dir.mkdir()
+    env_dir = tmp_path / "aws" / "envs" / "prod"
+    env_dir.mkdir(parents=True)
     _auth_file(env_dir)
     (env_dir / "env.auto.tfvars").write_text(f"uc_tables = {json.dumps(PROD_TABLES)}\n")
     monkeypatch.setenv("GENIERAILS_EVIDENCE_INTEGRATION", "1")
     assert main(["--env-dir", str(env_dir), "--warehouse-id", "warehouse-1"]) == 2
     assert "could not read the table tags" in capsys.readouterr().err
-    assert not (env_dir / "generated/evidence").exists()
+    assert not _out(env_dir).exists() and not (env_dir / "generated").exists()
 
 
 def test_listing_error_message_is_sanitized_and_capped(monkeypatch, tmp_path):

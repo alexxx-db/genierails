@@ -16,6 +16,7 @@ provider "databricks" {
   account_id    = var.databricks_account_id
   client_id     = var.databricks_client_id
   client_secret = var.databricks_client_secret
+  auth_type     = local.databricks_auth_type
 }
 
 provider "databricks" {
@@ -23,6 +24,7 @@ provider "databricks" {
   host          = var.databricks_workspace_host
   client_id     = var.databricks_client_id
   client_secret = var.databricks_client_secret
+  auth_type     = local.databricks_auth_type
 }
 
 variable "databricks_account_host" {
@@ -41,6 +43,27 @@ variable "databricks_client_id" {
 variable "databricks_client_secret" {
   type      = string
   sensitive = true
+}
+
+# Set only by scripts/terraform_layer.sh, from the DATABRICKS_AUTH_TYPE that
+# scripts/terraform_env.sh kept in a pipeline job (github-oidc or
+# azure-devops-oidc); it refuses any caller's value.
+variable "databricks_pipeline_auth_type" {
+  type    = string
+  default = ""
+  validation {
+    condition     = contains(["", "github-oidc", "azure-devops-oidc"], var.databricks_pipeline_auth_type)
+    error_message = "databricks_pipeline_auth_type is github-oidc, azure-devops-oidc or empty."
+  }
+}
+
+locals {
+  # The env's client secret pins OAuth M2M, so ARM_* kept for the azurerm
+  # backend (scripts/terraform_env.sh) can't add Azure auth ("more than one
+  # authorization method") or replace it. An IDs-only auth file in a pipeline
+  # job uses the job's OIDC; null leaves the provider's own choice.
+  databricks_auth_type = (var.databricks_pipeline_auth_type != "" ? var.databricks_pipeline_auth_type
+  : var.databricks_client_secret != "" ? "oauth-m2m" : null)
 }
 
 variable "databricks_workspace_id" {

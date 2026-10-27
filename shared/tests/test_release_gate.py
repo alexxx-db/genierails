@@ -1007,6 +1007,302 @@ def test_a_phase_manifest_is_recorded_on_the_final_release_receipt(repo, manifes
     assert receipt["phase_manifests"] == [json.loads(manifest.read_text())["id"]]
 
 
+# -- the final receipt's phase manifests: one release, whatever commit planned each phase -----------
+
+def _journal(repo: Repo, *, open_run: str = "", history=()) -> None:
+    journal = spa.empty_journal()
+    journal.update(transition={"run_id": open_run} if open_run else None, history=list(history))
+    spa.save_journal(repo.prod, journal)
+
+
+def _finished(run: str) -> dict:
+    return {"run_id": run, "commit": "c", "from": "a", "to": "b", "retired": "", "phases": [],
+            "finished_at": rg._now()}
+
+
+def _abandoned(run: str) -> dict:
+    return {"run_id": run, "abandoned": "b", "at": rg._now()}
+
+
+def _engine_fix(repo: Repo, n: int) -> Path:
+    """An engine fix merges mid-release; the next phase is planned at the new commit."""
+    repo.commit({"shared/scripts/code.py": f"x = {n}\n"})
+    rehearse(repo)
+    return _second_manifest(repo)
+
+
+def _id(path: Path) -> str:
+    return json.loads(Path(path).read_text())["id"]
+
+
+def _receipt(repo: Repo, final: Path) -> dict:
+    return json.loads(rg.release_receipt(repo.prod, "prod", final).read_text())
+
+
+def test_the_final_receipt_links_every_phase_of_the_release_whatever_commit_planned_it(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # planned at commit A
+    second = _engine_fix(repo, 2)
+    rg.phase_record(repo.prod, "prod", second)  # planned at commit B
+    final = _engine_fix(repo, 3)  # the final phase, at commit C
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest), _id(second)]
+    assert receipt["phase_manifests_unlinked"] == []
+    record = json.loads((rg.env_state(repo.cloud, "prod") / "receipts" / "phases" / f"{_id(second)}.json")
+                        .read_text())
+    assert record["policy_run"] == "run1" and record["manifest_sha256"] == rg.sha256_file(second)
+
+
+def test_an_earlier_releases_phases_are_not_linked_to_the_next_release(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)
+    first_final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    first = _receipt(repo, first_final)
+    assert first["phase_manifests"] == [_id(manifest)]
+    time.sleep(1.1)  # receipts and records are timestamped per second
+    _journal(repo, open_run="run2", history=[_finished("run1")])
+    phase = _engine_fix(repo, 3)
+    rg.phase_record(repo.prod, "prod", phase)
+    final = _engine_fix(repo, 4)
+    _journal(repo, history=[_finished("run1"), _finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(phase)]
+    assert receipt["phase_manifests_unlinked"] == []
+    assert first["release_epoch"] and receipt["release_epoch"] not in (None, first["release_epoch"])
+    assert [e["id"] for e in receipt["phase_manifests_earlier"]] == [_id(manifest)]
+
+
+@pytest.mark.parametrize("ended, reason", [
+    (_abandoned, "run run1, which was abandoned"),
+    (None, "run run1, which the policy journal doesn't record as finished"),
+])
+def test_an_abandoned_or_unfinished_runs_phases_are_not_linked(repo, manifest, ended, reason):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # run1's first phase; then make policy-abandon
+    history = [ended("run1")] if ended else []
+    _journal(repo, open_run="run2", history=history)
+    retry = _second_manifest(repo)  # the same commit: a commit filter can't tell the runs apart
+    rg.phase_record(repo.prod, "prod", retry)
+    final = _second_manifest(repo)
+    _journal(repo, history=history + [_finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(retry)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(manifest) and reason in unlinked["reason"]
+
+
+def _tamper_manifest(repo: Repo, phase: Path, record: Path) -> None:
+    os.chmod(phase, 0o600)
+    phase.write_text(phase.read_text().replace('"live-1"', '"live-forged"'))
+
+
+def _tamper_record_id(repo: Repo, phase: Path, record: Path) -> None:
+    data = json.loads(record.read_text()) | {"id": _id(phase).replace("-", "_")}
+    os.chmod(record, 0o600)
+    record.write_text(json.dumps(data))
+
+
+def _tamper_unreadable(repo: Repo, phase: Path, record: Path) -> None:
+    os.chmod(record, 0o600)
+    record.write_text("{not json")
+
+
+def _tamper_legacy(repo: Repo, phase: Path, record: Path) -> None:
+    data = {k: v for k, v in json.loads(record.read_text()).items() if k not in ("manifest_sha256", "policy_run")}
+    os.chmod(record, 0o600)
+    record.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("tamper, reason", [
+    (_tamper_manifest, "doesn't match the hash the record holds"),
+    (_tamper_record_id, "but is stored as"),
+    (_tamper_unreadable, "the phase record is unreadable"),
+    (_tamper_legacy, "written before phase records held their manifest's hash"),
+])
+def test_a_phase_record_that_does_not_verify_is_listed_unlinked_never_linked(repo, manifest, tamper, reason):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)
+    second = _engine_fix(repo, 2)
+    record = rg.env_state(repo.cloud, "prod") / "receipts" / "phases" / f"{_id(second)}.json"
+    rg.phase_record(repo.prod, "prod", second)
+    tamper(repo, second, record)
+    final = _engine_fix(repo, 3)
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(second) and reason in unlinked["reason"]
+    assert unlinked["record"] == str(record)
+
+
+def test_an_unreadable_journal_still_records_the_applied_phase_but_never_links_it(repo, manifest):
+    rg.phase_record(repo.prod, "prod", manifest)  # no journal yet: no policy run was open
+    journal = spa.journal_path(repo.prod)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text("{not json")
+    second = _engine_fix(repo, 2)
+    record = json.loads(rg.phase_record(repo.prod, "prod", second).read_text())  # the apply already happened
+    assert record["policy_run"] is None
+    _journal(repo, history=[_finished("run1")])
+    final = _engine_fix(repo, 3)
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(second) and "policy run is unknown" in unlinked["reason"]
+
+
+def test_a_deleted_earlier_receipt_does_not_let_its_phases_into_the_next_release(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # phase A of release 1
+    first_final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    first = rg.release_receipt(repo.prod, "prod", first_final)
+    first.unlink()  # lost, or deleted by hand
+    _journal(repo, open_run="run2", history=[_finished("run1")])
+    phase = _engine_fix(repo, 3)
+    rg.phase_record(repo.prod, "prod", phase)  # phase B of release 2
+    final = _engine_fix(repo, 4)
+    _journal(repo, history=[_finished("run1"), _finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(phase)]
+    [unlinked] = receipt["phase_manifests_unlinked"]
+    assert unlinked["id"] == _id(manifest) and "another release's phase" in unlinked["reason"]
+
+
+def test_a_foreign_receipt_neither_accounts_for_nor_hides_a_phase(repo, manifest):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)
+    final = _engine_fix(repo, 2)
+    time.sleep(1.1)  # the foreign receipt is newer than the phase
+    foreign = rg._write_once(rg.release_dir(repo.cloud, "prod") / "zz-dev.json", {
+        "kind": "release", "version": rg.VERSION, "env": "dev", "cloud": repo.cloud.name, "commit": repo.head(),
+        "manifest": {"id": _id(manifest), "sha256": rg.sha256_file(manifest)},
+        "phase_manifests": [_id(manifest)], "created_at": rg._now()})
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(manifest)]
+    assert receipt["phase_manifests_unlinked"] == []
+    assert receipt["release_receipts_ignored"] == [
+        {"receipt": str(foreign), "reason": "a receipt of aws/dev, not aws/prod"}]
+
+
+def test_a_clock_that_went_backwards_does_not_hide_a_phase(repo, manifest, monkeypatch):
+    rg.release_receipt(repo.prod, "prod", manifest)  # release 1
+    _journal(repo, open_run="run2")
+    phase = _engine_fix(repo, 2)
+    with monkeypatch.context() as m:
+        m.setattr(rg, "_now", lambda: "2000-01-01T00:00:00+00:00")  # before release 1's receipt
+        rg.phase_record(repo.prod, "prod", phase)
+    final = _engine_fix(repo, 3)
+    _journal(repo, history=[_finished("run2")])
+    receipt = _receipt(repo, final)
+    assert receipt["phase_manifests"] == [_id(phase)]
+    assert receipt["phase_manifests_unlinked"] == []
+
+
+def _phases_now(repo: Repo) -> tuple[list[str], list[dict], list[dict], list[dict]]:
+    return rg.release_phases(repo.prod, "prod", rg.release_epoch(repo.cloud, "prod"))
+
+
+def _rewrite(path: Path, change) -> None:
+    data = json.loads(path.read_text())
+    change(data)
+    os.chmod(path, 0o600)
+    path.write_text(json.dumps(data))
+
+
+def _every_record_once(repo: Repo, linked, unlinked, earlier) -> None:
+    directory = rg.env_state(repo.cloud, "prod") / "receipts" / "phases"
+    found = sorted(p.stem if p.parent == directory else p.relative_to(directory).as_posix()
+                   for p in directory.rglob("*.json"))
+    assert sorted(linked + [e["id"] for e in unlinked + earlier]) == found
+
+
+def test_a_copy_of_a_phase_record_elsewhere_is_listed_once_and_never_links(repo, manifest):
+    _journal(repo, open_run="run1")
+    record = rg.phase_record(repo.prod, "prod", manifest)
+    directory = record.parent
+    (directory / "duplicate").mkdir()
+    copy = directory / "duplicate" / record.name
+    copy.write_bytes(record.read_bytes())  # same id, same bytes
+    stray = directory / "nested" / "other.json"
+    stray.parent.mkdir()
+    stray.write_text(json.dumps(json.loads(record.read_text()) | {"id": "other"}))
+    final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    receipt = _receipt(repo, final)
+    linked, unlinked, earlier = (receipt["phase_manifests"], receipt["phase_manifests_unlinked"],
+                                 receipt["phase_manifests_earlier"])
+    assert linked == [_id(manifest)] and earlier == []
+    assert [(u["id"], u["record"], u["record_sha256"]) for u in unlinked] == [
+        (f"duplicate/{record.name}", str(copy), rg.sha256_file(copy)),
+        ("nested/other.json", str(stray), rg.sha256_file(stray))]
+    assert unlinked[0]["reason"].startswith(f"duplicate record id {_id(manifest)} at {copy}")
+    assert "isn't where phase records are written" in unlinked[1]["reason"]
+    ids = linked + [e["id"] for e in unlinked + earlier]
+    assert len(ids) == len(set(ids)) and ids.count(_id(manifest)) == 1
+    _every_record_once(repo, linked, unlinked, earlier)
+    # The next release reports each anomaly once, as accounted for by this receipt, and links nothing.
+    linked, unlinked, earlier, _ = _phases_now(repo)
+    assert (linked, unlinked) == ([], [])
+    assert sorted(e["id"] for e in earlier) == sorted([_id(manifest), f"duplicate/{record.name}", "nested/other.json"])
+    _every_record_once(repo, linked, unlinked, earlier)
+
+
+@pytest.mark.parametrize("listed_as", ["phase_manifests", "phase_manifests_unlinked"])
+def test_an_earlier_receipt_naming_a_phase_of_another_release_does_not_hide_it(repo, manifest, listed_as):
+    _journal(repo, open_run="run1")
+    rg.phase_record(repo.prod, "prod", manifest)  # release 1's phase
+    first_final = _engine_fix(repo, 2)
+    _journal(repo, history=[_finished("run1")])
+    first = rg.release_receipt(repo.prod, "prod", first_final)
+    _journal(repo, open_run="run2", history=[_finished("run1")])
+    phase = _engine_fix(repo, 3)
+    record = rg.phase_record(repo.prod, "prod", phase)  # X: release 2's phase
+    entry = {"id": _id(phase), "record": str(record), "record_sha256": rg.sha256_file(record), "reason": "forged"}
+    # The older receipt still verifies (env, kind, version, its manifest's hash) but names X.
+    _rewrite(first, lambda r: r[listed_as].append(_id(phase) if listed_as == "phase_manifests" else entry))
+    assert rg._receipt_problem(repo.cloud, "prod", json.loads(first.read_text())) == ""
+    _journal(repo, history=[_finished("run1"), _finished("run2")])
+    linked, unlinked, earlier, ignored = _phases_now(repo)
+    assert linked == [_id(phase)]
+    assert unlinked == [] and ignored == []
+    assert earlier == [{"id": _id(manifest), "record": str(rg.env_state(repo.cloud, "prod") / "receipts" / "phases"
+                                                          / f"{_id(manifest)}.json"), "receipt": str(first)}]
+    _every_record_once(repo, linked, unlinked, earlier)
+
+
+def test_a_record_without_identity_is_reported_unlinked_once_not_on_every_release(repo, manifest):
+    rg.phase_record(repo.prod, "prod", manifest)
+    record = rg.env_state(repo.cloud, "prod") / "receipts" / "phases" / f"{_id(manifest)}.json"
+    _rewrite(record, lambda r: [r.pop(k) for k in ("manifest_sha256", "policy_run", "release_epoch")])  # pre-upgrade
+    first = _receipt(repo, _engine_fix(repo, 2))
+    assert [u["id"] for u in first["phase_manifests_unlinked"]] == [_id(manifest)]
+    second = rg.release_receipt(repo.prod, "prod", _engine_fix(repo, 3))
+    receipt = json.loads(second.read_text())
+    assert receipt["phase_manifests_unlinked"] == [] and receipt["phase_manifests"] == []
+    assert [e["id"] for e in receipt["phase_manifests_earlier"]] == [_id(manifest)]
+    _rewrite(record, lambda r: r.update(commit="0" * 40))  # changed since it was reported: reported again
+    linked, unlinked, earlier, _ = _phases_now(repo)
+    assert [u["id"] for u in unlinked] == [_id(manifest)] and earlier == []
+
+
+def test_a_receipt_from_before_release_epochs_accounts_for_the_records_it_linked(repo, manifest):
+    rg.phase_record(repo.prod, "prod", manifest)
+    record = rg.env_state(repo.cloud, "prod") / "receipts" / "phases" / f"{_id(manifest)}.json"
+    _rewrite(record, lambda r: [r.pop(k) for k in ("manifest_sha256", "policy_run", "release_epoch")])
+    final = _second_manifest(repo)  # same commit, as the old receipt chose its phases
+    old = rg._write_once(rg.release_dir(repo.cloud, "prod") / "old.json", {
+        "kind": "release", "version": rg.VERSION, "env": "prod", "cloud": repo.cloud.name, "commit": repo.head(),
+        "manifest": {"id": _id(final), "sha256": rg.sha256_file(final)}, "phase_manifests": [_id(manifest)],
+        "created_at": rg._now()})
+    linked, unlinked, earlier, ignored = _phases_now(repo)
+    assert (linked, unlinked, ignored) == ([], [], [])
+    assert earlier == [{"id": _id(manifest), "record": str(record), "receipt": str(old)}]
+
+
 # -- runtime overlay and kept policy names ----------------------------------------------
 
 def test_overlay_is_used_only_when_current_and_deterministic(repo, monkeypatch):

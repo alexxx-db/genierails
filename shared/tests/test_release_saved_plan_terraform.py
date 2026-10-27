@@ -32,6 +32,12 @@ variable "value" {
   default = "v1"
 }
 
+# The runner always sets it (empty outside a pipeline job).
+variable "databricks_pipeline_auth_type" {
+  type    = string
+  default = ""
+}
+
 resource "terraform_data" "governed" {
   input = var.value
 }

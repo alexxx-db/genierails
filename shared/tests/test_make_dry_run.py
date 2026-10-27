@@ -31,10 +31,12 @@ def _write_valid_env(env_dir):
 
 def test_offline_evidence_does_not_resolve_a_terraform_warehouse():
     makefile = (ROOT / "shared" / "Makefile.shared").read_text()
-    recipe = makefile[makefile.index("evidence:"):makefile.index("audit-rulebook:")]
-    assert "GENIERAILS_EVIDENCE_INTEGRATION" in recipe
-    assert 'python3 "$(SHARED_ROOT)/evidence_report.py";' in recipe
-    assert '--warehouse-id "$$warehouse_id"' in recipe
+    recipe = makefile[makefile.index("\nevidence:"):makefile.index("audit-rulebook:")]
+    offline, live = recipe.split("\telse \\\n")
+    assert '"$(OFFLINE)"' in offline and "resolve_env_config.py" not in offline
+    assert 'env -u GENIERAILS_EVIDENCE_INTEGRATION python3 "$(SHARED_ROOT)/evidence_report.py";' in offline
+    assert "resolve_env_config.py" in live
+    assert 'GENIERAILS_EVIDENCE_INTEGRATION=1 python3 "$(SHARED_ROOT)/evidence_report.py" --warehouse-id "$$warehouse_id"' in live
 
 
 def _clean_env():
