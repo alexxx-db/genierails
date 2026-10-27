@@ -20,8 +20,8 @@ git add envs/dev/ && git commit           # PR; after merge the dev pipeline reh
 # prod
 make promote-to ENV=prod       # the promotion PR shows only mask and policy changes
 make check ENV=prod
-git add envs/prod/ && git commit          # PR; after merge, rehearse dev on the merge commit
-make release-plan ENV=prod     # on the deployment machine; approve the manifest
+git add envs/prod/ && git commit          # PR; merge it
+make release-plan ENV=prod     # on the deployment machine (reuses dev's rehearsal); approve the manifest
 make release ENV=prod          # releases the approved manifest
 ```
 
@@ -66,8 +66,7 @@ make rehearse ENV=dev                      # the dev pipeline, or the operator
 make setup ENV=prod                        # set governance_mode, deployer_principal_id, catalog_map
 make promote-to ENV=prod                   # commit envs/prod/, PR, merge
 #   Catalog Explorer: the same classification review on the prod catalog
-make rehearse ENV=dev                      # again, on the promotion's merge commit (release-plan needs it)
-make release-plan ENV=prod                 # on the deployment machine; approve the manifest
+make release-plan ENV=prod                 # on the deployment machine (reuses dev's rehearsal); approve the manifest
 make release ENV=prod                     # releases the approved manifest
 make maintain ENV=prod                     # on a schedule
 ```
@@ -86,8 +85,8 @@ make maintain ENV=prod                     # on a schedule
 3. **Generate, check, PR, rehearse.** **Pass looks like:** `ALL EFFECTIVE`.
 4. **Prod.** Set `governance_mode`, prod's `deployer_principal_id` and
    `catalog_map = { "dev_finance" = "prod_finance" }`, promote, classify prod;
-   then merge the promotion, rehearse the source env (`promote_from`, dev by
-   default) on its merge commit, `release-plan` and `release`. **Pass looks
+   then merge the promotion, `release-plan` (it reuses the source env's
+   rehearsal, or names the command to run) and `release`. **Pass looks
    like:** `ALL EFFECTIVE` and
    `=== Release complete (prod) ===`.
 
@@ -125,8 +124,8 @@ It writes `"class.<name>" = "<treatment>"` to `tag_treatments` in
 `envs/dev/env.auto.tfvars` for every unmapped class it finds. Run with
 `ENV=prod` when prod's release stopped on the class: it writes the env prod is
 promoted from. Then generate, check, PR, rehearse, `promote-to`, merge to
-`origin/main`, rehearse the source env (`promote_from`, dev by default) again
-on that commit, `release-plan`, `release`.
+`origin/main`, `release-plan` (it reuses the source env's rehearsal, or names
+the command to run), `release`.
 Refused: a class the library already maps (use `column_overrides`), a value that
 isn't a library treatment, and keys other than `class.*`
 ([tag_treatments](../../REFERENCE.md#customer-classes-tag_treatments)).

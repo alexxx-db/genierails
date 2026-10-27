@@ -43,8 +43,8 @@ def test_certify_points_each_mode_at_its_own_approval_step(tmp_path, cloud, mode
     assert result.returncode != 0
     if mode == "deterministic":
         assert ("make certify was removed; ENV=prod is deterministic: commit and push envs/prod/ to origin/main "
-                "(or merge its PR), make rehearse ENV=dev on that commit, make release-plan ENV=prod and "
-                "make release ENV=prod.") in result.stderr
+                "(or merge its PR), make release-plan ENV=prod (it reuses the dev rehearsal, or names the command "
+                "to run) and make release ENV=prod.") in result.stderr
         assert "approve the manifest make release-plan ENV=prod writes (it grants nothing)" in result.stderr
         assert "make plan" not in result.stderr
     else:

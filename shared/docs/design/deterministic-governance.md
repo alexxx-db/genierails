@@ -275,9 +275,9 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 | PR | read-only: validate, generated files current, coverage check, mask tests, `make plan ENV=dev` | no |
 | Merge to `main` | `make rehearse ENV=dev` on the new `main` | yes, one at a time |
 | Promote | a person runs `make promote-to ENV=prod` and opens the promotion PR | no |
-| Release | after the promotion PR is merged and rehearse has passed on that merge commit: the prod pipeline (section 17), or in v1 the operator on the deployment machine | prod |
+| Release | after the promotion PR is merged (`release-plan` reuses the source env's rehearsal when only the promoted env changed; otherwise rehearse must pass on that merge commit first): the prod pipeline (section 17), or in v1 the operator on the deployment machine | prod |
 
-- **Rehearse writes a receipt per commit** (append-only, keyed by commit) next to dev's state: commit, clean-tree flag, fingerprint of code and inputs, result, target env mapping, and the digest of what `promote-to` produces for each target. If the dev fingerprint matches a passing receipt, rehearse writes a receipt for the new commit without re-applying, and still recomputes the `promote-to` digests. This reuse does **not** re-check live dev for out-of-band drift. If dev was changed by hand, revert the live change and run a real apply/rehearse, or abandon/re-stage the unfinished policy change.
+- **Rehearse writes a receipt per commit** (append-only, keyed by commit) next to dev's state: commit, clean-tree flag, fingerprint of code and inputs, result, target env mapping, and the digest of what `promote-to` produces for each target. If the dev fingerprint matches a sealed, consistent passing receipt of an ancestor commit, rehearse (and `release-plan`, for its source env) writes a receipt for the new commit without re-applying, and still recomputes the `promote-to` digests. This reuse does **not** re-check live dev for out-of-band drift. If dev was changed by hand, revert the live change and run a real apply/rehearse, or abandon/re-stage the unfinished policy change.
 - **`release` recomputes everything and refuses unless** `HEAD` equals the receipt's commit, the tree is clean, `HEAD` is on freshly fetched `origin/main`, the fingerprints match, and the digest of `envs/prod/generated` matches the receipt. It also refuses a commit that is an ancestor of the last release (an out-of-order or stale approval) unless `<env>:rollback:<commit>` is acknowledged. The promotion PR's merge commit is the one that must pass rehearse, so code merged after it can't reach prod untested.
 - **Unfinished agents** never reach git, because capture is explicit. Promoting A carries B's last captured version unchanged.
 - **Removing an agent revokes `CAN_RUN` only. Removing a `table_readers` entry revokes the `SELECT` it granted.** Masks stay until `make ungovern`.
@@ -294,7 +294,7 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 3. `make generate ENV=dev`: imports the agents, derives governance, and proposes `table_readers` for the agents' tables. Review and commit.
 4. `make rehearse ENV=dev`.
 5. Set `catalog_map`; `make promote-to ENV=prod`; classify prod in the UI.
-6. Approve and merge the promotion PR; once rehearse passes on that commit, the operator runs `make release-plan ENV=prod`, gets the manifest approved, and runs `make release ENV=prod`.
+6. Approve and merge the promotion PR; the operator runs `make release-plan ENV=prod` (it reuses the dev rehearsal, or names the command to run), gets the manifest approved, and runs `make release ENV=prod`.
 7. `make maintain ENV=prod` on a schedule.
 
 **Governance-only flow (no agents):** the same commands with `uc_tables` set and no agents. GenieRails creates no agent. It grants `SELECT` only if `table_readers` is set; otherwise masks apply to whoever already has access, after the reader check (section 6).
@@ -303,15 +303,15 @@ organization-specific owner name. The `ACK` environment variable is accepted onl
 
 | Scenario | What happens |
 |---|---|
-| Promote A while B has unfinished dev edits | Capture A, merge, rehearse, promote; merge the promotion, rehearse the source env on its merge commit, `release-plan`, `release`. Prod B gets its last captured version unchanged. |
+| Promote A while B has unfinished dev edits | Capture A, merge, rehearse, promote; merge the promotion, `release-plan` (it reuses the source env's rehearsal), `release`. Prod B gets its last captured version unchanged. |
 | A adds a table | Capture records it; governance derives its masks; the promotion PR shows both; prod applies masks, then A's access. |
 | A and B share a table | Masks are shared and unchanged; only A changes. |
-| Mask change while B is mid-curation | Governance change; rehearse, promote, merge, rehearse the source env on the merge commit, `release-plan`, `release`. B's config is untouched in dev and prod. |
+| Mask change while B is mid-curation | Governance change; rehearse, promote, merge, `release-plan` (it reuses the source env's rehearsal, or names the command to run), `release`. B's config is untouched in dev and prod. |
 | New sensitive column in prod | `maintain` applies the library mask, or the fail-safe redaction if unmapped. |
-| Grant another group access to A in prod | Add the group to A's `acl_groups` in `envs/prod/agents/A.auto.tfvars` and, if it can't already read A's tables, to `table_readers`; PR, merge, rehearse the source env on the merge commit, `release-plan`, `release` (a no-op rehearse that writes a receipt). |
+| Grant another group access to A in prod | Add the group to A's `acl_groups` in `envs/prod/agents/A.auto.tfvars` and, if it can't already read A's tables, to `table_readers`; PR, merge, `release-plan` (a prod-only change: it reuses the source env's rehearsal), `release`. |
 | Remove agent A | A PR sets `acl_groups = []` and `detached = true` and is released (`CAN_RUN` revoked); then `make detach-agent`; then a governance PR adds `<env>:detached-agent:<key>`, removes only its capture, and keeps detached settings with a no-destroy plan. Revival removes that ack line. Table access and masks unchanged. |
-| Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, merge, rehearse the source env on the merge commit, `release-plan`, `release`. Additions are checked as widening. |
-| Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR applies the removal: merge, rehearse on the merge commit, and in a promoted env `release-plan` and `release`. |
+| Change who can read a table | Edit `table_readers` (dev, then promote, or prod directly as an env-owned change), PR, merge, `release-plan` (it reuses the source env's rehearsal, or names the command to run), `release`. Additions are checked as widening. |
+| Stop governing a table | `make ungovern TABLE=...` edits the committed governed-table list (refused while anything still covers it); a PR applies the removal: merge; in the rehearse env rehearse on the merge commit; in a promoted env `release-plan` (it reuses the source env's rehearsal) and `release`. |
 | Roll back | One revert PR covering the source change and its promotion, with `prod:rollback:<commit>` acknowledged; normal stages; masks switch back in place. |
 | Upgrade GenieRails | A governance change: upgrade, rehearse, promote, merge, rehearse the source env on the merge commit, `release-plan`, `release`. |
 | Several teams | Per-agent files with code owners; a central team owns governance files. |
@@ -369,7 +369,7 @@ One command per stage. People run the authoring commands on their own machine; p
 | **5. Keep protected** | **prod pipeline**, on a schedule, checked out at the last released commit (read from the release receipt) | `make maintain ENV=prod` | prod, governance only |
 | **6. Operations** | **prod pipeline**, manual dispatch, one approval per operation and per phase | `make detach-agent`, `make account-plan` then `make apply-account`, migration phases, phased policy changes (each with the provenance rules below) | prod or account layer |
 
-A promotion PR is just a PR whose diff includes `promote-to` output. It may also carry the dev change it promotes, in one PR. Prod-only PRs (`acl_groups`, `table_readers`, `ack.txt` in `envs/prod`) follow the same stages: rehearse on the merge commit is a no-op that writes a receipt, and the safety comes from the prod plan, refuse-weakening and the reader check.
+A promotion PR is just a PR whose diff includes `promote-to` output. It may also carry the dev change it promotes, in one PR. Prod-only PRs (`acl_groups`, `table_readers`, `ack.txt` in `envs/prod`) follow the same stages, except that no rehearse is needed: `release-plan` writes the source env's receipt itself from its earlier rehearsal (no apply), and the safety comes from the prod plan, refuse-weakening and the reader check.
 
 **Two-phase release.**
 1. **`make release-plan ENV=prod`**, under the prod lock, reads prod state and live policies and builds an ignored runtime overlay that keeps deployed policy names (#68: it fails closed when policies can't be listed, and refuses a collision with an unmanaged policy). From the committed promotion output plus that overlay it saves a Terraform plan for every root, runs the reader and refuse-weakening checks, and writes one immutable **manifest**: commit, state serial per root, plan file hashes, live-snapshot digest, the kept-name mapping and the reports. It becomes prod's **current** manifest; a newer `release-plan` supersedes it.
