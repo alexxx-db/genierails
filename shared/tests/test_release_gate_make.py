@@ -319,11 +319,16 @@ def test_release_plan_refuses_when_the_dev_rehearsal_cannot_be_reused(make, repo
     make.reset()
     result = make("release-plan", "prod")
     assert result.returncode != 0, case
-    assert "release-plan: did not reuse a rehearsal for this commit: " in result.stderr and why in result.stderr
-    assert "release-plan refused:" in result.stderr  # then provenance refuses exactly as before
-    named = "make release-plan ENV=prod" if case == "dirty tree" else (
-        "make promote-to ENV=prod" if case == "multi-hop" else "make rehearse ENV=dev")
-    assert named in result.stderr.split("did not reuse")[1].splitlines()[0], result.stderr
+    if case == "dirty tree":
+        # Refused up front (release_gate.py clean-check), before the check, the reuse and any lock.
+        assert "make release-plan refused: the checkout is not clean:" in result.stderr
+        assert "?? aws/notes.txt" in result.stderr and "re-run make release-plan ENV=prod" in result.stderr
+        assert "did not reuse" not in result.stderr and make.all_calls() == []
+    else:
+        assert "release-plan: did not reuse a rehearsal for this commit: " in result.stderr and why in result.stderr
+        assert "release-plan refused:" in result.stderr  # then provenance refuses exactly as before
+        named = "make promote-to ENV=prod" if case == "multi-hop" else "make rehearse ENV=dev"
+        assert named in result.stderr.split("did not reuse")[1].splitlines()[0], result.stderr
     assert make.calls() == [] and len(rg.rehearse_receipts(repo.cloud, "dev", any_store=True)) == before
     assert _no_lock(repo, "dev") and _no_lock(repo, "prod")
 
@@ -1592,6 +1597,30 @@ def test_a_failing_check_refuses_release_plan_before_reuse_the_lock_and_any_live
     assert len(rg.rehearse_receipts(repo.cloud, "dev")) == receipts
     assert _no_lock(repo, "prod") and _no_lock(repo, "dev")
     assert not list(rg.manifests_dir(repo.cloud, "prod").glob("*/manifest.json"))
+
+
+@pytest.mark.parametrize("dirt", ["envs", "shared"])
+def test_a_dirty_checkout_refuses_rehearse_before_the_check_the_lock_and_any_live_call(make, repo, dirt):
+    stubs = _cases_stub(make)
+    if dirt == "envs":
+        (repo.dev / "env.auto.tfvars").write_text(DEV_ENV + "# uncommitted\n")
+    else:
+        (repo.root / "shared" / "scripts" / "code.py").write_text("x = 3\n")
+    result = make("rehearse", "dev", stubs=stubs)
+    assert result.returncode != 0
+    assert "make rehearse refused: the checkout is not clean:" in result.stderr
+    assert ("aws/envs/dev/env.auto.tfvars" if dirt == "envs" else "shared/scripts/code.py") in result.stderr
+    assert make.all_calls() == []  # no check, no custom-mask live check, nothing under the lock
+    assert not rg.rehearse_receipts(repo.cloud, "dev") and _no_lock(repo, "dev")
+
+
+def test_ignored_files_never_make_rehearse_refuse_as_dirty(make, repo):
+    (repo.dev / "auth.auto.tfvars").write_text('databricks_client_id = "x"\n')
+    (repo.dev / "terraform.tfstate").write_text("{}")
+    assert repo.git("status", "--porcelain").strip() == ""  # both are git-ignored
+    result = make("rehearse", "dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not clean" not in result.stderr
 
 
 def test_legacy_rehearse_and_a_refused_release_plan_run_no_check(make, repo):

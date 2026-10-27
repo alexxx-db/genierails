@@ -1150,6 +1150,7 @@ rehearse: _guard-not-ci-apply _guard-genie-placeholder ## Run serial rehearsal (
 		$(_DEPLOYER_CHECK) "make rehearse" || exit 1; \
 		$(_ACCESS_CHECK) "make rehearse" || exit 1; \
 		$(_GROUP_CHECK) "make rehearse" || exit 1; \
+		$(_RELEASE_GATE) clean-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name "make rehearse" || exit 1; \
 		$(call _RUN_CHECK,rehearse); \
 		$(_CUSTOM_MASK_CASES) || exit 1; \
 		$(call _ENV_LOCK,rehearse); \
@@ -1335,6 +1336,7 @@ release-plan: _guard-not-ci-apply _guard-genie-placeholder ## [deterministic] Pl
 	$(_DEPLOYER_CHECK) "make release-plan" || exit 1; \
 	$(_ACCESS_CHECK) "make release-plan" || exit 1; \
 	$(_GROUP_CHECK) "make release-plan" || exit 1; \
+	$(_RELEASE_GATE) clean-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --command-name "make release-plan" || exit 1; \
 	$(call _RUN_CHECK,release-plan); \
 	$(_RELEASE_GATE) rehearse-reuse --env-dir "$(ENV_DIR)" --env "$(ENV)" $(_RELEASE_GATE_MAKE) || exit 1; \
 	prov="$$(mktemp)"; \
@@ -1794,9 +1796,12 @@ override _CHECK_ENV = python3 "$(SHARED_ROOT)/scripts/check_env.py"$(if $(filter
 # rehearse and release-plan (deterministic envs) run the same check through
 # _RUN_CHECK, after their local guards and before any live call, lock or
 # write; their _guard-genie-placeholder prerequisite already ran the two
-# guards above, so they call check_env.py directly. make check stays the
-# standalone read-only target (the PR check and the prod workflow run it).
-override _RUN_CHECK = $(_CHECK_ENV) check || { echo "$(1): refused: make check ENV=$(ENV) failed (above); nothing was locked, written or applied. Fix it, commit, then re-run make $(1) ENV=$(ENV)." >&2; exit 1; }
+# guards above, so they call check_env.py directly. They refuse a dirty
+# checkout first (release_gate.py clean-check), and their check reads the
+# committed files (--committed: HEAD, not the working tree). make check stays
+# the standalone read-only target (the PR check and the prod workflow run it),
+# on tracked working-tree content with its uncommitted-files note.
+override _RUN_CHECK = $(_CHECK_ENV) --committed check || { echo "$(1): refused: make check ENV=$(ENV) failed (above); nothing was locked, written or applied. Fix it, commit, then re-run make $(1) ENV=$(ENV)." >&2; exit 1; }
 
 check: ## Read-only PR check: validate, generated files current, validate-generated, coverage check, mask tests, structural plan
 	@$(_GENIE_PLACEHOLDER_GUARD)

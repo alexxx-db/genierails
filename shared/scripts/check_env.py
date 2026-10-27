@@ -8,6 +8,10 @@ check          make check ENV=<env>: validate; generated files are current
 promote-check  make promote-to ENV=<env> CHECK=1: rerun promote-to from the
                committed files and fail if its output differs.
 
+--committed (rehearse and release-plan) fills the scratch envs/ from HEAD
+instead of the tracked working-tree content, so the check passes only when
+the commit itself does (they refuse a dirty checkout before it runs).
+
 Every step runs make in a scratch copy of the cloud dir. The copy holds the
 env files git tracks, never git-ignored or untracked files, credentials,
 Terraform state or runtime records, so a local-only file can't change the
@@ -161,6 +165,37 @@ def _tracked_env_files(envs: Path) -> list[Path]:
     return files
 
 
+def _committed_env_files(envs: Path) -> list[tuple[Path, str]]:
+    """(path relative to envs/, blob id) for every regular file HEAD has under envs/."""
+    try:
+        listed = subprocess.run(["git", "-C", str(envs), "ls-tree", "-r", "-z", "HEAD", "--", "."],
+                                capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = (getattr(exc, "stderr", None) or b"").decode(errors="replace").strip()
+        raise CheckFailed(f"cannot list the files HEAD has under {envs}: {detail or exc}") from exc
+    found = []
+    for entry in filter(None, listed.split(b"\0")):
+        meta, _, raw = entry.partition(b"\t")
+        mode, kind, blob = meta.decode().split()
+        if kind == "blob" and mode in ("100644", "100755"):  # links (120000) are never copied
+            found.append((Path(os.fsdecode(raw)), blob))
+    if not found and any(envs.iterdir()):
+        _tracked_env_files(envs)  # the same refusal as the working-tree copy when nothing is committed
+    return found
+
+
+def _copy_committed_envs(source: Path, dest: Path) -> None:
+    """Copy the env files as HEAD has them, minus runtime files."""
+    dest.mkdir()
+    for rel, blob in _committed_env_files(source):
+        if _not_copied(rel):
+            continue
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.run(["git", "-C", str(source), "cat-file", "blob", blob],
+                                          capture_output=True, check=True).stdout)
+
+
 def _copy_tracked_envs(source: Path, dest: Path) -> None:
     """Copy the tracked env files, minus runtime files and the scaffold link."""
     dest.mkdir()
@@ -253,7 +288,7 @@ def _gnu_make(make: str, origin: str) -> str:
 class Scratch:
     """A throwaway cloud dir whose envs/ copies the tracked env files minus runtime files."""
 
-    def __init__(self, cloud_dir: Path, makefile: Path, make_bin: str):
+    def __init__(self, cloud_dir: Path, makefile: Path, make_bin: str, committed: bool = False):
         self.real_envs = cloud_dir / "envs"
         self.make_bin = make_bin
         _refuse_symlinks(cloud_dir, self.real_envs)
@@ -264,7 +299,7 @@ class Scratch:
             shutil.copyfile(makefile, self.cloud / "Makefile")
             self.envs = self.cloud / "envs"
             if self.real_envs.is_dir():
-                _copy_tracked_envs(self.real_envs, self.envs)
+                (_copy_committed_envs if committed else _copy_tracked_envs)(self.real_envs, self.envs)
             else:
                 self.envs.mkdir()
             _assert_contained(self.root)
@@ -350,7 +385,7 @@ def _report(label: str, before: dict, after: dict, fix: str) -> None:
 
 
 def _promote_check(args) -> None:
-    scratch = Scratch(args.cloud_dir, args.makefile, args.make)
+    scratch = Scratch(args.cloud_dir, args.makefile, args.make, getattr(args, "committed", False))
     try:
         scratch.add_credentials(args.env)
         before = _snapshot(scratch.envs)
@@ -368,11 +403,17 @@ def _promote_check(args) -> None:
 
 def _check(args) -> None:
     env = args.env
-    real_env_dir = args.cloud_dir / "envs" / env
-    is_deterministic = deterministic(real_env_dir)
-    promotes = env_role(real_env_dir) == PROMOTED
+    committed = getattr(args, "committed", False)
+    scratch = Scratch(args.cloud_dir, args.makefile, args.make, committed)
+    # The env as checked: HEAD's copy with --committed, else the working tree.
+    real_env_dir = scratch.envs / env if committed else args.cloud_dir / "envs" / env
+    try:
+        is_deterministic = deterministic(real_env_dir)
+        promotes = env_role(real_env_dir) == PROMOTED
+    except BaseException:
+        scratch.close()
+        raise
     has_generated = (real_env_dir / "generated" / "abac.auto.tfvars").is_file()
-    scratch = Scratch(args.cloud_dir, args.makefile, args.make)
     steps = 6
 
     def step(number: int, title: str) -> None:
@@ -493,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from", dest="from_env", default="", help="promote-check: FROM override")
     parser.add_argument("--catalog-map", default="", help="promote-check: CATALOG_MAP override")
     parser.add_argument("--env-dir-override", type=Path, help="a command-line ENV_DIR, refused unless it is envs/<env>")
+    parser.add_argument("--committed", action="store_true",
+                        help="check HEAD's env files, not the working tree (rehearse and release-plan)")
     args = parser.parse_args(argv)
     args.cloud_dir = args.cloud_dir.resolve()
     if args.env_dir_override and args.env_dir_override.resolve() != args.cloud_dir / "envs" / args.env:
@@ -515,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     except (CheckFailed, GovernedTablesError) as exc:
         print(f"\n=== {label}: FAILED ({exc}) ===", file=sys.stderr)
         return 1
-    if args.command == "check":
+    if args.command == "check" and not args.committed:
         _note_uncommitted_env_files(args.cloud_dir, args.env)
     print(f"\n=== {label}: passed ===")
     return 0

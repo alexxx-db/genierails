@@ -576,6 +576,29 @@ def checkout_status(env_dir: Path) -> dict:
     return {"repo": str(repo), "commit": head(repo), "clean_tree": not reasons, "dirty": reasons}
 
 
+def clean_check(env_dir: Path, env: str, command_name: str) -> None:
+    """rehearse and release-plan, before their check, any lock or live call: the checkout is clean.
+
+    The same test as a receipt's clean_tree and provenance (checkout_status: tracked or untracked,
+    not ignored, changes under the cloud dir and shared/), so ignored runtime files (credentials,
+    state) never count. Their check reads the commit, so it must be the tree they apply. A shared/
+    outside this checkout (a symlinked copy) is no part of the commit and isn't listed.
+    """
+    env_dir = Path(env_dir)
+    repo, cloud_dir = repo_root(env_dir), cloud_dir_of(env_dir)
+    shared = repo / "shared"
+    inside = shared.exists() and shared.resolve().is_relative_to(repo.resolve())
+    dirty = [f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir, *([shared] if inside else [])])]
+    if not tracked(repo, env_dir / "env.auto.tfvars"):
+        dirty.append(f"{_rel(repo, env_dir / 'env.auto.tfvars')} is not committed (commit envs/; "
+                     "see shared/docs/version-control.md)")
+    if dirty:
+        raise Refused(f"{command_name} refused: the checkout is not clean:\n      "
+                      + "\n      ".join(dirty[:10])
+                      + f"\n  Its check, receipt and release read the commit: commit or remove the changes, "
+                        f"then re-run {command_name} ENV={env}. Nothing was locked, written or applied.")
+
+
 def _write_rehearse(cloud_dir: Path, env: str, receipt: dict) -> Path:
     stamp = receipt["created_at"].replace(":", "").replace(".", "")
     name = f"{stamp}-{receipt['result']}-{os.getpid()}.json"
@@ -2650,6 +2673,7 @@ def main(argv: list[str] | None = None) -> int:
     command("generate-guard").add_argument("--default-env", default="")
     command("identity-check")
     command("legacy-guard").add_argument("--command-name", required=True)
+    command("clean-check").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "state-dir":
@@ -2778,6 +2802,8 @@ def main(argv: list[str] | None = None) -> int:
             generate_guard(args.env_dir, args.env, args.default_env or None)
         elif args.command == "identity-check":
             identity_check(args.env_dir, args.env)
+        elif args.command == "clean-check":
+            clean_check(args.env_dir, args.env, args.command_name)
         elif args.command == "maintain-check":
             last = maintain_check(args.env_dir, args.env)
             print(f"maintain: HEAD is the last released commit {last['commit'][:12]} (digests match).")

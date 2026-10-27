@@ -885,3 +885,71 @@ def test_release_plan_check_runs_after_the_workspace_env_and_mode_guards(repo, t
     assert "is not in deterministic governance mode" in result.stderr
     assert "make check ENV=dev" not in result.stdout + result.stderr
     assert live == ""
+
+
+def _broken_head_clean_worktree(repo, env):
+    """Codex's repro: commit a hand edit (HEAD is broken), then restore the file uncommitted."""
+    rel = "dev/data_access/abac.auto.tfvars" if env == "dev" else "prod/generated/abac.auto.tfvars"
+    path = _envs(repo) / rel
+    good = path.read_text()
+    path.write_text(good.replace('"c"', '"hand edited"', 1) if env == "dev" else good.replace("account_last4", "redact"))
+    _commit(repo, "hand edit")
+    path.write_text(good)
+    return rel
+
+
+@pytest.mark.parametrize("target, env", [("rehearse", "dev"), ("release-plan", "prod")])
+def test_a_broken_commit_under_a_restored_working_tree_is_refused_before_anything(promoted, tmp_path, target, env):
+    rel = _broken_head_clean_worktree(promoted, env)
+    _write_auth(promoted, env)
+    before = _baseline(promoted)
+
+    result, live = _make_gated(promoted, tmp_path, target, env)
+
+    assert result.returncode != 0
+    assert f"make {target} refused: the checkout is not clean:" in result.stderr
+    assert f"aws/envs/{rel}" in result.stderr
+    # Refused before the check, any live step, lock, receipt or terraform.
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(promoted)
+    _assert_read_only(promoted, before)
+
+
+def _check_env(repo, env, *flags):
+    return subprocess.run([sys.executable, str(SHARED / "scripts" / "check_env.py"), *flags, "check", "--env", env,
+                           "--cloud-dir", str(repo / "aws"), "--makefile", str(repo / "aws" / "Makefile")],
+                          text=True, capture_output=True, env=_env(repo.parent), timeout=300)
+
+
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_the_embedded_check_reads_head_not_the_working_tree(promoted, env):
+    rel = _broken_head_clean_worktree(promoted, env)
+    before = _baseline(promoted)
+
+    committed = _check_env(promoted, env, "--committed")
+    working = _check_env(promoted, env)
+
+    assert committed.returncode != 0, committed.stdout + committed.stderr
+    assert ": differs from the regenerated file" in committed.stderr
+    assert "uncommitted working-tree content" not in committed.stdout
+    # Standalone make check keeps checking the tracked working tree, with #238's note.
+    assert "differs from the regenerated file" not in working.stderr
+    assert f"NOTE: make check passed against uncommitted working-tree content in envs/{env}:" in working.stdout \
+        or "FAILED (plan)" in working.stderr, working.stdout + working.stderr
+    assert rel.split("/", 1)[1] in working.stdout
+    _assert_read_only(promoted, before)
+
+
+def test_ignored_runtime_files_never_make_the_checkout_dirty(repo, tmp_path):
+    _write_auth(repo, "dev")
+    (_envs(repo) / "dev" / "data_access").mkdir(exist_ok=True)
+    (_envs(repo) / "dev" / "data_access" / "terraform.tfstate").write_text("{}")
+    assert _git(repo, "status", "--porcelain") == ""
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert "not clean" not in result.stderr
+    assert "=== make check ENV=dev: passed ===" in result.stdout + result.stderr
+    assert "--env dev" in live
