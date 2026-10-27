@@ -184,6 +184,7 @@ Credentials only. Never commit it.
 | `databricks_account_id` | string | required by the account and data_access roots; `""` in workspace | The Databricks account ID. May be empty with `genie_only = true`. |
 | `databricks_client_id` | string | required | Application (client) ID of the service principal that applies this env. A deterministic env applies only when it equals `deployer_principal_id`. |
 | `databricks_client_secret` | string (sensitive) | required | That service principal's OAuth secret. |
+| `databricks_pipeline_auth_type` | string | `""` | Runner-only OIDC auth type, set by `scripts/terraform_layer.sh` from the `DATABRICKS_AUTH_TYPE` kept by `scripts/terraform_env.sh` in a pipeline job. Values are `github-oidc`, `azure-devops-oidc` or empty. Callers can't set it: the runner refuses caller `-var`, `-var-file` / tfvars, `TF_CLI_ARGS*`, `TF_VAR_` and Terraform override values. |
 | `databricks_workspace_id` | string | required by workspace; `""` elsewhere | The workspace ID. |
 | `databricks_workspace_host` | string | required by workspace and data_access; `""` in account | The workspace URL. |
 | `databricks_account_host` | string | `"https://accounts.cloud.databricks.com"` | Account console API URL. Azure must set `https://accounts.azuredatabricks.net`. |
