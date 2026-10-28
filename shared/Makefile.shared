@@ -1012,6 +1012,25 @@ override _RELEASE_GATE = python3 "$(SHARED_ROOT)/scripts/release_gate.py"
 override _RELEASE_GATE_MAKE = --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
 RELEASE_REMOTE ?= origin
 RELEASE_BRANCH ?= main
+# APPROVAL=<record> (scripts/approval.py): the write-once record of a y typed
+# at this terminal, which GenieRails' interactive flows pass to
+# _apply-account-locked and _release-manifest. It is audit, not a gate: it
+# approves nothing and skips no check. It counts only as a command-line
+# variable of a nested make (never from the environment or a top-level make;
+# apply-account and release clear it), is checked under the lock before
+# anything applies, and the receipt embeds it. Without it a receipt records
+# {"via": "external"} (approved outside GenieRails), as every receipt did before.
+override _APPROVAL = $(if $(and $(filter command line,$(origin APPROVAL)),$(filter-out 0,$(MAKELEVEL))),$(abspath $(strip $(APPROVAL))))
+override _APPROVAL_CHECK = approval='$(subst ','\'',$(_APPROVAL))'; \
+	if [ -n "$$approval" ]; then \
+		ap_out="$$(python3 "$(SHARED_ROOT)/scripts/approval.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --approval "$$approval")"; ap_rc=$$?; \
+		case "$$ap_rc:$$ap_out" in \
+			"0:genierails-approval:v1:valid") echo "Approval record $$approval: approves this manifest." ;; \
+			"1:genierails-approval:v1:invalid") echo "$(1): the approval record doesn't approve this manifest (above); nothing was applied." >&2; exit 1 ;; \
+			*) echo "ERROR: the approval check ($(SHARED_ROOT)/scripts/approval.py check) gave no valid answer (exit $$ap_rc); nothing was applied." >&2; exit 1 ;; \
+		esac; \
+	fi
+override _APPROVAL_ARG = $${approval:+--approval "$$approval"}
 # Live UC as release-plan saw it, and again (re-derived) before release applies.
 override _LIVE_SNAPSHOT = $(_RELEASE_GATE) live-snapshot --env-dir "$(ENV_DIR)" --env "$(ENV)"
 override _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)"
@@ -1103,7 +1122,7 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 		manifest="$(abspath $(strip $(MANIFEST)))"; \
 		$(_RELEASE_GATE) account-manifest-info --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --manifest "$$manifest" || exit 1; \
 	fi; \
-	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest"
+	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest" APPROVAL=
 
 _apply-account-locked: _guard-not-databricks-compute
 	@$(_DRY_RUN_GUARD); \
@@ -1111,6 +1130,7 @@ _apply-account-locked: _guard-not-databricks-compute
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
 	$(call _ENV_LOCK,apply-account); \
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
+	$(call _APPROVAL_CHECK,apply-account); \
 	apply_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-plan.XXXXXX")" || exit 1; chmod 700 "$$apply_dir"; \
 	trap '$(_NO_SIGNALS); rm -rf "$$apply_dir"; $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	cp "$$plans/account.tfplan" "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; chmod 400 "$$apply_dir/account.tfplan"; \
@@ -1124,7 +1144,7 @@ _apply-account-locked: _guard-not-databricks-compute
 	echo "=== Apply saved plan (account) ==="; \
 	LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" apply-plan "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; \
 	rm -rf "$$apply_dir"; \
-	$(_RELEASE_GATE) account-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	$(_RELEASE_GATE) account-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 	if ! rm -f "$$plans/account.tfplan"; then echo "WARNING: account apply succeeded and its receipt was written, but $$plans/account.tfplan contains credentials and could not be deleted; delete it." >&2; fi; \
 	echo ""; \
 	echo "=== Account apply complete ==="
@@ -1259,7 +1279,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
-		$(MAKE) --no-print-directory _release-manifest ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" MANIFEST="$(MANIFEST)"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); \
+		$(MAKE) --no-print-directory _release-manifest ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" MANIFEST="$(MANIFEST)" APPROVAL=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); \
 		exit $$?; \
 	fi; \
 	export GENIERAILS_RERUN_TARGET=release; \
@@ -1496,6 +1516,7 @@ _release-manifest: _guard-not-ci-apply
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
+	$(call _APPROVAL_CHECK,release); \
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
 	imports="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field imports.count)" || exit 1; \
@@ -1506,7 +1527,7 @@ _release-manifest: _guard-not-ci-apply
 			echo "release: a recorded import or stale-tag cleanup failed (above); the ones before it are done, nothing else was applied. Fix the cause, then make release-plan ENV=$(ENV) again." >&2; \
 			exit 1; \
 		fi; \
-		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest imported existing resources into Terraform state; nothing else was applied."; \
@@ -1519,7 +1540,7 @@ _release-manifest: _guard-not-ci-apply
 	staged_rc=0; GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) apply-saved --env-dir "$(ENV_DIR)" --env-name "$(ENV)" $(_STAGED_SPEC_FLAGS) \
 		--plan-dir "$$plans/data_access" --verify-access-cmd '$(_STAGED_VERIFY_ACCESS)' || staged_rc=$$?; \
 	if [ $$staged_rc -eq 10 ]; then \
-		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest held one phase of a staged policy change; it is applied and verified."; \
@@ -1532,7 +1553,7 @@ _release-manifest: _guard-not-ci-apply
 	fi; \
 	ws_skipped="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.skipped)" || exit 1; \
 	if [ "$${ws_skipped#deferred:}" != "$$ws_skipped" ]; then \
-		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest opened the SELECT the Genie agents need; the workspace (CAN_RUN) is planned with it live."; \
@@ -1569,7 +1590,7 @@ _release-manifest: _guard-not-ci-apply
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the staged policy journal could not be confirmed"; \
 		exit 1; \
 	fi; \
-	$(_RELEASE_GATE) release-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	$(_RELEASE_GATE) release-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 	echo ""; \
 	echo "=== Release complete ($(ENV)) ==="; \
 	$(_RELEASE_HELPER) access-summary "$(ENV_DIR)"; \

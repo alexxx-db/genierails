@@ -179,7 +179,7 @@ def test_release_hands_a_deterministic_env_to_the_manifest_release(make, repo):
     result = make("release", "prod", "MANIFEST=/m/manifest.json")
     assert result.returncode == 0, result.stderr
     assert make.calls() == [["--no-print-directory", "_release-manifest", "ENV=prod",
-                             f"ENV_DIR={repo.prod}", "MANIFEST=/m/manifest.json"]]
+                             f"ENV_DIR={repo.prod}", "MANIFEST=/m/manifest.json", "APPROVAL="]]
 
 
 def test_legacy_release_is_unchanged(make, repo):
