@@ -18,6 +18,7 @@ MAKEFILE = SHARED / "Makefile.shared"
 REFUSAL = "-i/-k are not supported for this target because guards would be skipped"
 ALLOWLIST = {"help", "check", "status", "next", "validate"}
 CONDITIONAL_ALLOW = {"evidence"}
+SYNTAX_ERROR = "syntax error"
 PROD_ENV = '''governance_mode = "deterministic"
 promote_from = "dev"
 catalog_map = { "paycat" = "ppay" }
@@ -107,6 +108,7 @@ def _assert_refused_without_change(make_bin: str, repo: Path, tmp_path: Path, *a
     before = _tree_snapshot(repo)
     result = _make(make_bin, repo, tmp_path, *args, env=env)
     output = result.stdout + result.stderr
+    assert SYNTAX_ERROR not in output
     assert result.returncode != 0, output
     assert REFUSAL in output, output
     assert _tree_snapshot(repo) == before
@@ -149,6 +151,17 @@ REPRESENTATIVE_TARGETS = [
     ("apply", ("ENV=dev",), _promoted),
 ]
 
+SHELL_SPECIAL_ASSIGNMENTS = [
+    pytest.param("NOTE=it's", id="single-quote"),
+    pytest.param('NOTE=a"b', id="double-quote"),
+    pytest.param("NOTE=a;b", id="semicolon"),
+    pytest.param("NOTE=x&y", id="ampersand"),
+    pytest.param("NOTE=x|y", id="pipe"),
+    pytest.param("NOTE=x<y", id="redirect"),
+    pytest.param("NOTE=x)y", id="close-paren"),
+    pytest.param("NOTE=$(printf bad)", id="make-reference"),
+]
+
 
 @pytest.mark.parametrize("make_bin", MAKE_BINARIES)
 @pytest.mark.parametrize(("target", "target_args", "builder"), REPRESENTATIVE_TARGETS)
@@ -165,6 +178,40 @@ def test_state_changing_targets_refuse_error_modes_before_any_write(make_bin, tm
                                                                     builder, mode_args, env):
     repo = builder(tmp_path)
     _assert_refused_without_change(make_bin, repo, tmp_path, *mode_args, target, *target_args, env=env)
+
+
+@pytest.mark.parametrize("make_bin", MAKE_BINARIES)
+@pytest.mark.parametrize("assignment", SHELL_SPECIAL_ASSIGNMENTS)
+def test_error_mode_parser_ignores_shell_special_command_line_assignments(make_bin, tmp_path, assignment):
+    repo = _promoted(tmp_path)
+    _assert_refused_without_change(make_bin, repo, tmp_path, "-i", "capture", "ENV=prod", "SPACE=s1", assignment)
+
+
+@pytest.mark.parametrize("make_bin", MAKE_BINARIES)
+@pytest.mark.parametrize("assignment", SHELL_SPECIAL_ASSIGNMENTS)
+def test_error_mode_parser_refuses_apply_with_shell_special_assignments(make_bin, tmp_path, assignment):
+    repo = _promoted(tmp_path)
+    _assert_refused_without_change(make_bin, repo, tmp_path, "-i", "apply", "ENV=dev", assignment)
+
+
+@pytest.mark.parametrize("make_bin", MAKE_BINARIES)
+@pytest.mark.parametrize("assignment", SHELL_SPECIAL_ASSIGNMENTS)
+def test_keep_going_refuses_before_parallel_writes_with_shell_special_assignments(make_bin, tmp_path, assignment):
+    repo = _promoted(tmp_path)
+    _assert_refused_without_change(
+        make_bin, repo, tmp_path, "-k", "-j8", "apply", "ENV=prod", assignment, env={"CI": "true"}
+    )
+
+
+@pytest.mark.parametrize("make_bin", MAKE_BINARIES)
+@pytest.mark.parametrize("assignment", SHELL_SPECIAL_ASSIGNMENTS)
+def test_read_only_help_allows_shell_special_assignments_without_syntax_error(make_bin, tmp_path, assignment):
+    repo = _bare(tmp_path)
+    result = _make(make_bin, repo, tmp_path, "-n", "help", assignment)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert REFUSAL not in output
+    assert SYNTAX_ERROR not in output
 
 
 @pytest.mark.skipif(not shutil.which("gmake"), reason="needs GNU Make 4.x as gmake")
@@ -246,3 +293,16 @@ def test_gnu_make_4_long_and_arg_options_do_not_false_match_i(tmp_path, args):
 def test_ci_keep_going_apply_refuses_before_parallel_prerequisites_write(make_bin, tmp_path):
     repo = _promoted(tmp_path)
     _assert_refused_without_change(make_bin, repo, tmp_path, "-k", "-j8", "apply", "ENV=prod", env={"CI": "true"})
+
+
+@pytest.mark.parametrize("make_bin", MAKE_BINARIES)
+@pytest.mark.parametrize(("args", "env"), [
+    pytest.param(("GENIERAILS_READONLY_ERROR_FLAGS=1",), {}, id="command-line"),
+    pytest.param((), {"GENIERAILS_READONLY_ERROR_FLAGS": "1"}, id="environment"),
+])
+def test_internal_readonly_error_flag_cannot_be_forged_at_top_level(make_bin, tmp_path, args, env):
+    repo = _bare(tmp_path)
+    result = _make(make_bin, repo, tmp_path, "-i", "apply", "ENV=dev", *args, env=env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "GENIERAILS_READONLY_ERROR_FLAGS is internal" in output

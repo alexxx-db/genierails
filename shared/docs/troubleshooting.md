@@ -69,6 +69,21 @@ make apply
 
 ## Common Issues
 
+### `make` refuses `-i` or `-k`
+
+GenieRails refuses GNU make's ignore-errors and keep-going modes
+(`-i`/`--ignore-errors` and `-k`/`--keep-going`) at parse time for every
+state-changing goal. Those modes can let recipe lines or sibling prerequisites
+continue after a guard fails. Read-only goals still allow them: `help`, `check`,
+`status`, `next`, `validate`, and `evidence OFFLINE=1`.
+
+The guard parses `MAKEFLAGS`/`GNUMAKEFLAGS` before recipes run and ignores
+command-line variable assignments after GNU make's `--` separator. It is an
+accident guard, not a security boundary: it does not detect a deliberate
+`--eval=.IGNORE:` override, and a caller who forges both `MAKELEVEL` and the
+internal `GENIERAILS_READONLY_ERROR_FLAGS` environment can bypass the inherited
+read-only marker.
+
 ### `make import ENV=account` fails with "abac.auto.tfvars not found"
 
 The account import reads `envs/account/abac.auto.tfvars`, and on a fresh repo nothing before it

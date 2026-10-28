@@ -357,24 +357,24 @@ endif
 # sibling prerequisites run after a guard fails. Refuse them at parse time for
 # every goal except a small read-only allowlist. GNU make 3.81 may put long
 # options before short ones in MAKEFLAGS; GNU make 4.x may also use GNUMAKEFLAGS.
-# The parser checks long options by exact name, skips variable assignments and
+# The parser uses only make functions, stops at GNU make's "--" separator before
+# command-line variable assignments, checks long options by exact name, skips
 # options whose words carry arguments (-I, -O, -j, -l, -C, -f, -o, -W), and checks
 # true short-flag clusters for i/k. It intentionally does not try to detect
-# --eval=.IGNORE:.
-override _MAKE_UNSAFE_ERROR_FLAGS := $(shell for word in $(MAKEFLAGS) $(GNUMAKEFLAGS) $$GNUMAKEFLAGS; do \
-	{ [ "$$word" = "--ignore-errors" ] || [ "$$word" = "--keep-going" ]; } && { echo 1; exit; }; \
-	printf '%s\n' "$$word" | grep -q '^--' && continue; \
-	printf '%s\n' "$$word" | grep -q '=' && continue; \
-	printf '%s\n' "$$word" | grep -Eq '^-[IOjlCfoW]' && continue; \
-	printf '%s\n' "$$word" | grep -Eq '^-[^-]*[ik]' && { echo 1; exit; }; \
-	printf '%s\n' "$$word" | grep -q '/' && continue; \
-	printf '%s\n' "$$word" | grep -Eq '^[IOjlCfoW]' && continue; \
-	printf '%s\n' "$$word" | grep -Eq '[ik]' && { echo 1; exit; }; \
-done)
+# --eval=.IGNORE:, and a caller who forges both MAKELEVEL and the internal
+# GENIERAILS_READONLY_ERROR_FLAGS can still bypass this accident guard.
+override _make_words_before_dashdash = $(if $(strip $(1)),$(if $(filter --,$(firstword $(1))),,$(firstword $(1)) $(call _make_words_before_dashdash,$(wordlist 2,$(words $(1)),$(1)))))
+override _MAKE_ERROR_FLAG_WORDS := $(strip $(call _make_words_before_dashdash,$(MAKEFLAGS)) $(call _make_words_before_dashdash,$(GNUMAKEFLAGS)))
+override _MAKE_SHORT_ERROR_FLAG_WORDS := $(filter-out -I% -O% -j% -l% -C% -f% -o% -W% I% O% j% l% C% f% o% W%,$(filter-out --% %=%, $(_MAKE_ERROR_FLAG_WORDS)))
+override _MAKE_UNSAFE_ERROR_FLAGS := $(strip $(filter --ignore-errors --keep-going,$(_MAKE_ERROR_FLAG_WORDS)) $(foreach word,$(_MAKE_SHORT_ERROR_FLAG_WORDS),$(if $(or $(findstring i,$(word)),$(findstring k,$(word))),1)))
 override _MAKE_EFFECTIVE_GOALS := $(or $(MAKECMDGOALS),help)
 override _MAKE_IGNORE_ERRORS_ALLOWED_GOALS := help check status next validate $(if $(filter 1,$(OFFLINE)),evidence)
 override _MAKE_IGNORE_ERRORS_REFUSED_GOALS := $(filter-out $(_MAKE_IGNORE_ERRORS_ALLOWED_GOALS),$(_MAKE_EFFECTIVE_GOALS))
 override _MAKE_INHERITED_READONLY_ERROR_FLAGS := $(if $(filter 0,$(MAKELEVEL)),,$(GENIERAILS_READONLY_ERROR_FLAGS))
+override _MAKE_FORGED_READONLY_ERROR_FLAGS := $(if $(and $(filter 0,$(MAKELEVEL)),$(_MAKE_UNSAFE_ERROR_FLAGS),$(_MAKE_IGNORE_ERRORS_REFUSED_GOALS)),$(strip $(findstring command line,$(origin GENIERAILS_READONLY_ERROR_FLAGS)) $(filter environment,$(origin GENIERAILS_READONLY_ERROR_FLAGS))))
+ifneq ($(_MAKE_FORGED_READONLY_ERROR_FLAGS),)
+$(error GENIERAILS_READONLY_ERROR_FLAGS is internal and cannot be set on the command line or environment)
+endif
 override GENIERAILS_READONLY_ERROR_FLAGS := $(if $(_MAKE_IGNORE_ERRORS_REFUSED_GOALS),$(_MAKE_INHERITED_READONLY_ERROR_FLAGS),1)
 export GENIERAILS_READONLY_ERROR_FLAGS
 ifneq ($(_MAKE_UNSAFE_ERROR_FLAGS),)
