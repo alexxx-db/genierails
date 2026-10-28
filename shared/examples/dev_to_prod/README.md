@@ -139,7 +139,7 @@ deterministic and legacy environments. A prod value of `false` does not persist;
 in a deterministic environment, committing it also fails the promotion-current
 check.
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
-It then offers to commit and push `.gitignore` and `envs/prod/` the same way (answer `y`; off a terminal, commit and push them yourself): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
+It then offers to commit and push `.gitignore`, `envs/prod/` and `envs/account/` (the shared account layer it writes) the same way (answer `y`; off a terminal, commit and push them yourself): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 

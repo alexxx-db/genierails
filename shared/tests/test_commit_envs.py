@@ -21,7 +21,7 @@ import pytest
 
 from scripts import commit_envs, coverage_fix, customer_gitignore
 from tests.test_deterministic_check_promote import (  # noqa: F401 (repo is a fixture)
-    DEPLOYER, _auth, _envs, _prod_env, repo,
+    DEPLOYER, LEGACY_ACCOUNT, _auth, _envs, _prod_env, repo,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -253,6 +253,99 @@ def test_a_failed_commit_hook_restores_the_index(checkout):
     assert code == 1, out
     assert "hook says no" in out and "git commit failed" in out  # the repo's hooks run
     assert _git_state(checkout) == before
+
+
+def _bare_origin(checkout, tmp_path):
+    bare = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
+    _git(checkout, "remote", "add", "origin", str(bare))
+    _git(checkout, "push", "-q", "origin", "main")
+    return bare
+
+
+def _hook(checkout, body):
+    hook = checkout / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\n" + body)
+    hook.chmod(0o755)
+
+
+def test_a_hook_that_stages_a_secret_file_is_undone_and_never_pushed(checkout, tmp_path):
+    """Codex r1: a pre-commit hook ran after validation and staged auth.auto.tfvars into the commit."""
+    bare = _bare_origin(checkout, tmp_path)
+    _hook(checkout, "git add -f aws/envs/dev/auth.auto.tfvars\n")
+    before, remote_head = _git_state(checkout), _git(bare, "rev-parse", "main")
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 1, out
+    assert "a commit hook changed what was committed, so the commit was undone and nothing was pushed" in out
+    assert "aws/envs/dev/auth.auto.tfvars: credentials" in out
+    assert "Pushed" not in out and "Committed " not in out
+    assert _git_state(checkout) == before  # no new commit, index as before the offer
+    assert _git(bare, "rev-parse", "main") == remote_head
+
+
+def test_a_hook_that_stages_a_file_outside_the_env_is_undone_and_never_pushed(checkout, tmp_path):
+    bare = _bare_origin(checkout, tmp_path)
+    _hook(checkout, "echo hook > notes.txt\ngit add notes.txt\n")
+    head, remote_head = _git(checkout, "rev-parse", "HEAD"), _git(bare, "rev-parse", "main")
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 1, out
+    assert "notes.txt: outside .gitignore and envs/dev/" in out
+    assert "Pushed" not in out
+    assert _git(checkout, "rev-parse", "HEAD") == head
+    assert not _git(checkout, "diff", "--cached", "--name-only")  # notes.txt unstaged again
+    assert _git(bare, "rev-parse", "main") == remote_head
+
+
+def test_non_utf8_content_is_scanned_without_crashing(checkout):
+    generated = _cloud(checkout) / "envs" / "dev" / "generated"
+    (generated / "logo.bin").write_bytes(b"\x89PNG\xff\xfe\x00\x01not text")
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 0 and "Traceback" not in out, out
+    assert "aws/envs/dev/generated/logo.bin" in _committed(checkout)
+
+
+def test_a_secret_in_non_utf8_content_is_refused_cleanly(checkout):
+    generated = _cloud(checkout) / "envs" / "dev" / "generated"
+    (generated / "dump.bin").write_bytes(b"\xff\xfe\x00\ndatabricks_client_secret = \"dose123\"\n\xc3\x28")
+    before = _git_state(checkout)
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert "Traceback" not in out
+    _assert_refused(checkout, before, code, out, "dump.bin: it holds a client secret or token value")
+
+
+def _with_account_change(checkout):
+    account = _cloud(checkout) / "envs" / "account"
+    account.mkdir()
+    (account / "env.auto.tfvars").write_text("x = 1\n")
+    _git(checkout, "add", "aws/envs/account")
+    _git(checkout, "commit", "-q", "-m", "account")
+    (account / "env.auto.tfvars").write_text("x = 2\n")
+
+
+def test_promote_to_commits_the_account_layer_too(checkout):
+    _with_account_change(checkout)
+    code, out = _pty_run(_args(checkout, step="promote-to"), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 0, out
+    assert "=== Commit dev's changes (.gitignore, envs/dev/ and envs/account/) ===" in out
+    assert "aws/envs/account/env.auto.tfvars" in out  # the --stat
+    assert _committed(checkout) == sorted(EXPECTED + ["aws/envs/account/env.auto.tfvars"])
+    assert "aws/envs/account" not in _git(checkout, "status", "--porcelain")
+
+
+def test_generate_leaves_the_account_layer_out(checkout):
+    _with_account_change(checkout)
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 0, out
+    assert _committed(checkout) == EXPECTED
+    assert "Not included (left as they are): aws/envs/account/env.auto.tfvars" in out
+
+
+def test_a_secret_in_the_account_layer_is_refused_for_promote_to(checkout):
+    _with_account_change(checkout)
+    (_cloud(checkout) / "envs" / "account" / "env.auto.tfvars").write_text('client_secret = "abc"\n')
+    before = _git_state(checkout)
+    code, out = _pty_run(_args(checkout, step="promote-to"), "y", _environ(GENIERAILS_COMMIT="ask"))
+    _assert_refused(checkout, before, code, out, "aws/envs/account/env.auto.tfvars: it holds a client secret")
 
 
 @pytest.mark.parametrize("path, why", [
@@ -493,3 +586,19 @@ def test_the_offer_is_the_last_step_of_the_recipe(target, step):
     """make stops at the first failing recipe line, so the offer runs only after the target succeeded."""
     last = _recipe(target)[-1]
     assert "$(_COMMIT_ENVS) offer" in last and f"--step {step}" in last, last
+
+
+def test_make_promote_to_commits_the_account_layer_it_changed_and_leaves_a_clean_checkout(repo, tmp_path):
+    # A legacy env keeps envs/account/abac.auto.tfvars committed (customer_gitignore.block), and the
+    # committed copy predates dev's merged values, so the promotion rewrites it.
+    (_envs(repo) / "legacy").mkdir()
+    (_envs(repo) / "legacy" / "env.auto.tfvars").write_text('governance_mode = "legacy"\n')
+    (_envs(repo) / "account" / "abac.auto.tfvars").write_text(LEGACY_ACCOUNT)
+    repo = _customer_promote_repo(repo)
+    code, out = _pty_run(_make_cmd(repo), "y", _make_env(tmp_path))
+    assert code == 0, out
+    assert "(.gitignore, envs/prod/ and envs/account/)" in out
+    committed = _committed(repo)
+    assert "aws/envs/account/abac.auto.tfvars" in committed, committed
+    assert "aws/envs/prod/generated/abac.auto.tfvars" in committed
+    assert _git(repo, "status", "--porcelain") == ""  # rehearse and release-plan need this

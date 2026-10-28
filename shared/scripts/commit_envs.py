@@ -2,7 +2,9 @@
 """make generate and make promote-to offer to commit what they wrote (option A).
 
 After a successful run, ``offer`` shows ``git diff --stat`` for exactly
-``.gitignore`` and ``envs/<env>/`` (the cloud folder's) and asks y/N. On y it
+``.gitignore`` and ``envs/<env>/`` (the cloud folder's; for make promote-to also
+``envs/account/``, the shared account layer it writes, so rehearse and
+release-plan get a clean checkout) and asks y/N. On y it
 stages only those paths (never ``git add -A``), commits them with a fixed
 message (the repo's commit hooks run) and, when the ``origin`` remote
 (RELEASE_REMOTE) exists, pushes HEAD to its main (RELEASE_BRANCH): never
@@ -33,7 +35,12 @@ Refused, with nothing committed (exit 1):
     rebase, cherry-pick or revert is in progress;
   - a path it would commit is credentials, Terraform state or plans, a runtime
     or evidence file (DENIED, or git-ignored by the .gitignore rules even though
-    tracked), or holds a client secret or token value (SECRET_RE).
+    tracked), holds a client secret or token value (SECRET_RE, matched on the raw
+    bytes, binary files included), or can't be read to scan.
+The repo's commit hooks run (they are its secret scan) and may stage more, so
+what HEAD holds is checked again after the commit, the same way: anything
+outside those paths or denied undoes that commit (git reset --soft to the old
+HEAD, the index restored to what it was before the offer) and nothing is pushed.
 The preview stages into a temporary copy of the index, so answering n (or a
 refusal) leaves the index, HEAD and the work tree exactly as they were; a
 failed commit restores the index.
@@ -73,9 +80,10 @@ DENIED_NAMES = {"auth.auto.tfvars": "credentials", "classification.auto.tfvars":
                 "discovered_uc_tables.auto.tfvars": "a runtime file"}
 DENIED_DIRS = {".terraform": "Terraform's working directory", ".genierails-state": "the receipt store",
                "__pycache__": "Python bytecode", "evidence": "an evidence record"}
+# Matched on the raw bytes, so a binary or non-UTF-8 file is scanned too.
 SECRET_RE = re.compile(
-    r"""(?mi)^[ \t]*"?(?:databricks_client_secret|azure_client_secret|client_secret|databricks_token)"?"""
-    r"""[ \t]*[=:][ \t]*"[^"\s]+"|\bdapi[0-9a-f]{32}\b""")
+    rb"""(?mi)^[ \t]*"?(?:databricks_client_secret|azure_client_secret|client_secret|databricks_token)"?"""
+    rb"""[ \t]*[=:][ \t]*"[^"\s]+"|\bdapi[0-9a-f]{32}\b""")
 
 
 def _git_env(**extra: str) -> dict[str, str]:
@@ -86,7 +94,31 @@ def _git_env(**extra: str) -> dict[str, str]:
 
 def _git(cwd: Path, *args: str, index: str = "", stdin: str | None = None) -> subprocess.CompletedProcess:
     env = _git_env(GIT_INDEX_FILE=index) if index else _git_env()
-    return subprocess.run(["git", "-C", str(cwd), *args], text=True, capture_output=True, env=env, input=stdin)
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, env=env, input=stdin,
+                          encoding="utf-8", errors="surrogateescape")
+
+
+def _blob(root: Path, spec: str, index: str = "") -> bytes | None:
+    """The raw bytes of ``spec`` (``:path`` in the index, ``<rev>:path``), or None if git can't read it."""
+    env = _git_env(GIT_INDEX_FILE=index) if index else _git_env()
+    proc = subprocess.run(["git", "-C", str(root), "cat-file", "blob", spec], capture_output=True, env=env)
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def scope(cloud_rel: str, env: str, step: str, account_env: str = "account",
+          account_exists: bool = True) -> tuple[list[str], str]:
+    """(repo-relative paths offer commits, how they read). promote-to also writes the shared
+    account layer (envs/<account>/), so its offer covers it too: rehearse and release-plan need a
+    clean checkout. generate writes only envs/<env>/."""
+    paths = [f"{cloud_rel}/.gitignore", f"{cloud_rel}/envs/{env}"]
+    if step == "promote-to" and account_exists and account_env != env:
+        paths.append(f"{cloud_rel}/envs/{account_env}")
+        return paths, f".gitignore, envs/{env}/ and envs/{account_env}/"
+    return paths, f".gitignore and envs/{env}/"
+
+
+def _inside(path: str, paths: list[str]) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in paths)
 
 
 def mode(environ: Mapping[str, str], interactive: bool) -> str:
@@ -171,7 +203,9 @@ def _staged(root: Path, index: str = "") -> list[tuple[str, str]]:
     return [(fields[i], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
 
 
-def _problems(root: Path, cloud_rel: str, staged: list[tuple[str, str]], index: str) -> list[str]:
+def _problems(root: Path, cloud_rel: str, staged: list[tuple[str, str]], index: str = "",
+              rev: str = "") -> list[str]:
+    """Why each staged (or, with ``rev``, committed) path must not be committed."""
     problems = []
     for status, path in staged:
         rel = path[len(cloud_rel) + 1:] if cloud_rel else path
@@ -179,12 +213,23 @@ def _problems(root: Path, cloud_rel: str, staged: list[tuple[str, str]], index: 
         if not why and not _git(root, "check-ignore", "-q", "--no-index", "--", path).returncode:
             why = "git-ignored by .gitignore (a runtime file), though tracked"
         if not why and status != "D":
-            blob = _git(root, "show", f":{path}", index=index)
-            if blob.returncode == 0 and SECRET_RE.search(blob.stdout):
+            blob = _blob(root, f"{rev}:{path}", index)
+            if blob is None:
+                why = "its content can't be read to scan it for secrets"
+            elif SECRET_RE.search(blob):
                 why = "it holds a client secret or token value"
         if why:
             problems.append(f"{path}: {why}")
     return problems
+
+
+def _committed(root: Path) -> list[tuple[str, str]]:
+    """(status letter, repo-relative path) of every change HEAD made to its parent."""
+    out = _git(root, "diff-tree", "--no-commit-id", "--name-status", "--no-renames", "-r", "-z", "--root", "HEAD")
+    if out.returncode:
+        raise RuntimeError((out.stderr or out.stdout).strip())
+    fields = out.stdout.split("\0")
+    return [(fields[i], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
 
 
 def _in_progress(root: Path) -> str:
@@ -197,7 +242,8 @@ def _in_progress(root: Path) -> str:
 
 
 def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = "origin",
-          branch: str = "main", environ: Mapping[str, str] | None = None, tty: bool | None = None) -> int:
+          branch: str = "main", environ: Mapping[str, str] | None = None, tty: bool | None = None,
+          account_env: str = "account") -> int:
     environ = os.environ if environ is None else environ
     how = mode(environ, interactive() if tty is None else tty)
     if not how:
@@ -212,8 +258,9 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
         return 0
     root = cloud_dir.parent
     cloud_rel = cloud_dir.name
-    paths = [f"{cloud_rel}/.gitignore", f"{cloud_rel}/envs/{env}"]
-    manual = f"git add .gitignore envs/{env}/ && git commit"
+    paths, label = scope(cloud_rel, env, step, account_env, (cloud_dir / "envs" / account_env).is_dir())
+    manual = f"git add {' '.join(p[len(cloud_rel) + 1:] + ('' if p.endswith('.gitignore') else '/') for p in paths)}"
+    manual += " && git commit"
     has_remote = _git(root, "remote", "get-url", remote).returncode == 0
     if has_remote:
         manual += f" && git push {remote} HEAD:{branch}"
@@ -226,8 +273,7 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
     busy = _in_progress(root)
     if busy:
         return refuse(f"{busy} is in progress.")
-    allowed = (f"{cloud_rel}/.gitignore", f"{cloud_rel}/envs/{env}/")
-    other = sorted(p for _s, p in _staged(root) if p != allowed[0] and not p.startswith(allowed[1]))
+    other = sorted(p for _s, p in _staged(root) if not _inside(p, paths))
     if other:
         return refuse("other changes are already staged (" + ", ".join(other[:5])
                       + (", ..." if len(other) > 5 else "") + "); commit or unstage them first (git restore --staged).")
@@ -242,7 +288,7 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
         staged = _staged(root, preview)
         if not staged:
             if how == "ask":
-                print(f"  Nothing to commit: .gitignore and envs/{env}/ match HEAD.")
+                print(f"  Nothing to commit: {label} match HEAD.")
             return 0
         problems = _problems(root, cloud_rel, staged, preview)
         if problems:
@@ -250,10 +296,10 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
                           + "\n  The GenieRails .gitignore block keeps them out; a tracked one needs "
                           "git rm --cached <path>.")
         stat = _git(root, "diff", "--cached", "--stat", "--no-renames", "--", *paths, index=preview).stdout
-    print(f"\n=== Commit {env}'s changes (.gitignore and envs/{env}/) ===")
+    print(f"\n=== Commit {env}'s changes ({label}) ===")
     print(stat.rstrip("\n"))
     rest = sorted({line[3:] for line in _git(root, "status", "--porcelain").stdout.splitlines()
-                   if not line[3:].strip('"').startswith(allowed) and line[3:].strip('"') != allowed[0]})
+                   if not _inside(line[3:].strip('"').rstrip("/"), paths)})
     if rest:
         print("  Not included (left as they are): " + ", ".join(rest[:5]) + (", ..." if len(rest) > 5 else ""))
     target = f"push them to {remote}/{branch}" if has_remote else f"keep them local (no {remote} remote)"
@@ -286,14 +332,32 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
         problems = _problems(root, cloud_rel, staged_now, "")
         if problems:
             return restore("these would be committed:\n    " + "\n    ".join(problems))
+        old_head = _git(root, "rev-parse", "-q", "--verify", "HEAD").stdout.strip()
         commit = subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", STEPS[step].format(env=env)],
                                 env=_git_env())
         if commit.returncode:
             return restore("git commit failed (see above).")
+        # The repo's hooks ran between the checks above and the commit, and a hook can
+        # stage more: check what HEAD actually holds before anything is pushed.
+        parent = _git(root, "rev-parse", "-q", "--verify", "HEAD^").stdout.strip()
+        committed = _committed(root) if parent == old_head else []
+        extra = sorted(p for _s, p in committed if not _inside(p, paths))
+        bad = [] if parent != old_head else (
+            [f"{p}: outside {label}" for p in extra]
+            + _problems(root, cloud_rel, [c for c in committed if c[1] not in extra], rev="HEAD"))
+        if parent != old_head or bad:
+            if old_head:
+                _git(root, "reset", "-q", "--soft", old_head)
+            else:
+                _git(root, "update-ref", "-d", "HEAD")
+            detail = ("\n    " + "\n    ".join(bad)) if bad else (
+                f" HEAD's parent is {parent[:12] or 'none'}, not {old_head[:12] or 'an unborn branch'}")
+            return restore("a commit hook changed what was committed, so the commit was undone and "
+                           f"nothing was pushed:{detail}")
     finally:
         shutil.rmtree(saved, ignore_errors=True)
     sha = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
-    print(f"  Committed {sha} on {branch}: .gitignore and envs/{env}/ ({len(staged)} file(s)).")
+    print(f"  Committed {sha} on {branch}: {label} ({len(staged)} file(s)).")
     if not has_remote:
         print(f"  No {remote} remote (a local-only repo): committed locally only; nothing was pushed.")
         return 0
@@ -321,10 +385,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--step", required=True, choices=sorted(STEPS))
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--branch", default="main")
+    parser.add_argument("--account-env", default="account")
     args = parser.parse_args(argv)
     if args.command == "will-offer":
         return 0 if will_offer(args.cloud_dir, args.env, args.env_dir, args.step, branch=args.branch) else 1
-    return offer(args.cloud_dir, args.env, args.env_dir, args.step, remote=args.remote, branch=args.branch)
+    return offer(args.cloud_dir, args.env, args.env_dir, args.step, remote=args.remote, branch=args.branch,
+                 account_env=args.account_env)
 
 
 if __name__ == "__main__":

@@ -670,7 +670,7 @@ GENIERAILS_COMMIT ?= 0
 endif
 export GENIERAILS_COMMIT
 override _COMMIT_ENVS = python3 "$(SHARED_ROOT)/scripts/commit_envs.py" --cloud-dir "$(CLOUD_ROOT)" \
-	--remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)"
+	--remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --account-env "$(ACCOUNT_ENV)"
 
 # A new agent file is captured (import-new) before the governed-table record is
 # written: its tables come from the capture, so the first generate records them.
