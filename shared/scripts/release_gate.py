@@ -2118,11 +2118,39 @@ def drop_saved_plans(env_dir: Path, env: str, manifest_path: Path) -> list[Path]
     return left
 
 
-def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
+def _approval(env_dir: Path, env: str, manifest_path: Path, approval: Path | None) -> dict:
+    """A receipt's ``approval`` field (scripts/approval.py): the checked record, or {"via": "external"}.
+
+    Audit only: no record means it was approved outside GenieRails, as before.
+    A record that is given but doesn't approve this manifest refuses, before
+    anything is written.
+    """
+    from scripts import approval as approval_records
+
+    try:
+        return approval_records.embed(env_dir, env, manifest_path, approval)
+    except approval_records.Refused as exc:
+        raise Refused(str(exc)) from exc
+
+
+def _phase_approvals(cloud_dir: Path, env: str, phases: Iterable[str]) -> dict:
+    """Each linked phase record's ``approval`` ({"via": "external"} for a record written before they had one)."""
+    from scripts.approval import EXTERNAL
+
+    directory = env_state(cloud_dir, env) / "receipts" / "phases"
+    found = {}
+    for phase in phases:
+        value = (_read_json(directory / f"{phase}.json") or {}).get("approval")
+        found[str(phase)] = value if isinstance(value, dict) else dict(EXTERNAL)
+    return found
+
+
+def release_receipt(env_dir: Path, env: str, manifest_path: Path, approval: Path | None = None) -> Path:
     from scripts.agent_ownership import receipt_agents
 
     env_dir, manifest_path = Path(env_dir), Path(manifest_path)
     manifest = load_manifest(manifest_path, env)
+    approved = _approval(env_dir, env, manifest_path, approval)
     cloud_dir = cloud_dir_of(env_dir)
     status = checkout_status(env_dir)
     repo = Path(status["repo"])
@@ -2140,6 +2168,7 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
         "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
         "release_epoch": epoch, "phase_manifests": phases, "phase_manifests_unlinked": unlinked,
         "phase_manifests_earlier": earlier, "release_receipts_ignored": ignored,
+        "approval": approved, "phase_approvals": _phase_approvals(cloud_dir, env, phases),
         # Prod agent IDs live here and in state, never in git (design section 5).
         "agents": receipt_agents(env_dir, manifest),
         "state_serials": state_serials(env_dir), "host": socket.gethostname(), "created_at": _now(),
@@ -2154,16 +2183,17 @@ def release_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
     return path
 
 
-def account_receipt(env_dir: Path, env: str, manifest_path: Path) -> Path:
+def account_receipt(env_dir: Path, env: str, manifest_path: Path, approval: Path | None = None) -> Path:
     env_dir, manifest_path = Path(env_dir), Path(manifest_path)
     manifest = load_account_manifest(manifest_path, env)
+    approved = _approval(env_dir, env, manifest_path, approval)
     cloud_dir = cloud_dir_of(env_dir)
     status = checkout_status(env_dir)
     receipt = {
         "kind": "account", "version": VERSION, "env": env, "cloud": cloud_dir.name,
         "commit": manifest["commit"], "clean_tree": status["clean_tree"],
         "manifest": {"id": manifest["id"], "path": str(manifest_path), "sha256": sha256_file(manifest_path)},
-        "plan": manifest["plan"], "state_serial": account_state_serial(env_dir),
+        "plan": manifest["plan"], "state_serial": account_state_serial(env_dir), "approval": approved,
         "host": socket.gethostname(), "created_at": _now(),
     }
     stamp = receipt["created_at"].replace(":", "").replace(".", "")
@@ -2187,7 +2217,7 @@ def _policy_run(env_dir: Path) -> str | None:
     return str(transition.get("run_id") or "") if isinstance(transition, dict) else ""
 
 
-def phase_record(env_dir: Path, env: str, manifest_path: Path) -> Path:
+def phase_record(env_dir: Path, env: str, manifest_path: Path, approval: Path | None = None) -> Path:
     """A non-final manifest (one staged policy phase) was applied.
 
     The record holds the manifest's hash, the release epoch and the staged
@@ -2198,6 +2228,7 @@ def phase_record(env_dir: Path, env: str, manifest_path: Path) -> Path:
     unknown (never linked), not a failure.
     """
     manifest = load_manifest(Path(manifest_path), env)
+    approved = _approval(env_dir, env, manifest_path, approval)
     cloud_dir = cloud_dir_of(env_dir)
     try:
         epoch = release_epoch(cloud_dir, env, create=True)
@@ -2205,7 +2236,7 @@ def phase_record(env_dir: Path, env: str, manifest_path: Path) -> Path:
         epoch = None
     record = {"kind": "release-phase", "version": VERSION, "env": env, "commit": manifest["commit"],
               "id": manifest["id"], "manifest": str(manifest_path), "manifest_sha256": sha256_file(manifest_path),
-              "release_epoch": epoch, "policy_run": _policy_run(env_dir), "created_at": _now()}
+              "release_epoch": epoch, "policy_run": _policy_run(env_dir), "approval": approved, "created_at": _now()}
     return _write_once(env_state(cloud_dir, env) / "receipts" / "phases" / f"{manifest['id']}.json", record)
 
 
@@ -2636,11 +2667,13 @@ def main(argv: list[str] | None = None) -> int:
     command("account-manifest-summary").add_argument("--manifest", type=Path, required=True)
     cmd = command("account-manifest-info")
     cmd.add_argument("--manifest", type=Path, required=True)
-    for name in ("release-receipt", "phase-record"):
-        command(name).add_argument("--manifest", type=Path, required=True)
+    for name in ("release-receipt", "phase-record", "account-receipt"):
+        cmd = command(name)
+        cmd.add_argument("--manifest", type=Path, required=True)
+        cmd.add_argument("--approval", type=Path, default=None,
+                         help="the approval record (scripts/approval.py) to check and embed; none: external")
     command("current-manifest")
     command("manifest-summary").add_argument("--manifest", type=Path, required=True)
-    command("account-receipt").add_argument("--manifest", type=Path, required=True)
     command("account-lock-check")
     command("any-deterministic-env")
     command("maintain-check")
@@ -2755,12 +2788,12 @@ def main(argv: list[str] | None = None) -> int:
             manifest = load_account_manifest(args.manifest, args.env)
             print(f"Selected account manifest {manifest['id']} (sha256 {sha256_file(args.manifest)})")
         elif args.command == "release-receipt":
-            print(f"Release receipt: {release_receipt(args.env_dir, args.env, args.manifest)}")
+            print(f"Release receipt: {release_receipt(args.env_dir, args.env, args.manifest, args.approval)}")
             drop_saved_plans(args.env_dir, args.env, args.manifest)  # after the receipt, never before
         elif args.command == "account-receipt":
-            print(f"Account receipt: {account_receipt(args.env_dir, args.env, args.manifest)}")
+            print(f"Account receipt: {account_receipt(args.env_dir, args.env, args.manifest, args.approval)}")
         elif args.command == "phase-record":
-            print(f"Phase record: {phase_record(args.env_dir, args.env, args.manifest)}")
+            print(f"Phase record: {phase_record(args.env_dir, args.env, args.manifest, args.approval)}")
             drop_saved_plans(args.env_dir, args.env, args.manifest)  # after the record, never before
         elif args.command == "apply-guard":
             apply_guard(args.env_dir, args.env, args.target)
