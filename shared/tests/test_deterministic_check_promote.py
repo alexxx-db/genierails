@@ -357,7 +357,11 @@ def test_direct_promote_marker_cannot_be_forged_from_user_inputs(repo, tmp_path,
     assert _state(repo) == before
 
 
-@pytest.mark.parametrize("contents", [None, 'governance_mode = "future"\n'])
+UNREADABLE_MODES = {"missing": None, "malformed": "governance_mode = \n", "unknown": 'governance_mode = "future"\n'}
+MODE_FIX = 'Set governance_mode = "legacy" or "deterministic" in envs/prod/env.auto.tfvars.'
+
+
+@pytest.mark.parametrize("contents", UNREADABLE_MODES.values(), ids=UNREADABLE_MODES.keys())
 def test_direct_promote_fails_closed_when_destination_mode_is_not_readable(repo, tmp_path, contents):
     prod = _envs(repo) / "prod"
     prod.mkdir()
@@ -370,9 +374,57 @@ def test_direct_promote_fails_closed_when_destination_mode_is_not_readable(repo,
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
     assert "refusing make promote" in out
-    assert "make promote-to ENV=prod" in out
+    # promote-to refuses this env too, so the refusal names the fix instead.
+    assert MODE_FIX in out
+    assert "make promote-to" not in out
     assert "Cross-env promote" not in out
     assert _state(repo) == before
+
+
+def _refusal_commands(out):
+    """Every make command but promote itself named in an ERROR: block (the ERROR line and its indented follow-ups)."""
+    commands, in_refusal = [], False
+    for line in out.splitlines():
+        if line.startswith("ERROR:"):
+            in_refusal = True
+        elif not line.startswith(" "):
+            in_refusal = False
+        if in_refusal:
+            commands += re.findall(r"make ([a-z][a-z-]*(?: [A-Z_]+=[^\s.]+)*)", line)
+    return [c for c in commands if c.split()[0] != "promote"]
+
+
+@pytest.mark.parametrize("mode", [*UNREADABLE_MODES, "legacy", "deterministic"])
+def test_direct_promote_refusal_never_names_a_command_refused_for_the_same_env(repo, tmp_path, mode):
+    prod = _envs(repo) / "prod"
+    prod.mkdir()
+    if mode == "legacy":
+        (prod / "env.auto.tfvars").write_text(PROD_ENV.replace('"deterministic"', '"legacy"'))
+    elif mode == "deterministic":
+        (prod / "env.auto.tfvars").write_text(PROD_ENV)
+    elif UNREADABLE_MODES[mode] is not None:
+        (prod / "env.auto.tfvars").write_text(UNREADABLE_MODES[mode])
+    (prod / "auth.auto.tfvars").write_text(_auth(DEPLOYER, host=""))
+
+    result = _make(repo, tmp_path, *_direct_promote_args())
+    out = result.stdout + result.stderr
+    commands = _refusal_commands(out)
+
+    if mode == "legacy":
+        assert "refusing make promote" not in out and "is refused" not in out, out
+    elif mode == "deterministic":
+        assert result.returncode != 0, out
+        assert commands == ["promote-to ENV=prod"], out
+    else:
+        assert result.returncode != 0, out
+        assert commands == [], out
+        assert MODE_FIX in out
+        # Why it can't name promote-to: promote-to refuses the same env.
+        loop = _make(repo, tmp_path, "promote-to", "ENV=prod")
+        assert loop.returncode != 0, loop.stdout + loop.stderr
+    for command in commands:
+        follow = _make(repo, tmp_path, *command.split())
+        assert follow.returncode == 0, (command, follow.stdout + follow.stderr)
 
 
 def test_direct_promote_to_legacy_destination_keeps_the_existing_path(repo, tmp_path):

@@ -235,6 +235,10 @@ _bootstrap:
 	@$(MAKE) --no-print-directory _guard-root ENV="$(ENV)" ENV_ORIGIN="$(ENV_ORIGIN)"
 	@$(MAKE) --no-print-directory _prepare-env ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 
+# make promote's refusal for a destination whose governance_mode it cannot read or
+# doesn't support. promote-to refuses that env the same way, so name the fix, not it.
+override _PROMOTE_MODE_HINT = echo "       Set governance_mode = \"legacy\" or \"deterministic\" in envs/$(DEST_ENV)/env.auto.tfvars." >&2
+
 # _bootstrap for targets that consume env config. The placeholder guard is the
 # first recipe line (not a sibling prerequisite), so it finishes before any
 # _prepare-env side effect, even under make -j. setup/destroy/clean keep _bootstrap
@@ -245,8 +249,8 @@ _bootstrap:
 _guarded-bootstrap:
 	@set -e; \
 	if [ -n "$(and $(filter promote,$(MAKECMDGOALS)),$(strip $(DEST_ENV)))" ]; then \
-		dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" || { echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1; }; \
-		case "$$dest_mode" in legacy) ;; deterministic) $(_PROMOTE_TO_TOKEN) check --env-dir "$(DEST_ENV_DIR)" || { echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1; } ;; *) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1 ;; esac; \
+		dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" || { echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; $(_PROMOTE_MODE_HINT); exit 1; }; \
+		case "$$dest_mode" in legacy) ;; deterministic) $(_PROMOTE_TO_TOKEN) check --env-dir "$(DEST_ENV_DIR)" || { echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1; } ;; *) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; $(_PROMOTE_MODE_HINT); exit 1 ;; esac; \
 	fi; \
 	$(_GENIE_PLACEHOLDER_GUARD); \
 	$(_SCHEDULED_GOVERNANCE_GUARD); \
@@ -547,8 +551,10 @@ setup: ## Prepare the selected environment(s) and show next steps
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
 		if [ "$$gov_only" = 1 ]; then \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (derives the masks for the governed tables from their class.* tags)"; \
-		else \
+		elif [ "$(ENV)" = "$(DEFAULT_ENV)" ]; then \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
+		else \
+			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: finds the agent's tables, drafts rules; agents are imported only in $(DEFAULT_ENV))"; \
 		fi; \
 		echo "     Review envs/$(ENV)/generated/, then commit and push envs/."; \
 		step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; rehearse doesn't run it)"; \
@@ -1636,7 +1642,7 @@ promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target
 	@set -e; $(_DRY_RUN_GUARD); if [ -n "$(DEST_ENV)" ]; then \
 		dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" || { \
 			echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; \
-			echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+			$(_PROMOTE_MODE_HINT); \
 			exit 1; \
 		}; \
 		case "$$dest_mode" in \
@@ -1647,7 +1653,7 @@ promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target
 					echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
 					exit 1; \
 				fi ;; \
-			*) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1 ;; \
+			*) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; $(_PROMOTE_MODE_HINT); exit 1 ;; \
 		esac; \
 		if [ "$(DEST_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(DEST_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: DEST_ENV cannot be '$(ACCOUNT_ENV)' or '$(DATA_ACCESS_SUBDIR)'."; exit 1; \
