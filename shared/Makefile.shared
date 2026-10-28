@@ -373,6 +373,23 @@ $(error make $(MAKECMDGOALS) refused before any recipe ran (Databricks compute, 
 endif
 endif
 
+# GNU make's -i/--ignore-errors lets a recipe continue after a guard line fails.
+# Refuse it while parsing every state-changing goal whose guard must stop the
+# run before setup, generation, promotion, release, apply or cleanup can write.
+# Only the short-flag word counts: make puts it first (for example "ik -j4"),
+# and long options or variable assignments in MAKEFLAGS must not match.
+override _MAKE_SHORT_FLAGS := $(patsubst -%,%,$(filter-out --% %=%, $(firstword $(MAKEFLAGS))))
+override _MAKE_IGNORE_ERRORS := $(findstring i,$(_MAKE_SHORT_FLAGS))
+override _IGNORE_ERRORS_GUARDED_TARGETS = $(_DATABRICKS_GUARDED_TARGETS) generate generate-delta init-env promote setup
+override _IGNORE_ERRORS_GUARDED_GOALS := $(strip $(filter $(_IGNORE_ERRORS_GUARDED_TARGETS),$(MAKECMDGOALS)) \
+	$(if $(filter 1,$(CHECK)),,$(filter promote-to,$(MAKECMDGOALS))) \
+	$(if $(filter 1,$(IMPORT_CLASSIFICATION)),$(filter _prepare-classification,$(MAKECMDGOALS))))
+ifneq ($(_IGNORE_ERRORS_GUARDED_GOALS),)
+ifneq ($(_MAKE_IGNORE_ERRORS),)
+$(error make $(MAKECMDGOALS) refused: -i/-k is not supported for this target because guards would be skipped)
+endif
+endif
+
 # CI detection lives in scripts/ci_guard.py alone (CI=true|1|yes or a CI runner
 # marker; GENIERAILS_ALLOW_CI_APPLY=1 opts out of the apply guard; dev rehearse
 # with locked remote state is state_layout.ci_allowed). make next reads the
