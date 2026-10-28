@@ -353,20 +353,35 @@ $(error make $(MAKECMDGOALS) refused before any recipe ran (Databricks compute, 
 endif
 endif
 
-# GNU make's -i/--ignore-errors lets a recipe continue after a guard line fails.
-# Refuse it while parsing every state-changing goal whose guard must stop the
-# run before setup, generation, promotion, release, apply or cleanup can write.
-# Only the short-flag word counts: make puts it first (for example "ik -j4"),
-# and long options or variable assignments in MAKEFLAGS must not match.
-override _MAKE_SHORT_FLAGS := $(patsubst -%,%,$(filter-out --% %=%, $(firstword $(MAKEFLAGS))))
-override _MAKE_IGNORE_ERRORS := $(findstring i,$(_MAKE_SHORT_FLAGS))
-override _IGNORE_ERRORS_GUARDED_TARGETS = $(_DATABRICKS_GUARDED_TARGETS) generate generate-delta init-env promote setup
-override _IGNORE_ERRORS_GUARDED_GOALS := $(strip $(filter $(_IGNORE_ERRORS_GUARDED_TARGETS),$(MAKECMDGOALS)) \
-	$(if $(filter 1,$(CHECK)),,$(filter promote-to,$(MAKECMDGOALS))) \
-	$(if $(filter 1,$(IMPORT_CLASSIFICATION)),$(filter _prepare-classification,$(MAKECMDGOALS))))
-ifneq ($(_IGNORE_ERRORS_GUARDED_GOALS),)
-ifneq ($(_MAKE_IGNORE_ERRORS),)
-$(error make $(MAKECMDGOALS) refused: -i/-k is not supported for this target because guards would be skipped)
+# GNU make's -i/--ignore-errors and -k/--keep-going let other recipe lines or
+# sibling prerequisites run after a guard fails. Refuse them at parse time for
+# every goal except a small read-only allowlist. GNU make 3.81 may put long
+# options before short ones in MAKEFLAGS; GNU make 4.x may also use GNUMAKEFLAGS.
+# The parser checks long options by exact name, skips variable assignments and
+# options whose words carry arguments (-I, -O, -j, -l, -C, -f, -o, -W), and checks
+# true short-flag clusters for i/k. It intentionally does not try to detect
+# --eval=.IGNORE:.
+override _MAKE_UNSAFE_ERROR_FLAGS := $(shell for word in $(MAKEFLAGS) $(GNUMAKEFLAGS) $$GNUMAKEFLAGS; do \
+	{ [ "$$word" = "--ignore-errors" ] || [ "$$word" = "--keep-going" ]; } && { echo 1; exit; }; \
+	printf '%s\n' "$$word" | grep -q '^--' && continue; \
+	printf '%s\n' "$$word" | grep -q '=' && continue; \
+	printf '%s\n' "$$word" | grep -Eq '^-[IOjlCfoW]' && continue; \
+	printf '%s\n' "$$word" | grep -Eq '^-[^-]*[ik]' && { echo 1; exit; }; \
+	printf '%s\n' "$$word" | grep -q '/' && continue; \
+	printf '%s\n' "$$word" | grep -Eq '^[IOjlCfoW]' && continue; \
+	printf '%s\n' "$$word" | grep -Eq '[ik]' && { echo 1; exit; }; \
+done)
+override _MAKE_EFFECTIVE_GOALS := $(or $(MAKECMDGOALS),help)
+override _MAKE_IGNORE_ERRORS_ALLOWED_GOALS := help check status next validate $(if $(filter 1,$(OFFLINE)),evidence)
+override _MAKE_IGNORE_ERRORS_REFUSED_GOALS := $(filter-out $(_MAKE_IGNORE_ERRORS_ALLOWED_GOALS),$(_MAKE_EFFECTIVE_GOALS))
+override _MAKE_INHERITED_READONLY_ERROR_FLAGS := $(if $(filter 0,$(MAKELEVEL)),,$(GENIERAILS_READONLY_ERROR_FLAGS))
+override GENIERAILS_READONLY_ERROR_FLAGS := $(if $(_MAKE_IGNORE_ERRORS_REFUSED_GOALS),$(_MAKE_INHERITED_READONLY_ERROR_FLAGS),1)
+export GENIERAILS_READONLY_ERROR_FLAGS
+ifneq ($(_MAKE_UNSAFE_ERROR_FLAGS),)
+ifneq ($(GENIERAILS_READONLY_ERROR_FLAGS),1)
+ifneq ($(_MAKE_IGNORE_ERRORS_REFUSED_GOALS),)
+$(error make $(_MAKE_IGNORE_ERRORS_REFUSED_GOALS) refused: -i/-k are not supported for this target because guards would be skipped)
+endif
 endif
 endif
 
