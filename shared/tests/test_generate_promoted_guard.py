@@ -46,7 +46,9 @@ def _assert_refused(result, env, source, tree, before):
     assert "stale promotion" in result.stderr, out
     assert f"make generate ENV={source}" in result.stderr, out
     assert f"then make promote-to ENV={env}, then commit and push envs/{env}/" in result.stderr, out
-    assert f"make release-plan ENV={env} and make release ENV={env}" in result.stderr, out
+    assert f"make release-plan ENV={env}" in result.stderr, out
+    assert f"make release ENV={env}" in result.stderr, out
+    assert result.stderr.index(f"make release-plan ENV={env}") < result.stderr.index(f"make release ENV={env}")
     # Refused before generate starts: no banner, no generate_abac run, nothing written.
     assert "=== Generate ABAC Config" not in out, out
     assert "Traceback" not in out, out

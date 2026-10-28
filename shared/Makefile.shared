@@ -1,4 +1,4 @@
-.PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-promote-destination _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
+.PHONY: help bootstrap-sp bootstrap-pipelines genie-adopt-preflight _guard-root _prepare-env _bootstrap _guarded-bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-genie-placeholder setup init-env enable-classification generate scaffold-treatments materialize-treatment derive-assignments generate-delta audit-schema validate validate-generated coverage-gate promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _prepare-classification _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema evidence validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config setup init-env generate generate-delta audit-schema audit-rulebook validate validate-generated promote plan sync-tags wait-tag-policies apply apply-governance apply-genie import migrate-state destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo
 .PHONY: help _guard-root _prepare-env _bootstrap _guard-workspace-target _guard-account-config _guard-data-access-config _guard-workspace-config _guard-not-ci-apply _guard-not-ci-rebind _guard-not-databricks-compute setup init-env generate generate-delta audit-schema validate validate-generated coverage-gate rehearse certify promote plan sync-tags _sync-tags-add-only-locked wait-tag-policies apply apply-governance apply-genie import migrate-state migrate-state-dir destroy destroy-governance destroy-genie clean clean-all integration-test migrate-root-to-env _apply-layer _plan-layer _destroy-layer test-unit test-ci test-abac-only test-multi-space-import test-schema-drift test-genie-only test-country-overlay test-aus-bank-demo test-india-bank-demo test-asean-bank-demo verify-access _verify-access-gate verify-access-spec verify-access-keys _verify-access-keys-readonly _guard-account-admin-env release release-plan _release-plan-roots _release-manifest maintain ungovern rebuild-governed-tables test-champion _derive-before-exposure _refresh-live-ddl promote-to _external-mask-inventory account-plan _account-plan-locked apply-account check policy-status policy-abandon policy-rebind status next
@@ -235,6 +235,10 @@ _bootstrap:
 	@$(MAKE) --no-print-directory _guard-root ENV="$(ENV)" ENV_ORIGIN="$(ENV_ORIGIN)"
 	@$(MAKE) --no-print-directory _prepare-env ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 
+# make promote's refusal for a destination whose governance_mode it cannot read or
+# doesn't support. promote-to refuses that env the same way, so name the fix, not it.
+override _PROMOTE_MODE_HINT = echo "       Set governance_mode = \"legacy\" or \"deterministic\" in envs/$(DEST_ENV)/env.auto.tfvars." >&2
+
 # _bootstrap for targets that consume env config. The placeholder guard is the
 # first recipe line (not a sibling prerequisite), so it finishes before any
 # _prepare-env side effect, even under make -j. setup/destroy/clean keep _bootstrap
@@ -243,35 +247,15 @@ _bootstrap:
 # deterministic promoted env, or any env but $(DEFAULT_ENV) with no
 # env.auto.tfvars yet (make setup writes it), is refused before anything is written.
 _guarded-bootstrap:
-	@$(if $(and $(filter promote,$(MAKECMDGOALS)),$(strip $(DEST_ENV))),$(MAKE) --no-print-directory _guard-promote-destination DEST_ENV="$(DEST_ENV)" DEST_ENV_DIR="$(DEST_ENV_DIR)",:)
-	@$(_GENIE_PLACEHOLDER_GUARD)
-	@$(_SCHEDULED_GOVERNANCE_GUARD)
-	@$(if $(filter generate,$(MAKECMDGOALS)),$(_RELEASE_GATE) generate-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --default-env "$(DEFAULT_ENV)",:)
-	@$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
-
-# Cross-env promote's destination guard is an ordered recipe step, never a
-# sibling prerequisite: it completes before _bootstrap can create auth/config
-# files or directories, including with make -j. promote-to supplies a distinct,
-# destination-bound, one-shot accident token to its nested promote.
-_guard-promote-destination:
-	@if ! dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; then \
-		echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; \
-		echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
-		exit 1; \
+	@set -e; \
+	if [ -n "$(and $(filter promote,$(MAKECMDGOALS)),$(strip $(DEST_ENV)))" ]; then \
+		dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" || { echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; $(_PROMOTE_MODE_HINT); exit 1; }; \
+		case "$$dest_mode" in legacy) ;; deterministic) $(_PROMOTE_TO_TOKEN) check --env-dir "$(DEST_ENV_DIR)" || { echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1; } ;; *) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; $(_PROMOTE_MODE_HINT); exit 1 ;; esac; \
 	fi; \
-	case "$$dest_mode" in \
-		legacy) ;; \
-		deterministic) \
-			if ! $(_PROMOTE_TO_TOKEN) consume --env-dir "$(DEST_ENV_DIR)"; then \
-				echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; \
-				echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
-				exit 1; \
-			fi ;; \
-		*) \
-			echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; \
-			echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
-			exit 1 ;; \
-	esac
+	$(_GENIE_PLACEHOLDER_GUARD); \
+	$(_SCHEDULED_GOVERNANCE_GUARD); \
+	$(if $(filter generate,$(MAKECMDGOALS)),$(_RELEASE_GATE) generate-guard --env-dir "$(ENV_DIR)" --env "$(ENV)" --default-env "$(DEFAULT_ENV)",:); \
+	$(MAKE) --no-print-directory _bootstrap ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" ENV_ORIGIN="$(ENV_ORIGIN)"
 
 _guard-workspace-target:
 	@if [ "$(ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -568,8 +552,10 @@ setup: ## Prepare the selected environment(s) and show next steps
 		echo "     Prefer a script? make enable-classification ENV=$(ENV) turns it on (you still review detections in the UI)."; \
 		if [ "$$gov_only" = 1 ]; then \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (derives the masks for the governed tables from their class.* tags)"; \
-		else \
+		elif [ "$(ENV)" = "$(DEFAULT_ENV)" ]; then \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: imports the agent, finds its tables, drafts rules)"; \
+		else \
+			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: finds the agent's tables, drafts rules; agents are imported only in $(DEFAULT_ENV))"; \
 		fi; \
 		echo "     Review envs/$(ENV)/generated/, then commit and push envs/ (generate offers it on a terminal: answer y)."; \
 		step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; rehearse doesn't run it)"; \
@@ -1036,6 +1022,25 @@ override _RELEASE_GATE = python3 "$(SHARED_ROOT)/scripts/release_gate.py"
 override _RELEASE_GATE_MAKE = --makefile "$(abspath $(firstword $(MAKEFILE_LIST)))" --make "$(firstword $(MAKE))"
 RELEASE_REMOTE ?= origin
 RELEASE_BRANCH ?= main
+# APPROVAL=<record> (scripts/approval.py): the write-once record of a y typed
+# at this terminal, which GenieRails' interactive flows pass to
+# _apply-account-locked and _release-manifest. It is audit, not a gate: it
+# approves nothing and skips no check. It counts only as a command-line
+# variable of a nested make (never from the environment or a top-level make;
+# apply-account and release clear it), is checked under the lock before
+# anything applies, and the receipt embeds it. Without it a receipt records
+# {"via": "external"} (approved outside GenieRails), as every receipt did before.
+override _APPROVAL = $(if $(and $(filter command line,$(origin APPROVAL)),$(filter-out 0,$(MAKELEVEL))),$(abspath $(strip $(APPROVAL))))
+override _APPROVAL_CHECK = approval='$(subst ','\'',$(_APPROVAL))'; \
+	if [ -n "$$approval" ]; then \
+		ap_out="$$(python3 "$(SHARED_ROOT)/scripts/approval.py" check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --approval "$$approval")"; ap_rc=$$?; \
+		case "$$ap_rc:$$ap_out" in \
+			"0:genierails-approval:v1:valid") echo "Approval record $$approval: approves this manifest." ;; \
+			"1:genierails-approval:v1:invalid") echo "$(1): the approval record doesn't approve this manifest (above); nothing was applied." >&2; exit 1 ;; \
+			*) echo "ERROR: the approval check ($(SHARED_ROOT)/scripts/approval.py check) gave no valid answer (exit $$ap_rc); nothing was applied." >&2; exit 1 ;; \
+		esac; \
+	fi
+override _APPROVAL_ARG = $${approval:+--approval "$$approval"}
 # Live UC as release-plan saw it, and again (re-derived) before release applies.
 override _LIVE_SNAPSHOT = $(_RELEASE_GATE) live-snapshot --env-dir "$(ENV_DIR)" --env "$(ENV)"
 override _RELEASE_REPORTS = $(_RELEASE_GATE) reports --env-dir "$(ENV_DIR)" --env "$(ENV)"
@@ -1127,7 +1132,7 @@ apply-account: _guard-not-ci-apply _guarded-bootstrap ## Apply shared account re
 		manifest="$(abspath $(strip $(MANIFEST)))"; \
 		$(_RELEASE_GATE) account-manifest-info --env-dir "$(ACCOUNT_ENV_DIR)" --env "$(ACCOUNT_ENV)" --manifest "$$manifest" || exit 1; \
 	fi; \
-	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest"
+	$(MAKE) --no-print-directory _apply-account-locked ENV=$(ACCOUNT_ENV) ENV_DIR="$(ACCOUNT_ENV_DIR)" MANIFEST="$$manifest" APPROVAL=
 
 _apply-account-locked: _guard-not-databricks-compute
 	@$(_DRY_RUN_GUARD); \
@@ -1135,6 +1140,7 @@ _apply-account-locked: _guard-not-databricks-compute
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
 	$(call _ENV_LOCK,apply-account); \
 	$(_RELEASE_GATE) account-manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --allow-removal "$(strip $(ALLOW_TAG_VALUE_REMOVAL))" || exit 1; \
+	$(call _APPROVAL_CHECK,apply-account); \
 	apply_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/genierails-account-plan.XXXXXX")" || exit 1; chmod 700 "$$apply_dir"; \
 	trap '$(_NO_SIGNALS); rm -rf "$$apply_dir"; $(_ENV_LOCK_HELPER) unlock "$(ENV_DIR)" --pid $$$$' EXIT; \
 	cp "$$plans/account.tfplan" "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; chmod 400 "$$apply_dir/account.tfplan"; \
@@ -1148,7 +1154,7 @@ _apply-account-locked: _guard-not-databricks-compute
 	echo "=== Apply saved plan (account) ==="; \
 	LAYER_ENV_DIR="$(ACCOUNT_ENV_DIR)" "$(ROOT_RUNNER)" account "$(ACCOUNT_ENV)" apply-plan "$$apply_dir/account.tfplan" || { rm -rf "$$apply_dir"; exit 1; }; \
 	rm -rf "$$apply_dir"; \
-	$(_RELEASE_GATE) account-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	$(_RELEASE_GATE) account-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 	if ! rm -f "$$plans/account.tfplan"; then echo "WARNING: account apply succeeded and its receipt was written, but $$plans/account.tfplan contains credentials and could not be deleted; delete it." >&2; fi; \
 	echo ""; \
 	echo "=== Account apply complete ==="
@@ -1283,7 +1289,7 @@ release: _guard-not-ci-apply _guard-genie-placeholder ## Derive, validate, prove
 	@$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)" = 1 ]; then \
-		$(MAKE) --no-print-directory _release-manifest ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" MANIFEST="$(MANIFEST)"$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); \
+		$(MAKE) --no-print-directory _release-manifest ENV="$(ENV)" ENV_DIR="$(ENV_DIR)" MANIFEST="$(MANIFEST)" APPROVAL=$(if $(strip $(VERIFY_KEY_COLUMN)), VERIFY_KEY_COLUMN="$(strip $(VERIFY_KEY_COLUMN))",); \
 		exit $$?; \
 	fi; \
 	export GENIERAILS_RERUN_TARGET=release; \
@@ -1520,6 +1526,7 @@ _release-manifest: _guard-not-ci-apply
 	$(call _ENV_LOCK,release); \
 	live="$$($(_LIVE_SNAPSHOT) --rederive)" || { echo "release: could not re-read live UC; nothing was applied." >&2; exit 1; }; \
 	$(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --live-snapshot "$$live" || exit 1; \
+	$(call _APPROVAL_CHECK,release); \
 	key="$$(python3 "$(SHARED_ROOT)/scripts/resolve_env_config.py" verify-key --env-dir "$(ENV_DIR)" --explicit "$(VERIFY_KEY_COLUMN)")" || exit 1; \
 	$(_REQUIRE_MASK_PROOF) || exit 1; \
 	imports="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field imports.count)" || exit 1; \
@@ -1530,7 +1537,7 @@ _release-manifest: _guard-not-ci-apply
 			echo "release: a recorded import or stale-tag cleanup failed (above); the ones before it are done, nothing else was applied. Fix the cause, then make release-plan ENV=$(ENV) again." >&2; \
 			exit 1; \
 		fi; \
-		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest imported existing resources into Terraform state; nothing else was applied."; \
@@ -1543,7 +1550,7 @@ _release-manifest: _guard-not-ci-apply
 	staged_rc=0; GENIERAILS_COVERAGE_GATE_RUNNER="$(ROOT_RUNNER)" $(_STAGED_POLICY) apply-saved --env-dir "$(ENV_DIR)" --env-name "$(ENV)" $(_STAGED_SPEC_FLAGS) \
 		--plan-dir "$$plans/data_access" --verify-access-cmd '$(_STAGED_VERIFY_ACCESS)' || staged_rc=$$?; \
 	if [ $$staged_rc -eq 10 ]; then \
-		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest held one phase of a staged policy change; it is applied and verified."; \
@@ -1556,7 +1563,7 @@ _release-manifest: _guard-not-ci-apply
 	fi; \
 	ws_skipped="$$($(_RELEASE_GATE) manifest-check --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" --field plans.workspace.skipped)" || exit 1; \
 	if [ "$${ws_skipped#deferred:}" != "$$ws_skipped" ]; then \
-		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+		$(_RELEASE_GATE) phase-record --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 		echo ""; \
 		echo "=== Release phase applied ($(ENV)) ==="; \
 		echo "  This manifest opened the SELECT the Genie agents need; the workspace (CAN_RUN) is planned with it live."; \
@@ -1593,7 +1600,7 @@ _release-manifest: _guard-not-ci-apply
 		$(_RELEASE_HELPER) failed "$(ENV_DIR)" --env "$(ENV)" --reason "the staged policy journal could not be confirmed"; \
 		exit 1; \
 	fi; \
-	$(_RELEASE_GATE) release-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" || exit 1; \
+	$(_RELEASE_GATE) release-receipt --env-dir "$(ENV_DIR)" --env "$(ENV)" --manifest "$$manifest" $(_APPROVAL_ARG) || exit 1; \
 	echo ""; \
 	echo "=== Release complete ($(ENV)) ==="; \
 	$(_RELEASE_HELPER) access-summary "$(ENV_DIR)"; \
@@ -1657,6 +1664,21 @@ validate: _guarded-bootstrap ## Validate split config in the selected environmen
 
 promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target ## Split generated/ into layers (same-env), or cross-env: make promote SOURCE_ENV=dev DEST_ENV=prod DEST_CATALOG_MAP="dev_cat=prod_cat"
 	@set -e; $(_DRY_RUN_GUARD); if [ -n "$(DEST_ENV)" ]; then \
+		dest_mode="$$($(_GOVERNANCE_MODE_OF) "$(DEST_ENV_DIR)/env.auto.tfvars" 2>/dev/null)" || { \
+			echo "ERROR: cannot read governance_mode for destination $(DEST_ENV); refusing make promote." >&2; \
+			$(_PROMOTE_MODE_HINT); \
+			exit 1; \
+		}; \
+		case "$$dest_mode" in \
+			legacy) ;; \
+			deterministic) \
+				if ! $(_PROMOTE_TO_TOKEN) consume --env-dir "$(DEST_ENV_DIR)"; then \
+					echo "ERROR: make promote SOURCE_ENV=... DEST_ENV=$(DEST_ENV) is refused for deterministic destinations." >&2; \
+					echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
+					exit 1; \
+				fi ;; \
+			*) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; $(_PROMOTE_MODE_HINT); exit 1 ;; \
+		esac; \
 		if [ "$(DEST_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(DEST_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: DEST_ENV cannot be '$(ACCOUNT_ENV)' or '$(DATA_ACCESS_SUBDIR)'."; exit 1; \
 		fi; \
@@ -1794,9 +1816,10 @@ _PROMOTE_TO_MAP = $(if $(filter command line,$(origin CATALOG_MAP)),$(CATALOG_MA
 # CHECK=1 writes nothing: it reruns promote-to in a scratch copy of envs/ (no
 # credentials or state) and fails if the committed output differs.
 promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote configured rules into ENV: set envs/prod/env.auto.tfvars, then make promote-to ENV=prod (CHECK=1: read-only, fail if the committed output differs)
-	@$(_PROMOTE_TO_PLACEHOLDER_GUARD)
-	@$(_SCHEDULED_GOVERNANCE_GUARD)
-	@$(_GUARD_WORKSPACE_ENV); \
+	@set -e; \
+	$(_PROMOTE_TO_PLACEHOLDER_GUARD); \
+	$(_SCHEDULED_GOVERNANCE_GUARD); \
+	$(_GUARD_WORKSPACE_ENV); \
 	$(_DRY_RUN_GUARD); \
 	if [ "$(CHECK)" = 1 ]; then \
 		$(_CHECK_ENV) promote-check --from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)"; \
