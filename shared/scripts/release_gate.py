@@ -612,12 +612,39 @@ def _engine_dirty(repo: Path) -> list[str]:
     return reasons
 
 
+def hidden_from_status(repo: Path, paths: Iterable[Path]) -> list[str]:
+    """Tracked files under ``paths`` whose edits git status can't see: assume-unchanged (a
+    lowercase `git ls-files -v` tag) or skip-worktree ('S'/'s'). The fingerprints hash the bytes
+    on disk, so a flagged file could run uncommitted content under a clean receipt; it refuses."""
+    rels = [_rel(repo, p) for p in paths if Path(p).exists()]
+    if not rels:
+        return []
+    scrubbed = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    out = subprocess.run(["git", "-C", str(repo), "ls-files", "-v", "-z", "--", *rels],
+                         capture_output=True, env=scrubbed)
+    if out.returncode:
+        raise Refused(f"git ls-files -v failed: {out.stderr.decode(errors='replace').strip()}")
+    reasons = []
+    for entry in filter(None, out.stdout.decode(errors="replace").split("\0")):
+        tag, _, rel = entry.partition(" ")
+        flags = (["skip-worktree"] if tag in ("S", "s") else []) + (["assume-unchanged"] if tag.islower() else [])
+        if flags:
+            clear = " and ".join(f"git update-index --no-{flag} -- {rel}" for flag in flags)
+            reasons.append(f"{rel} is marked {' and '.join(flags)}, so git status can't show its edits: "
+                           f"clear it ({clear})")
+    return reasons
+
+
 def checkout_status(env_dir: Path) -> dict:
     """Commit, clean flag (with why not) of the checkout an env lives in."""
     env_dir = Path(env_dir)
     repo = repo_root(env_dir)
     cloud_dir = cloud_dir_of(env_dir)
-    reasons = ([f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir])] + _engine_dirty(repo))[:20]
+    shared = repo / "shared"
+    # _engine_dirty refuses a shared/ that is a link or resolves elsewhere; only a real one is scanned here.
+    scanned = [cloud_dir] + ([shared] if shared.is_dir() and not shared.is_symlink() else [])
+    reasons = ([f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir])] + _engine_dirty(repo)
+               + hidden_from_status(repo, scanned))[:20]
     if not tracked(repo, env_dir / "env.auto.tfvars"):
         reasons.append(f"{_rel(repo, env_dir / 'env.auto.tfvars')} is not committed (commit envs/; "
                        "see shared/docs/version-control.md)")
