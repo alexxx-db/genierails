@@ -40,6 +40,7 @@ Older GenieRails versions held the tier groups' `USE_CATALOG`, `USE_SCHEMA` and 
 If groups, tag policies, tag assignments, or FGAC policies already exist in Databricks, import them so Terraform can manage them without `already exists` errors:
 
 ```bash
+make promote ENV=dev         # first: writes envs/account/abac.auto.tfvars, which the account import reads
 make import ENV=account      # import account groups + tag policies into module.account
 make import                  # import env-scoped governance + workspace-local resources for ENV=dev
 make import ENV=prod         # import env-scoped governance + workspace-local resources for ENV=prod
@@ -67,6 +68,19 @@ make apply
 ```
 
 ## Common Issues
+
+### `make import ENV=account` fails with "abac.auto.tfvars not found"
+
+The account import reads `envs/account/abac.auto.tfvars`, and on a fresh repo nothing before it
+writes that file: `make setup` and a plain `make generate` don't. Split the generated config into the layer
+files, then import:
+
+```bash
+make promote ENV=dev
+make import ENV=account
+```
+
+See [import existing](../IMPORT_EXISTING.md).
 
 ### Tag sync warns "live value(s) not desired by this checkout are left in place"
 
