@@ -9,6 +9,10 @@ Before running imports, ensure:
 1. The relevant `envs/<layer-or-workspace>/auth.auto.tfvars` contains valid credentials.
 2. The target `abac.auto.tfvars` contains the resources you want Terraform to manage.
 3. You have already run `make setup` for the workspace you are working on.
+4. For `ENV=account`: `envs/account/abac.auto.tfvars` exists. `make setup` and a plain `make generate` don't
+   write it; `make promote ENV=<env>` does (it splits `envs/<env>/generated/` into the account,
+   data_access and workspace files). On a fresh repo, run it before `make import ENV=account`, or the
+   import stops at `ERROR: abac.auto.tfvars not found. Configure it before importing.`
 
 ## Layer ownership
 
@@ -21,6 +25,10 @@ Before running imports, ensure:
 From your cloud wrapper directory (`aws/` or `azure/`):
 
 ```bash
+# Split envs/dev/generated/ into the layer files first: it writes
+# envs/account/abac.auto.tfvars, which the account import reads
+make promote ENV=dev
+
 # Import account groups and tag policies
 make import ENV=account
 

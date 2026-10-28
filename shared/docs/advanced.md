@@ -121,7 +121,25 @@ Each env keeps its own Terraform state and local artifacts. `account` is the onl
 ## Independent Environments
 
 For a business unit or environment that should not inherit dev's governance,
-generate it on its own instead of promoting:
+generate it on its own instead of promoting. `make setup` seeds every new env
+except `dev` and `account` as promoted from dev, and `make generate ENV=bu2`
+refuses an env with no `env.auto.tfvars`, so create the env first and then
+remove the seeded promotion settings:
+
+```bash
+make setup ENV=bu2
+```
+
+In `envs/bu2/env.auto.tfvars`, delete the two seeded lines at the end of the
+file (and the comment above them):
+
+```hcl
+promote_from = "dev"
+catalog_map  = { "<dev_catalog>" = "<bu2_catalog>" }
+```
+
+Run `make setup ENV=bu2` again: with no `promote_from` it prints the rehearsal
+(Dev section) steps for bu2 instead of the promotion ones. Follow them, then:
 
 ```bash
 make generate ENV=bu2
@@ -129,7 +147,8 @@ make generate ENV=bu2
 
 Review and commit the result. CI runs `make check ENV=bu2`; after approval the
 deployment machine runs `make rehearse ENV=bu2`, which applies and verifies it.
-`make release` is only for envs filled by `make promote-to`. See [Pipelines](pipelines.md).
+`make release` is only for envs filled by `make promote-to`. `make capture`
+runs only in `dev`, and `make generate` imports agents only there. See [Pipelines](pipelines.md).
 
 ## Migrating an Existing Root-Based Workspace
 
