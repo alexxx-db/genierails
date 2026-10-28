@@ -461,6 +461,28 @@ def test_setup_stg_without_promote_from_uses_the_rehearsal_banner(tmp_path):
     assert "promotion — the walkthrough's Prod section" not in result.stdout
 
 
+@pytest.mark.parametrize("mode", ["deterministic", "legacy"])
+def test_setup_non_dev_rehearsal_banner_says_generate_imports_agents_only_in_dev(mode, tmp_path):
+    # make generate imports agents (agent_ownership import-new) only with ENV=dev.
+    outs = {}
+    for env in ("dev", "stg"):
+        env_dir = tmp_path / "aws/envs" / env
+        env_dir.mkdir(parents=True)
+        # An agent ID, so deterministic isn't governance-only.
+        env_dir.joinpath("env.auto.tfvars").write_text(f'governance_mode = "{mode}"\ngenie_space_id = "01ef00000000000a"\n')
+        result = _make("aws", tmp_path, "setup", f"ENV={env}")
+        assert result.returncode == 0, result.stderr
+        outs[env] = result.stdout
+    dev, stg = outs["dev"], outs["stg"]
+    assert "   (one run: imports the agent, finds its tables, drafts rules)\n" in dev
+    assert "imports the agent" not in stg
+    assert ("Run: make generate ENV=stg   (one run: finds the agent's tables, drafts rules; "
+            "agents are imported only in dev)\n") in stg
+    # Same commands in the same order; only the wording differs.
+    commands = lambda out: re.findall(r"make [a-z][a-z-]*(?: [A-Z_]+=\S+)*", out)
+    assert commands(stg) == [c.replace("ENV=dev", "ENV=stg") for c in commands(dev)]
+
+
 @pytest.mark.parametrize("target", ["promote-to", "check"])
 @pytest.mark.parametrize("ci", [False, True])
 def test_duplicate_catalog_map_is_actionable_without_parser_traceback(target, ci, tmp_path):
