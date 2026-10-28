@@ -26,6 +26,7 @@ import pytest
 
 from scripts import release_gate as rg
 from tests.test_check_target import FAKE_TERRAFORM, _env
+from tests.test_commit_envs import _pty_run
 from tests.test_deterministic_check_promote import DEPLOYER, DEV_ENV, LEGACY_ACCOUNT, TIERS, _auth, _write_generated
 from tests.test_release_gate import git_env
 from tests.test_release_gate_make import Make
@@ -49,15 +50,19 @@ def prod_commands() -> list[str]:
     """Each command the Prod section tells the user to run, in order, up to release-plan.
 
     Commands are the lines of its bash blocks plus the inline commit
-    instruction ("Commit and push ... (`git add ...`, commit, `git push`)").
+    instruction ("Commit and push ... (`git add ...`, commit, `git push`)"), or
+    the answer to promote-to's commit offer ("It then offers to commit and push
+    ... (answer `y`"), which is "answer y".
     """
     section = _section("Prod")
     commands = []
-    for match in re.finditer(r"```bash\n(.*?)```|Commit and push[^\n]*?\(`(git add [^`]+)`, commit, `(git push)`\)",
-                             section, re.S):
+    for match in re.finditer(r"```bash\n(.*?)```|Commit and push[^\n]*?\(`(git add [^`]+)`, commit, `(git push)`\)"
+                             r"|It then offers to commit and push[^\n]*?\(answer `(y)`", section, re.S):
         if match.group(1):
             commands += [line.split("#")[0].strip() for line in match.group(1).splitlines()
                          if line.split("#")[0].strip()]
+        elif match.group(4):
+            commands.append("answer y")
         else:
             commands += [match.group(2), "git commit", match.group(3)]
     assert "make release-plan ENV=prod" in commands, commands
@@ -150,13 +155,13 @@ def _fill_in_prod(repo: Customer) -> None:
 
 def test_the_prod_section_reads_as_expected():
     assert prod_commands() == [
-        "make setup ENV=prod", "make promote-to ENV=prod",
-        "git add .gitignore envs/", "git commit", "git push",
+        "make setup ENV=prod", "make promote-to ENV=prod", "answer y",
         "make check ENV=prod", "make release-plan ENV=prod",
     ]
-    # The whole flow's prod commit adds the same files.
+    # The whole flow's promote-to commits the same files itself.
     flow = _section("The whole flow")
-    assert "git add .gitignore envs/ && git commit -m \"Promote the rules to prod\"" in flow
+    assert "make promote-to ENV=prod    # copies the reviewed rules; shows the diff, offers to commit + push (y)" in flow
+    assert "Promote the rules to prod" not in flow
 
 
 def _step(section: str, title: str) -> str:
@@ -248,7 +253,10 @@ def test_prod_step_3_tells_legacy_envs_to_skip_release_plan():
 def test_following_the_prod_section_word_for_word_reaches_a_release_manifest(customer):
     repo = customer
     out = {}
-    for command in prod_commands():
+    commands = prod_commands()
+    for i, command in enumerate(commands):
+        if command == "answer y":
+            continue  # typed at the promote-to run before it
         words = shlex.split(command)
         if words[0] == "git":
             if words[1] == "commit":
@@ -258,6 +266,12 @@ def test_following_the_prod_section_word_for_word_reaches_a_release_manifest(cus
         target, env = words[1], words[2].split("=", 1)[1]
         if target in ("rehearse", "release-plan"):
             result = repo.stub_make(target, env)
+        elif commands[i + 1:i + 2] == ["answer y"]:
+            code, tty_out = _pty_run(["make", "--no-print-directory", target, f"ENV={env}"], "y",
+                                     _env(repo.tmp, **repo.env), cwd=repo.cloud)
+            result = subprocess.CompletedProcess(command, code, tty_out, "")
+            assert "Commit these changes and push them to origin/main? [y/N]" in tty_out, tty_out
+            assert "Pushed to origin/main." in tty_out, tty_out
         else:
             result = repo.make(target, f"ENV={env}")
         text = out[command] = result.stdout + result.stderr
