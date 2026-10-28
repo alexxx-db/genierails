@@ -63,10 +63,19 @@ def consume(env_dir: Path, token: str | None) -> bool:
 def run(env_dir: Path, command: list[str]) -> int:
     token = None
     child = None
+    stopping = False
+    received_signals: list[int] = []
+    exiting_for_signal = False
 
     def terminate(signum, _frame):
+        nonlocal stopping, exiting_for_signal
+        received_signals.append(signum)
+        if stopping:
+            return
+        stopping = True
         if child is not None and child.poll() is None:
             child.terminate()
+        exiting_for_signal = True
         raise SystemExit(128 + signum)
 
     signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -85,16 +94,19 @@ def run(env_dir: Path, command: list[str]) -> int:
         child = subprocess.Popen(command, env=env)
         return child.wait()
     finally:
+        stopping = True
         cleanup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
         try:
             if token is not None:
                 token.unlink(missing_ok=True)
+        finally:
+            # Let pending signals run through terminate while it is in its
+            # non-raising cleanup state, then restore the caller's handlers.
+            signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
-        finally:
-            # Restore the old mask last: a pending signal must not interrupt
-            # token deletion or restoration of the caller's handlers.
-            signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
+        if received_signals and not exiting_for_signal:
+            os.kill(os.getpid(), received_signals[0])
 
 
 def main(argv: list[str] | None = None) -> int:

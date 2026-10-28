@@ -1021,6 +1021,77 @@ promote_token.run(Path({str(env)!r}), [sys.executable, "-c", "pass"])
     assert not token.exists()
 
 
+@pytest.mark.parametrize("first,second", [
+    (signal.SIGTERM, signal.SIGINT),
+    (signal.SIGINT, signal.SIGTERM),
+    (signal.SIGHUP, signal.SIGTERM),
+])
+def test_promote_to_token_two_signals_leave_no_token_and_keep_first_exit(tmp_path, first, second):
+    env = tmp_path / "prod"
+    env.mkdir()
+    token = tmp_path / "promote-token"
+    child = (
+        "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"os.kill(os.getppid(), {first}); time.sleep(.05); "
+        f"os.kill(os.getppid(), {second}); time.sleep(2)"
+    )
+    program = f'''\
+import sys, time
+from pathlib import Path
+sys.path.insert(0, {str(SHARED / "scripts")!r})
+import promote_token
+class SlowPath(type(Path())):
+    def unlink(self, *args, **kwargs):
+        time.sleep(.2)
+        return super().unlink(*args, **kwargs)
+def mint(env_dir):
+    path = SlowPath({str(token)!r})
+    path.write_text(promote_token.TOKEN_PREFIX + str(env_dir.resolve()) + "\\n")
+    path.chmod(0o600)
+    return path
+promote_token.mint = mint
+promote_token.run(Path({str(env)!r}), [sys.executable, "-c", {child!r}])
+'''
+
+    result = subprocess.run([sys.executable, "-c", program], timeout=10)
+
+    assert result.returncode == 128 + first
+    assert not token.exists()
+
+
+def test_promote_to_token_signal_at_cleanup_entry_leaves_no_token(tmp_path):
+    env = tmp_path / "prod"
+    env.mkdir()
+    token = tmp_path / "promote-token"
+    program = f'''\
+import os, signal, sys
+from pathlib import Path
+sys.path.insert(0, {str(SHARED / "scripts")!r})
+import promote_token
+real_mask = signal.pthread_sigmask
+calls = 0
+def mask_with_signal(how, mask):
+    global calls
+    calls += 1
+    if calls == 3:
+        os.kill(os.getpid(), signal.SIGTERM)
+    return real_mask(how, mask)
+def mint(env_dir):
+    path = Path({str(token)!r})
+    path.write_text(promote_token.TOKEN_PREFIX + str(env_dir.resolve()) + "\\n")
+    path.chmod(0o600)
+    return path
+signal.pthread_sigmask = mask_with_signal
+promote_token.mint = mint
+promote_token.run(Path({str(env)!r}), [sys.executable, "-c", "pass"])
+'''
+
+    result = subprocess.run([sys.executable, "-c", program])
+
+    assert result.returncode == -signal.SIGTERM
+    assert not token.exists()
+
+
 def test_apply_check_passes_when_auth_matches_and_ignores_legacy(tmp_path):
     from deployer_identity import apply_problems
 

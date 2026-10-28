@@ -1626,7 +1626,7 @@ promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target
 					echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; \
 					exit 1; \
 				fi ;; \
-			*) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; exit 1 ;; \
+			*) echo "ERROR: unsupported governance_mode '$$dest_mode' for destination $(DEST_ENV); refusing make promote." >&2; echo "       Use: make promote-to ENV=$(DEST_ENV)" >&2; exit 1 ;; \
 		esac; \
 		if [ "$(DEST_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(DEST_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
 			echo "ERROR: DEST_ENV cannot be '$(ACCOUNT_ENV)' or '$(DATA_ACCESS_SUBDIR)'."; exit 1; \
