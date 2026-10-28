@@ -81,8 +81,8 @@ The guard parses `MAKEFLAGS`/`GNUMAKEFLAGS` before recipes run and ignores
 command-line variable assignments after GNU make's `--` separator. It is an
 accident guard, not a security boundary: it does not detect a deliberate
 `--eval=.IGNORE:` override, and a caller who forges both `MAKELEVEL` and the
-internal `GENIERAILS_READONLY_ERROR_FLAGS` environment can bypass the inherited
-read-only marker.
+internal `GENIERAILS_READONLY_ERROR_FLAGS` from the environment or command line
+can bypass the inherited read-only marker.
 
 ### `make import ENV=account` fails with "abac.auto.tfvars not found"
 
