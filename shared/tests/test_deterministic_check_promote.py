@@ -994,6 +994,33 @@ promote_token.run(promote_token.Path({str(env)!r}), [sys.executable, "-c", "pass
     assert not Path(marker.read_text()).exists()
 
 
+def test_promote_to_token_signal_during_final_unlink_cannot_leave_token(tmp_path):
+    env = tmp_path / "prod"
+    env.mkdir()
+    token = tmp_path / "promote-token"
+    program = f'''\
+import os, signal, sys
+from pathlib import Path
+sys.path.insert(0, {str(SHARED / "scripts")!r})
+import promote_token
+class SignallingPath(type(Path())):
+    def unlink(self, *args, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return super().unlink(*args, **kwargs)
+def mint(env_dir):
+    path = SignallingPath({str(token)!r})
+    path.write_text(promote_token.TOKEN_PREFIX + str(env_dir.resolve()) + "\\n")
+    path.chmod(0o600)
+    return path
+promote_token.mint = mint
+promote_token.run(Path({str(env)!r}), [sys.executable, "-c", "pass"])
+'''
+
+    subprocess.run([sys.executable, "-c", program])
+
+    assert not token.exists()
+
+
 def test_apply_check_passes_when_auth_matches_and_ignores_legacy(tmp_path):
     from deployer_identity import apply_problems
 

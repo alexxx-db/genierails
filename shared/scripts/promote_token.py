@@ -85,10 +85,16 @@ def run(env_dir: Path, command: list[str]) -> int:
         child = subprocess.Popen(command, env=env)
         return child.wait()
     finally:
-        if token is not None:
-            token.unlink(missing_ok=True)
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+        cleanup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+        try:
+            if token is not None:
+                token.unlink(missing_ok=True)
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+        finally:
+            # Restore the old mask last: a pending signal must not interrupt
+            # token deletion or restoration of the caller's handlers.
+            signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
 
 
 def main(argv: list[str] | None = None) -> int:
