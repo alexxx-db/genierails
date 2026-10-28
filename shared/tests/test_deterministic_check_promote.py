@@ -17,6 +17,7 @@ Terraform is a stub on PATH; nothing reaches Databricks.
 import json
 import re
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -306,7 +307,7 @@ def _direct_promote_args():
     return ("promote", "SOURCE_ENV=dev", "DEST_ENV=prod", "DEST_CATALOG_MAP=paycat=ppay")
 
 
-@pytest.mark.parametrize("jobs", [(), ("-j4",)], ids=["serial", "make-j4"])
+@pytest.mark.parametrize("jobs", [(), ("-j4",), ("-i",), ("-k",)], ids=["serial", "make-j4", "make-i", "make-k"])
 @pytest.mark.parametrize("selected_env", [False, True], ids=["default-env", "env-prod"])
 def test_direct_promote_refuses_deterministic_destination_without_writing(repo, tmp_path, jobs, selected_env):
     _write_prod(repo, PROD_ENV)
@@ -318,7 +319,10 @@ def test_direct_promote_refuses_deterministic_destination_without_writing(repo, 
     result = _make(repo, tmp_path, *args)
 
     out = result.stdout + result.stderr
-    assert result.returncode != 0, out
+    # GNU make -i reports success after deliberately ignoring the refusing
+    # recipe's non-zero status; refusal is the diagnostic plus no writes.
+    if jobs != ("-i",):
+        assert result.returncode != 0, out
     assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused for deterministic destinations" in out
     assert "make promote-to ENV=prod" in out
     assert "Cross-env promote" not in out
@@ -909,7 +913,7 @@ def test_the_exposure_token_works_once_and_only_for_its_env(tmp_path, monkeypatc
 
 def test_the_promote_to_token_works_once_and_only_for_its_env(tmp_path):
     sys.path.insert(0, str(SHARED / "scripts"))
-    from promote_token import TOKEN_PREFIX, consume, mint
+    from promote_token import TOKEN_PREFIX, check, consume, mint
 
     env, other = tmp_path / "prod", tmp_path / "dev"
     env.mkdir()
@@ -928,6 +932,7 @@ def test_the_promote_to_token_works_once_and_only_for_its_env(tmp_path):
     good = mint(env)
     link.symlink_to(good)
     assert not consume(env, str(link)) and good.exists()
+    assert check(env, str(good)) and good.exists()
     assert consume(env, str(good)) and not good.exists()
     assert not consume(env, str(good))  # one use only
 
@@ -962,6 +967,31 @@ def test_promote_to_token_is_removed_on_sigterm(tmp_path):
 
     assert process.returncode != 0
     assert not list(token_tmp.glob(".genierails-promote-to-*"))
+
+
+def test_promote_to_token_signal_at_mint_cannot_leave_token(tmp_path):
+    env = tmp_path / "prod"
+    env.mkdir()
+    marker = tmp_path / "minted-path"
+    program = f'''\
+import os, signal, sys
+sys.path.insert(0, {str(SHARED / "scripts")!r})
+import promote_token
+real_mint = promote_token.mint
+def signal_during_mint(env_dir):
+    os.kill(os.getpid(), signal.SIGINT)
+    token = real_mint(env_dir)
+    open({str(marker)!r}, "w").write(str(token))
+    return token
+promote_token.mint = signal_during_mint
+promote_token.run(promote_token.Path({str(env)!r}), [sys.executable, "-c", "pass"])
+'''
+
+    result = subprocess.run([sys.executable, "-c", program])
+
+    assert result.returncode == 128 + signal.SIGINT
+    assert marker.exists()
+    assert not Path(marker.read_text()).exists()
 
 
 def test_apply_check_passes_when_auth_matches_and_ignores_legacy(tmp_path):

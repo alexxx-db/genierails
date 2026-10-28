@@ -33,7 +33,7 @@ def mint(env_dir: Path) -> Path:
     return Path(name)
 
 
-def consume(env_dir: Path, token: str | None) -> bool:
+def check(env_dir: Path, token: str | None) -> bool:
     if not token:
         return False
     path = Path(token)
@@ -47,14 +47,21 @@ def consume(env_dir: Path, token: str | None) -> bool:
         valid = valid and path.read_text() == TOKEN_PREFIX + str(env_dir.resolve()) + "\n"
     except OSError:
         valid = False
-    if valid:
-        path.unlink()
     return valid
 
 
+def consume(env_dir: Path, token: str | None) -> bool:
+    if not check(env_dir, token):
+        return False
+    try:
+        Path(token).unlink()
+    except OSError:
+        return False
+    return True
+
+
 def run(env_dir: Path, command: list[str]) -> int:
-    token = mint(env_dir)
-    env = os.environ | {ENV_VAR: str(token)}
+    token = None
     child = None
 
     def terminate(signum, _frame):
@@ -62,13 +69,24 @@ def run(env_dir: Path, command: list[str]) -> int:
             child.terminate()
         raise SystemExit(128 + signum)
 
-    previous = {sig: signal.signal(sig, terminate) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous = {sig: signal.signal(sig, terminate) for sig in signals}
     try:
+        # Keep a signal from landing after mkstemp creates the token but before
+        # its path is assigned.  Pending signals run after the mask is restored,
+        # when the cleanup handler can always find the token.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+        try:
+            token = mint(env_dir)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        env = os.environ | {ENV_VAR: str(token)}
         import subprocess
         child = subprocess.Popen(command, env=env)
         return child.wait()
     finally:
-        token.unlink(missing_ok=True)
+        if token is not None:
+            token.unlink(missing_ok=True)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
@@ -76,7 +94,7 @@ def run(env_dir: Path, command: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("mint", "consume"):
+    for name in ("mint", "check", "consume"):
         child = sub.add_parser(name)
         child.add_argument("--env-dir", required=True, type=Path)
     runner = sub.add_parser("run")
@@ -92,7 +110,8 @@ def main(argv: list[str] | None = None) -> int:
             print("promote_token.py run: missing command", file=sys.stderr)
             return 2
         return run(args.env_dir, command)
-    return 0 if consume(args.env_dir, os.environ.get(ENV_VAR)) else 1
+    operation = check if args.command == "check" else consume
+    return 0 if operation(args.env_dir, os.environ.get(ENV_VAR)) else 1
 
 
 if __name__ == "__main__":
