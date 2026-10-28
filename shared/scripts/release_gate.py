@@ -564,39 +564,51 @@ def receipt_problem(receipt: Mapping, env: str) -> str | None:
     return next((why for ok, why in checks if not ok), None)
 
 
-# Ignored files under shared/ that are caches or local runtime data, never engine
-# code: Python bytecode (only used for its own matching tracked source),
-# Terraform's provider cache and lock files. Any other ignored file with a code
-# suffix could be loaded but is not in the code fingerprint, so it refuses.
-_ENGINE_CACHE_DIRS = ("__pycache__", ".terraform", ".pytest_cache")
-_ENGINE_CODE_SUFFIXES = (".py", ".sh", ".tf", ".hcl", ".sql", ".json")
+# The only untracked or ignored things allowed under shared/: caches nothing
+# loads as engine code. Python reads __pycache__/ bytecode only for its own
+# matching tracked source (a bare *.pyc elsewhere is importable, so it isn't
+# allowed); .terraform/ and .terraform.lock.hcl are Terraform's provider cache
+# and lock; .pytest_cache/ and .DS_Store are never read. Anything else (any
+# suffix: .py, .yaml, .env, ...) is not in the code fingerprint and refuses.
+_ENGINE_CACHE_DIRS = ("__pycache__", ".pytest_cache", ".terraform")
+_ENGINE_CACHE_FILES = (".terraform.lock.hcl", ".DS_Store")
+_ENGINE_NOT_COMMITTED = ("deterministic rehearse/release-plan need the engine committed as regular files in this "
+                         "repo so receipts can fingerprint it")
+
+
+def _engine_cache(rel: str) -> bool:
+    parts = Path(rel).parts
+    return any(part in _ENGINE_CACHE_DIRS for part in parts[:-1]) or parts[-1] in _ENGINE_CACHE_FILES
 
 
 def _engine_dirty(repo: Path) -> list[str]:
-    """Why the GenieRails engine (shared/) isn't the committed one ([] when it is).
+    """Why the GenieRails engine (shared/) isn't exactly the committed one ([] when it is).
 
-    shared/ must be a real directory in this checkout: the code fingerprint
-    hashes only the files git tracks here, so a shared/ that resolves
-    elsewhere (a symlink, at any revision) can't be bound by a receipt and
-    always refuses. Inside the checkout it must have no uncommitted change, and
-    no ignored file that could be loaded as code.
+    The code fingerprint hashes the regular files git tracks under shared/ in
+    this checkout, so shared/ must be just that: not a path resolving
+    elsewhere (a symlink, at any revision), not a submodule or a nested git
+    repo anywhere under it, no uncommitted change, and no untracked or ignored
+    file except the caches above (deny by default).
     """
     shared = repo / "shared"
     if not shared.exists() and not shared.is_symlink():
         return []
     target = shared.resolve()
     if shared.is_symlink() or not target.is_relative_to(repo):
-        return [f"shared/ resolves outside this checkout ({target}); deterministic rehearse/release-plan need "
-                "the engine committed in this repo so receipts can fingerprint it"]
+        return [f"shared/ resolves outside this checkout ({target}); {_ENGINE_NOT_COMMITTED}"]
+    staged = git(repo, "ls-files", "-s", "-z", "--", _rel(repo, shared)).stdout
+    gitlinks = [entry.split("\t", 1)[1] for entry in filter(None, staged.split("\0")) if entry.startswith("160000 ")]
+    nested = sorted(_rel(repo, Path(top) / ".git") for top, dirs, files in os.walk(shared)
+                    if ".git" in dirs or ".git" in files)
+    if gitlinks or nested:
+        return [f"shared/ holds a git submodule or nested repository ({', '.join(gitlinks + nested)}); "
+                f"{_ENGINE_NOT_COMMITTED}"]
     reasons = [f"uncommitted: {line}" for line in dirty_paths(repo, [shared])]
     ignored = git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
                   _rel(repo, shared)).stdout
     for rel in sorted(filter(None, ignored.split("\0"))):
-        parts = Path(rel).parts
-        if any(part in _ENGINE_CACHE_DIRS for part in parts) or rel.endswith(".terraform.lock.hcl"):
-            continue
-        if rel.endswith(_ENGINE_CODE_SUFFIXES):
-            reasons.append(f"ignored engine file (not in the code fingerprint; commit or delete it): {rel}")
+        if not _engine_cache(rel):
+            reasons.append(f"ignored file under shared/ (not in the code fingerprint; commit or delete it): {rel}")
     return reasons
 
 

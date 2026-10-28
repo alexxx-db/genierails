@@ -994,7 +994,7 @@ def _external_shared(repo, tmp_path, *, git_tree=True):
 
 
 EXTERNAL = "shared/ resolves outside this checkout"
-COMMITTED_HERE = "need the engine committed in this repo so receipts can fingerprint it"
+COMMITTED_HERE = "need the engine committed as regular files in this repo so receipts can fingerprint it"
 
 
 @pytest.mark.parametrize("state", ["clean", "untracked", "modified", "not-a-git-tree"])
@@ -1037,25 +1037,110 @@ def test_receipts_and_provenance_use_the_same_engine_test_as_clean_check(repo, t
     with pytest.raises(rg.Refused, match=COMMITTED_HERE):
         rg.clean_check(_envs(repo) / "dev", "dev", "make rehearse")
 
+# What a normal clone's .gitignore ignores under shared/ (the root .gitignore): caches only.
+CACHE_IGNORES = "__pycache__/\n*.pyc\n.pytest_cache/\n.terraform/\n.terraform.lock.hcl\n.DS_Store\n"
 
-@pytest.mark.parametrize("planted, refused", [
-    ("scripts/.planted.json", True),                         # ignored (.*.json) and loadable: not fingerprinted
-    ("roots/data_access/.terraform/providers/p", False),     # Terraform's provider cache
-    ("roots/data_access/.terraform.lock.hcl", False),
-])
-def test_ignored_engine_code_under_an_in_repo_shared_refuses(repo, planted, refused):
+
+def _ignore(repo, patterns):
+    (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + patterns)
+    _commit(repo, "ignore")
+
+
+def _plant(repo, rel):
+    path = repo / "shared" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x\n")
+
+
+def test_a_normal_clone_with_caches_is_clean(repo):
     from shared.scripts import release_gate as rg
 
     _vendor_shared(repo)
-    path = repo / "shared" / planted
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("x\n")
-    if planted.endswith(".terraform.lock.hcl"):
-        (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + ".terraform.lock.hcl\n")
-        _commit(repo, "ignore lock files")
+    _ignore(repo, CACHE_IGNORES)
+    for rel in ("scripts/__pycache__/check_env.cpython-311.pyc", "tests/__pycache__/x.cpython-311.pyc",
+                "roots/data_access/.terraform/providers/p", "roots/data_access/.terraform.lock.hcl",
+                ".pytest_cache/v/cache/nodeids", "scripts/.DS_Store"):
+        _plant(repo, rel)
+    assert _git(repo, "status", "--porcelain") == ""
+    status = rg.checkout_status(_envs(repo) / "dev")
+    assert status["clean_tree"] is True, status
+
+
+@pytest.mark.parametrize("planted, pattern", [
+    ("countries/ZZ.yaml", "ZZ.yaml\n"),             # r4 repro: load_country_overlays(["ZZ"]) reads it
+    ("industries/zz.yaml", "zz.yaml\n"),
+    ("scripts/.planted.json", ""),                   # the fixture's .*.json
+    ("scripts/stray.pyc", ""),                       # a bare .pyc beside the sources is importable
+    ("scripts/account-admin.aws.env", "*.env\n"),    # any suffix: deny by default
+])
+def test_any_other_ignored_file_under_shared_refuses(repo, planted, pattern):
+    from shared.scripts import release_gate as rg
+
+    _vendor_shared(repo)
+    _ignore(repo, CACHE_IGNORES + pattern)
+    _plant(repo, planted)
     assert _git(repo, "status", "--porcelain") == "", "the planted file must be git-ignored"
     status = rg.checkout_status(_envs(repo) / "dev")
-    assert status["clean_tree"] is (not refused), status
-    if refused:
-        assert any(f"ignored engine file (not in the code fingerprint; commit or delete it): shared/{planted}" == line
-                   for line in status["dirty"]), status
+    assert status["clean_tree"] is False, status
+    assert (f"ignored file under shared/ (not in the code fingerprint; commit or delete it): shared/{planted}"
+            in status["dirty"]), status
+
+
+def _submodule_shared(repo, tmp_path, *, nested_only=False):
+    """shared/ as a committed submodule (gitlink), or a nested repo under shared/scripts."""
+    engine = tmp_path / "engine-repo"
+    _copy_tracked_shared(engine)
+    _git(engine, "init", "-q")
+    _git(engine, "add", "-A")
+    _git(engine, "commit", "-q", "-m", "engine")
+    if nested_only:
+        _vendor_shared(repo)
+        nested = repo / "shared" / "scripts" / "vendored"
+        _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(engine), str(nested.relative_to(repo)))
+    else:
+        (repo / "shared").unlink()
+        _git(repo, "rm", "-q", "--cached", "shared")
+        _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(engine), "shared")
+    _commit(repo, "engine as a submodule")
+
+
+@pytest.mark.parametrize("where", ["shared", "under-shared"])
+def test_an_engine_submodule_refuses_rehearse_before_anything(repo, tmp_path, where):
+    _submodule_shared(repo, tmp_path, nested_only=where == "under-shared")
+    staged = _git(repo, "ls-files", "-s", "--", "shared")
+    assert any(line.startswith("160000 ") for line in staged.splitlines()), staged
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert result.returncode != 0
+    assert "make rehearse refused: the checkout is not clean:" in result.stderr
+    assert f"holds a git submodule or nested repository" in result.stderr
+    assert COMMITTED_HERE in result.stderr
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
+
+
+def test_an_ignored_country_overlay_refuses_rehearse_before_anything(repo, tmp_path):
+    _vendor_shared(repo)
+    _ignore(repo, CACHE_IGNORES + "ZZ.yaml\n")
+    _plant(repo, "countries/ZZ.yaml")
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert result.returncode != 0
+    assert "ignored file under shared/ (not in the code fingerprint; commit or delete it): shared/countries/ZZ.yaml" \
+        in result.stderr
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
