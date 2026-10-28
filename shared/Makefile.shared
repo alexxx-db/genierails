@@ -653,6 +653,7 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 
 # make generate and make promote-to (deterministic) end by offering to commit
 # .gitignore and envs/<env>/, and push them when origin exists (scripts/commit_envs.py).
+# promote-to also commits envs/account/, unless it was already dirty when it began.
 # Only the top-level make decides, from a command-line COMMIT and only for those
 # two goals: unset asks on a terminal, COMMIT=0 never commits, COMMIT=1 commits
 # without asking; every nested make inherits that answer, and every other goal
@@ -1801,6 +1802,7 @@ promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote
 		$(_CHECK_ENV) promote-check --from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)"; \
 		exit $$?; \
 	fi; \
+	account_dirty="$$($(_COMMIT_ENVS) dirty --env "$(ENV)" --env-dir "$(ENV_DIR)" --step promote-to)"; \
 	resolved="$$($(_SAVED_SETTINGS) promote-resolve --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" \
 		--from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)")" || exit 1; \
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
@@ -1819,8 +1821,8 @@ promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote
 	fi; \
 	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" changes --from "$$txn_dir/snapshot" || exit 1; \
 	$(_PROMOTION_TXN_COMMIT); \
-	$(_TABLE_READERS) show --env-dir "$$dest_dir"
-	@$(if $(filter 1,$(CHECK)),:,$(_COMMIT_ENVS) offer --env "$(ENV)" --env-dir "$(CLOUD_ROOT)/envs/$(ENV)" --step promote-to)
+	$(_TABLE_READERS) show --env-dir "$$dest_dir" || exit 1; \
+	$(_COMMIT_ENVS) offer --env "$(ENV)" --env-dir "$$dest_dir" --step promote-to --account-dirty "$$account_dirty"
 
 # Read-only PR check (scripts/check_env.py): every step runs in a scratch copy
 # of the cloud dir, so nothing under envs/ is written and no applying target

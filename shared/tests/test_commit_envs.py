@@ -263,8 +263,8 @@ def _bare_origin(checkout, tmp_path):
     return bare
 
 
-def _hook(checkout, body):
-    hook = checkout / ".git" / "hooks" / "pre-commit"
+def _hook(checkout, body, name="pre-commit"):
+    hook = checkout / ".git" / "hooks" / name
     hook.write_text("#!/bin/sh\n" + body)
     hook.chmod(0o755)
 
@@ -294,6 +294,56 @@ def test_a_hook_that_stages_a_file_outside_the_env_is_undone_and_never_pushed(ch
     assert _git(checkout, "rev-parse", "HEAD") == head
     assert not _git(checkout, "diff", "--cached", "--name-only")  # notes.txt unstaged again
     assert _git(bare, "rev-parse", "main") == remote_head
+
+
+@pytest.mark.parametrize("name", ["prepare-commit-msg", "commit-msg", "post-commit"])
+def test_a_late_hook_that_leaves_a_secret_staged_is_undone_and_never_pushed(checkout, tmp_path, name):
+    """Codex r2: these hooks run after the commit's tree is built, so what they stage isn't in HEAD
+    (which passed its check) but stays staged for the next git commit: exit 0, pushed, secret staged."""
+    bare = _bare_origin(checkout, tmp_path)
+    _hook(checkout, "git add -f aws/envs/dev/auth.auto.tfvars\n", name)
+    before, remote_head = _git_state(checkout), _git(bare, "rev-parse", "main")
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 1, out
+    assert "a commit hook staged more after the commit was built, so the commit was undone" in out
+    assert "\n    aws/envs/dev/auth.auto.tfvars" in out
+    assert "Pushed" not in out and "Committed " not in out
+    assert _git_state(checkout) == before  # no new commit, nothing extra staged, index as before
+    assert _git(bare, "rev-parse", "main") == remote_head
+
+
+def test_a_hook_that_switches_branches_is_never_pushed_or_switched_back(checkout, tmp_path):
+    """Codex r2: a post-commit hook switched to another branch, and HEAD:main still went to origin/main."""
+    bare = _bare_origin(checkout, tmp_path)
+    _hook(checkout, "git switch -q -c side\n", "post-commit")
+    remote_head = _git(bare, "rev-parse", "main")
+    code, out = _pty_run(_args(checkout), "y", _environ(GENIERAILS_COMMIT="ask"))
+    assert code == 1, out
+    assert "a commit hook moved HEAD: HEAD is on side, not main. Nothing was pushed and nothing was undone" in out
+    assert "git switch main, then push yourself: git push origin main" in out
+    assert "Pushed" not in out
+    assert _git(bare, "rev-parse", "main") == remote_head
+    assert _git(checkout, "symbolic-ref", "--short", "HEAD").strip() == "side"  # not switched back
+    assert _committed(checkout) == EXPECTED  # the commit stays, on main and side
+
+
+def test_the_push_sends_the_checked_commit_to_the_branch(checkout, tmp_path, monkeypatch):
+    """Even if HEAD moves between the check and the push, the push names the checked commit."""
+    bare = _bare_origin(checkout, tmp_path)
+    calls = []
+    real = commit_envs._git
+
+    def spy(cwd, *args, **kw):
+        if args[:1] == ("push",):
+            calls.append(args)
+        return real(cwd, *args, **kw)
+    monkeypatch.setattr(commit_envs, "_git", spy)
+    monkeypatch.setenv("GENIERAILS_COMMIT", "1")
+    cloud = _cloud(checkout)
+    assert commit_envs.offer(cloud, "dev", cloud / "envs" / "dev", "generate", tty=False) == 0
+    head = _git(checkout, "rev-parse", "HEAD").strip()
+    assert calls == [("push", "origin", f"{head}:refs/heads/main")]
+    assert _git(bare, "rev-parse", "main").strip() == head
 
 
 def test_non_utf8_content_is_scanned_without_crashing(checkout):
@@ -330,6 +380,29 @@ def test_promote_to_commits_the_account_layer_too(checkout):
     assert "aws/envs/account/env.auto.tfvars" in out  # the --stat
     assert _committed(checkout) == sorted(EXPECTED + ["aws/envs/account/env.auto.tfvars"])
     assert "aws/envs/account" not in _git(checkout, "status", "--porcelain")
+
+
+def test_promote_to_refuses_an_account_layer_that_was_already_dirty(checkout):
+    """Codex r2: promote-to swept edits that were in envs/account/ before it ran into its commit."""
+    _with_account_change(checkout)
+    (_cloud(checkout) / "envs" / "account" / "notes.md").write_text("mine\n")
+    dirty = commit_envs.dirty(_cloud(checkout), "dev", "promote-to")
+    assert dirty == ["aws/envs/account/env.auto.tfvars", "aws/envs/account/notes.md"]
+    before = _git_state(checkout)
+    code, out = _pty_run(_args(checkout, step="promote-to") + ["--account-dirty", "\n".join(dirty)], "y",
+                         _environ(GENIERAILS_COMMIT="ask"))
+    _assert_refused(checkout, before, code, out,
+                    "envs/account/ already had uncommitted changes before this promote-to "
+                    "(aws/envs/account/env.auto.tfvars, aws/envs/account/notes.md)",
+                    "commit or revert them first, then re-run make promote-to ENV=dev")
+
+
+def test_dirty_is_empty_for_a_clean_account_layer_and_for_generate(checkout):
+    _with_account_change(checkout)
+    assert commit_envs.dirty(_cloud(checkout), "dev", "generate") == []
+    assert commit_envs.dirty(_cloud(checkout), "account", "promote-to") == []
+    _git(checkout, "checkout", "--", "aws/envs/account")
+    assert commit_envs.dirty(_cloud(checkout), "dev", "promote-to") == []
 
 
 def test_generate_leaves_the_account_layer_out(checkout):
@@ -602,3 +675,18 @@ def test_make_promote_to_commits_the_account_layer_it_changed_and_leaves_a_clean
     assert "aws/envs/account/abac.auto.tfvars" in committed, committed
     assert "aws/envs/prod/generated/abac.auto.tfvars" in committed
     assert _git(repo, "status", "--porcelain") == ""  # rehearse and release-plan need this
+
+
+def test_make_promote_to_refuses_account_edits_made_before_it_ran(repo, tmp_path):
+    """Codex r2: an edit already in envs/account/ was committed (and pushed) with the promotion."""
+    (_envs(repo) / "account" / "notes.md").write_text("team notes\n")
+    repo = _customer_promote_repo(repo)
+    (_envs(repo) / "account" / "notes.md").write_text("team notes\nmy unreviewed edit\n")
+    head = _git(repo, "rev-parse", "HEAD")
+    code, out = _pty_run(_make_cmd(repo), "y", _make_env(tmp_path))
+    assert code != 0, out  # make reports the refusal as 2
+    assert "envs/account/ already had uncommitted changes before this promote-to (aws/envs/account/notes.md)" in out
+    assert PROMPT not in out
+    assert _git(repo, "rev-parse", "HEAD") == head
+    assert not _git(repo, "diff", "--cached", "--name-only")
+    assert "my unreviewed edit" in (_envs(repo) / "account" / "notes.md").read_text()  # left as it was

@@ -33,14 +33,26 @@ does. Like setup's REPO=, this is an accident guard, not a security boundary.
 Refused, with nothing committed (exit 1):
   - something outside .gitignore and envs/<env>/ is already staged, or a merge,
     rebase, cherry-pick or revert is in progress;
+  - make promote-to: envs/account/ already had uncommitted changes when it
+    started (``dirty`` snapshots them first, passed as --account-dirty), so they
+    aren't swept into its commit; account changes the promotion itself made are
+    committed;
   - a path it would commit is credentials, Terraform state or plans, a runtime
     or evidence file (DENIED, or git-ignored by the .gitignore rules even though
     tracked), holds a client secret or token value (SECRET_RE, matched on the raw
-    bytes, binary files included), or can't be read to scan.
-The repo's commit hooks run (they are its secret scan) and may stage more, so
-what HEAD holds is checked again after the commit, the same way: anything
-outside those paths or denied undoes that commit (git reset --soft to the old
-HEAD, the index restored to what it was before the offer) and nothing is pushed.
+    bytes, binary files included), or can't be read to scan. The scan matches
+    ASCII/UTF-8 bytes only: a UTF-16 file's secret isn't seen (the repo's own
+    secret scan is the backstop); it is an accident guard, not a security boundary.
+The repo's commit hooks run (they are its secret scan) and may stage more or
+switch branches, so after the commit:
+  - HEAD must still be on RELEASE_BRANCH; if a hook moved it, nothing is pushed
+    and nothing is undone (it never switches back), and it says where HEAD is;
+  - what HEAD holds is checked again, the same way, and the real index must
+    equal HEAD's tree (a late hook can stage more after the tree was built):
+    anything outside those paths, denied or left staged undoes that commit (git
+    reset --soft to the old HEAD, the index restored to what it was before the
+    offer) and nothing is pushed;
+  - the push sends that checked commit (never whatever HEAD is by then).
 The preview stages into a temporary copy of the index, so answering n (or a
 refusal) leaves the index, HEAD and the work tree exactly as they were; a
 failed commit restores the index.
@@ -232,6 +244,38 @@ def _committed(root: Path) -> list[tuple[str, str]]:
     return [(fields[i], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
 
 
+def _left_staged(root: Path) -> list[str]:
+    """Paths whose staged content differs from HEAD's tree (nothing after a clean commit)."""
+    out = _git(root, "diff-index", "--cached", "--name-only", "--no-renames", "-z", "HEAD")
+    if out.returncode:
+        raise RuntimeError((out.stderr or out.stdout).strip())
+    return sorted(p for p in out.stdout.split("\0") if p)
+
+
+def _off_branch(root: Path, branch: str, sha: str = "") -> str:
+    """Where HEAD went if it isn't ``branch`` (at ``sha``, when given); "" when it is."""
+    head = _git(root, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip()
+    if head != branch:
+        return f"HEAD is {'detached' if not head else 'on ' + head}, not {branch}"
+    tip = _git(root, "rev-parse", "-q", "--verify", f"refs/heads/{branch}").stdout.strip()
+    if sha and tip != sha:
+        return f"{branch} is at {tip[:12] or 'nothing'}, not the checked commit {sha[:12]}"
+    return ""
+
+
+def dirty(cloud_dir: Path, env: str, step: str, account_env: str = "account") -> list[str]:
+    """Repo-relative paths under envs/<account>/ that already differ from HEAD (staged, unstaged
+    or untracked) when make promote-to starts: its offer refuses to sweep them into its commit."""
+    cloud_dir = Path(cloud_dir).resolve()
+    if step != "promote-to" or account_env == env or not (cloud_dir / "envs" / account_env).is_dir():
+        return []
+    out = _git(cloud_dir.parent, "status", "--porcelain", "-z", "--no-renames", "--untracked-files=all", "--",
+               f"{cloud_dir.name}/envs/{account_env}")
+    if out.returncode:
+        return []
+    return sorted(entry[3:] for entry in out.stdout.split("\0") if len(entry) > 3)
+
+
 def _in_progress(root: Path) -> str:
     for name, what in (("MERGE_HEAD", "a merge"), ("rebase-merge", "a rebase"), ("rebase-apply", "a rebase"),
                        ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert")):
@@ -243,7 +287,7 @@ def _in_progress(root: Path) -> str:
 
 def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = "origin",
           branch: str = "main", environ: Mapping[str, str] | None = None, tty: bool | None = None,
-          account_env: str = "account") -> int:
+          account_env: str = "account", account_dirty: list[str] | None = None) -> int:
     environ = os.environ if environ is None else environ
     how = mode(environ, interactive() if tty is None else tty)
     if not how:
@@ -273,6 +317,12 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
     busy = _in_progress(root)
     if busy:
         return refuse(f"{busy} is in progress.")
+    before = sorted(p for p in account_dirty or [] if _inside(p, paths))
+    if before:
+        return refuse(f"envs/{account_env}/ already had uncommitted changes before this promote-to ("
+                      + ", ".join(before[:5]) + (", ..." if len(before) > 5 else "")
+                      + "), so they'd be swept into its commit; commit or revert them first, then re-run "
+                      f"make promote-to ENV={env}.")
     other = sorted(p for _s, p in _staged(root) if not _inside(p, paths))
     if other:
         return refuse("other changes are already staged (" + ", ".join(other[:5])
@@ -337,6 +387,22 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
                                 env=_git_env())
         if commit.returncode:
             return restore("git commit failed (see above).")
+        # A hook that switched branches moved HEAD: resetting or restoring now would hit the
+        # other branch, so leave everything where it is and push nothing.
+        moved = _off_branch(root, branch)
+        if moved:
+            print(f"ERROR: a commit hook moved HEAD: {moved}. Nothing was pushed and nothing was undone "
+                  f"(GenieRails doesn't switch branches back). Check git log {branch} and git status, "
+                  f"git switch {branch}, then push yourself: git push {remote} {branch}", file=sys.stderr)
+            return 1
+
+        def undo(message: str) -> int:
+            if old_head:
+                _git(root, "reset", "-q", "--soft", old_head)
+            else:
+                _git(root, "update-ref", "-d", "HEAD")
+            return restore(message)
+
         # The repo's hooks ran between the checks above and the commit, and a hook can
         # stage more: check what HEAD actually holds before anything is pushed.
         parent = _git(root, "rev-parse", "-q", "--verify", "HEAD^").stdout.strip()
@@ -346,22 +412,30 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
             [f"{p}: outside {label}" for p in extra]
             + _problems(root, cloud_rel, [c for c in committed if c[1] not in extra], rev="HEAD"))
         if parent != old_head or bad:
-            if old_head:
-                _git(root, "reset", "-q", "--soft", old_head)
-            else:
-                _git(root, "update-ref", "-d", "HEAD")
             detail = ("\n    " + "\n    ".join(bad)) if bad else (
                 f" HEAD's parent is {parent[:12] or 'none'}, not {old_head[:12] or 'an unborn branch'}")
-            return restore("a commit hook changed what was committed, so the commit was undone and "
-                           f"nothing was pushed:{detail}")
+            return undo("a commit hook changed what was committed, so the commit was undone and "
+                        f"nothing was pushed:{detail}")
+        # prepare-commit-msg, commit-msg and post-commit run after the tree is built: what they
+        # stage isn't in HEAD, but a later git commit would take it.
+        late = _left_staged(root)
+        if late:
+            return undo("a commit hook staged more after the commit was built, so the commit was undone, "
+                        "the index restored and nothing was pushed:\n    " + "\n    ".join(late))
     finally:
         shutil.rmtree(saved, ignore_errors=True)
-    sha = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
+    full = _git(root, "rev-parse", "HEAD").stdout.strip()
+    sha = full[:7]
     print(f"  Committed {sha} on {branch}: {label} ({len(staged)} file(s)).")
     if not has_remote:
         print(f"  No {remote} remote (a local-only repo): committed locally only; nothing was pushed.")
         return 0
-    push = _git(root, "push", remote, f"HEAD:{branch}")
+    moved = _off_branch(root, branch, full)
+    if moved:
+        print(f"ERROR: committed {sha}, but did not push: {moved}. Check it, then: git push {remote} {sha}:{branch}",
+              file=sys.stderr)
+        return 1
+    push = _git(root, "push", remote, f"{full}:refs/heads/{branch}")
     if push.returncode == 0:
         print(f"  Pushed to {remote}/{branch}.")
         return 0
@@ -378,7 +452,7 @@ def offer(cloud_dir: Path, env: str, env_dir: Path, step: str, *, remote: str = 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("offer", "will-offer"))
+    parser.add_argument("command", choices=("offer", "will-offer", "dirty"))
     parser.add_argument("--cloud-dir", required=True, type=Path)
     parser.add_argument("--env", required=True)
     parser.add_argument("--env-dir", required=True, type=Path)
@@ -386,11 +460,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--branch", default="main")
     parser.add_argument("--account-env", default="account")
+    parser.add_argument("--account-dirty", default="",
+                        help="dirty's output (one path per line), taken when make promote-to started")
     args = parser.parse_args(argv)
+    if args.command == "dirty":
+        for path in dirty(args.cloud_dir, args.env, args.step, args.account_env):
+            print(path)
+        return 0
     if args.command == "will-offer":
         return 0 if will_offer(args.cloud_dir, args.env, args.env_dir, args.step, branch=args.branch) else 1
     return offer(args.cloud_dir, args.env, args.env_dir, args.step, remote=args.remote, branch=args.branch,
-                 account_env=args.account_env)
+                 account_env=args.account_env, account_dirty=args.account_dirty.splitlines())
 
 
 if __name__ == "__main__":
