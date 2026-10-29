@@ -90,8 +90,8 @@ those).
 checkout your repo: an `origin` at GenieRails becomes the `genierails` remote
 and `origin` = `<url>` (refused, before anything is written, if `origin`
 already points elsewhere; never pushed). Without `REPO=`, a fresh clone's
-GenieRails `origin` is renamed to `genierails` (a local-only repo), except with
-`GITIGNORE=off` or in CI. If `origin` is still
+GenieRails `origin` (its only remote, not a linked worktree) is renamed to
+`genierails` (a local-only repo), except with `GITIGNORE=off` or in CI. If `origin` is still
 `github.com/databricks-solutions/genierails` (https or ssh), it is GenieRails'
 own repo, which must never commit `envs/`: it writes nothing and only prints how
 to opt in (as it does outside a git checkout). Any other checkout (your fork, an

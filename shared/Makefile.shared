@@ -450,8 +450,10 @@ _SETUP_ENV_REL = $(patsubst $(CLOUD_ROOT)/%,%,$(ENV_DIR))
 _SETUP_WALKTHROUGH := ../shared/examples/dev_to_prod/README.md
 
 # REPO=<url> makes this checkout your repo: origin at GenieRails becomes the
-# genierails remote and origin = <url>; with no REPO a fresh clone becomes a
-# local-only repo (scripts/setup_repo.py). --check runs before anything is
+# genierails remote and origin = <url>; with no REPO a fresh clone (origin at
+# GenieRails is its only remote, not a linked worktree) becomes a local-only
+# repo (scripts/setup_repo.py); a linked worktree refuses REPO, since its
+# remotes are shared by every worktree. --check runs before anything is
 # written, so a refused REPO leaves files and remotes alone. REPO never enters
 # shell text: make exports its raw $(value REPO) as GENIERAILS_SETUP_REPO, so
 # no shell parses REPO='$$(cmd)': it is just a refused URL. make itself still
