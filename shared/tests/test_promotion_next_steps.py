@@ -82,7 +82,7 @@ REUSE = "it reuses the"
 # with its reuse, then release, and never asks for a rehearse on that commit.
 DOC_REUSE = [
     ("shared/examples/dev_to_prod/README.md", "make promote-to ENV=prod # copies the reviewed rules",
-     ["git push", "make release-plan ENV=prod # reuses dev's rehearsal", "make release ENV=prod"]),
+     ["offers to commit + push (y)", "make release-plan ENV=prod # reuses dev's rehearsal", "make release ENV=prod"]),
     ("shared/examples/dev_to_prod/README.md", "**3. Plan, release.**", MAKE_PLAN),
     ("shared/examples/dev_to_prod/README.md", "**Reuse an existing mask** (the common case)",
      ["`make promote-to ENV=prod`", "`make release-plan ENV=prod`", REUSE,

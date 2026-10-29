@@ -104,7 +104,7 @@ def test_setup_dev_prints_champion_phase_1_steps(cloud, tmp_path):
     assert "     auto-tagging. Wait until the class.* tags appear.\n" in out
     assert "     Prefer a script? make enable-classification ENV=dev turns it on (you still review detections in the UI).\n" in out
     assert "  6. Run: make generate ENV=dev   (one run: imports the agent, finds its tables, drafts rules)\n" in out
-    assert "     Review envs/dev/generated/, then commit and push envs/.\n" in out
+    assert "     Review envs/dev/generated/, then commit and push envs/ (generate offers it on a terminal: answer y).\n" in out
     # No separate make check step: a deterministic rehearse runs it first.
     assert "Run: make check" not in out
     # A first deterministic rehearse refuses a non-empty account plan (finding #5).
@@ -327,7 +327,8 @@ def test_setup_prod_prints_promote_release_maintain_steps(cloud, tmp_path):
         "     (FROM=/CATALOG_MAP= remain optional command-line overrides.)\n",
         "In Catalog Explorer, open the catalog > Details tab > Data classification: turn it on",
         "Prefer a script? make enable-classification ENV=prod turns it on",
-        "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run:\n",
+        "  5. Commit and push .gitignore and envs/ to origin/main (promote-to offers it on a terminal: answer y;\n"
+        "     or git add .gitignore envs/ yourself); on that commit run:\n",
         "     make rehearse ENV=dev   (release-plan needs a passing rehearsal of this commit), then:\n",
         "     make release-plan ENV=prod   (runs make check ENV=prod and promote-to CHECK=1, checks the commit "
         "was rehearsed",

@@ -9,17 +9,15 @@ Take a Genie agent you've curated in **dev** and ship it to **prod** with its se
 make setup ENV=dev REPO=<your-repo-url>   # first run: origin -> genierails (kept for upgrades), origin = your repo; writes the .gitignore that commits envs/; copy the templates; set deployer_principal_id and groups; per agent, its ID and acl_groups
 git add .gitignore envs/ && git commit -m "Govern the first agent in dev" && git push -u origin main
 #   Catalog Explorer: turn on Data classification, review detections, enable auto-tagging
-make generate ENV=dev       # imports the agent, finds its tables, drafts the rules
-git add envs/ && git commit -m "Draft the rules" && git push
+make generate ENV=dev       # imports the agent, finds its tables, drafts the rules; shows the diff, offers to commit + push (y)
 make account-plan           # first deploy: plan the shared account layer (gr_treatment tag policy) for approval
 make apply-account          # applies exactly that approved account manifest (rehearse refuses a non-empty account plan)
 make rehearse ENV=dev       # checks the committed files, applies in dev and proves the masks work (verify-access: ALL EFFECTIVE)
 
 # prod (same for stg or any env)
 make setup ENV=prod         # set deployer_principal_id, catalog_map and group_map; leave access_tier_groups placeholders
-make promote-to ENV=prod    # copies the reviewed rules
+make promote-to ENV=prod    # copies the reviewed rules; shows the diff, offers to commit + push (y)
 #   Catalog Explorer: same classification review on the prod catalog
-git add .gitignore envs/ && git commit -m "Promote the rules to prod" && git push
 make release-plan ENV=prod  # reuses dev's rehearsal for this commit (dev isn't re-applied) after checking the committed files, plans prod, writes the manifest to approve
 make release ENV=prod       # applies exactly the approved plan, proves the masks; a first release repeats release-plan + release until "Release complete"
 make evidence ENV=prod      # live compliance record; finds the warehouse itself
@@ -86,7 +84,7 @@ Commit (and push) again after each step below that changes `envs/`. Later change
 ```bash
 make generate ENV=dev
 ```
-It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes its `table_readers`. Review those and the drafted rules in `envs/dev/generated/`. If the tags aren't there yet, it stops and tells you to wait; re-run it later. Then commit and push `envs/`. What a re-run keeps depends on the env's `governance_mode`:
+It captures each new agent to `envs/dev/agents/<agent>.space.json` and proposes its `table_readers`. Review those and the drafted rules in `envs/dev/generated/`. If the tags aren't there yet, it stops and tells you to wait; re-run it later. Then it shows `git diff --stat` for `.gitignore` and `envs/dev/` and asks `Commit these changes and push them to origin/main? [y/N]`: `y` commits exactly those paths and pushes (never forced; with no `origin` it commits locally only), `n` leaves git unchanged. Off a terminal, in CI or with `COMMIT=0` it asks nothing: commit and push `envs/` yourself. What a re-run keeps depends on the env's `governance_mode`:
 - **Deterministic** (the template's default): every run recomputes the column masks, the `gr_treatment` column tags, the `gr_treatment` tag policy and the mask-library functions in `masking_functions.sql` from the `class.*` tags and the mask library. It replaces hand edits to those in `envs/dev/generated/` without a warning; row filters, table tags and any custom SQL above the `-- === GenieRails deterministic mask library ===` marker in `masking_functions.sql` are kept. To change a treatment, set it in `envs/dev/env.auto.tfvars` and re-run `make generate ENV=dev`: `column_overrides` for one column, `treatment_versions` for a treatment's partial version, `tag_treatments` to map a class to another treatment ([settings](REFERENCE.md#deterministic-governance-settings)).
 - **Legacy**: re-runs keep whatever is already in `envs/dev/generated/`, including your edits, and only add rules for new columns.
 
@@ -134,7 +132,7 @@ deterministic and legacy environments. A prod value of `false` does not persist;
 in a deterministic environment, committing it also fails the promotion-current
 check.
 Using the sample environment? Load its tables into prod first (`--skip-agent`, see [SAMPLE_ENV.md](SAMPLE_ENV.md)).
-Commit and push the promoted files to `main` (`git add .gitignore envs/`, commit, `git push`): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
+It then offers to commit and push `.gitignore`, `envs/prod/` and `envs/account/` (the shared account layer it writes) the same way (answer `y`; off a terminal, commit and push them yourself): `make setup ENV=prod` added prod's lines to `.gitignore`, and `make rehearse` and `make release-plan` need a clean checkout.
 
 **2. Classify (in the UI).** Same as dev, on the prod catalog. Prod's real data may surface sensitive types dev never had.
 

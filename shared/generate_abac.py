@@ -8990,16 +8990,29 @@ Before you apply, tune for your business roles, security requirements, and Genie
                     tuning=not deterministic_mode,
                     source_env=str(auth_cfg.get("promote_from") or "dev"),
                     promoted=role == "promoted",
+                    commit_offer=_commit_offered(WORK_DIR),
                 ):
                     print(line)
     print("=" * 60)
 
 
+def _commit_offered(work_dir: Path) -> bool:
+    """Whether make generate's commit offer (scripts/commit_envs.py) follows this run."""
+    try:
+        from scripts.commit_envs import will_offer
+        return will_offer(work_dir.parent.parent, work_dir.name, work_dir, "generate")
+    except Exception:
+        return False
+
+
 def generate_next_steps(
     out_dir: Path, mode: str, env_name: str, *, has_sql: bool, champion_flow: bool,
-    tuning: bool = True, source_env: str = "dev", promoted: bool | None = None,
+    tuning: bool = True, source_env: str = "dev", promoted: bool | None = None, commit_offer: bool = False,
 ) -> list[str]:
     """Next steps printed after a full (non --space, non --promote) generate.
+
+    ``commit_offer``: make generate offers the commit itself once this run ends
+    (scripts/commit_envs.py), so the commit step names that instead of git.
 
     ``tuning`` is false for a deterministic draft, which has no TUNING.md.
     ``source_env`` is the env a deterministic prod is promoted from (its promote_from).
@@ -9020,16 +9033,24 @@ def generate_next_steps(
         lines = ["  Next steps:", "    1. Review the draft:"]
         if has_sql:
             lines.append(f"       {out_dir}/masking_functions.sql")
+        commit = ("answer y when make generate offers to commit envs/ below" if commit_offer
+                  else "git add envs/ && git commit")
         lines += [
             f"       {out_dir}/abac.auto.tfvars",
-            f"    2. git add envs/ && git commit, then: make check ENV={env_name}   (reads committed files only)"
-            if tuning else "    2. git add envs/ && git commit   (rehearse and release-plan run make check on the committed files)",
+            f"    2. {commit}, then: make check ENV={env_name}   (reads committed files only)"
+            if tuning else f"    2. {commit}   (rehearse and release-plan run make check on the committed files)",
         ]
         is_promoted = (env_name == "prod") if promoted is None else promoted
         if not is_promoted:
             lines.append(f"    3. make rehearse ENV={env_name}   (applies, then proves the masks: ALL EFFECTIVE)")
         elif tuning:
             lines.append(f"    3. make release ENV={env_name}")
+        elif commit_offer:
+            lines += [
+                f"    3. make release-plan ENV={env_name}   (it reuses the {source_env} rehearsal, "
+                "or names the command to run)",
+                f"    4. make release ENV={env_name}",
+            ]
         else:
             lines += [
                 "    3. git push (or merge the PR) so the commit is on origin/main",
