@@ -319,12 +319,14 @@ def test_direct_promote_refuses_deterministic_destination_without_writing(repo, 
     result = _make(repo, tmp_path, *args)
 
     out = result.stdout + result.stderr
-    # GNU make -i reports success after deliberately ignoring the refusing
-    # recipe's non-zero status; refusal is the diagnostic plus no writes.
-    if jobs != ("-i",):
-        assert result.returncode != 0, out
-    assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused for deterministic destinations" in out
-    assert "make promote-to ENV=prod" in out
+    assert result.returncode != 0, out
+    if jobs in (("-i",), ("-k",)):
+        # make -i/-k would skip a failing guard, so the parse-time refusal (#280)
+        # stops promote before any recipe runs.
+        assert "make promote refused: -i/-k are not supported for this target because guards would be skipped" in out
+    else:
+        assert "make promote SOURCE_ENV=... DEST_ENV=prod is refused for deterministic destinations" in out
+        assert "make promote-to ENV=prod" in out
     assert "Cross-env promote" not in out
     assert (_snapshot(repo), _state(repo)) == before
 
