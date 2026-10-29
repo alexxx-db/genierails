@@ -357,6 +357,39 @@ $(error make $(MAKECMDGOALS) refused before any recipe ran (Databricks compute, 
 endif
 endif
 
+# GNU make's -i/--ignore-errors and -k/--keep-going let other recipe lines or
+# sibling prerequisites run after a guard fails. Refuse them at parse time for
+# every goal except a small read-only allowlist. GNU make 3.81 may put long
+# options before short ones in MAKEFLAGS; GNU make 4.x may also use GNUMAKEFLAGS.
+# The parser uses only make functions, stops at GNU make's "--" separator before
+# command-line variable assignments and at --eval's opaque recipe text, checks
+# long options by exact name, skips options whose words carry arguments (-I, -O,
+# -j, -l, -C, -f, -o, -W), and checks true short-flag clusters for i/k. It
+# intentionally does not try to detect --eval=.IGNORE:, and a caller who forges
+# both MAKELEVEL and the internal
+# GENIERAILS_READONLY_ERROR_FLAGS can still bypass this accident guard.
+override _make_error_flag_words = $(if $(strip $(1)),$(if $(filter -- --eval%,$(firstword $(1))),,$(firstword $(1)) $(call _make_error_flag_words,$(wordlist 2,$(words $(1)),$(1)))))
+override _MAKE_ERROR_FLAG_WORDS := $(strip $(call _make_error_flag_words,$(MAKEFLAGS)) $(call _make_error_flag_words,$(GNUMAKEFLAGS)))
+override _MAKE_SHORT_ERROR_FLAG_WORDS := $(filter-out -I% -O% -j% -l% -C% -f% -o% -W% I% O% j% l% C% f% o% W%,$(filter-out --% %=%, $(_MAKE_ERROR_FLAG_WORDS)))
+override _MAKE_UNSAFE_ERROR_FLAGS := $(strip $(filter --ignore-errors --keep-going,$(_MAKE_ERROR_FLAG_WORDS)) $(foreach word,$(_MAKE_SHORT_ERROR_FLAG_WORDS),$(if $(or $(findstring i,$(word)),$(findstring k,$(word))),1)))
+override _MAKE_EFFECTIVE_GOALS := $(or $(MAKECMDGOALS),help)
+override _MAKE_IGNORE_ERRORS_ALLOWED_GOALS := help check status next validate $(if $(filter 1,$(OFFLINE)),evidence)
+override _MAKE_IGNORE_ERRORS_REFUSED_GOALS := $(filter-out $(_MAKE_IGNORE_ERRORS_ALLOWED_GOALS),$(_MAKE_EFFECTIVE_GOALS))
+override _MAKE_INHERITED_READONLY_ERROR_FLAGS := $(if $(filter 0,$(MAKELEVEL)),,$(GENIERAILS_READONLY_ERROR_FLAGS))
+override _MAKE_FORGED_READONLY_ERROR_FLAGS := $(if $(and $(filter 0,$(MAKELEVEL)),$(_MAKE_UNSAFE_ERROR_FLAGS),$(_MAKE_IGNORE_ERRORS_REFUSED_GOALS)),$(strip $(findstring command line,$(origin GENIERAILS_READONLY_ERROR_FLAGS)) $(filter environment,$(origin GENIERAILS_READONLY_ERROR_FLAGS))))
+ifneq ($(_MAKE_FORGED_READONLY_ERROR_FLAGS),)
+$(error GENIERAILS_READONLY_ERROR_FLAGS is internal and cannot be set on the command line or environment)
+endif
+override GENIERAILS_READONLY_ERROR_FLAGS := $(if $(_MAKE_IGNORE_ERRORS_REFUSED_GOALS),$(_MAKE_INHERITED_READONLY_ERROR_FLAGS),1)
+export GENIERAILS_READONLY_ERROR_FLAGS
+ifneq ($(_MAKE_UNSAFE_ERROR_FLAGS),)
+ifneq ($(GENIERAILS_READONLY_ERROR_FLAGS),1)
+ifneq ($(_MAKE_IGNORE_ERRORS_REFUSED_GOALS),)
+$(error make $(_MAKE_IGNORE_ERRORS_REFUSED_GOALS) refused: -i/-k are not supported for this target because guards would be skipped)
+endif
+endif
+endif
+
 # CI detection lives in scripts/ci_guard.py alone (CI=true|1|yes or a CI runner
 # marker; GENIERAILS_ALLOW_CI_APPLY=1 opts out of the apply guard; dev rehearse
 # with locked remote state is state_layout.ci_allowed). make next reads the
