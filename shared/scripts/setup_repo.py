@@ -25,6 +25,9 @@ git runs at the GenieRails checkout root, the cloud folder's parent, which must
 hold shared/ and be the top of its own repo (GIT_DIR, GIT_WORK_TREE and the
 like are scrubbed). A cloud folder inside some other repo (GenieRails vendored
 into an outer project) is refused, never touching the outer repo's remotes.
+Nor does setup touch a linked worktree (git worktree add, or a copy of one
+with its .git file): its remotes live in the common git dir every worktree of
+that repo shares, so REPO= is refused there and without REPO nothing is renamed.
 
 With a REPO:
   - origin is GenieRails (github.com/databricks-solutions/genierails) and no
@@ -39,11 +42,14 @@ With a REPO:
     branch main, then add origin = <url>;
   - anything else (origin elsewhere, or GenieRails with a genierails remote
     already there) is refused: setup never repoints a remote.
-Without it, a fresh clone (origin at GenieRails, no genierails remote) becomes
-a local-only repo: origin is renamed to ``genierails`` and no origin is added,
-so make setup writes the .gitignore block and envs/ is committed locally. That
+Without it, a fresh clone (origin at GenieRails is its only remote, not a
+linked worktree) becomes a local-only repo: origin is renamed to
+``genierails`` and no origin is added, so make setup writes the .gitignore
+block and envs/ is committed locally. That
 rename is skipped with GITIGNORE=off (contributors working on GenieRails
-itself), in CI, and inside another repo. Every other layout is left alone.
+itself), in CI, and inside another repo; a contributor clone (a fork or
+upstream remote next to origin) or a linked worktree only gets a note. Every
+other layout is left alone.
 """
 
 from __future__ import annotations
@@ -221,8 +227,7 @@ def plan(remotes: dict[str, str] | None, repo: str, *, auto: bool = True) -> lis
         raise Refused(f"origin already points at {origin}, not {repo}; make setup never repoints a remote. "
                       f"Re-run with that REPO (or none), or, to move this checkout to {repo} on purpose:\n"
                       f"         git remote set-url origin {repo}")
-    if (auto and remotes is not None and _is_upstream(remotes.get("origin"))
-            and UPSTREAM_REMOTE not in remotes):
+    if auto and remotes is not None and set(remotes) == {"origin"} and _is_upstream(remotes["origin"]):
         return [("rename", "origin", UPSTREAM_REMOTE)]
     return []
 
@@ -242,6 +247,20 @@ def _git(cwd: Path, *args: str) -> None:
     proc = _run(cwd, *args)
     if proc.returncode:
         raise Refused(f"git {' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()}")
+
+
+def shared_git_dir(root: Path) -> Path | None:
+    """The common git dir when root is a linked worktree (or a copy of its .git file), else None.
+
+    Both dirs are resolved against root: git before 2.31 (no --path-format)
+    may print them relative to it.
+    """
+    proc = _run(root, "rev-parse", "--git-dir", "--git-common-dir")
+    dirs = proc.stdout.splitlines()
+    if proc.returncode or len(dirs) != 2:
+        raise Refused(f"git can't tell whether {root} is a linked worktree: {(proc.stderr or proc.stdout).strip()}")
+    git_dir, common = ((root / d).resolve() for d in dirs)
+    return None if git_dir == common else common
 
 
 def checkout(cloud_dir: Path) -> tuple[Path, dict[str, str] | None, str]:
@@ -298,7 +317,13 @@ def main(argv: list[str] | None = None) -> int:
             if repo:
                 raise Refused(unusable)
             return 0  # no REPO: nothing to do outside a GenieRails checkout root
-        steps = plan(remotes, repo, auto=args.gitignore != "off" and not in_ci())
+        common = shared_git_dir(root) if remotes is not None else None
+        if common is not None and repo:
+            raise Refused(f"{root} is a linked git worktree: its remotes live in {common}, shared by every "
+                          "worktree of that repo, so setup won't change them. Run make setup REPO= in a clone "
+                          "of its own, or manage remotes yourself.")
+        auto = args.gitignore != "off" and not in_ci()
+        steps = plan(remotes, repo, auto=auto and common is None)
         if args.check:
             return 0
         done = apply(root, steps)
@@ -309,6 +334,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     for line in done:
         print(f"Git: {line}")
+    if (auto and not repo and not steps and remotes and _is_upstream(remotes.get("origin"))
+            and UPSTREAM_REMOTE not in remotes):
+        why = (f"a linked worktree, its remotes shared through {common}" if common is not None else
+               f"not a fresh clone: origin isn't its only remote ({', '.join(sorted(remotes))})")
+        print(f"Git: left origin (GenieRails) as it is: {why}.")
     if repo and not steps:
         print(f"Git: origin is already {remotes.get('origin')}; nothing to change.")
     elif done and not repo:

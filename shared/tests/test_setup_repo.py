@@ -12,6 +12,7 @@ apply.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -250,6 +251,11 @@ def test_plan_layouts():
     assert sr.plan({"origin": UPSTREAM}, "") == [("rename", "origin", "genierails")]
     assert sr.plan({"origin": UPSTREAM}, "", auto=False) == []
     assert sr.plan({"origin": UPSTREAM, "genierails": UPSTREAM}, "") == []
+    # Not a fresh clone: a contributor's fork or upstream remote next to origin.
+    assert sr.plan({"origin": UPSTREAM, "upstream": UPSTREAM}, "") == []
+    assert sr.plan({"origin": UPSTREAM, "fork": "https://github.com/someone/genierails.git"}, "") == []
+    assert sr.plan({"origin": UPSTREAM, "fork": "https://github.com/someone/genierails.git"}, url) == [
+        ("rename", "origin", "genierails"), ("add", "origin", url)]
     assert sr.plan({"origin": url}, "") == [] and sr.plan(None, "") == []
     for remotes in ({"origin": "https://example.com/x.git"}, {"origin": UPSTREAM, "genierails": UPSTREAM}):
         with pytest.raises(sr.Refused):
@@ -429,3 +435,64 @@ def test_same_repo_compares_user_port_and_host():
     assert not same("https://github.com/acme/gov", "https://github.com/acme/Gov")
     assert not same("/srv/gov", "ssh://git@srv/gov")
     assert not same("not a url", "not a url")
+
+
+def _worktree(tmp_path):
+    """A tmp clone with one commit and a linked worktree of it; both share the clone's .git/config."""
+    repo = _clone(tmp_path)
+    for keep in ("aws/.keep", "shared/.keep"):
+        (repo / keep).write_text("")
+    _git(repo, "add", ".")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--no-verify", "-m", "init")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt))
+    return repo, wt
+
+
+def test_no_repo_in_a_linked_worktree_renames_nothing(tmp_path):
+    repo, wt = _worktree(tmp_path)
+    config = (repo / ".git/config").read_bytes()
+    result = _setup(wt / "aws", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / ".git/config").read_bytes() == config and _remotes(repo) == {"origin": UPSTREAM}
+    assert "renamed" not in result.stdout
+    assert f"linked worktree, its remotes shared through {(repo / '.git').resolve()}" in result.stdout
+
+
+def test_repo_in_a_linked_worktree_is_refused_and_touches_nothing(tmp_path):
+    repo, wt = _worktree(tmp_path)
+    config = (repo / ".git/config").read_bytes()
+    url = _customer_repo(tmp_path)
+    result = _setup(wt / "aws", "ENV=dev", f"REPO={url}")
+    assert result.returncode != 0
+    assert f"is a linked git worktree: its remotes live in {(repo / '.git').resolve()}" in result.stderr
+    assert (repo / ".git/config").read_bytes() == config and _remotes(repo) == {"origin": UPSTREAM}
+    assert not (wt / "aws/envs").exists() and "=== Setup" not in result.stdout
+    assert _no_refs(url)
+
+
+def test_a_copied_worktree_gitfile_renames_nothing(tmp_path):
+    """The 2026-10-28 incident: cp -R of a worktree keeps its .git file, and git init just reinitialises
+    the shared repo, so the "copy" still writes the original clone's .git/config."""
+    repo, wt = _worktree(tmp_path)
+    copy = tmp_path / "copy"
+    shutil.copytree(wt, copy, symlinks=True)
+    _git(copy, "init", "-q", ".")
+    config = (repo / ".git/config").read_bytes()
+    result = _setup(copy / "aws", "ENV=bu2")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / ".git/config").read_bytes() == config and _remotes(repo) == {"origin": UPSTREAM}
+    assert "renamed" not in result.stdout and "linked worktree" in result.stdout
+
+
+@pytest.mark.parametrize("extra", ["fork", "upstream"])
+def test_no_repo_leaves_a_contributor_clone_with_extra_remotes_alone(extra, tmp_path):
+    repo = _clone(tmp_path)
+    other = UPSTREAM if extra == "upstream" else "https://github.com/someone/genierails.git"
+    _git(repo, "remote", "add", extra, other)
+    before = _snapshot(repo)
+    result = _setup(repo / "aws", "ENV=dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remotes(repo) == {"origin": UPSTREAM, extra: other} and "renamed" not in result.stdout
+    assert f"origin isn't its only remote ({', '.join(sorted(['origin', extra]))})" in result.stdout
+    assert _snapshot(repo)[1] == before[1]
