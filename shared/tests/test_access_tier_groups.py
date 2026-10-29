@@ -618,13 +618,13 @@ def test_champion_walkthrough_lets_release_plan_reuse_the_dev_rehearsal_on_the_p
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
     gap = prod[prod.index("**Reuse an existing mask**"):prod.index("**A new kind of mask**")]
 
-    # The whole flow: promote, commit and push, then release-plan (no second dev rehearse).
-    promoted = flow.index('git commit -m "Promote the rules to prod" && git push')
+    # The whole flow: promote-to (which offers the commit + push), then release-plan (no second dev rehearse).
+    promoted = flow.index("offers to commit + push (y)", flow.index("make promote-to ENV=prod"))
     assert flow.index("make promote-to ENV=prod") < promoted < flow.index("make release-plan ENV=prod")
     assert "make rehearse ENV=dev" not in flow[promoted:]
 
-    # Prod: push the promoted files, then plan; release-plan reuses dev's rehearsal.
-    steps = ["Commit and push the promoted files to `main`", "**3. Plan, release.**",
+    # Prod: promote-to offers to commit and push the promoted files, then plan; release-plan reuses dev's rehearsal.
+    steps = ["It then offers to commit and push `.gitignore`, `envs/prod/`", "**3. Plan, release.**",
              "make release-plan ENV=prod", "make release ENV=prod"]
     positions = [prod.index(step) for step in steps]
     assert positions == sorted(positions)
