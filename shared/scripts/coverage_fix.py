@@ -285,11 +285,14 @@ def fix_lines(
     return lines
 
 
-def promoted_release_steps(env_name: str, source: str) -> str:
+def promoted_release_steps(env_name: str, source: str, commit_offer: bool = False) -> str:
     """What follows promote-to in a deterministic env: release-plan plans only a commit on
     origin/main with a passing rehearsal of the source env there, and writes that receipt itself
-    from an earlier rehearsal when the source env's inputs are unchanged (rehearse-reuse)."""
-    return (f"commit and push envs/{env_name}/ to origin/main (or merge its PR), make release-plan "
+    from an earlier rehearsal when the source env's inputs are unchanged (rehearse-reuse).
+    ``commit_offer``: promote-to offers that commit itself once it finishes (scripts/commit_envs.py)."""
+    commit = (f"answer y when promote-to offers to commit envs/{env_name}/ below (it also pushes when "
+              "origin exists)" if commit_offer else f"commit and push envs/{env_name}/ to origin/main (or merge its PR)")
+    return (f"{commit}, make release-plan "
             f"ENV={env_name} (it reuses the {source} rehearsal, or names the command to run) and make release "
             f"ENV={env_name}")
 
@@ -319,10 +322,10 @@ def recovery_steps(chain: list[str], changed: str, rerun: str = "") -> str:
     return ", ".join(steps) + "; commit and push after each step that changes envs/"
 
 
-def release_steps(env_name: str, env_dir: Path, source: str = "") -> str:
+def release_steps(env_name: str, env_dir: Path, source: str = "", commit_offer: bool = False) -> str:
     """What follows promote-to, for this env's mode: the deterministic sequence, or a legacy release."""
     if _deterministic(env_dir):
-        return promoted_release_steps(env_name, source or promote_source(env_dir) or "dev")
+        return promoted_release_steps(env_name, source or promote_source(env_dir) or "dev", commit_offer)
     return f"make release ENV={env_name}"
 
 
@@ -475,9 +478,10 @@ def main(argv: list[str] | None = None) -> int:
     steps.add_argument("--env-dir", type=Path, required=True)
     steps.add_argument("--env", required=True)
     steps.add_argument("--source", default="", help="the env it is promoted from (default: its promote_from)")
+    steps.add_argument("--commit-offer", action="store_true", help="promote-to offers the commit itself")
     args = parser.parse_args(argv)
     if args.command == "release-steps":
-        print(release_steps(args.env, args.env_dir, args.source))
+        print(release_steps(args.env, args.env_dir, args.source, args.commit_offer))
     else:
         print(drift_hint(args.env, args.env_dir, args.target))
     return 0

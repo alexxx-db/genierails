@@ -531,7 +531,8 @@ setup: ## Prepare the selected environment(s) and show next steps
 		if [ "$$det" = 1 ]; then \
 			src="$$(python3 -c 'import sys,hcl2; print(hcl2.load(open(sys.argv[1])).get("promote_from") or "dev")' "$(ENV_DIR)/env.auto.tfvars" 2>/dev/null)"; \
 			[ -n "$$src" ] || src=dev; \
-			echo "  5. Commit and push .gitignore and envs/ (git add .gitignore envs/) to origin/main; on that commit run:"; \
+			echo "  5. Commit and push .gitignore and envs/ to origin/main (promote-to offers it on a terminal: answer y;"; \
+			echo "     or git add .gitignore envs/ yourself); on that commit run:"; \
 			echo "     make check ENV=$(ENV)   (read-only; also runs promote-to CHECK=1, which release-plan doesn't)"; \
 			echo "     make rehearse ENV=$$src   (release-plan needs a passing rehearsal of this commit), then:"; \
 			echo "     make release-plan ENV=$(ENV)   (checks the commit was rehearsed; saves every plan in one manifest)"; \
@@ -589,7 +590,7 @@ setup: ## Prepare the selected environment(s) and show next steps
 		else \
 			step=$$((step+1)); echo "  $$step. Run: make generate ENV=$(ENV)   (one run: finds the agent's tables, drafts rules; agents are imported only in $(DEFAULT_ENV))"; \
 		fi; \
-		echo "     Review envs/$(ENV)/generated/, then commit and push envs/."; \
+		echo "     Review envs/$(ENV)/generated/, then commit and push envs/ (generate offers it on a terminal: answer y)."; \
 		step=$$((step+1)); echo "  $$step. Run: make check ENV=$(ENV)   (read-only check of the committed files; rehearse doesn't run it)"; \
 		if [ "$$det" = 1 ]; then \
 			step=$$((step+1)); echo "  $$step. First deploy only (rehearse refuses a non-empty account plan, e.g. the new gr_treatment tag policy):"; \
@@ -669,6 +670,28 @@ enable-classification: _guard-not-ci-apply _guarded-bootstrap _guard-workspace-t
 		echo "In Catalog Explorer, review detections and exclude false positives, then turn on auto-tagging in the UI."; \
 	fi
 
+# make generate and make promote-to (deterministic) end by offering to commit
+# .gitignore and envs/<env>/, and push them when origin exists (scripts/commit_envs.py).
+# promote-to also commits envs/account/, unless it was already dirty when it began.
+# Only the top-level make decides, from a command-line COMMIT and only for those
+# two goals: unset asks on a terminal, COMMIT=0 never commits, COMMIT=1 commits
+# without asking; every nested make inherits that answer, and every other goal
+# and CHECK=1 get 0. An inherited 0 stays 0 even in a fresh top-level make (make
+# check's scratch copy scrubs MAKELEVEL but keeps it): the environment can only
+# turn the offer off. make can't tell a COMMIT inherited through MAKEFLAGS apart, so it counts
+# too (an accident guard, not a security boundary); a shell COMMIT never does.
+ifeq ($(MAKELEVEL),0)
+ifneq ($(and $(filter generate promote-to,$(MAKECMDGOALS)),$(filter command line,$(origin COMMIT)),$(filter-out 0 1,$(value COMMIT))),)
+$(error COMMIT=$(value COMMIT): use COMMIT=0 (never commit) or COMMIT=1 (commit without asking); leave it off to be asked)
+endif
+override GENIERAILS_COMMIT := $(if $(or $(filter 1,$(CHECK)),$(and $(filter environment,$(origin GENIERAILS_COMMIT)),$(filter 0,$(GENIERAILS_COMMIT)))),0,$(if $(filter generate promote-to,$(MAKECMDGOALS)),$(if $(filter command line,$(origin COMMIT)),$(or $(value COMMIT),ask),ask),0))
+else
+GENIERAILS_COMMIT ?= 0
+endif
+export GENIERAILS_COMMIT
+override _COMMIT_ENVS = python3 "$(SHARED_ROOT)/scripts/commit_envs.py" --cloud-dir "$(CLOUD_ROOT)" \
+	--remote "$(RELEASE_REMOTE)" --branch "$(RELEASE_BRANCH)" --account-env "$(ACCOUNT_ENV)"
+
 # A new agent file is captured (import-new) before the governed-table record is
 # written: its tables come from the capture, so the first generate records them.
 # An agent whose committed capture is gone is refused before anything is written
@@ -706,6 +729,7 @@ generate: _guarded-bootstrap _guard-workspace-target ## Run generate_abac.py in 
 	@if [ "$$($(_IS_DETERMINISTIC) "$(ENV_DIR)/env.auto.tfvars")" = 1 ]; then \
 		$(_TABLE_READERS) propose --env-dir "$(ENV_DIR)" && $(_ACCESS_CHECK) "make generate"; \
 	fi
+	@$(_COMMIT_ENVS) offer --env "$(ENV)" --env-dir "$(ENV_DIR)" --step generate
 
 # Agents (scripts/agent_ownership.py, design section 5). capture is authoring:
 # one read-only GET, writes only envs/dev/agents/<agent>.space.json and, in a
@@ -1750,7 +1774,8 @@ promote: $(_PROMOTE_DATABRICKS_GUARD) _guarded-bootstrap _guard-workspace-target
 		echo "  Then: in Catalog Explorer, open the $(DEST_ENV) catalog > Details tab > Data classification and turn it on."; \
 		echo "        When the scan finishes, review detections, exclude false positives, enable auto-tagging,"; \
 		echo "        and wait for class.* tags,"; \
-		echo "        then $$($(_RELEASE_STEPS) --env-dir "$$dest_env_dir" --env "$(DEST_ENV)" --source "$(SOURCE_ENV)") (the walkthrough's Prod section)"; \
+		commit_offer=; $(_COMMIT_ENVS) will-offer --env "$(DEST_ENV)" --env-dir "$$dest_env_dir" --step promote-to && commit_offer=--commit-offer; \
+		echo "        then $$($(_RELEASE_STEPS) --env-dir "$$dest_env_dir" --env "$(DEST_ENV)" --source "$(SOURCE_ENV)" $$commit_offer) (the walkthrough's Prod section)"; \
 		$(_PROMOTION_TXN_COMMIT); \
 	else \
 		if [ "$(SOURCE_ENV)" = "$(ACCOUNT_ENV)" ] || [ "$(SOURCE_ENV)" = "$(DATA_ACCESS_SUBDIR)" ]; then \
@@ -1833,6 +1858,7 @@ promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote
 		$(_CHECK_ENV) promote-check --from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)"; \
 		exit $$?; \
 	fi; \
+	account_dirty="$$($(_COMMIT_ENVS) dirty --env "$(ENV)" --env-dir "$(ENV_DIR)" --step promote-to)"; \
 	resolved="$$($(_SAVED_SETTINGS) promote-resolve --env "$(ENV)" --env-dir "$(ENV_DIR)" --envs-dir "$(CLOUD_ROOT)/envs" \
 		--from "$(_PROMOTE_TO_FROM)" --catalog-map "$(_PROMOTE_TO_MAP)")" || exit 1; \
 	src="$${resolved%% *}"; map="$${resolved#* }"; src_dir="$(CLOUD_ROOT)/envs/$$src"; dest_dir="$(CLOUD_ROOT)/envs/$(ENV)"; \
@@ -1851,7 +1877,8 @@ promote-to: $(if $(filter 1,$(CHECK)),,_guard-not-databricks-compute) ## Promote
 	fi; \
 	python3 "$(SHARED_ROOT)/scripts/promotion_txn.py" changes --from "$$txn_dir/snapshot" || exit 1; \
 	$(_PROMOTION_TXN_COMMIT); \
-	$(_TABLE_READERS) show --env-dir "$$dest_dir"
+	$(_TABLE_READERS) show --env-dir "$$dest_dir" || exit 1; \
+	$(_COMMIT_ENVS) offer --env "$(ENV)" --env-dir "$$dest_dir" --step promote-to --account-dirty "$$account_dirty"
 
 # Read-only PR check (scripts/check_env.py): every step runs in a scratch copy
 # of the cloud dir, so nothing under envs/ is written and no applying target
