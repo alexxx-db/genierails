@@ -92,7 +92,8 @@ class Make:
                                                               passthrough=list(passthrough),
                                                               imports=str(self.imports)))
         self.stubs = {name: self._recorder(name) for name in
-                      ("staged", "gate", "runner", "reports", "live", "inventory", "classification", "audit")}
+                      ("staged", "gate", "runner", "reports", "live", "inventory", "classification", "audit",
+                       "check")}
 
     def _write(self, name: str, text: str) -> Path:
         path = self.tmp / name
@@ -117,7 +118,9 @@ class Make:
             "release_gate.py live-snapshot": str(self.stubs["live"]),
             "release_gate.py reports": str(self.stubs["reports"]),
             "staged_policy_apply.py": str(self.stubs["staged"]), "coverage_gate.py": str(self.stubs["gate"]),
-            "audit_schema_drift.py": str(self.stubs["audit"]), **(extra or {}),
+            "audit_schema_drift.py": str(self.stubs["audit"]),
+            # make check's scratch run (tests/test_check_target.py runs it for real).
+            "check_env.py": str(self.stubs["check"]), **(extra or {}),
         }
 
     def __call__(self, target: str, env: str, *extra: str, stub_make: bool = True, ci: bool = False,
@@ -136,11 +139,15 @@ class Make:
         environ["PATH"] = f"{bin_dir}:{environ['PATH']}"
         return subprocess.run(args, cwd=cwd or ROOT / self.cloud, text=True, capture_output=True, env=environ)
 
-    def calls(self) -> list[list[str]]:
+    def all_calls(self) -> list[list[str]]:
         if not self.log.exists():
             return []
         # Drop the scratch promote-to the receipt digest runs (make -C <scratch> promote-to).
         return [c for c in map(json.loads, self.log.read_text().splitlines()) if c[:1] != ["-C"]]
+
+    def calls(self) -> list[list[str]]:
+        """all_calls minus make check, which rehearse and release-plan run first (tested on its own below)."""
+        return [c for c in self.all_calls() if c[:1] != ["check"]]
 
     def names(self) -> list[str]:
         return [next((a for a in c if not a.startswith("-") and "=" not in a), "?") for c in self.calls()]
@@ -312,11 +319,16 @@ def test_release_plan_refuses_when_the_dev_rehearsal_cannot_be_reused(make, repo
     make.reset()
     result = make("release-plan", "prod")
     assert result.returncode != 0, case
-    assert "release-plan: did not reuse a rehearsal for this commit: " in result.stderr and why in result.stderr
-    assert "release-plan refused:" in result.stderr  # then provenance refuses exactly as before
-    named = "make release-plan ENV=prod" if case == "dirty tree" else (
-        "make promote-to ENV=prod" if case == "multi-hop" else "make rehearse ENV=dev")
-    assert named in result.stderr.split("did not reuse")[1].splitlines()[0], result.stderr
+    if case == "dirty tree":
+        # Refused up front (release_gate.py clean-check), before the check, the reuse and any lock.
+        assert "make release-plan refused: the checkout is not clean:" in result.stderr
+        assert "?? aws/notes.txt" in result.stderr and "re-run make release-plan ENV=prod" in result.stderr
+        assert "did not reuse" not in result.stderr and make.all_calls() == []
+    else:
+        assert "release-plan: did not reuse a rehearsal for this commit: " in result.stderr and why in result.stderr
+        assert "release-plan refused:" in result.stderr  # then provenance refuses exactly as before
+        named = "make promote-to ENV=prod" if case == "multi-hop" else "make rehearse ENV=dev"
+        assert named in result.stderr.split("did not reuse")[1].splitlines()[0], result.stderr
     assert make.calls() == [] and len(rg.rehearse_receipts(repo.cloud, "dev", any_store=True)) == before
     assert _no_lock(repo, "dev") and _no_lock(repo, "prod")
 
@@ -1522,6 +1534,101 @@ def test_release_plan_and_release_run_the_custom_mask_cases_before_the_lock(make
     result = make("release-plan", "prod", stubs=stubs)
     assert result.returncode != 0
     assert make.names() == ["inventory", "cases"] and _no_lock(repo, "prod")
+
+
+# -- rehearse and release-plan run make check first ---------------------------------------
+
+def _check_call(make: Make, env: str) -> list[str]:
+    return ["check", "--env", env, "--cloud-dir", str(ROOT / make.cloud), "--makefile",
+            str(ROOT / make.cloud / "Makefile")]
+
+
+def test_rehearse_runs_make_check_first_before_the_lock_and_any_live_call(make, repo):
+    stubs = _cases_stub(make)
+    result = make("rehearse", "dev", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    first, second = make.all_calls()[:2]
+    # check_env.py's arguments as make check passes them (ENV_DIR given here, so its override too).
+    assert first[:3] == ["check", "--env-dir-override", str(repo.dev)] and first[-1] == "check"
+    assert first[3:9] == _check_call(make, "dev")[1:]
+    assert second == ["cases", "unlocked", "dev"]
+    assert [c[0] for c in make.all_calls()].count("check") == 1
+
+
+def test_release_plan_runs_make_check_first_before_reuse_provenance_and_the_lock(make, repo):
+    stubs = _cases_stub(make)
+    assert make("rehearse", "dev", stubs=stubs).returncode == 0
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    make.reset()
+    result = make("release-plan", "prod", stubs=stubs)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "reusing dev's passing rehearsal" in result.stdout
+    calls = make.all_calls()
+    assert calls[0][0] == "check" and calls[0][3:9] == _check_call(make, "prod")[1:]
+    assert calls[1:3] == [["inventory", "--env-dir", str(repo.prod)], ["cases", "unlocked", "prod"]]
+    assert [c[0] for c in calls].count("check") == 1
+
+
+def test_a_failing_check_refuses_rehearse_before_the_lock_the_receipt_and_any_live_call(make, repo):
+    stubs = _cases_stub(make)
+    make.exit_code("check", 1)
+    result = make("rehearse", "dev", stubs=stubs)
+    assert result.returncode != 0
+    assert ("rehearse: refused: make check ENV=dev failed (above); nothing was locked, written or applied. "
+            "Fix it, commit, then re-run make rehearse ENV=dev.") in result.stderr
+    assert [c[0] for c in make.all_calls()] == ["check"]
+    assert "environment lock acquired" not in result.stdout
+    assert not rg.rehearse_receipts(repo.cloud, "dev") and _no_lock(repo, "dev")
+
+
+def test_a_failing_check_refuses_release_plan_before_reuse_the_lock_and_any_live_call(make, repo):
+    stubs = _cases_stub(make)
+    assert make("rehearse", "dev", stubs=stubs).returncode == 0
+    repo.commit({"aws/envs/prod/ack.txt": "# none\n"})
+    receipts = len(rg.rehearse_receipts(repo.cloud, "dev"))
+    make.exit_code("check", 1)
+    make.reset()
+    result = make("release-plan", "prod", stubs=stubs)
+    assert result.returncode != 0
+    assert "release-plan: refused: make check ENV=prod failed (above)" in result.stderr
+    assert "reusing dev's passing rehearsal" not in result.stdout
+    assert [c[0] for c in make.all_calls()] == ["check"]
+    # rehearse-reuse never ran: no receipt for the new commit, no lock, no manifest.
+    assert len(rg.rehearse_receipts(repo.cloud, "dev")) == receipts
+    assert _no_lock(repo, "prod") and _no_lock(repo, "dev")
+    assert not list(rg.manifests_dir(repo.cloud, "prod").glob("*/manifest.json"))
+
+
+@pytest.mark.parametrize("dirt", ["envs", "shared"])
+def test_a_dirty_checkout_refuses_rehearse_before_the_check_the_lock_and_any_live_call(make, repo, dirt):
+    stubs = _cases_stub(make)
+    if dirt == "envs":
+        (repo.dev / "env.auto.tfvars").write_text(DEV_ENV + "# uncommitted\n")
+    else:
+        (repo.root / "shared" / "scripts" / "code.py").write_text("x = 3\n")
+    result = make("rehearse", "dev", stubs=stubs)
+    assert result.returncode != 0
+    assert "make rehearse refused: the checkout is not clean:" in result.stderr
+    assert ("aws/envs/dev/env.auto.tfvars" if dirt == "envs" else "shared/scripts/code.py") in result.stderr
+    assert make.all_calls() == []  # no check, no custom-mask live check, nothing under the lock
+    assert not rg.rehearse_receipts(repo.cloud, "dev") and _no_lock(repo, "dev")
+
+
+def test_ignored_files_never_make_rehearse_refuse_as_dirty(make, repo):
+    (repo.dev / "auth.auto.tfvars").write_text('databricks_client_id = "x"\n')
+    (repo.dev / "terraform.tfstate").write_text("{}")
+    assert repo.git("status", "--porcelain").strip() == ""  # both are git-ignored
+    result = make("rehearse", "dev")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not clean" not in result.stderr
+
+
+def test_legacy_rehearse_and_a_refused_release_plan_run_no_check(make, repo):
+    (repo.dev / "env.auto.tfvars").write_text('genie_space_id = "x"\n')
+    assert make("rehearse", "dev").returncode == 0
+    (repo.prod / "env.auto.tfvars").write_text(LEGACY_ENV)
+    assert make("release-plan", "prod").returncode != 0
+    assert "check" not in [c[0] for c in make.all_calls()]
 
 
 # -- a failed verify-key stops every release path ---------------------------------------

@@ -122,7 +122,7 @@ def test_maintain_runs_on_the_deployment_machine_at_the_last_released_commit_not
 
 def _generate_step(readme: str) -> str:
     dev = _section(readme, "## Dev", "## Prod")
-    return dev[dev.index("**4. Generate.**"):dev.index("**5. Check.**")]
+    return dev[dev.index("**4. Generate.**"):dev.index("**5. Rehearse.**")]
 
 
 def test_dev_step_4_says_a_deterministic_generate_replaces_masks_and_points_at_the_settings():

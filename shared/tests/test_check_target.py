@@ -789,3 +789,358 @@ def test_check_removes_the_scratch_copy_when_copying_credentials_fails(repo, tmp
         check_env._check(args)
 
     assert list(scratch_tmp.iterdir()) == []
+
+
+# ── rehearse and release-plan run the same check first ──────────────────────
+# The first step after the check is a live call (rehearse: the custom-mask live
+# check; release-plan: rehearse-reuse, which takes the source env's lock). Both
+# are stubbed to record and stop, so a test sees whether the check let the
+# command reach them, and nothing else live can run.
+
+FIRST_LIVE_STEP = {"rehearse": "custom_masks.py live-check", "release-plan": "release_gate.py rehearse-reuse"}
+
+
+def _make_gated(repo, tmp_path, target, env):
+    """make <target> ENV=<env>, first live step stubbed (the deployer SP's auth file is written first)."""
+    from shared.tests import script_stubs
+
+    log = tmp_path / "live-steps.log"
+    recorder = tmp_path / "live-step"
+    recorder.write_text(f'#!/bin/sh\necho "$0 $*" >> "{log}"\nexit 1\n')
+    recorder.chmod(0o755)
+    # The fixture's agent has no acl_groups: the local reader and group guards
+    # (tested on their own) pass here so the command reaches the check.
+    stub_bin = script_stubs.install(tmp_path / "stub-bin", {FIRST_LIVE_STEP[target]: str(recorder),
+                                                           "table_readers.py check": "true",
+                                                           "group_map.py check": "true"})
+    environ = _env(tmp_path)
+    environ["PATH"] = f"{stub_bin}:{environ['PATH']}"
+    result = subprocess.run(["make", "--no-print-directory", "-C", str(repo / "aws"), target, f"ENV={env}"],
+                            text=True, capture_output=True, env=environ, timeout=300)
+    return result, (log.read_text() if log.exists() else "")
+
+
+def _copy_tracked_shared(dest):
+    """The engine as git tracks it (no local __pycache__, .terraform or other untracked files)."""
+    listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "shared"],
+                            capture_output=True, check=True).stdout
+    for rel in filter(None, listed.decode().split("\0")):
+        source = ROOT / rel
+        if source.is_file() and not source.is_symlink():
+            target = dest / Path(rel).relative_to("shared")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+
+def _vendor_shared(repo):
+    """Replace the fixture's shared/ symlink with a committed copy, as a customer checkout has."""
+    shared = repo / "shared"
+    if shared.is_symlink():
+        shared.unlink()
+        _copy_tracked_shared(shared)
+        _commit(repo, "vendor shared/")
+
+
+def _ready_to_apply(repo, env):
+    """What rehearse/release-plan need of the checkout: its own committed shared/ and the deployer's auth."""
+    _vendor_shared(repo)
+    deployer = hcl2.load(open(_envs(repo) / env / "env.auto.tfvars")).get("deployer_principal_id", "")
+    (_envs(repo) / env / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+
+
+def _no_lock_or_receipt(repo):
+    assert not list(_envs(repo).rglob(".governance.lock")), "a lock was taken"
+    assert not list(repo.rglob("receipts")), "a receipt was written"
+
+
+@pytest.mark.parametrize("target, env", [("rehearse", "dev"), ("release-plan", "prod")])
+def test_a_broken_committed_config_is_refused_before_any_lock_write_or_live_call(promoted, tmp_path, target, env):
+    # Valid config whose committed generated file the commit doesn't regenerate.
+    edited = _envs(promoted) / env / "generated" / "abac.auto.tfvars"
+    edited.write_text(edited.read_text().replace('"c"' if env == "dev" else "account_last4",
+                                                 '"hand edited"' if env == "dev" else "redact", 1))
+    _commit(promoted, "hand edit")
+    _ready_to_apply(promoted, env)
+    before = _baseline(promoted)
+
+    result, live = _make_gated(promoted, tmp_path, target, env)
+
+    assert result.returncode != 0
+    # check's own message, then the command's refusal.
+    assert ": differs from the regenerated file" in result.stderr
+    assert f"=== make check ENV={env}: FAILED (" in result.stderr
+    assert (f"{target}: refused: make check ENV={env} failed (above); nothing was locked, written or applied."
+            in result.stderr)
+    if env == "prod":
+        assert "FAILED (promote-to ENV=prod CHECK=1)" in result.stderr
+    assert live == "", "the command went past the check"
+    assert "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(promoted)
+    _assert_read_only(promoted, before)
+
+
+def test_rehearse_on_a_valid_committed_config_passes_the_check_and_goes_on(repo, tmp_path):
+    _ready_to_apply(repo, "dev")
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    out = result.stdout + result.stderr
+    assert "=== make check ENV=dev: passed ===" in out, out
+    assert "refused: make check" not in out
+    # The check's structural plan ran; then rehearse went on to its first live step.
+    assert (tmp_path / "tf.log").read_text().split("\n")[:2] == ["plan data_access",
+                                                                  "plan workspace expected-withholding"]
+    assert "--env dev" in live, out
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
+
+
+def test_release_plan_check_runs_after_the_workspace_env_and_mode_guards(repo, tmp_path):
+    # A legacy env is refused with release-plan's own message, before any check.
+    (_envs(repo) / "dev" / "env.auto.tfvars").write_text(DEV_ENV.replace("deterministic", "legacy"))
+    _commit(repo, "legacy")
+
+    result, live = _make_gated(repo, tmp_path, "release-plan", "dev")
+
+    assert result.returncode != 0
+    assert "is not in deterministic governance mode" in result.stderr
+    assert "make check ENV=dev" not in result.stdout + result.stderr
+    assert live == ""
+
+
+def _broken_head_clean_worktree(repo, env):
+    """Codex's repro: commit a hand edit (HEAD is broken), then restore the file uncommitted."""
+    rel = "dev/data_access/abac.auto.tfvars" if env == "dev" else "prod/generated/abac.auto.tfvars"
+    path = _envs(repo) / rel
+    good = path.read_text()
+    path.write_text(good.replace('"c"', '"hand edited"', 1) if env == "dev" else good.replace("account_last4", "redact"))
+    _commit(repo, "hand edit")
+    path.write_text(good)
+    return rel
+
+
+@pytest.mark.parametrize("target, env", [("rehearse", "dev"), ("release-plan", "prod")])
+def test_a_broken_commit_under_a_restored_working_tree_is_refused_before_anything(promoted, tmp_path, target, env):
+    _vendor_shared(promoted)  # first: vendoring commits everything, the restored file included
+    rel = _broken_head_clean_worktree(promoted, env)
+    _ready_to_apply(promoted, env)
+    before = _baseline(promoted)
+
+    result, live = _make_gated(promoted, tmp_path, target, env)
+
+    assert result.returncode != 0
+    assert f"make {target} refused: the checkout is not clean:" in result.stderr
+    assert f"aws/envs/{rel}" in result.stderr
+    # Refused before the check, any live step, lock, receipt or terraform.
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(promoted)
+    _assert_read_only(promoted, before)
+
+
+def _check_env(repo, env, *flags):
+    return subprocess.run([sys.executable, str(SHARED / "scripts" / "check_env.py"), *flags, "check", "--env", env,
+                           "--cloud-dir", str(repo / "aws"), "--makefile", str(repo / "aws" / "Makefile")],
+                          text=True, capture_output=True, env=_env(repo.parent), timeout=300)
+
+
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_the_embedded_check_reads_head_not_the_working_tree(promoted, env):
+    rel = _broken_head_clean_worktree(promoted, env)
+    before = _baseline(promoted)
+
+    committed = _check_env(promoted, env, "--committed")
+    working = _check_env(promoted, env)
+
+    assert committed.returncode != 0, committed.stdout + committed.stderr
+    assert ": differs from the regenerated file" in committed.stderr
+    assert "uncommitted working-tree content" not in committed.stdout
+    # Standalone make check keeps checking the tracked working tree, with #238's note.
+    assert "differs from the regenerated file" not in working.stderr
+    assert f"NOTE: make check passed against uncommitted working-tree content in envs/{env}:" in working.stdout \
+        or "FAILED (plan)" in working.stderr, working.stdout + working.stderr
+    assert rel.split("/", 1)[1] in working.stdout
+    _assert_read_only(promoted, before)
+
+
+def test_ignored_runtime_files_never_make_the_checkout_dirty(repo, tmp_path):
+    _ready_to_apply(repo, "dev")
+    (_envs(repo) / "dev" / "data_access").mkdir(exist_ok=True)
+    (_envs(repo) / "dev" / "data_access" / "terraform.tfstate").write_text("{}")
+    assert _git(repo, "status", "--porcelain") == ""
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert "not clean" not in result.stderr
+    assert "=== make check ENV=dev: passed ===" in result.stdout + result.stderr
+    assert "--env dev" in live
+
+
+def _external_shared(repo, tmp_path, *, git_tree=True):
+    """repo/shared as a committed symlink to an engine copy outside the checkout."""
+    outside = tmp_path / "engine" / "shared"
+    _copy_tracked_shared(outside)
+    if git_tree:
+        _git(outside.parent, "init", "-q")
+        _git(outside.parent, "add", "-A")
+        _git(outside.parent, "commit", "-q", "-m", "engine")
+    (repo / "shared").unlink()
+    (repo / "shared").symlink_to(outside)
+    _commit(repo, "point shared/ at the engine")
+    return outside
+
+
+EXTERNAL = "shared/ resolves outside this checkout"
+COMMITTED_HERE = "need the engine committed as regular files in this repo so receipts can fingerprint it"
+
+
+@pytest.mark.parametrize("state", ["clean", "untracked", "modified", "not-a-git-tree"])
+def test_an_external_shared_refuses_rehearse_before_anything(repo, tmp_path, state):
+    # The code fingerprint hashes only this checkout's tracked files, so a shared/ that resolves
+    # elsewhere can't be bound by a receipt, clean (at any revision) or not. "untracked" is the
+    # r2 repro.
+    outside = _external_shared(repo, tmp_path, git_tree=state != "not-a-git-tree")
+    if state == "untracked":
+        (outside / "scripts" / "planted.py").write_text("x = 1\n")
+    elif state == "modified":
+        (outside / "scripts" / "check_env.py").write_text((outside / "scripts" / "check_env.py").read_text()
+                                                          + "\n# edited\n")
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert result.returncode != 0
+    assert "make rehearse refused: the checkout is not clean:" in result.stderr
+    assert f"{EXTERNAL} ({outside.resolve()}); deterministic rehearse/release-plan {COMMITTED_HERE}" in result.stderr
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
+
+
+@pytest.mark.parametrize("state", ["clean", "untracked", "not-a-git-tree"])
+def test_receipts_and_provenance_use_the_same_engine_test_as_clean_check(repo, tmp_path, state):
+    from shared.scripts import release_gate as rg
+
+    outside = _external_shared(repo, tmp_path, git_tree=state != "not-a-git-tree")
+    if state == "untracked":
+        (outside / "planted.txt").write_text("x\n")
+    status = rg.checkout_status(_envs(repo) / "dev")
+    assert status["clean_tree"] is False, status
+    assert any(EXTERNAL in line and COMMITTED_HERE in line for line in status["dirty"]), status
+    with pytest.raises(rg.Refused, match=COMMITTED_HERE):
+        rg.clean_check(_envs(repo) / "dev", "dev", "make rehearse")
+
+# What a normal clone's .gitignore ignores under shared/ (the root .gitignore): caches only.
+CACHE_IGNORES = "__pycache__/\n*.pyc\n.pytest_cache/\n.terraform/\n.terraform.lock.hcl\n.DS_Store\n"
+
+
+def _ignore(repo, patterns):
+    (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + patterns)
+    _commit(repo, "ignore")
+
+
+def _plant(repo, rel):
+    path = repo / "shared" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x\n")
+
+
+def test_a_normal_clone_with_caches_is_clean(repo):
+    from shared.scripts import release_gate as rg
+
+    _vendor_shared(repo)
+    _ignore(repo, CACHE_IGNORES)
+    for rel in ("scripts/__pycache__/check_env.cpython-311.pyc", "tests/__pycache__/x.cpython-311.pyc",
+                "roots/data_access/.terraform/providers/p", "roots/data_access/.terraform.lock.hcl",
+                ".pytest_cache/v/cache/nodeids", "scripts/.DS_Store"):
+        _plant(repo, rel)
+    assert _git(repo, "status", "--porcelain") == ""
+    status = rg.checkout_status(_envs(repo) / "dev")
+    assert status["clean_tree"] is True, status
+
+
+@pytest.mark.parametrize("planted, pattern", [
+    ("countries/ZZ.yaml", "ZZ.yaml\n"),             # r4 repro: load_country_overlays(["ZZ"]) reads it
+    ("industries/zz.yaml", "zz.yaml\n"),
+    ("scripts/.planted.json", ""),                   # the fixture's .*.json
+    ("scripts/stray.pyc", ""),                       # a bare .pyc beside the sources is importable
+    ("scripts/account-admin.aws.env", "*.env\n"),    # any suffix: deny by default
+])
+def test_any_other_ignored_file_under_shared_refuses(repo, planted, pattern):
+    from shared.scripts import release_gate as rg
+
+    _vendor_shared(repo)
+    _ignore(repo, CACHE_IGNORES + pattern)
+    _plant(repo, planted)
+    assert _git(repo, "status", "--porcelain") == "", "the planted file must be git-ignored"
+    status = rg.checkout_status(_envs(repo) / "dev")
+    assert status["clean_tree"] is False, status
+    assert (f"ignored file under shared/ (not in the code fingerprint; commit or delete it): shared/{planted}"
+            in status["dirty"]), status
+
+
+def _submodule_shared(repo, tmp_path, *, nested_only=False):
+    """shared/ as a committed submodule (gitlink), or a nested repo under shared/scripts."""
+    engine = tmp_path / "engine-repo"
+    _copy_tracked_shared(engine)
+    _git(engine, "init", "-q")
+    _git(engine, "add", "-A")
+    _git(engine, "commit", "-q", "-m", "engine")
+    if nested_only:
+        _vendor_shared(repo)
+        nested = repo / "shared" / "scripts" / "vendored"
+        _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(engine), str(nested.relative_to(repo)))
+    else:
+        (repo / "shared").unlink()
+        _git(repo, "rm", "-q", "--cached", "shared")
+        _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(engine), "shared")
+    _commit(repo, "engine as a submodule")
+
+
+@pytest.mark.parametrize("where", ["shared", "under-shared"])
+def test_an_engine_submodule_refuses_rehearse_before_anything(repo, tmp_path, where):
+    _submodule_shared(repo, tmp_path, nested_only=where == "under-shared")
+    staged = _git(repo, "ls-files", "-s", "--", "shared")
+    assert any(line.startswith("160000 ") for line in staged.splitlines()), staged
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert result.returncode != 0
+    assert "make rehearse refused: the checkout is not clean:" in result.stderr
+    assert f"holds a git submodule or nested repository" in result.stderr
+    assert COMMITTED_HERE in result.stderr
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)
+
+
+def test_an_ignored_country_overlay_refuses_rehearse_before_anything(repo, tmp_path):
+    _vendor_shared(repo)
+    _ignore(repo, CACHE_IGNORES + "ZZ.yaml\n")
+    _plant(repo, "countries/ZZ.yaml")
+    deployer = hcl2.load(open(_envs(repo) / "dev" / "env.auto.tfvars"))["deployer_principal_id"]
+    (_envs(repo) / "dev" / "auth.auto.tfvars").write_text(f'databricks_client_id = "{deployer}"\n')
+    before = _baseline(repo)
+
+    result, live = _make_gated(repo, tmp_path, "rehearse", "dev")
+
+    assert result.returncode != 0
+    assert "ignored file under shared/ (not in the code fingerprint; commit or delete it): shared/countries/ZZ.yaml" \
+        in result.stderr
+    assert "=== make check" not in result.stdout + result.stderr
+    assert live == "" and "environment lock acquired" not in result.stdout
+    assert not (tmp_path / "tf.log").exists()
+    _no_lock_or_receipt(repo)
+    _assert_read_only(repo, before)

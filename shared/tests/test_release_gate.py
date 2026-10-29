@@ -2135,3 +2135,43 @@ def test_group_map_acknowledgements_are_reconciled_with_the_rest(released_prod, 
     assert rg.reports(released_prod, "prod")["ok"]
     monkeypatch.setattr(group_map, "required_acks", lambda env_dir, env, cfg: {})
     assert not rg.reports(released_prod, "prod")["ok"]  # now stale
+
+
+# -- edits git status can't see: skip-worktree / assume-unchanged ------------------------------
+
+HIDDEN = [("skip-worktree", "shared/scripts/code.py"), ("assume-unchanged", "shared/scripts/code.py"),
+          ("skip-worktree", "aws/envs/dev/env.auto.tfvars"), ("assume-unchanged", "aws/envs/account/env.auto.tfvars")]
+
+
+def _hide_an_edit(repo, flag, rel):
+    """Codex's repro: flag a tracked file, then edit it; git status stays empty."""
+    repo.git("update-index", f"--{flag}", "--", rel)
+    path = repo.root / rel
+    path.write_text(path.read_text() + "# hidden edit\n")
+    assert repo.git("status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("flag, rel", HIDDEN, ids=[f"{f}:{r}" for f, r in HIDDEN])
+def test_a_flag_hiding_an_edit_makes_the_checkout_unclean_everywhere(repo, flag, rel):
+    rehearse(repo)  # a passing clean receipt of HEAD before the hidden edit
+    _hide_an_edit(repo, flag, rel)
+    message = f"{rel} is marked {flag}, so git status can't show its edits: clear it (git update-index --no-{flag} -- {rel})"
+    status = rg.checkout_status(repo.dev)
+    assert status["clean_tree"] is False and message in status["dirty"], status
+    # clean-check (before rehearse/release-plan's check, lock and live calls) refuses.
+    with pytest.raises(rg.Refused, match="checkout is not clean") as refused:
+        rg.clean_check(repo.dev, "dev", "make rehearse")
+    assert message in str(refused.value)
+    # A receipt written now records it as not clean, so it never counts for a release.
+    receipt = rg.rehearse_finish(repo.dev, "dev", "passed", Path("Makefile"), "make")
+    assert receipt["clean_tree"] is False and message in receipt["dirty"]
+    # Provenance refuses too.
+    with pytest.raises(rg.Refused, match="checkout is not clean"):
+        rg.provenance(repo.prod, "prod")
+
+
+def test_a_flag_without_an_edit_still_refuses_and_clearing_it_restores_clean(repo):
+    repo.git("update-index", "--skip-worktree", "--", "shared/scripts/code.py")
+    assert rg.checkout_status(repo.dev)["clean_tree"] is False
+    repo.git("update-index", "--no-skip-worktree", "--", "shared/scripts/code.py")
+    assert rg.checkout_status(repo.dev)["clean_tree"] is True

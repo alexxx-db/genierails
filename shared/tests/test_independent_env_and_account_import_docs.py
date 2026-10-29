@@ -83,7 +83,7 @@ def test_reference_documents_the_independent_env_steps():
     assert "2. In `envs/bu2/env.auto.tfvars`, delete the seeded `promote_from = \"dev\"`" in text
     assert "Setup never rewrites an existing `env.auto.tfvars`, so they stay deleted." in text
     assert ("3. `make setup ENV=bu2` again: it now prints the rehearsal (Dev section) steps for bu2. Then "
-            "`make generate ENV=bu2`, `make check ENV=bu2` and `make rehearse ENV=bu2`") in text
+            "`make generate ENV=bu2` and `make rehearse ENV=bu2` (which runs `make check ENV=bu2` first)") in text
     assert "[independent environments](shared/docs/advanced.md#independent-environments)" in text
     # The generate row points at it.
     assert ("With no `env.auto.tfvars`, refused for any env but `dev`: run `make setup ENV=<env>` first "

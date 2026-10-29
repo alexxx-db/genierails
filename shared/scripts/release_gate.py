@@ -564,16 +564,107 @@ def receipt_problem(receipt: Mapping, env: str) -> str | None:
     return next((why for ok, why in checks if not ok), None)
 
 
+# The only untracked or ignored things allowed under shared/: caches nothing
+# loads as engine code. Python reads __pycache__/ bytecode only for its own
+# matching tracked source (a bare *.pyc elsewhere is importable, so it isn't
+# allowed); .terraform/ and .terraform.lock.hcl are Terraform's provider cache
+# and lock; .pytest_cache/ and .DS_Store are never read. Anything else (any
+# suffix: .py, .yaml, .env, ...) is not in the code fingerprint and refuses.
+_ENGINE_CACHE_DIRS = ("__pycache__", ".pytest_cache", ".terraform")
+_ENGINE_CACHE_FILES = (".terraform.lock.hcl", ".DS_Store")
+_ENGINE_NOT_COMMITTED = ("deterministic rehearse/release-plan need the engine committed as regular files in this "
+                         "repo so receipts can fingerprint it")
+
+
+def _engine_cache(rel: str) -> bool:
+    parts = Path(rel).parts
+    return any(part in _ENGINE_CACHE_DIRS for part in parts[:-1]) or parts[-1] in _ENGINE_CACHE_FILES
+
+
+def _engine_dirty(repo: Path) -> list[str]:
+    """Why the GenieRails engine (shared/) isn't exactly the committed one ([] when it is).
+
+    The code fingerprint hashes the regular files git tracks under shared/ in
+    this checkout, so shared/ must be just that: not a path resolving
+    elsewhere (a symlink, at any revision), not a submodule or a nested git
+    repo anywhere under it, no uncommitted change, and no untracked or ignored
+    file except the caches above (deny by default).
+    """
+    shared = repo / "shared"
+    if not shared.exists() and not shared.is_symlink():
+        return []
+    target = shared.resolve()
+    if shared.is_symlink() or not target.is_relative_to(repo):
+        return [f"shared/ resolves outside this checkout ({target}); {_ENGINE_NOT_COMMITTED}"]
+    staged = git(repo, "ls-files", "-s", "-z", "--", _rel(repo, shared)).stdout
+    gitlinks = [entry.split("\t", 1)[1] for entry in filter(None, staged.split("\0")) if entry.startswith("160000 ")]
+    nested = sorted(_rel(repo, Path(top) / ".git") for top, dirs, files in os.walk(shared)
+                    if ".git" in dirs or ".git" in files)
+    if gitlinks or nested:
+        return [f"shared/ holds a git submodule or nested repository ({', '.join(gitlinks + nested)}); "
+                f"{_ENGINE_NOT_COMMITTED}"]
+    reasons = [f"uncommitted: {line}" for line in dirty_paths(repo, [shared])]
+    ignored = git(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--",
+                  _rel(repo, shared)).stdout
+    for rel in sorted(filter(None, ignored.split("\0"))):
+        if not _engine_cache(rel):
+            reasons.append(f"ignored file under shared/ (not in the code fingerprint; commit or delete it): {rel}")
+    return reasons
+
+
+def hidden_from_status(repo: Path, paths: Iterable[Path]) -> list[str]:
+    """Tracked files under ``paths`` whose edits git status can't see: assume-unchanged (a
+    lowercase `git ls-files -v` tag) or skip-worktree ('S'/'s'). The fingerprints hash the bytes
+    on disk, so a flagged file could run uncommitted content under a clean receipt; it refuses."""
+    rels = [_rel(repo, p) for p in paths if Path(p).exists()]
+    if not rels:
+        return []
+    scrubbed = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    out = subprocess.run(["git", "-C", str(repo), "ls-files", "-v", "-z", "--", *rels],
+                         capture_output=True, env=scrubbed)
+    if out.returncode:
+        raise Refused(f"git ls-files -v failed: {out.stderr.decode(errors='replace').strip()}")
+    reasons = []
+    for entry in filter(None, out.stdout.decode(errors="replace").split("\0")):
+        tag, _, rel = entry.partition(" ")
+        flags = (["skip-worktree"] if tag in ("S", "s") else []) + (["assume-unchanged"] if tag.islower() else [])
+        if flags:
+            clear = " and ".join(f"git update-index --no-{flag} -- {rel}" for flag in flags)
+            reasons.append(f"{rel} is marked {' and '.join(flags)}, so git status can't show its edits: "
+                           f"clear it ({clear})")
+    return reasons
+
+
 def checkout_status(env_dir: Path) -> dict:
     """Commit, clean flag (with why not) of the checkout an env lives in."""
     env_dir = Path(env_dir)
     repo = repo_root(env_dir)
     cloud_dir = cloud_dir_of(env_dir)
-    reasons = [f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir, repo / "shared"])[:20]]
+    shared = repo / "shared"
+    # _engine_dirty refuses a shared/ that is a link or resolves elsewhere; only a real one is scanned here.
+    scanned = [cloud_dir] + ([shared] if shared.is_dir() and not shared.is_symlink() else [])
+    reasons = ([f"uncommitted: {line}" for line in dirty_paths(repo, [cloud_dir])] + _engine_dirty(repo)
+               + hidden_from_status(repo, scanned))[:20]
     if not tracked(repo, env_dir / "env.auto.tfvars"):
         reasons.append(f"{_rel(repo, env_dir / 'env.auto.tfvars')} is not committed (commit envs/; "
                        "see shared/docs/version-control.md)")
     return {"repo": str(repo), "commit": head(repo), "clean_tree": not reasons, "dirty": reasons}
+
+
+def clean_check(env_dir: Path, env: str, command_name: str) -> None:
+    """rehearse and release-plan, before their check, any lock or live call: the checkout is clean.
+
+    Exactly a receipt's clean_tree and provenance's test (checkout_status: tracked or untracked,
+    not ignored, changes under the cloud dir, and a shared/ proven clean even when it resolves
+    outside the checkout), so ignored runtime files (credentials, state) never count and none of
+    them passes where this refuses. Their check reads the commit, so it must be the tree they apply.
+    """
+    dirty = checkout_status(env_dir)["dirty"]
+    if dirty:
+        raise Refused(f"{command_name} refused: the checkout is not clean:\n      "
+                      + "\n      ".join(dirty[:10])
+                      + f"\n  Its check, receipt and release read the commit: commit or remove the changes, "
+                        f"then re-run {command_name} ENV={env}. Nothing was locked, written or applied.")
 
 
 def _write_rehearse(cloud_dir: Path, env: str, receipt: dict) -> Path:
@@ -2683,6 +2774,7 @@ def main(argv: list[str] | None = None) -> int:
     command("generate-guard").add_argument("--default-env", default="")
     command("identity-check")
     command("legacy-guard").add_argument("--command-name", required=True)
+    command("clean-check").add_argument("--command-name", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "state-dir":
@@ -2811,6 +2903,8 @@ def main(argv: list[str] | None = None) -> int:
             generate_guard(args.env_dir, args.env, args.default_env or None)
         elif args.command == "identity-check":
             identity_check(args.env_dir, args.env)
+        elif args.command == "clean-check":
+            clean_check(args.env_dir, args.env, args.command_name)
         elif args.command == "maintain-check":
             last = maintain_check(args.env_dir, args.env)
             print(f"maintain: HEAD is the last released commit {last['commit'][:12]} (digests match).")

@@ -148,9 +148,7 @@ jobs:
             "databricks_workspace_id   = \"$WORKSPACE_ID\"" \
             "databricks_workspace_host = \"$HOST\"" > envs/dev/auth.auto.tfvars
 
-      - name: Read-only check of the merged commit
-        run: make check ENV=dev
-
+      # make rehearse runs make check ENV=dev itself before its lock.
       - name: Rehearse dev
         run: make rehearse ENV=dev
 

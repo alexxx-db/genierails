@@ -9023,8 +9023,9 @@ def generate_next_steps(
         return champion_genie_next_steps(env_name)
     if champion_flow or not tuning:
         # make check reads only committed env files, and a rehearse or
-        # release-plan needs a clean checkout. Rehearse already runs
-        # validate-generated + apply; prod never rehearses (the Makefile
+        # release-plan needs a clean checkout. A deterministic rehearse and
+        # release-plan run make check first; a legacy rehearse doesn't, but
+        # runs validate-generated + apply; prod never rehearses (the Makefile
         # refuses). A deterministic prod releases the manifest release-plan wrote,
         # and release-plan plans only a commit on origin/main with a passing
         # rehearsal of the source env at that same commit, which it writes itself
@@ -9036,7 +9037,8 @@ def generate_next_steps(
                   else "git add envs/ && git commit")
         lines += [
             f"       {out_dir}/abac.auto.tfvars",
-            f"    2. {commit}, then: make check ENV={env_name}   (reads committed files only)",
+            f"    2. {commit}, then: make check ENV={env_name}   (reads committed files only)"
+            if tuning else f"    2. {commit}   (rehearse and release-plan run make check on the committed files)",
         ]
         is_promoted = (env_name == "prod") if promoted is None else promoted
         if not is_promoted:

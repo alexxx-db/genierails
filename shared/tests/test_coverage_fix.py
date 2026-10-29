@@ -166,8 +166,8 @@ def test_a_prod_promoted_from_a_rehearsed_stg_follows_the_printed_steps_to_a_rel
     next_line = _next(_scaffold(repo, "ppay.s.t.email", "redact"))
     assert hcl2.loads((stg / "env.auto.tfvars").read_text())["tag_treatments"] == {LABEL: "redact"}
     assert re.findall(r"make [a-z-]+ ENV=[a-z]+", next_line) == [
-        "make generate ENV=stg", "make check ENV=stg", "make rehearse ENV=stg", "make promote-to ENV=prod",
-        "make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod"]
+        "make generate ENV=stg", "make rehearse ENV=stg", "make promote-to ENV=prod",
+        "make release-plan ENV=prod", "make release ENV=prod"]
     assert "make release-plan ENV=prod (it reuses the stg rehearsal, or names the command to run)" in next_line
 
     out = _follow(repo, next_line)
@@ -209,7 +209,7 @@ def test_a_prod_promoted_through_a_promoted_stg_maps_and_adopts_in_dev_then_stop
     assert hcl2.loads((dev / "env.auto.tfvars").read_text())["tag_treatments"] == {LABEL: NAME}
     assert (stg / "env.auto.tfvars").read_text() == stg_file
     assert re.findall(r"make [a-z-]+ ENV=[a-z]+", next_line) == [
-        "make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev", "make promote-to ENV=stg",
+        "make generate ENV=dev", "make rehearse ENV=dev", "make promote-to ENV=stg",
         "make check ENV=stg", "make promote-to ENV=prod", "make check ENV=prod"]
     assert "release-plan ENV=prod needs a passing rehearsal of stg" in next_line
 

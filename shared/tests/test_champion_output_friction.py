@@ -151,12 +151,13 @@ def test_legacy_full_and_governance_keep_validate_then_apply(tmp_path, mode, tar
     ],
 )
 def test_deterministic_next_steps_match_walkthrough(tmp_path, mode, env_name, tail):
-    """A deterministic draft follows the walkthrough: commit, make check, then rehearse or release-plan."""
+    """A deterministic draft follows the walkthrough: commit, then rehearse or release-plan (both run make check)."""
     lines = generate_next_steps(tmp_path, mode, env_name, has_sql=True, champion_flow=False, tuning=False)
 
     assert lines[: -len(tail)][-1] == (
-        f"    2. git add envs/ && git commit, then: make check ENV={env_name}   (reads committed files only)"
+        "    2. git add envs/ && git commit   (rehearse and release-plan run make check on the committed files)"
     )
+    assert not any("make check ENV=" in line for line in lines)
     assert lines[-len(tail):] == tail
     assert not any("validate-generated" in line for line in lines)
     assert not any(re.search(r"make apply\b", line) for line in lines)
@@ -177,10 +178,10 @@ def test_deterministic_prod_banner_pushes_then_release_plan_reuses_the_source_re
     assert "make rehearse" not in text
     readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
-    step = prod[prod.index("**3. Check, plan, release.**"):prod.index("**4. Record evidence.**")]
+    step = prod[prod.index("**3. Plan, release.**"):prod.index("**4. Record evidence.**")]
     block = step[step.index("```bash"):step.index("```", step.index("```bash") + 3)]
-    assert block.split("\n")[1:] == ["make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod",
-                                     ""]
+    # release-plan runs make check itself, so the block has no separate check line.
+    assert block.split("\n")[1:] == ["make release-plan ENV=prod", "make release ENV=prod", ""]
     flat = " ".join(step.split())
     order = ["plans only a commit on your `origin/main` that has a passing `make rehearse ENV=dev` of that same commit",
              "release-plan reuses that rehearsal itself and applies nothing in dev",

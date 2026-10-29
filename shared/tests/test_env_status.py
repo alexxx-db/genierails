@@ -647,3 +647,9 @@ def test_make_and_next_share_one_ci_detection():
 def test_the_real_guard_and_ci_guard_agree(world, ci):
     expected = ci_guard.apply_allowed(ci)
     assert guard_accepts(world, "make release ENV=prod", ci) is expected
+
+
+def test_next_never_suggests_a_separate_make_check():
+    """rehearse and release-plan run make check themselves (deterministic envs), so make next never names it."""
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "env_status.py").read_text()
+    assert "make check" not in source

@@ -2,14 +2,14 @@
 
 The repo starts as a GenieRails clone (the upstream root .gitignore) with
 its own origin, like the walkthrough's "your own repo first". Dev is
-committed and rehearsed at an earlier commit (dev step 6). Then every command
+committed and rehearsed at an earlier commit (dev step 5). Then every command
 in shared/examples/dev_to_prod/README.md's Prod section runs in order, read
 from the README itself, up to make release-plan ENV=prod: setup, promote-to,
-the commit command, check, rehearse and release-plan.
+the commit command and release-plan (which runs make check itself).
 
-setup, promote-to and check run the real recipes (Terraform is a stub);
-rehearse and release-plan run with tests/test_release_gate_make.py's stubbed
-recursive make and live checks, so nothing reaches Databricks.
+setup and promote-to run the real recipes (Terraform is a stub); rehearse
+and release-plan run with tests/test_release_gate_make.py's stubbed
+recursive make, check and live checks, so nothing reaches Databricks.
 """
 
 from __future__ import annotations
@@ -91,6 +91,14 @@ class Customer:
         (bin_dir / "terraform").write_text(FAKE_TERRAFORM)
         (bin_dir / "terraform").chmod(0o755)
         self.git("init", "-q", "-b", "main")
+        # Like a real clone, the engine files GenieRails tracks are tracked here too, the ones the
+        # root .gitignore matches (treatment_config.json, example masking_functions.sql) included:
+        # release_gate refuses an ignored engine file, which the code fingerprint can't see.
+        listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "shared"],
+                                capture_output=True, check=True).stdout.split(b"\0")
+        engine = b"\0".join(rel for rel in listed if rel and (self.root / os.fsdecode(rel)).is_file())
+        subprocess.run(["git", "-C", str(self.root), "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                       input=engine, check=True, capture_output=True, env=os.environ | self.env)
         subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True, env=os.environ | self.env)
         self.git("remote", "add", "origin", str(self.origin))
         self.stubbed = Make(tmp_path, self)
@@ -134,7 +142,7 @@ def customer(tmp_path, monkeypatch):
     repo.git("commit", "-q", "-m", "Govern the first agent in dev")
     repo.git("push", "-q", "-u", "origin", "main")
     assert repo.git("status", "--porcelain") == ""
-    # Dev step 6.
+    # Dev step 5.
     result = repo.stub_make("rehearse", "dev")
     assert result.returncode == 0, result.stdout + result.stderr
     assert rg.passing_receipt(repo.cloud, "dev", repo.head())
@@ -156,7 +164,7 @@ def _fill_in_prod(repo: Customer) -> None:
 def test_the_prod_section_reads_as_expected():
     assert prod_commands() == [
         "make setup ENV=prod", "make promote-to ENV=prod", "answer y",
-        "make check ENV=prod", "make release-plan ENV=prod",
+        "make release-plan ENV=prod",
     ]
     # The whole flow's promote-to commits the same files itself.
     flow = _section("The whole flow")
@@ -211,7 +219,7 @@ def test_the_release_recipe_prints_heading_then_explanation_then_next_per_round(
 
 
 def test_prod_step_3_says_a_first_release_takes_several_rounds_in_the_real_messages():
-    step = _step(_section("Prod"), "3. Check, plan, release.")
+    step = _step(_section("Prod"), "3. Plan, release.")
     rounds = step[step.index("**A first release takes several rounds.**"):]
     rounds = rounds[:rounds.index("\n")]
     # The README shows one round's output in the recipe's order: heading, what it applied, Next;
@@ -241,7 +249,7 @@ def test_prod_step_3_says_a_first_release_takes_several_rounds_in_the_real_messa
 
 
 def test_prod_step_3_tells_legacy_envs_to_skip_release_plan():
-    step = _step(_section("Prod"), "3. Check, plan, release.")
+    step = _step(_section("Prod"), "3. Plan, release.")
     line = "Legacy envs skip `make release-plan`: run `make release ENV=prod` directly " \
         "(`release-plan` refuses them with `Legacy envs keep: make release ENV=prod`)."
     assert line in step.splitlines()

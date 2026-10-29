@@ -101,13 +101,6 @@ stages:
                     WORKSPACE_ID: $(DEV_DATABRICKS_WORKSPACE_ID)
                     HOST: $(DEV_DATABRICKS_WORKSPACE_HOST)
 
-                - script: make check ENV=dev
-                  displayName: Read-only check of the merged commit
-                  workingDirectory: aws
-                  env:
-                    DATABRICKS_AUTH_TYPE: azure-devops-oidc
-                    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
-
                 # Configure service connection genierails-dev-state-aws with
                 # Azure DevOps workload identity federation to the state role.
                 - task: AWSShellScript@1

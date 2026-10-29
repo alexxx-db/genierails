@@ -565,13 +565,15 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     dev = readme[readme.index("## Dev"):readme.index("## Prod")]
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
 
-    # The whole flow: own repo (setup REPO=) and first commit before check; check before rehearse and release-plan.
+    # The whole flow: own repo (setup REPO=) and first commit first; rehearse and release-plan run
+    # make check themselves, so the flow has no separate check line.
     order = ["make setup ENV=dev REPO=<your-repo-url>", "git add .gitignore envs/",
-             "make generate ENV=dev", "make check ENV=dev", "make rehearse ENV=dev",
-             "make promote-to ENV=prod", "make check ENV=prod", "make release-plan ENV=prod",
+             "make generate ENV=dev", "make rehearse ENV=dev       # checks the committed files",
+             "make promote-to ENV=prod", "make release-plan ENV=prod", "after checking the committed files",
              "make release ENV=prod"]
     positions = [flow.index(step) for step in order]
     assert positions == sorted(positions)
+    assert "make check ENV=" not in flow
     assert "Data classification" in flow
     assert (
         "make setup ENV=prod         # set deployer_principal_id, catalog_map and group_map; "
@@ -585,45 +587,48 @@ def test_champion_walkthrough_covers_check_commit_verify_and_agent_forms():
     committed = dev[dev.index("**2. Commit it (own repo).**"):]
     assert "make setup ENV=dev REPO=<your-repo-url>" in step_1
     assert "git add .gitignore envs/" in committed
-    steps = ["git add .gitignore envs/", "**4. Generate.**", "**5. Check.**",
-             "make check ENV=dev", "**6. Rehearse.**"]
+    steps = ["git add .gitignore envs/", "**4. Generate.**", "**5. Rehearse.**", "make rehearse ENV=dev",
+             "It first runs `make check ENV=dev`", "before it takes the lock, writes anything or reads live dev"]
     positions = [committed.index(step) for step in steps]
     assert positions == sorted(positions)
+    assert "**5. Check.**" not in dev and "**6. Rehearse.**" not in dev
     detailed_positions = [readme.index("make setup ENV=dev REPO=", readme.index("## Dev")),
                           readme.index("git add .gitignore envs/", readme.index("**2. Commit it (own repo).**"))]
     assert detailed_positions == sorted(detailed_positions)
-    assert "`make rehearse` and `make release-plan` don't run it" in dev
+    assert "The same `make check` runs alone as the PR check." in dev
     assert "`verify-access` as its last gate (`_verify-access-gate`)" in dev
     assert "**Pass looks like:** `ALL EFFECTIVE`" in dev and "make verify-access ENV=dev" in dev
     assert "**Agents (preferred):**" in dev and "envs/dev/agents/" in dev
     assert "**Also accepted:**" in dev and "genie_spaces = [{" in dev
 
-    assert prod.index("make check ENV=prod") < prod.index("make release-plan ENV=prod")
+    assert ("`make release-plan` first runs `make check ENV=prod`, which for a promoted env also runs "
+            "`promote-to CHECK=1`; if a step fails, it refuses before any lock, live call or write.") in prod
     assert "make verify-access ENV=prod" in prod
-    assert "not run by `rehearse` or `release-plan`" in ref
-    assert "Does **not** run `make check`" in ref
+    assert "`rehearse` (deterministic envs) and `release-plan` run it first" in ref
+    assert "Does **not** run `make check`" not in ref
+    assert "`make check ENV=dev` first (refuses before the lock, any write or live call if it fails)" in ref
     assert "**Preferred:**" in ref and "**Also accepted:**" in ref
 
 
 def test_champion_walkthrough_lets_release_plan_reuse_the_dev_rehearsal_on_the_promotion_commit():
-    """release-plan needs a passing dev rehearsal of HEAD and writes it itself from dev step 6's (dev unchanged)."""
+    """release-plan needs a passing dev rehearsal of HEAD and writes it itself from dev step 5's (dev unchanged)."""
     readme = (SHARED / "examples/dev_to_prod/README.md").read_text()
     gate = (SHARED / "scripts/release_gate.py").read_text()
     flow = readme[readme.index("## The whole flow"):readme.index("## Before you start")]
     prod = readme[readme.index("## Prod"):readme.index("## Keep it safe")]
     gap = prod[prod.index("**Reuse an existing mask**"):prod.index("**A new kind of mask**")]
 
-    # The whole flow: promote, commit and push, then release-plan (no second dev rehearse).
-    promoted = flow.index('git commit -m "Promote the rules to prod" && git push')
+    # The whole flow: promote-to (which offers the commit + push), then release-plan (no second dev rehearse).
+    promoted = flow.index("offers to commit + push (y)", flow.index("make promote-to ENV=prod"))
     assert flow.index("make promote-to ENV=prod") < promoted < flow.index("make release-plan ENV=prod")
     assert "make rehearse ENV=dev" not in flow[promoted:]
 
-    # Prod: push the promoted files, then plan; release-plan reuses dev's rehearsal.
-    steps = ["Commit and push the promoted files to `main`", "**3. Check, plan, release.**",
-             "make check ENV=prod", "make release-plan ENV=prod", "make release ENV=prod"]
+    # Prod: promote-to offers to commit and push the promoted files, then plan; release-plan reuses dev's rehearsal.
+    steps = ["It then offers to commit and push `.gitignore`, `envs/prod/`", "**3. Plan, release.**",
+             "make release-plan ENV=prod", "make release ENV=prod"]
     positions = [prod.index(step) for step in steps]
     assert positions == sorted(positions)
-    step3 = prod[prod.index("**3. Check, plan, release.**"):]
+    step3 = prod[prod.index("**3. Plan, release.**"):]
     assert "make rehearse ENV=dev" not in step3[:step3.index("make release ENV=prod")]
     # What the user sees, in release_gate.py's own words.
     for quoted in ("no passing rehearsal of", "without re-applying", "did not reuse a rehearsal for this commit"):
